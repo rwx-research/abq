@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -113,8 +113,6 @@ enum QueueWorkerMsg {
     Shutdown,
 }
 
-// type NotifyStart = Arc<(Mutex<bool>, Condvar)>;
-
 /// Initializes a queue.
 /// Right now the only initialization option is
 ///   - in-process, the queue taking and acting on work in threads
@@ -156,6 +154,21 @@ fn start_queue() -> Abq {
     }
 }
 
+static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
+
+fn read_all_nonpolling(read_from: &mut impl Read) -> io::Result<String> {
+    use std::io::ErrorKind;
+
+    let mut msg_buf = String::new();
+    loop {
+        match read_from.read_to_string(&mut msg_buf) {
+            Ok(_) => return Ok(msg_buf),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn start_queue_server(stream: UnixListener, queue: SharedJobQueue) {
     stream
         .set_nonblocking(true)
@@ -163,21 +176,12 @@ fn start_queue_server(stream: UnixListener, queue: SharedJobQueue) {
 
     let mut shutdown_inst_and_timeout = None;
     let mut shutdown_after_n_results = None;
-    let message_wait_time = Duration::from_millis(10);
 
     use std::io::ErrorKind;
     for client in stream.incoming() {
         match client {
             Ok(mut client) => {
-                let mut msg_buf = String::new();
-                loop {
-                    match client.read_to_string(&mut msg_buf) {
-                        Ok(_) => break,
-                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                        Err(e) => panic!("Unhandled IO error: {e:?}"),
-                    }
-                }
-
+                let msg_buf = read_all_nonpolling(&mut client).unwrap();
                 let msg: Message =
                     serde_json::from_str(&msg_buf).expect("Bad message over the protocol");
 
@@ -224,7 +228,7 @@ fn start_queue_server(stream: UnixListener, queue: SharedJobQueue) {
                         // message, it's likely that there are a burst of pending jobs that need to
                         // be completed. In this case we may want to consider sleeping longer than
                         // the default timeout.
-                        thread::sleep(message_wait_time);
+                        thread::sleep(POLL_WAIT_TIME);
                     }
                     _ => panic!("Unhandled IO error: {e:?}"),
                 }
@@ -235,17 +239,26 @@ fn start_queue_server(stream: UnixListener, queue: SharedJobQueue) {
 
 fn start_queue_woker(socket: PathBuf, queue: SharedJobQueue, recv: mpsc::Receiver<QueueWorkerMsg>) {
     loop {
-        if matches!(
-            recv.try_recv(),
-            Ok(QueueWorkerMsg::Shutdown) | Err(mpsc::TryRecvError::Disconnected)
-        ) {
-            // Time to close the queue.
-            break;
+        match recv.try_recv() {
+            Ok(QueueWorkerMsg::Shutdown) => {
+                // We've been asked to shutdown
+                break;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // The corresponding sender has closed; assume this means we should close too.
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        if let Some(WorkItem { id, action }) = queue.lock().unwrap().get_work() {
-            match action {
+        let opt_work = queue.lock().unwrap().get_work();
+        match opt_work {
+            Some(WorkItem { id, action }) => match action {
                 WorkAction::Echo(s) => notify::send_result(&socket, WorkResult { id, message: s }),
+            },
+            None => {
+                // Relinquish the thread before we poll again to avoid spinning cpu.
+                thread::sleep(POLL_WAIT_TIME);
             }
         }
     }
