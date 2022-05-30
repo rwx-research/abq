@@ -20,7 +20,7 @@ jobs:
         uses: actions-rs/toolchain@v1.0.7
         with:
           profile: minimal
-          toolchain: nightly
+          toolchain: stable
           override: true
           components: rustfmt
 
@@ -38,7 +38,6 @@ jobs:
       matrix:
         rust:
           - stable
-          - nightly
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
