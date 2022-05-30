@@ -3,3 +3,7 @@
 pub mod notify;
 pub mod protocol;
 pub mod queue;
+mod workers;
+
+#[cfg(test)]
+procspawn::enable_test_support!();

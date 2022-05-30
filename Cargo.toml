@@ -3,4 +3,6 @@
 members = [
   "bin",
   "lib",
+  "workers/protocol",
+  "workers/echo",
 ]
