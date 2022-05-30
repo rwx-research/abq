@@ -33,8 +33,6 @@ jobs:
   test:
     name: Lint, test
     runs-on: ubuntu-latest
-    rust:
-      - stable
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
