@@ -1,0 +1,3 @@
+{
+  "rust-analyzer.checkOnSave.extraArgs": ["--target-dir", "/tmp/rust-analyzer-check"]
+}
