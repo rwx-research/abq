@@ -1,12 +1,7 @@
 name: CI
 
 on:
-  pull_request:
-    paths:
-      - "**.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/*"
+  - push
 
 jobs:
   fmt:
