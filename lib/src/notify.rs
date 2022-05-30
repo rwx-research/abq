@@ -1,16 +1,16 @@
 use std::path::Path;
 use std::{os::unix::net::UnixStream, time::Duration};
 
-use crate::protocol::{Message, Shutdown, WorkItem, WorkResult};
+use crate::protocol::{Message, Shutdown, WorkAction, WorkId, WorkResult};
 
-pub fn send_work(socket: &Path, work: WorkItem) {
+pub fn send_work(socket: &Path, id: WorkId, action: WorkAction) {
     let stream = UnixStream::connect(socket).expect("socket not available");
-    serde_json::to_writer(stream, &Message::Work(work)).unwrap();
+    serde_json::to_writer(stream, &Message::Work(id, action)).unwrap();
 }
 
-pub(crate) fn send_result(socket: &Path, result: WorkResult) {
+pub(crate) fn send_result(socket: &Path, id: WorkId, result: WorkResult) {
     let stream = UnixStream::connect(socket).expect("socket not available");
-    serde_json::to_writer(stream, &Message::Result(result)).unwrap();
+    serde_json::to_writer(stream, &Message::Result(id, result)).unwrap();
 }
 
 pub(crate) fn send_shutdown(socket: &Path, opt_expect_n: Option<usize>, timeout: Duration) {

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use abq_worker_protocol::Output;
 use serde_derive::{Deserialize, Serialize};
 
 /// ID for a piece of work, reflected both during work queueing and completion.
@@ -8,21 +9,20 @@ use serde_derive::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct WorkId(pub String);
 
-#[derive(Serialize, Deserialize, Debug)]
+/// A unit of work.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg(not(test))]
 pub enum WorkAction {
     Echo(String),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct WorkItem {
-    pub id: WorkId,
-    pub action: WorkAction,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
-pub struct WorkResult {
-    pub id: WorkId,
-    pub message: String,
+/// A unit of work, specialized for testing.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg(test)]
+pub enum WorkAction {
+    Echo(String),
+    InduceTimeout,
+    EchoOnRetry(usize, String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -31,9 +31,16 @@ pub(crate) struct Shutdown {
     pub opt_expect_n: Option<usize>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum WorkResult {
+    Output(Output),
+    Timeout(Duration),
+    Panic(String),
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) enum Message {
     Shutdown(Shutdown),
-    Work(WorkItem),
-    Result(WorkResult),
+    Work(WorkId, WorkAction),
+    Result(WorkId, WorkResult),
 }
