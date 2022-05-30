@@ -33,11 +33,8 @@ jobs:
   test:
     name: Lint, test
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        rust:
-          - stable
+    rust:
+      - stable
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
@@ -52,13 +49,13 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin
             target
-          key: ${{ matrix.os }}-${{ env.cache-name }}-${{ matrix.rust }}-${{ hashFiles('Cargo.lock') }}
+          key: ${{ hashFiles('Cargo.lock') }}
 
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1.0.7
         with:
           profile: minimal
-          toolchain: ${{ matrix.rust }}
+          toolchain: stable
           override: true
           components: clippy
 
