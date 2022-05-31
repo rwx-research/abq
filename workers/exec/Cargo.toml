@@ -1,0 +1,7 @@
+[package]
+name = "abq_exec_worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+abq_worker_protocol = { path = "../protocol" }
