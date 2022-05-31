@@ -24,6 +24,7 @@ pub enum Command {
     /// Runs commands related to Rust's `cargo` toolchain.
     #[clap(subcommand)]
     Cargo(CargoCmd),
+    Jest,
 }
 
 #[derive(Subcommand)]

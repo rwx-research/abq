@@ -13,6 +13,7 @@ dependencies = [
  "indicatif",
  "libabq",
  "log",
+ "serde_json",
  "signal-hook",
  "tempfile",
 ]
