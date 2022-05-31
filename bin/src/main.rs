@@ -26,5 +26,10 @@ fn main() {
             let collector = plugin::cargo::collector();
             run_work(abq, collector);
         }
+        Command::Jest => {
+            let abq = instance::find_abq();
+            let collector = plugin::jest::collector();
+            run_work(abq, collector);
+        }
     }
 }

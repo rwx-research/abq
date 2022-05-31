@@ -281,7 +281,7 @@ fn start_queue_woker(
     let worker_config = WorkerPoolConfig {
         size: NonZeroUsize::new(4).unwrap(),
         notify_result,
-        work_timeout: Duration::from_secs(5),
+        work_timeout: Duration::from_secs(60),
         work_retries: 1,
     };
     let mut worker_pool = WorkerPool::new(worker_config);
