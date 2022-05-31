@@ -5,4 +5,5 @@ members = [
   "lib",
   "workers/protocol",
   "workers/echo",
+  "workers/exec",
 ]

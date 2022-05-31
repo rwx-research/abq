@@ -9,20 +9,21 @@ use abq_worker_protocol::{Output, Worker};
 use procspawn as proc;
 use serde::{Deserialize, Serialize};
 
-use crate::protocol::{WorkAction, WorkId, WorkResult};
+use crate::protocol::{InvocationId, WorkId, WorkerAction, WorkerResult};
 
 #[derive(Serialize, Deserialize)]
 enum Message {
-    Work(WorkId, WorkAction),
+    Work(InvocationId, WorkId, WorkerAction),
     Shutdown,
 }
 
 type SharedMessageRx = Arc<Mutex<mpsc::Receiver<Message>>>;
 
-pub type NotifyResult = Box<dyn Fn(WorkId, WorkResult) + Send + Sync + 'static>;
+pub(crate) type NotifyResult =
+    Box<dyn Fn(InvocationId, WorkId, WorkerResult) + Send + Sync + 'static>;
 
 /// Configuration for a [WorkerPool].
-pub struct WorkerPoolConfig {
+pub(crate) struct WorkerPoolConfig {
     pub size: NonZeroUsize,
     /// How should results be communicated back?
     pub notify_result: NotifyResult,
@@ -54,7 +55,7 @@ pub fn init() {
 /// Work execution is done in the process pool so that the managing worker threads can easily
 /// terminate the process if needed, and panics in the process pool don't induce a panic in the
 /// worker pool process.
-pub struct WorkerPool {
+pub(crate) struct WorkerPool {
     process_pool: Arc<proc::Pool>,
     msg_tx: mpsc::Sender<Message>,
     workers: Vec<ThreadWorker>,
@@ -102,8 +103,10 @@ impl WorkerPool {
         }
     }
 
-    pub fn send_work(&self, id: WorkId, action: WorkAction) {
-        self.msg_tx.send(Message::Work(id, action)).unwrap();
+    pub fn send_work(&self, invocation_id: InvocationId, work_id: WorkId, action: WorkerAction) {
+        self.msg_tx
+            .send(Message::Work(invocation_id, work_id, action))
+            .unwrap();
     }
 
     pub fn shutdown(&mut self) {
@@ -146,8 +149,10 @@ impl ThreadWorker {
         let handle = thread::spawn(move || loop {
             let try_message = msg_rx.lock().unwrap().try_recv();
 
-            let (id, action) = match try_message {
-                Ok(Message::Work(id, action)) => (id, action),
+            let (invocation_id, work_id, action) = match try_message {
+                Ok(Message::Work(invocation_id, work_id, action)) => {
+                    (invocation_id, work_id, action)
+                }
                 Ok(Message::Shutdown) => {
                     break;
                 }
@@ -171,7 +176,7 @@ impl ThreadWorker {
                 let result = handle.join_timeout(work_timeout);
                 match result {
                     Ok(output) => {
-                        notify_result(id.clone(), WorkResult::Output(output));
+                        notify_result(invocation_id, work_id.clone(), WorkerResult::Output(output));
                         break 'attempts;
                     }
                     Err(e) => {
@@ -180,9 +185,9 @@ impl ThreadWorker {
                         }
 
                         let result = if let Some(info) = e.panic_info() {
-                            WorkResult::Panic(info.message().to_string())
+                            WorkerResult::Panic(info.message().to_string())
                         } else if e.is_timeout() {
-                            WorkResult::Timeout(work_timeout)
+                            WorkerResult::Timeout(work_timeout)
                         } else if e.is_cancellation() {
                             panic!("Never cancelled the job, but error is cancellation");
                         } else if e.is_remote_close() {
@@ -191,7 +196,7 @@ impl ThreadWorker {
                             panic!("Unknown error {e:?}");
                         };
 
-                        notify_result(id.clone(), result);
+                        notify_result(invocation_id, work_id.clone(), result);
                     }
                 }
             }
@@ -204,21 +209,32 @@ impl ThreadWorker {
 }
 
 #[cfg(not(test))]
-fn multiplex_action(action: WorkAction, _attempt: usize) -> Output {
+fn multiplex_action(action: WorkerAction, _attempt: usize) -> Output {
+    use abq_exec_worker as exec;
+
     match action {
-        WorkAction::Echo(s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
+        WorkerAction::Echo(s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
+        WorkerAction::Exec {
+            cmd,
+            args,
+            working_dir,
+        } => exec::ExecWorker::run(exec::Work {
+            cmd,
+            args,
+            working_dir,
+        }),
     }
 }
 
 #[cfg(test)]
-fn multiplex_action(action: WorkAction, attempt: usize) -> Output {
+fn multiplex_action(action: WorkerAction, attempt: usize) -> Output {
     match action {
-        WorkAction::Echo(s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
-        WorkAction::InduceTimeout => {
+        WorkerAction::Echo(s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
+        WorkerAction::InduceTimeout => {
             thread::sleep(Duration::MAX);
             unreachable!()
         }
-        WorkAction::EchoOnRetry(succeed_on, s) => {
+        WorkerAction::EchoOnRetry(succeed_on, s) => {
             if succeed_on == attempt {
                 echo::EchoWorker::run(echo::EchoWork { message: s })
             } else {
@@ -238,16 +254,16 @@ mod test {
     use abq_worker_protocol::Output;
 
     use super::{NotifyResult, WorkerPool};
-    use crate::protocol::{WorkAction, WorkId, WorkResult};
+    use crate::protocol::{InvocationId, WorkId, WorkerAction, WorkerResult};
     use crate::workers::WorkerPoolConfig;
 
-    type ResultsCollector = Arc<Mutex<HashMap<String, WorkResult>>>;
+    type ResultsCollector = Arc<Mutex<HashMap<String, WorkerResult>>>;
 
     fn results_collector() -> (ResultsCollector, NotifyResult) {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
-        let notify_result = Box::new(move |id: WorkId, result: WorkResult| {
-            let old_result = results2.lock().unwrap().insert(id.0, result);
+        let notify_result: NotifyResult = Box::new(move |_, work_id, result| {
+            let old_result = results2.lock().unwrap().insert(work_id.0, result);
             debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
         });
         (results, notify_result)
@@ -271,7 +287,11 @@ mod test {
             let echo_string = format!("echo {}", i);
             expected_results.insert(i.to_string(), echo_string.clone());
 
-            pool.send_work(WorkId(i.to_string()), WorkAction::Echo(echo_string));
+            pool.send_work(
+                InvocationId::new(),
+                WorkId(i.to_string()),
+                WorkerAction::Echo(echo_string),
+            );
         }
 
         pool.shutdown();
@@ -285,7 +305,7 @@ mod test {
                 (
                     k,
                     match v {
-                        WorkResult::Output(o) => o.output,
+                        WorkerResult::Output(o) => o.output,
                         res => panic!("unexpected result {res:?}"),
                     },
                 )
@@ -333,12 +353,16 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        pool.send_work(WorkId("id1".to_string()), WorkAction::InduceTimeout);
+        pool.send_work(
+            InvocationId::new(),
+            WorkId("id1".to_string()),
+            WorkerAction::InduceTimeout,
+        );
         pool.shutdown();
 
         assert_eq!(
             results.lock().unwrap().get("id1").unwrap(),
-            &WorkResult::Timeout(timeout)
+            &WorkerResult::Timeout(timeout)
         );
     }
 
@@ -356,14 +380,15 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         pool.send_work(
+            InvocationId::new(),
             WorkId("id1".to_string()),
-            WorkAction::EchoOnRetry(10, "".to_string()),
+            WorkerAction::EchoOnRetry(10, "".to_string()),
         );
         pool.shutdown();
 
         assert_eq!(
             results.lock().unwrap().get("id1").unwrap(),
-            &WorkResult::Panic("Failed to echo!".to_string())
+            &WorkerResult::Panic("Failed to echo!".to_string())
         );
     }
 
@@ -381,14 +406,15 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         pool.send_work(
+            InvocationId::new(),
             WorkId("id1".to_string()),
-            WorkAction::EchoOnRetry(2, "okay".to_string()),
+            WorkerAction::EchoOnRetry(2, "okay".to_string()),
         );
         pool.shutdown();
 
         assert_eq!(
             results.lock().unwrap().get("id1").unwrap(),
-            &WorkResult::Output(Output {
+            &WorkerResult::Output(Output {
                 output: "okay".to_string()
             })
         );

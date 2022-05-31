@@ -1,24 +1,30 @@
-use std::time::Duration;
+mod args;
+mod collect;
+mod instance;
+mod plugin;
 
-use libabq::protocol::{WorkAction, WorkId};
-use libabq::queue::Abq;
+use clap::Parser;
+
+use collect::run_work;
+
+use args::{CargoCmd, Cli, Command};
 
 fn main() {
-    libabq::queue::init();
+    env_logger::Builder::from_env("ABQ_LOG").init();
 
-    let mut queue = Abq::start();
+    let args = Cli::parse();
 
-    libabq::notify::send_work(
-        queue.socket(),
-        WorkId("i1".to_string()),
-        WorkAction::Echo("hello".to_string()),
-    );
-    libabq::notify::send_work(
-        queue.socket(),
-        WorkId("i2".to_string()),
-        WorkAction::Echo("world".to_string()),
-    );
-    let results = queue.shutdown_in(Duration::from_millis(100));
-
-    dbg!(results);
+    match args.command {
+        Command::Start => instance::start_abq_forever(),
+        Command::Echo { strings } => {
+            let abq = instance::find_abq();
+            let collector = plugin::echo::collector(strings);
+            run_work(abq, collector);
+        }
+        Command::Cargo(CargoCmd::Test) => {
+            let abq = instance::find_abq();
+            let collector = plugin::cargo::collector();
+            run_work(abq, collector);
+        }
+    }
 }
