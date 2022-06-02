@@ -133,7 +133,7 @@ fn start_queue(socket: PathBuf) -> Abq {
     let worker_handle = thread::spawn({
         let socket_path = socket.clone();
         let queue = Arc::clone(&queue);
-        move || start_queue_woker(socket_path, queue, recv_worker)
+        move || start_queue_worker(socket_path, queue, recv_worker)
     });
 
     Abq {
@@ -264,7 +264,7 @@ fn start_queue_server(server_listener: UnixListener, queue: SharedJobQueue) {
     }
 }
 
-fn start_queue_woker(
+fn start_queue_worker(
     queue_socket: PathBuf,
     queue: SharedJobQueue,
     recv: mpsc::Receiver<QueueWorkerMsg>,
