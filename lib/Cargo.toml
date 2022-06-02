@@ -23,6 +23,6 @@ features = [
 ]
 
 [dev-dependencies]
-ntest = "0.7.5"
+ntest = "0.8.0"
 procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile = "3.3.0"
