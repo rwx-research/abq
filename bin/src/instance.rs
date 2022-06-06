@@ -5,7 +5,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use tempfile::TempDir;
 
-use libabq::queue::Abq;
+use libabq::queue::{Abq, WorkersConfig};
 
 fn abq_socket() -> &'static Path {
     Path::new("/tmp/abq.socket")
@@ -36,7 +36,7 @@ pub fn start_abq_forever() {
         }
     });
 
-    let mut abq = Abq::start(socket.to_path_buf());
+    let mut abq = Abq::start(socket.to_path_buf(), WorkersConfig::default());
     abq.wait_forever();
 }
 
@@ -70,7 +70,7 @@ pub fn find_abq() -> AbqInstance {
         libabq::queue::init();
 
         let (sock_dir, socket) = temp_socket();
-        let queue = Abq::start(socket);
+        let queue = Abq::start(socket, WorkersConfig::default());
         AbqInstance::Temp(queue, sock_dir)
     }
 }

@@ -46,10 +46,34 @@ pub fn init() {
 pub struct Abq {
     socket: PathBuf,
     server_handle: Option<JoinHandle<()>>,
-    send_worker: mpsc::Sender<QueueWorkerMsg>,
+    send_worker: mpsc::Sender<WorkerSchedulerMsg>,
     worker_handle: Option<JoinHandle<()>>,
 
     active: bool,
+}
+
+enum WorkerPolicy {
+    /// Use a process pool of workers in the same process as the scheduler.
+    InBandProcessPool,
+    /// Use a process pool of workers in a process sandbox isolated from the scheduler.
+    #[allow(unused)]
+    SandboxedProcessPool,
+}
+
+pub struct WorkersConfig {
+    /// How workers should be allocated.
+    policy: WorkerPolicy,
+    /// Number of workers to create.
+    num_workers: NonZeroUsize,
+}
+
+impl Default for WorkersConfig {
+    fn default() -> Self {
+        Self {
+            policy: WorkerPolicy::InBandProcessPool,
+            num_workers: NonZeroUsize::new(4).unwrap(),
+        }
+    }
 }
 
 impl Abq {
@@ -57,8 +81,8 @@ impl Abq {
         &self.socket
     }
 
-    pub fn start(socket: PathBuf) -> Self {
-        start_queue(socket)
+    pub fn start(socket: PathBuf, scheduler_config: WorkersConfig) -> Self {
+        start_queue(socket, scheduler_config)
     }
 
     pub fn wait_forever(&mut self) {
@@ -92,7 +116,7 @@ impl Abq {
             .unwrap();
 
         // Server has closed; shut down all workers.
-        self.send_worker.send(QueueWorkerMsg::Shutdown).unwrap();
+        self.send_worker.send(WorkerSchedulerMsg::Shutdown).unwrap();
         self.worker_handle
             .take()
             .expect("worker handle must be available during Drop")
@@ -110,7 +134,7 @@ impl Drop for Abq {
     }
 }
 
-enum QueueWorkerMsg {
+enum WorkerSchedulerMsg {
     Shutdown,
 }
 
@@ -118,7 +142,7 @@ enum QueueWorkerMsg {
 /// Right now the only initialization option is
 ///   - in-process, the queue taking and acting on work in threads
 ///   - communication over a unix socket
-fn start_queue(socket: PathBuf) -> Abq {
+fn start_queue(socket: PathBuf, scheduler_config: WorkersConfig) -> Abq {
     // TODO: we probably want something more sophisticated here, in particular
     // a concurrent work-stealing queue.
     let queue = Arc::new(Mutex::new(JobQueue::default()));
@@ -131,9 +155,16 @@ fn start_queue(socket: PathBuf) -> Abq {
     });
 
     let worker_handle = thread::spawn({
-        let socket_path = socket.clone();
+        let queue_server_socket = socket.clone();
         let queue = Arc::clone(&queue);
-        move || start_queue_worker(socket_path, queue, recv_worker)
+        move || {
+            start_worker_scheduler(SchedulerConfig {
+                queue_server_socket,
+                queue,
+                msg_recv: recv_worker,
+                workers_config: scheduler_config,
+            })
+        }
     });
 
     Abq {
@@ -264,31 +295,32 @@ fn start_queue_server(server_listener: UnixListener, queue: SharedJobQueue) {
     }
 }
 
-fn start_queue_worker(
-    queue_socket: PathBuf,
+struct SchedulerConfig {
+    /// Socket of the parent queue's in-band server, to which workers should report results.
+    queue_server_socket: PathBuf,
+    /// Queue to steal work from.
     queue: SharedJobQueue,
-    recv: mpsc::Receiver<QueueWorkerMsg>,
-) {
-    let notify_result: NotifyResult = Box::new(move |invocation_id, work_id, result| {
-        let mut queue_stream = UnixStream::connect(&queue_socket).expect("socket not available");
-        protocol::write(
-            &mut queue_stream,
-            Message::WorkerResult(invocation_id, work_id, result),
-        )
-        .unwrap();
-    });
+    /// Channel on which the scheduler itself will receive messages from the parent queue.
+    msg_recv: mpsc::Receiver<WorkerSchedulerMsg>,
+    workers_config: WorkersConfig,
+}
 
-    let worker_config = WorkerPoolConfig {
-        size: NonZeroUsize::new(4).unwrap(),
-        notify_result,
-        work_timeout: Duration::from_secs(60),
-        work_retries: 1,
-    };
-    let mut worker_pool = WorkerPool::new(worker_config);
+/// Starts an out-of-band worker scheduler to manage associated local or remote workers.
+/// As the [queue receives work][start_queue_server], the scheduler will try to steal it and
+/// distribute it appropriately.
+fn start_worker_scheduler(config: SchedulerConfig) {
+    let SchedulerConfig {
+        queue_server_socket,
+        queue,
+        msg_recv,
+        workers_config,
+    } = config;
+
+    let workers = initialize_workers(queue_server_socket, workers_config);
 
     loop {
-        match recv.try_recv() {
-            Ok(QueueWorkerMsg::Shutdown) => {
+        match msg_recv.try_recv() {
+            Ok(WorkerSchedulerMsg::Shutdown) => {
                 // We've been asked to shutdown
                 break;
             }
@@ -299,10 +331,11 @@ fn start_queue_worker(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
+        // No messages from our invoker yet, try to do some work.
         let opt_work = queue.lock().unwrap().get_work();
         match opt_work {
             Some((invocation_id, work_id, action)) => {
-                worker_pool.send_work(invocation_id, work_id, action)
+                workers.send_work(invocation_id, work_id, action)
             }
             None => {
                 // Relinquish the thread before we poll again to avoid spinning cpu.
@@ -311,14 +344,77 @@ fn start_queue_worker(
         }
     }
 
-    worker_pool.shutdown()
+    workers.shutdown()
+}
+
+/// A handle to a set of workers initialized via a [SchedulerPolicy].
+enum WorkersHandle {
+    InBandProcessPool(WorkerPool),
+}
+
+/// Initializes a set of workers according to the requested [policy][WorkerPolicy].
+fn initialize_workers(queue_server_socket: PathBuf, config: WorkersConfig) -> WorkersHandle {
+    let WorkersConfig {
+        policy,
+        num_workers,
+    } = config;
+
+    match policy {
+        WorkerPolicy::InBandProcessPool => {
+            let notify_result: NotifyResult = Box::new(move |invocation_id, work_id, result| {
+                send_result_to_queue(&queue_server_socket, invocation_id, work_id, result)
+            });
+
+            let worker_config = WorkerPoolConfig {
+                size: num_workers,
+                notify_result,
+                // TODO: specify this in WorkersConfig
+                work_timeout: Duration::from_secs(60),
+                work_retries: 1,
+            };
+            let worker_pool = WorkerPool::new(worker_config);
+
+            WorkersHandle::InBandProcessPool(worker_pool)
+        }
+        WorkerPolicy::SandboxedProcessPool => todo!(),
+    }
+}
+
+impl WorkersHandle {
+    fn send_work(&self, invocation_id: InvocationId, work_id: WorkId, action: WorkerAction) {
+        match self {
+            WorkersHandle::InBandProcessPool(pool) => {
+                pool.send_work(invocation_id, work_id, action)
+            }
+        }
+    }
+
+    fn shutdown(self) {
+        match self {
+            WorkersHandle::InBandProcessPool(mut pool) => pool.shutdown(),
+        }
+    }
+}
+
+fn send_result_to_queue(
+    queue_server_socket: &Path,
+    invocation_id: InvocationId,
+    work_id: WorkId,
+    result: WorkerResult,
+) {
+    let mut queue_stream = UnixStream::connect(queue_server_socket).expect("socket not available");
+    protocol::write(
+        &mut queue_stream,
+        Message::WorkerResult(invocation_id, work_id, result),
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
 mod test {
     use std::path::PathBuf;
 
-    use super::Abq;
+    use super::{Abq, WorkersConfig};
     use crate::invoke;
     use crate::protocol::{WorkId, WorkerAction, WorkerResult};
     use ntest::timeout;
@@ -333,7 +429,7 @@ mod test {
     #[test]
     fn socket_alive() {
         let (_dir, socket) = temp_socket();
-        let queue = Abq::start(socket);
+        let queue = Abq::start(socket, WorkersConfig::default());
         assert!(queue.socket().exists());
     }
 
@@ -352,7 +448,7 @@ mod test {
     #[timeout(1000)] // 1 second
     fn multiple_jobs_complete() {
         let (_dir, socket) = temp_socket();
-        let mut queue = Abq::start(socket);
+        let mut queue = Abq::start(socket, WorkersConfig::default());
 
         let id1 = WorkId("Test1".to_string());
         let id2 = WorkId("Test2".to_string());
@@ -377,7 +473,7 @@ mod test {
     #[timeout(1000)] // 1 second
     fn multiple_invokers() {
         let (_dir, socket) = temp_socket();
-        let mut queue = Abq::start(socket);
+        let mut queue = Abq::start(socket, WorkersConfig::default());
 
         let id1 = WorkId("Test1".to_string());
         let id2 = WorkId("Test2".to_string());
