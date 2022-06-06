@@ -1,9 +1,10 @@
 [workspace]
 
 members = [
-  "bin",
-  "lib",
-  "workers/protocol",
-  "workers/echo",
-  "workers/exec",
+  "crates/abq_cli",
+  "crates/abq_queue",
+  "crates/abq_workers",
+  "crates/abq_runners/protocol",
+  "crates/abq_runners/echo",
+  "crates/abq_runners/exec",
 ]

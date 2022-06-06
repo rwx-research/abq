@@ -1,0 +1,25 @@
+[package]
+edition = "2021"
+name = "abq_workers"
+version = "0.1.0"
+
+[dependencies]
+abq_runner_protocol = { path = "../abq_runners/protocol" }
+abq_echo_worker = { path = "../abq_runners/echo" }
+abq_exec_worker = { path = "../abq_runners/exec" }
+
+procspawn = "0.10.1"
+serde = "1.0.137"
+serde_derive = "1.0.137"
+serde_json = "1.0.81"
+
+[dependencies.uuid]
+version = "1.1.1"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+]
+
+[dev-dependencies]
+procspawn = { version = "0.10.1", features = ["test-support"] }
