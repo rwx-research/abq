@@ -1,0 +1,10 @@
+[package]
+edition = "2021"
+name = "abq_output"
+version = "0.1.0"
+
+[dependencies]
+abq_workers = { path = "../abq_workers" }
+abq_runner_protocol = { path = "../abq_runners/protocol" }
+
+[dev-dependencies]

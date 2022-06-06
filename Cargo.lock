@@ -6,12 +6,14 @@ version = 3
 name = "abq"
 version = "0.1.0"
 dependencies = [
- "abq_worker_protocol",
+ "abq_output",
+ "abq_queue",
+ "abq_runner_protocol",
+ "abq_workers",
  "anyhow",
  "clap",
  "env_logger",
  "indicatif",
- "libabq",
  "log",
  "serde_json",
  "signal-hook",
@@ -22,23 +24,63 @@ dependencies = [
 name = "abq_echo_worker"
 version = "0.1.0"
 dependencies = [
- "abq_worker_protocol",
+ "abq_runner_protocol",
 ]
 
 [[package]]
 name = "abq_exec_worker"
 version = "0.1.0"
 dependencies = [
- "abq_worker_protocol",
+ "abq_runner_protocol",
 ]
 
 [[package]]
-name = "abq_worker_protocol"
+name = "abq_output"
+version = "0.1.0"
+dependencies = [
+ "abq_runner_protocol",
+ "abq_workers",
+]
+
+[[package]]
+name = "abq_queue"
+version = "0.1.0"
+dependencies = [
+ "abq_echo_worker",
+ "abq_exec_worker",
+ "abq_runner_protocol",
+ "abq_workers",
+ "anyhow",
+ "ntest",
+ "procspawn",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tempfile",
+ "uuid 1.1.1",
+]
+
+[[package]]
+name = "abq_runner_protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+]
+
+[[package]]
+name = "abq_workers"
+version = "0.1.0"
+dependencies = [
+ "abq_echo_worker",
+ "abq_exec_worker",
+ "abq_runner_protocol",
+ "procspawn",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "uuid 1.1.1",
 ]
 
 [[package]]
@@ -417,23 +459,6 @@ name = "lazy_static"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
-
-[[package]]
-name = "libabq"
-version = "0.1.0"
-dependencies = [
- "abq_echo_worker",
- "abq_exec_worker",
- "abq_worker_protocol",
- "anyhow",
- "ntest",
- "procspawn",
- "serde",
- "serde_derive",
- "serde_json",
- "tempfile",
- "uuid 1.1.1",
-]
 
 [[package]]
 name = "libc"
