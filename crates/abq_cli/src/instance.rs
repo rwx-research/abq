@@ -36,7 +36,7 @@ pub fn start_abq_forever() {
         }
     });
 
-    let mut abq = Abq::start(socket.to_path_buf(), WorkersConfig::default());
+    let mut abq = Abq::start(socket.to_path_buf(), WorkersConfig::default_in_band());
     abq.wait_forever();
 }
 
@@ -70,7 +70,7 @@ pub fn find_abq() -> AbqInstance {
         abq_queue::queue::init();
 
         let (sock_dir, socket) = temp_socket();
-        let queue = Abq::start(socket, WorkersConfig::default());
+        let queue = Abq::start(socket, WorkersConfig::default_in_band());
         AbqInstance::Temp(queue, sock_dir)
     }
 }

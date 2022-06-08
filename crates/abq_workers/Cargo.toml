@@ -7,6 +7,7 @@ version = "0.1.0"
 abq_runner_protocol = { path = "../abq_runners/protocol" }
 abq_echo_worker = { path = "../abq_runners/echo" }
 abq_exec_worker = { path = "../abq_runners/exec" }
+abq_utils = { path = "../abq_utils" }
 
 procspawn = "0.10.1"
 serde = "1.0.137"
@@ -23,3 +24,4 @@ features = [
 
 [dev-dependencies]
 procspawn = { version = "0.10.1", features = ["test-support"] }
+tempfile = "3.3.0"

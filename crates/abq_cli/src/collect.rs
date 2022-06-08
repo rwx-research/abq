@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use abq_queue::invoke;
-use abq_workers::protocol::{WorkId, WorkerAction, WorkerResult};
+use abq_workers::protocol::{WorkId, WorkUnit, WorkerResult};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::instance::AbqInstance;
@@ -26,7 +26,7 @@ pub trait CollectInputs<Input>: FnOnce() -> Vec<Input> {}
 impl<T, Input> CollectInputs<Input> for T where T: FnOnce() -> Vec<Input> {}
 
 /// Creates a unit of work.
-type CreateWork<Input, Ctx> = fn(&mut Ctx, Input) -> (String, WorkId, WorkerAction);
+type CreateWork<Input, Ctx> = fn(&mut Ctx, Input) -> (String, WorkId, WorkUnit);
 
 /// Formats a returned result as a string for reporting.
 type ReportResult = fn(WorkerResult) -> String;

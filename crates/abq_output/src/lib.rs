@@ -15,7 +15,13 @@ pub fn format_results(mut results: Vec<(WorkId, WorkerResult)>) -> String {
 
 pub fn format_result(result: WorkerResult) -> String {
     match result {
-        WorkerResult::Output(Output { output }) => output,
+        WorkerResult::Output(Output { success, message }) => {
+            if success {
+                "OK".to_string()
+            } else {
+                format!("FAIL: {}", message)
+            }
+        }
         WorkerResult::Timeout(duration) => {
             format!("timeout after {}", format_duration(duration))
         }

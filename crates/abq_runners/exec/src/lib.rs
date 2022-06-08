@@ -1,12 +1,10 @@
-use std::path::PathBuf;
-use std::process::{self, Stdio};
+use std::process;
 
 use abq_runner_protocol::{Output, Runner};
 
 pub struct Work {
     pub cmd: String,
     pub args: Vec<String>,
-    pub working_dir: PathBuf,
 }
 
 pub struct ExecWorker {}
@@ -15,19 +13,21 @@ impl Runner for ExecWorker {
     type Input = Work;
 
     fn run(input: Work) -> Output {
-        let status = process::Command::new(input.cmd)
+        let output = process::Command::new(input.cmd)
             .args(input.args)
-            .current_dir(input.working_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .stdin(Stdio::null())
-            .status()
+            .output()
+            // TODO: handle failure
             .unwrap();
 
-        let msg = if status.success() { "OK" } else { "FAIL" };
+        let success = output.status.success();
+        let message = if success {
+            output.stdout
+        } else {
+            output.stderr
+        };
+        // TODO: handle not utf8 encodable
+        let message = String::from_utf8(message).unwrap();
 
-        Output {
-            output: msg.to_string(),
-        }
+        Output { success, message }
     }
 }

@@ -15,14 +15,15 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
 
-use crate::protocol::{self, InvokeWork, InvokerResponse, Message};
-use abq_workers::protocol::{InvocationId, WorkId, WorkerAction, WorkerResult};
+use crate::protocol::{InvokeWork, InvokerResponse, Message};
+use abq_utils::net_protocol;
+use abq_workers::protocol::{InvocationId, WorkId, WorkUnit, WorkerResult};
 
 /// Invokes work on an instance of [Abq]. This function blocks, but cedes control to [on_result]
 /// when an individual result for a unit of work is received.
 pub fn invoke_work<OnResult>(
     abq_socket: &Path,
-    work: Vec<(WorkId, WorkerAction)>,
+    work: Vec<(WorkId, WorkUnit)>,
     mut on_result: OnResult,
 ) where
     OnResult: FnMut(WorkId, WorkerResult),
@@ -36,10 +37,10 @@ pub fn invoke_work<OnResult>(
         work,
     });
 
-    protocol::write(&mut stream, invoke_msg).unwrap();
+    net_protocol::write(&mut stream, invoke_msg).unwrap();
 
     loop {
-        match protocol::read(&mut stream).expect("failed to read message") {
+        match net_protocol::read(&mut stream).expect("failed to read message") {
             InvokerResponse::Result(work_id, work_result) => {
                 results_remaining -= 1;
                 on_result(work_id, work_result);
@@ -62,7 +63,7 @@ pub(crate) fn respond(
     while results_remaining > 0 {
         match results_rx.recv() {
             Ok((work_id, work_result)) => {
-                protocol::write(&mut invoker, InvokerResponse::Result(work_id, work_result))
+                net_protocol::write(&mut invoker, InvokerResponse::Result(work_id, work_result))
                     .unwrap();
             }
             Err(_) => {
@@ -75,6 +76,6 @@ pub(crate) fn respond(
         }
         results_remaining -= 1;
     }
-    protocol::write(&mut invoker, InvokerResponse::EndOfResults).unwrap();
+    net_protocol::write(&mut invoker, InvokerResponse::EndOfResults).unwrap();
     invoker.shutdown(std::net::Shutdown::Write).unwrap();
 }

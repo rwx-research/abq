@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use abq_runner_protocol::Output;
@@ -20,25 +21,35 @@ impl InvocationId {
 #[derive(Serialize, Deserialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct WorkId(pub String);
 
-/// A unit of work sent to a worker.
+/// Action to be run by a worker.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg(not(test))]
-pub enum WorkerAction {
+pub enum WorkAction {
     Echo(String),
-    Exec {
-        cmd: String,
-        args: Vec<String>,
-        working_dir: std::path::PathBuf,
-    },
+    Exec { cmd: String, args: Vec<String> },
 }
 
-/// A unit of work, specialized for testing.
+/// Action to be run by a worker, specialized for testing.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg(test)]
-pub enum WorkerAction {
+pub enum WorkAction {
     Echo(String),
+    Exec { cmd: String, args: Vec<String> },
     InduceTimeout,
-    EchoOnRetry(usize, String),
+    EchoOnRetry(u8, String),
+}
+
+/// Context for a unit of work.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkContext {
+    pub working_dir: PathBuf,
+}
+
+/// A unit of work sent to a worker.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WorkUnit {
+    pub action: WorkAction,
+    pub context: WorkContext,
 }
 
 /// The result of a worker's execution of a unit of work.
