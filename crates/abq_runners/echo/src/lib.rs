@@ -11,7 +11,8 @@ impl Runner for EchoWorker {
 
     fn run(input: EchoWork) -> Output {
         Output {
-            output: input.message,
+            success: true,
+            message: input.message,
         }
     }
 }

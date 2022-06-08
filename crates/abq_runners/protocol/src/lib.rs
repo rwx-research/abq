@@ -2,7 +2,8 @@ use serde_derive::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct Output {
-    pub output: String,
+    pub success: bool,
+    pub message: String,
 }
 
 pub trait Runner {

@@ -1,5 +1,5 @@
 use abq_output::format_result;
-use abq_workers::protocol::{WorkId, WorkerAction};
+use abq_workers::protocol::{WorkAction, WorkContext, WorkId, WorkUnit};
 
 use crate::collect::{CollectInputs, Collector};
 
@@ -21,7 +21,14 @@ pub fn collector(strings: Vec<String>) -> Collector<String, Ctx, impl CollectInp
     let create_work = |ctx: &mut Ctx, s: String| {
         let id = ctx.next_id();
         let prefix = format!("echo {s}");
-        (prefix, id, WorkerAction::Echo(s))
+
+        let context = WorkContext {
+            working_dir: std::env::current_dir().unwrap(),
+        };
+
+        let action = WorkAction::Echo(s);
+
+        (prefix, id, WorkUnit { action, context })
     };
 
     let report_result = format_result;

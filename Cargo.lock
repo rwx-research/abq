@@ -49,6 +49,7 @@ dependencies = [
  "abq_echo_worker",
  "abq_exec_worker",
  "abq_runner_protocol",
+ "abq_utils",
  "abq_workers",
  "anyhow",
  "ntest",
@@ -70,16 +71,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "abq_utils"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "abq_workers"
 version = "0.1.0"
 dependencies = [
  "abq_echo_worker",
  "abq_exec_worker",
  "abq_runner_protocol",
+ "abq_utils",
  "procspawn",
  "serde",
  "serde_derive",
  "serde_json",
+ "tempfile",
  "uuid 1.1.1",
 ]
 

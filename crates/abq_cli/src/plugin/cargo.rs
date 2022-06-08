@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::process;
 
 use abq_output::format_result;
-use abq_workers::protocol::{WorkId, WorkerAction};
+use abq_workers::protocol::{WorkAction, WorkContext, WorkId, WorkUnit};
 
 use crate::collect::{CollectInputs, Collector};
 
@@ -31,13 +31,16 @@ pub fn collector() -> Collector<String, Ctx, impl CollectInputs<String>> {
         let id = ctx.next_id();
         let prefix = test_path.clone();
 
-        let action = WorkerAction::Exec {
-            cmd: "cargo".to_string(),
-            args: vec!["test".to_string(), test_path],
+        let context = WorkContext {
             working_dir: std::env::current_dir().unwrap(),
         };
 
-        (prefix, id, action)
+        let action = WorkAction::Exec {
+            cmd: "cargo".to_string(),
+            args: vec!["test".to_string(), test_path],
+        };
+
+        (prefix, id, WorkUnit { action, context })
     };
 
     let report_result = format_result;
