@@ -52,6 +52,12 @@ jobs:
           override: true
           components: clippy
 
+      - name: Install cargo2junit
+        uses: actions-rs/install@v0.1
+        with:
+          crate: cargo2junit
+          version: latest
+
       - name: Run lints
         uses: actions-rs/cargo@v1.0.3
         with:
@@ -62,3 +68,23 @@ jobs:
         uses: actions-rs/cargo@v1.0.3
         with:
           command: test
+
+      - name: Write test XML output
+        run: |
+            cargo test -- -Z unstable-options --format json --report-time \
+              | cargo2junit > cargo-tests.xml
+
+      - name: Upload artifacts to vanguard production
+        uses: rwx-research/upload-vanguard-artifact@main
+        with:
+          artifacts: |
+            [
+              {
+                "name": "test",
+                "path": "cargo-tests.xml",
+                "kind": "test_results"
+              }
+            ]
+          job-name: "Lint, test"
+          job-matrix: "${{ toJSON(matrix) }}"
+          vanguard-token: "${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}"
