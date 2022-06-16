@@ -24,7 +24,7 @@ features = [
 ]
 
 [dev-dependencies]
-ntest = "0.8.0"
+ntest = "0.8.1"
 # Needed for testing abq_workers.
 # TODO: figure out a better way to implement abq_workers::test_support to avoid this!
 procspawn = { version = "0.10.1", features = ["test-support"] }
