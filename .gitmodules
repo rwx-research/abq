@@ -1,0 +1,3 @@
+[submodule "native-runners/abq-jest"]
+	path = native-runners/abq-jest
+	url = git@github.com:rwx-research/abq-jest
