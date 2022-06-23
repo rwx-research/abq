@@ -7,4 +7,5 @@ members = [
   "crates/abq_runners/protocol",
   "crates/abq_runners/echo",
   "crates/abq_runners/exec",
+  "crates/abq_runners/generic_test_runner",
 ]

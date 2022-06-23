@@ -64,14 +64,37 @@ jobs:
           command: clippy
           args: -- -D warnings
 
+      # setup testdata
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+          cache: 'npm'
+          cache-dependency-path: 'testdata/**/package-lock.json'
+
+      - name: Pull native test runners
+        run: |
+          eval `ssh-agent -s`
+
+          echo "${{secrets.SSH_KEY_ABQ_JEST}}" | ssh-add -
+          git submodule update --init -- native-runners/abq-jest
+
+          eval `ssh-agent -k`
+
+      - name: Load test dependencies
+        run: |
+            scripts/init_testdata
+
+      # End setup testdata
+
       - name: Run tests
         uses: actions-rs/cargo@v1.0.3
         with:
           command: test
+          args: --all-features
 
       - name: Write test XML output
         run: |
-            cargo test -- -Z unstable-options --format json --report-time \
+            cargo test --all-features -- -Z unstable-options --format json --report-time \
               | cargo2junit > cargo-tests.xml
 
       - name: Upload artifacts to vanguard production
