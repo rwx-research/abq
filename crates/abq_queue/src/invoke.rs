@@ -11,71 +11,30 @@
 //!    the stream is closed.
 //! 1. Once it's done reading, the invoker closes its side of the stream.
 
-use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::sync::mpsc;
+use std::net::{SocketAddr, TcpStream};
 
-use crate::protocol::{InvokeWork, InvokerResponse, Message};
-use abq_utils::net_protocol;
-use abq_workers::protocol::{InvocationId, WorkId, WorkUnit, WorkerResult};
+use abq_utils::net_protocol::{
+    self,
+    queue::{InvokeWork, InvokerResponse, Message},
+    workers::{InvocationId, WorkId, WorkerResult},
+};
 
 /// Invokes work on an instance of [Abq]. This function blocks, but cedes control to [on_result]
 /// when an individual result for a unit of work is received.
-pub fn invoke_work<OnResult>(
-    abq_socket: &Path,
-    work: Vec<(WorkId, WorkUnit)>,
-    mut on_result: OnResult,
-) where
+pub fn invoke_work<OnResult>(abq_server_addr: SocketAddr, mut on_result: OnResult)
+where
     OnResult: FnMut(WorkId, WorkerResult),
 {
-    let mut stream = UnixStream::connect(abq_socket).expect("socket not available");
+    let mut stream = TcpStream::connect(abq_server_addr).expect("socket not available");
 
-    let mut results_remaining = work.len();
     let invocation_id = InvocationId::new();
-    let invoke_msg = Message::InvokeWork(InvokeWork {
-        invocation_id,
-        work,
-    });
+    let invoke_msg = Message::InvokeWork(InvokeWork { invocation_id });
 
     net_protocol::write(&mut stream, invoke_msg).unwrap();
 
-    loop {
-        match net_protocol::read(&mut stream).expect("failed to read message") {
-            InvokerResponse::Result(work_id, work_result) => {
-                results_remaining -= 1;
-                on_result(work_id, work_result);
-            }
-            InvokerResponse::EndOfResults => {
-                debug_assert_eq!(results_remaining, 0);
-                break;
-            }
-        }
+    while let InvokerResponse::Result(work_id, work_result) =
+        net_protocol::read(&mut stream).expect("failed to read message")
+    {
+        on_result(work_id, work_result);
     }
-}
-
-/// Communicates results of work back to an invoker as they are received by the queue.
-/// Once all the work submitted is sent back, the connection to the invoker is terminated.
-pub(crate) fn respond(
-    mut invoker: UnixStream,
-    results_rx: mpsc::Receiver<(WorkId, WorkerResult)>,
-    mut results_remaining: usize,
-) {
-    while results_remaining > 0 {
-        match results_rx.recv() {
-            Ok((work_id, work_result)) => {
-                net_protocol::write(&mut invoker, InvokerResponse::Result(work_id, work_result))
-                    .unwrap();
-            }
-            Err(_) => {
-                // TODO: there are many reasonable cases why there might be a receive error,
-                // including the invoker process was terminated.
-                // This needs to be handled gracefully, and we must tell the parent that it
-                // should drop the channel results are being sent over when it happens.
-                panic!("Invoker shutdown before all our messages were received")
-            }
-        }
-        results_remaining -= 1;
-    }
-    net_protocol::write(&mut invoker, InvokerResponse::EndOfResults).unwrap();
-    invoker.shutdown(std::net::Shutdown::Write).unwrap();
 }

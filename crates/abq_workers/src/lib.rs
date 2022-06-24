@@ -1,4 +1,4 @@
-pub mod protocol;
+pub mod negotiate;
 pub mod workers;
 
 /// Supports running worker pools in tests. This must be run before any tests involving workers are

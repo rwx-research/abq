@@ -9,6 +9,7 @@ dependencies = [
  "abq_output",
  "abq_queue",
  "abq_runner_protocol",
+ "abq_utils",
  "abq_workers",
  "anyhow",
  "clap",
@@ -25,6 +26,7 @@ name = "abq_echo_worker"
 version = "0.1.0"
 dependencies = [
  "abq_runner_protocol",
+ "abq_utils",
 ]
 
 [[package]]
@@ -32,6 +34,7 @@ name = "abq_exec_worker"
 version = "0.1.0"
 dependencies = [
  "abq_runner_protocol",
+ "abq_utils",
 ]
 
 [[package]]
@@ -50,6 +53,7 @@ name = "abq_output"
 version = "0.1.0"
 dependencies = [
  "abq_runner_protocol",
+ "abq_utils",
  "abq_workers",
 ]
 
@@ -76,6 +80,7 @@ dependencies = [
 name = "abq_runner_protocol"
 version = "0.1.0"
 dependencies = [
+ "abq_utils",
  "serde",
  "serde_derive",
  "serde_json",
@@ -86,7 +91,9 @@ name = "abq_utils"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_derive",
  "serde_json",
+ "uuid 1.1.2",
 ]
 
 [[package]]
@@ -102,7 +109,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tempfile",
- "uuid 1.1.2",
 ]
 
 [[package]]

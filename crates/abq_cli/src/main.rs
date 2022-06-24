@@ -1,11 +1,8 @@
 mod args;
-mod collect;
 mod instance;
-mod plugin;
+mod workers;
 
 use clap::Parser;
-
-use collect::run_work;
 
 use args::{CargoCmd, Cli, Command};
 
@@ -15,21 +12,28 @@ fn main() {
     let args = Cli::parse();
 
     match args.command {
-        Command::Start => instance::start_abq_forever(),
-        Command::Echo { strings } => {
-            let abq = instance::find_abq();
-            let collector = plugin::echo::collector(strings);
-            run_work(abq, collector);
+        Command::Start {} => instance::start_abq_forever(),
+        Command::Work {
+            working_dir,
+            queue_addr,
+        } => workers::start_workers(working_dir, queue_addr),
+        Command::Echo { strings: _ } => {
+            todo!();
+            // let abq = instance::find_abq();
+            // let collector = plugin::echo::collector(strings);
+            // run_work(abq, collector);
         }
         Command::Cargo(CargoCmd::Test) => {
-            let abq = instance::find_abq();
-            let collector = plugin::cargo::collector();
-            run_work(abq, collector);
+            todo!();
+            // let abq = instance::find_abq();
+            // let collector = plugin::cargo::collector();
+            // run_work(abq, collector);
         }
         Command::Jest => {
-            let abq = instance::find_abq();
-            let collector = plugin::jest::collector();
-            run_work(abq, collector);
+            todo!();
+            // let abq = instance::find_abq();
+            // let collector = plugin::jest::collector();
+            // run_work(abq, collector);
         }
     }
 }

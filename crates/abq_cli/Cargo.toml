@@ -8,6 +8,7 @@ abq_queue = { path = "../abq_queue" }
 abq_runner_protocol = { path = "../abq_runners/protocol" }
 abq_output = { path = "../abq_output" }
 abq_workers = { path = "../abq_workers" }
+abq_utils = { path = "../abq_utils" }
 
 anyhow = "1.0.57"
 clap = { version = "3.2.4", features = ["derive"] }
