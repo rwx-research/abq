@@ -1,6 +1,7 @@
 use std::process;
 
-use abq_runner_protocol::{Output, Runner};
+use abq_runner_protocol::Runner;
+use abq_utils::net_protocol::runners::Output;
 
 pub struct Work {
     pub cmd: String,

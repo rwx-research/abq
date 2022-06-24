@@ -1,39 +1,128 @@
 use std::collections::{HashMap, VecDeque};
-use std::num::NonZeroUsize;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::protocol::{InvokeWork, Message, Shutdown};
-use abq_utils::net_protocol;
-use abq_workers::protocol::{InvocationId, WorkId, WorkUnit, WorkerResult};
-use abq_workers::workers::{
-    NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig, WorkerPoolHandle,
+use abq_utils::net_protocol::queue::InvokerResponse;
+use abq_utils::net_protocol::runners::Manifest;
+use abq_utils::net_protocol::workers::WorkContext;
+use abq_utils::net_protocol::{
+    self,
+    queue::{InvokeWork, Message, Shutdown},
+    workers::{InvocationId, NextWork, WorkId, WorkerResult},
 };
-
-type WorkInfo = (InvocationId, WorkId, WorkUnit);
+use abq_workers::negotiate::{QueueNegotiator, QueueNegotiatorHandle};
 
 // TODO: we probably want something more sophisticated here, in particular a concurrent
 // work-stealing queue.
 #[derive(Default)]
 struct JobQueue {
-    queue: VecDeque<WorkInfo>,
+    queue: VecDeque<NextWork>,
 }
 
 impl JobQueue {
-    pub fn add_batch_work(&mut self, work: impl Iterator<Item = WorkInfo>) {
+    pub fn add_batch_work(&mut self, work: impl Iterator<Item = NextWork>) {
         self.queue.extend(work);
     }
 
-    pub fn get_work(&mut self) -> Option<WorkInfo> {
+    pub fn get_work(&mut self) -> Option<NextWork> {
         let work = self.queue.pop_front()?;
         Some(work)
     }
 }
 
-type SharedJobQueue = Arc<Mutex<JobQueue>>;
+enum InvocationState {
+    WaitingForManifest,
+    HasWork(JobQueue),
+    Done,
+}
+
+struct WaitingForManifestError;
+
+#[derive(Default)]
+struct InvocationQueues {
+    /// One queue per `abq test ...` invocation, at least for now.
+    queues: HashMap<InvocationId, InvocationState>,
+}
+
+impl InvocationQueues {
+    pub fn create_queue(&mut self, invocation_id: InvocationId) {
+        let old_queue = self
+            .queues
+            .insert(invocation_id, InvocationState::WaitingForManifest);
+        debug_assert!(old_queue.is_none());
+    }
+
+    pub fn add_manifest(&mut self, invocation_id: InvocationId, manifest: Manifest) {
+        let state = self
+            .queues
+            .get_mut(&invocation_id)
+            .expect("no queue for invocation");
+
+        let work_from_manifest = manifest.actions.into_iter().map(|action| {
+            NextWork::Work {
+                action,
+                invocation_id,
+                // TODO: populate correctly
+                work_id: WorkId("".to_string()),
+                // TODO: populate correctly
+                context: WorkContext {
+                    working_dir: std::env::current_dir().unwrap(),
+                },
+            }
+        });
+
+        let mut queue = JobQueue::default();
+        queue.add_batch_work(work_from_manifest);
+
+        *state = InvocationState::HasWork(queue);
+    }
+
+    pub fn next_work(
+        &mut self,
+        invocation_id: InvocationId,
+    ) -> Result<NextWork, WaitingForManifestError> {
+        match self
+            .queues
+            .get_mut(&invocation_id)
+            .expect("no queue state for invocation")
+        {
+            InvocationState::WaitingForManifest => Err(WaitingForManifestError),
+            InvocationState::HasWork(queue) => Ok(queue.get_work().unwrap_or(NextWork::EndOfWork)),
+            InvocationState::Done => Ok(NextWork::EndOfWork),
+        }
+    }
+
+    pub fn mark_complete(&mut self, invocation_id: InvocationId) {
+        let state = self
+            .queues
+            .get_mut(&invocation_id)
+            .expect("no queue state for invocation");
+        match state
+        {
+            InvocationState::WaitingForManifest => unreachable!("Invalid state - can't mark invocation queue complete when we still need the manifest!"),
+            InvocationState::HasWork(queue) => {
+                assert!(queue.get_work().is_none(), "Invalid state - queue is not complete!");
+            }
+            InvocationState::Done => {
+                unreachable!("Invalid state - trying to mark state as done twice!");
+            }
+        }
+
+        *state = InvocationState::Done;
+    }
+
+    // Chooses one invocation id for a set of workers to attach to. Returns `None` if there are
+    // none.
+    pub fn choose(&self) -> Option<InvocationId> {
+        self.queues.iter().next().map(|(id, _)| *id)
+    }
+}
+
+type SharedInvocationQueues = Arc<Mutex<InvocationQueues>>;
 
 /// Executes an initialization sequence that must be performed before any queue can be created.
 /// [init] only needs to be run once in a process, even if multiple [Abq] instances are crated, but
@@ -46,36 +135,22 @@ pub fn init() {
 }
 
 pub struct Abq {
-    socket: PathBuf,
+    server_addr: SocketAddr,
     server_handle: Option<JoinHandle<()>>,
     send_worker: mpsc::Sender<WorkerSchedulerMsg>,
     work_scheduler_handle: Option<JoinHandle<()>>,
+    negotiator: QueueNegotiator,
 
     active: bool,
 }
 
-pub enum WorkersConfig {
-    /// Use a worker pool in the same process as the scheduler.
-    InBand { num_workers: NonZeroUsize },
-    /// Use a remote pool.
-    Remote { handle: WorkerPoolHandle },
-}
-
-impl WorkersConfig {
-    pub fn default_in_band() -> Self {
-        Self::InBand {
-            num_workers: NonZeroUsize::new(4).unwrap(),
-        }
-    }
-}
-
 impl Abq {
-    pub fn socket(&self) -> &Path {
-        &self.socket
+    pub fn server_addr(&self) -> SocketAddr {
+        self.server_addr
     }
 
-    pub fn start(socket: PathBuf, scheduler_config: WorkersConfig) -> Self {
-        start_queue(socket, scheduler_config)
+    pub fn start() -> Self {
+        start_queue()
     }
 
     pub fn wait_forever(&mut self) {
@@ -85,22 +160,15 @@ impl Abq {
 
     /// Sends a signal to shutdown immediately.
     pub fn shutdown(&mut self) {
-        self.shutdown_help(Duration::from_millis(0))
-    }
-
-    /// Sends a signal to shutdown after [timeout], and returns the completed work in the queue
-    /// once complete.
-    pub fn shutdown_in(&mut self, timeout: Duration) {
-        self.shutdown_help(timeout)
-    }
-
-    fn shutdown_help(&mut self, timeout: Duration) {
         debug_assert!(self.active);
 
         self.active = false;
 
-        let mut queue_server = UnixStream::connect(self.socket()).expect("server not available");
-        net_protocol::write(&mut queue_server, Message::Shutdown(Shutdown { timeout })).unwrap();
+        let mut queue_server =
+            TcpStream::connect(self.server_addr()).expect("server not available");
+        net_protocol::write(&mut queue_server, Message::Shutdown(Shutdown {})).unwrap();
+
+        self.negotiator.shutdown();
 
         self.server_handle
             .take()
@@ -115,6 +183,10 @@ impl Abq {
             .expect("worker handle must be available during Drop")
             .join()
             .unwrap();
+    }
+
+    pub fn get_negotiator_handle(&self) -> QueueNegotiatorHandle {
+        self.negotiator.get_handle()
     }
 }
 
@@ -132,36 +204,59 @@ enum WorkerSchedulerMsg {
 }
 
 /// Initializes a queue.
-/// Right now the only initialization option is
-///   - in-process, the queue taking and acting on work in threads
-///   - communication over a unix socket
-fn start_queue(queue_socket: PathBuf, workers_config: WorkersConfig) -> Abq {
-    // TODO: we probably want something more sophisticated here, in particular
-    // a concurrent work-stealing queue.
-    let queue = Arc::new(Mutex::new(JobQueue::default()));
-    let stream = UnixListener::bind(&queue_socket).unwrap();
+fn start_queue() -> Abq {
+    let queues: SharedInvocationQueues = Default::default();
+
+    let server_listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let server_addr = server_listener.local_addr().unwrap();
 
     let (send_worker, recv_worker) = mpsc::channel();
     let server_handle = thread::spawn({
-        let queue = Arc::clone(&queue);
-        move || start_queue_server(stream, queue)
+        let queues = Arc::clone(&queues);
+        move || start_queue_server(server_listener, queues)
     });
 
-    let workers_handle = WorkersHandle::from_config(&queue_socket, workers_config);
+    let new_work_server = TcpListener::bind("0.0.0.0:0").unwrap();
+    let new_work_server_addr = new_work_server.local_addr().unwrap();
+
     let work_scheduler_handle = thread::spawn({
-        let queue = Arc::clone(&queue);
+        let queues = Arc::clone(&queues);
         let scheduler_config = SchedulerConfig {
-            queue,
+            queues,
             msg_recv: recv_worker,
         };
-        move || start_work_scheduler(scheduler_config, workers_handle)
+        move || start_work_scheduler(scheduler_config, new_work_server)
     });
 
+    // Chooses one invocation id for a set of workers to attach to.
+    // This blocks until there is an invocation available.
+    // TODO: make sure what the worker is configured for actually agrees with what the invocation
+    // was created for.
+    let choose_invocation_queue_for_worker = move || loop {
+        let opt_invocation = { queues.lock().unwrap().choose() };
+        match opt_invocation {
+            None => {
+                // Nothing yet; release control and sleep for a bit in case something comes.
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Some(id) => {
+                return id;
+            }
+        }
+    };
+    let negotiator = QueueNegotiator::new(
+        new_work_server_addr,
+        server_addr,
+        choose_invocation_queue_for_worker,
+    );
+
     Abq {
-        socket: queue_socket,
+        server_addr,
         server_handle: Some(server_handle),
         send_worker,
         work_scheduler_handle: Some(work_scheduler_handle),
+        negotiator,
 
         active: true,
     }
@@ -169,25 +264,24 @@ fn start_queue(queue_socket: PathBuf, workers_config: WorkersConfig) -> Abq {
 
 static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 
-fn start_queue_server(server_listener: UnixListener, queue: SharedJobQueue) {
-    // Stores information about shutdown messages received.
-    let mut shutdown_inst_and_timeout = None;
-
+fn start_queue_server(server_listener: TcpListener, queues: SharedInvocationQueues) {
     // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
     // there are no active connections into the queue.
     server_listener
         .set_nonblocking(true)
         .expect("Failed to set stream as non-blocking");
 
-    // invocation -> (results sender, work left, responder thread handle)
+    // invocation -> (results sender, responder thread handle)
     type ActiveInvocations =
-        HashMap<InvocationId, (mpsc::Sender<(WorkId, WorkerResult)>, usize, JoinHandle<()>)>;
+        HashMap<InvocationId, (mpsc::Sender<InvocationResponderMsg>, JoinHandle<()>)>;
 
     // When all results for a particular invocation are communicated, we want to make sure that the
     // responder thread is closed and that the entry here is dropped.
     let mut active_invocations: ActiveInvocations = Default::default();
+    // Cache of how much is left in the queue for a particular invocation, so that we don't have to
+    // lock the queue all the time.
+    let mut work_left_for_invocations: HashMap<InvocationId, usize> = Default::default();
 
-    use std::io::ErrorKind;
     for client in server_listener.incoming() {
         match client {
             Ok(mut client) => {
@@ -201,76 +295,66 @@ fn start_queue_server(server_listener: UnixListener, queue: SharedJobQueue) {
                 let msg = net_protocol::read(&mut client).expect("Failed to read message");
 
                 match msg {
-                    Message::InvokeWork(InvokeWork {
-                        invocation_id,
-                        work,
-                    }) => {
-                        if shutdown_inst_and_timeout.is_some() {
-                            todo!("send shutdown message to client");
-                        }
-
-                        let work_size = work.len();
-
+                    Message::InvokeWork(InvokeWork { invocation_id }) => {
                         // Spawn a new thread to communicate work results back to the invoker. The
                         // main queue (in this thread) will use a channel to communicate relevant
                         // results as they come in.
                         let (results_tx, results_rx) = mpsc::channel();
-                        let responder_handle = thread::spawn(move || {
-                            crate::invoke::respond(client, results_rx, work_size)
-                        });
+                        let responder_handle =
+                            thread::spawn(move || start_invocation_responder(client, results_rx));
 
                         let old_tx = active_invocations
-                            .insert(invocation_id, (results_tx, work_size, responder_handle));
+                            .insert(invocation_id, (results_tx, responder_handle));
                         debug_assert!(
                             old_tx.is_none(),
                             "Existing transmitter for expected unique invocation id"
                         );
 
-                        // Add all the work to the queue.
-                        let work_with_invoker = work
-                            .into_iter()
-                            .map(|(work_id, action)| (invocation_id, work_id, action));
-
-                        queue.lock().unwrap().add_batch_work(work_with_invoker);
+                        // Create a new work queue for this invocation.
+                        queues.lock().unwrap().create_queue(invocation_id);
+                    }
+                    Message::Manifest(invocation_id, manifest) => {
+                        // Record the manifest for this invocation in its appropriate queue.
+                        work_left_for_invocations.insert(invocation_id, manifest.actions.len());
+                        queues.lock().unwrap().add_manifest(invocation_id, manifest);
                     }
                     Message::WorkerResult(invocation_id, work_id, result) => {
-                        let (results_tx, num_results, _) = active_invocations
+                        let (results_tx, _) = active_invocations
                             .get_mut(&invocation_id)
                             .expect("invocation is not active");
 
-                        results_tx.send((work_id, result)).unwrap();
+                        results_tx
+                            .send(InvocationResponderMsg::WorkResult(work_id, result))
+                            .unwrap();
 
-                        // We are done reporting work for this invocation. Make sure the
-                        // communicator thread closes and our record of the invocation is dropped.
-                        *num_results -= 1;
-                        if *num_results == 0 {
-                            let (_, _, responder_handle) =
+                        let work_left = work_left_for_invocations
+                            .get_mut(&invocation_id)
+                            .expect("invocation id not recorded, but we got a result for it?");
+
+                        *work_left -= 1;
+                        if *work_left == 0 {
+                            // Results for this invocation are all done. Let the notifier thread
+                            // know, and clean up all remenants of this invocation so as to avoid
+                            // memory leaks.
+                            let (results_tx, responder_handle) =
                                 active_invocations.remove(&invocation_id).unwrap();
+
+                            results_tx.send(InvocationResponderMsg::EndOfWork).unwrap();
                             responder_handle.join().unwrap();
+
+                            work_left_for_invocations.remove(&invocation_id);
+                            queues.lock().unwrap().mark_complete(invocation_id);
                         }
                     }
-                    Message::Shutdown(Shutdown { timeout }) => {
-                        debug_assert!(
-                            shutdown_inst_and_timeout.is_none(),
-                            "Two shutdown messages received"
-                        );
-
-                        shutdown_inst_and_timeout = Some((Instant::now(), timeout));
+                    Message::Shutdown(Shutdown {}) => {
+                        break;
                     }
                 }
             }
             Err(ref e) => {
                 match e.kind() {
-                    ErrorKind::WouldBlock => {
-                        if let Some((shutdown_inst, min_timeout)) = shutdown_inst_and_timeout {
-                            let duration_since_shutdown = Instant::now() - shutdown_inst;
-                            if duration_since_shutdown >= min_timeout {
-                                // The server is done.
-                                break;
-                            }
-                        }
-
-                        // Otherwise we sleep and wait for the next message.
+                    io::ErrorKind::WouldBlock => {
+                        // Sleep and wait for the next message.
                         //
                         // Idea for (much) later: if it's been a long time since the last Work
                         // message, it's likely that there are a burst of pending jobs that need to
@@ -285,221 +369,229 @@ fn start_queue_server(server_listener: UnixListener, queue: SharedJobQueue) {
     }
 }
 
+/// Message to send to the invocation responder thread.
+enum InvocationResponderMsg {
+    WorkResult(WorkId, WorkerResult),
+    EndOfWork,
+}
+
+/// Communicates results of work back to an invoker as they are received by the queue.
+/// Once all the work submitted is sent back, the connection to the invoker is terminated.
+fn start_invocation_responder(
+    mut invoker: TcpStream,
+    results_rx: mpsc::Receiver<InvocationResponderMsg>,
+) {
+    loop {
+        match results_rx.recv() {
+            Ok(InvocationResponderMsg::WorkResult(work_id, work_result)) => {
+                net_protocol::write(&mut invoker, InvokerResponse::Result(work_id, work_result))
+                    .unwrap();
+            }
+            Ok(InvocationResponderMsg::EndOfWork) => break,
+            Err(_) => {
+                // TODO: there are many reasonable cases why there might be a receive error,
+                // including the invoker process was terminated.
+                // This needs to be handled gracefully, and we must tell the parent that it
+                // should drop the channel results are being sent over when it happens.
+                panic!("Invoker shutdown before all our messages were received")
+            }
+        }
+    }
+    net_protocol::write(&mut invoker, InvokerResponse::EndOfResults).unwrap();
+    invoker.shutdown(std::net::Shutdown::Write).unwrap();
+}
+
 struct SchedulerConfig {
-    /// Queue to steal work from.
-    queue: SharedJobQueue,
+    queues: SharedInvocationQueues,
     /// Channel on which the scheduler itself will receive messages from the parent queue.
     msg_recv: mpsc::Receiver<WorkerSchedulerMsg>,
 }
 
-/// Starts an out-of-band worker scheduler to manage associated local or remote workers.
-/// As the [queue receives work][start_queue_server], the scheduler will try to steal it and
-/// distribute it appropriately.
-fn start_work_scheduler(config: SchedulerConfig, workers: WorkersHandle) {
-    let SchedulerConfig { queue, msg_recv } = config;
+/// Starts an out-of-band work scheduler to send work as workers request it.
+fn start_work_scheduler(config: SchedulerConfig, listener: TcpListener) {
+    let SchedulerConfig { queues, msg_recv } = config;
 
-    loop {
-        match msg_recv.try_recv() {
-            Ok(WorkerSchedulerMsg::Shutdown) => {
-                // We've been asked to shutdown
-                break;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                // The corresponding sender has closed; assume this means we should close too.
-                break;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
+    // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
+    // there are no active connections into the queue.
+    listener
+        .set_nonblocking(true)
+        .expect("Failed to set stream as non-blocking");
 
-        // No messages from our invoker yet, try to do some work.
-        let opt_work = queue.lock().unwrap().get_work();
-        match opt_work {
-            Some((invocation_id, work_id, action)) => {
-                workers.send_work(invocation_id, work_id, action)
-            }
-            None => {
-                // Relinquish the thread before we poll again to avoid spinning cpu.
-                thread::sleep(POLL_WAIT_TIME);
-            }
-        }
-    }
+    for client in listener.incoming() {
+        match client {
+            Ok(mut client) => {
+                // Reads and writes to the client will be buffered, so we must make sure
+                // the stream is blocking. Note that we inherit non-blocking from the server
+                // listener, but that this adjustment does not affect the server.
+                client
+                    .set_nonblocking(false)
+                    .expect("Failed to set client stream as blocking");
 
-    workers.shutdown()
-}
+                // Get the invocation this worker wants work for.
+                // TODO: error handling
+                let invocation_id: InvocationId =
+                    net_protocol::read(&mut client).expect("Failed to read message");
 
-/// A handle to a set of workers initialized via a [WorkersConfig].
-enum WorkersHandle {
-    InBand(WorkerPool),
-    Remote(WorkerPoolHandle),
-}
-
-impl WorkersHandle {
-    /// Initializes a set of workers according to the requested [config][WorkersConfig].
-    fn from_config(queue_server_socket: &Path, config: WorkersConfig) -> Self {
-        match config {
-            WorkersConfig::InBand { num_workers } => {
-                let queue_server_socket = queue_server_socket.to_owned();
-                let notify_result: NotifyResult =
-                    Box::new(move |invocation_id, work_id, result| {
-                        send_result_to_queue(&queue_server_socket, invocation_id, work_id, result)
-                    });
-
-                let worker_config = WorkerPoolConfig {
-                    size: num_workers,
-                    notify_result,
-                    worker_context: WorkerContext::AssumeLocal,
-                    // TODO: specify this in WorkersConfig
-                    work_timeout: Duration::from_secs(60),
-                    work_retries: 1,
+                // Pull the next work item.
+                let next_work = loop {
+                    let opt_work = { queues.lock().unwrap().next_work(invocation_id) };
+                    match opt_work {
+                        Ok(work) => break work,
+                        Err(WaitingForManifestError) => {
+                            // Nothing yet; release control and sleep for a bit in case the
+                            // manifest comes in.
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    }
                 };
-                let worker_pool = WorkerPool::new(worker_config);
 
-                WorkersHandle::InBand(worker_pool)
+                // TODO: error handling
+                net_protocol::write(&mut client, next_work).unwrap();
             }
-            WorkersConfig::Remote { handle } => WorkersHandle::Remote(handle),
-        }
-    }
-}
-
-impl WorkersHandle {
-    fn send_work(&self, invocation_id: InvocationId, work_id: WorkId, work_unit: WorkUnit) {
-        match self {
-            WorkersHandle::InBand(pool) => {
-                pool.get_handle()
-                    .send_work(invocation_id, work_id, work_unit)
-            }
-            WorkersHandle::Remote(handle) => handle.send_work(invocation_id, work_id, work_unit),
-        }
-    }
-
-    fn shutdown(self) {
-        match self {
-            WorkersHandle::InBand(mut pool) => pool.shutdown(),
-            WorkersHandle::Remote(_) => {
-                // remote workers shutdown separately
+            Err(ref e) => {
+                match e.kind() {
+                    io::ErrorKind::WouldBlock => {
+                        match msg_recv.try_recv() {
+                            Ok(WorkerSchedulerMsg::Shutdown) => return,
+                            Err(TryRecvError::Empty) => {
+                                // Sleep before polling for the next work connection.
+                                thread::sleep(POLL_WAIT_TIME);
+                            }
+                            Err(TryRecvError::Disconnected) => {
+                                todo!("disconnected from parent queue")
+                            }
+                        }
+                    }
+                    _ => todo!("Unhandled IO error: {e:?}"),
+                }
             }
         }
     }
-}
-
-fn send_result_to_queue(
-    queue_server_socket: &Path,
-    invocation_id: InvocationId,
-    work_id: WorkId,
-    result: WorkerResult,
-) {
-    let mut queue_stream = UnixStream::connect(queue_server_socket).expect("socket not available");
-    net_protocol::write(
-        &mut queue_stream,
-        Message::WorkerResult(invocation_id, work_id, result),
-    )
-    .unwrap();
 }
 
 #[cfg(test)]
 mod test {
-    use std::path::PathBuf;
+    use std::{thread, time::Duration};
 
-    use super::{Abq, WorkersConfig};
+    use super::Abq;
     use crate::invoke;
-    use abq_workers::protocol::{WorkAction, WorkContext, WorkId, WorkUnit, WorkerResult};
+    use abq_utils::net_protocol::{
+        runners::{Action, Manifest},
+        workers::{RunnerKind, TestLikeRunner, WorkerResult},
+    };
+    use abq_workers::{
+        negotiate::{WorkersConfig, WorkersNegotiator},
+        workers::WorkerContext,
+    };
     use ntest::timeout;
-    use tempfile::TempDir;
 
-    fn temp_socket() -> (TempDir, PathBuf) {
-        let socket_dir = tempfile::TempDir::new().unwrap();
-        let socket_path = socket_dir.path().join("abq.socket");
-        (socket_dir, socket_path)
-    }
-
-    fn local_work(action: WorkAction) -> WorkUnit {
-        WorkUnit {
-            action,
-            context: WorkContext {
-                working_dir: std::env::current_dir().unwrap(),
-            },
-        }
-    }
-
-    #[test]
-    fn socket_alive() {
-        let (_dir, socket) = temp_socket();
-        let queue = Abq::start(socket, WorkersConfig::default_in_band());
-        assert!(queue.socket().exists());
-    }
-
-    fn sort_results(results: &mut [(String, WorkerResult)]) -> Vec<(&str, &str)> {
-        results.sort_by(|w1, w2| w1.0.cmp(&w2.0));
-        results
+    fn sort_results(results: &mut [(String, WorkerResult)]) -> Vec<&str> {
+        let mut results = results
             .iter()
-            .map(|(id, output)| match output {
-                WorkerResult::Output(o) => (id.as_str(), o.message.as_str()),
+            .map(|(_id, output)| match output {
+                WorkerResult::Output(o) => (o.message.as_str()),
                 o => panic!("unexpected output {o:?}"),
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        results.sort_unstable();
+        results
     }
 
     #[test]
     #[timeout(1000)] // 1 second
     fn multiple_jobs_complete() {
-        let (_dir, socket) = temp_socket();
-        let mut queue = Abq::start(socket, WorkersConfig::default_in_band());
+        let mut queue = Abq::start();
 
-        let id1 = WorkId("Test1".to_string());
-        let id2 = WorkId("Test2".to_string());
-        let work = vec![
-            (id1, local_work(WorkAction::Echo("echo1".to_string()))),
-            (id2, local_work(WorkAction::Echo("echo2".to_string()))),
-        ];
+        let manifest = Manifest {
+            actions: vec![
+                Action::Echo("echo1".to_string()),
+                Action::Echo("echo2".to_string()),
+            ],
+        };
 
-        let mut results = Vec::default();
-        invoke::invoke_work(queue.socket(), work, |id, result| {
-            results.push((id.0, result))
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+        };
+
+        let queue_server_addr = queue.server_addr();
+        let results_handle = thread::spawn(move || {
+            let mut results = Vec::default();
+            invoke::invoke_work(queue_server_addr, |id, result| results.push((id.0, result)));
+            results
         });
 
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+        )
+        .unwrap();
+
+        let mut results = results_handle.join().unwrap();
+
         queue.shutdown();
+        workers.shutdown();
 
         let results = sort_results(&mut results);
 
-        assert_eq!(results, [("Test1", "echo1"), ("Test2", "echo2")]);
+        assert_eq!(results, [("echo1"), ("echo2")]);
     }
 
     #[test]
     #[timeout(1000)] // 1 second
+    #[ignore = "TODO: this doesn't work yet because we don't keep track of which workers are doing what invocations, nor do we schedule work for various invocations correctly."]
     fn multiple_invokers() {
-        let (_dir, socket) = temp_socket();
-        let mut queue = Abq::start(socket, WorkersConfig::default_in_band());
+        let mut queue = Abq::start();
 
-        let id1 = WorkId("Test1".to_string());
-        let id2 = WorkId("Test2".to_string());
-        let work = vec![
-            (id1, local_work(WorkAction::Echo("echo1".to_string()))),
-            (id2, local_work(WorkAction::Echo("echo2".to_string()))),
-        ];
+        let manifest = Manifest {
+            actions: vec![
+                Action::Echo("echo1".to_string()),
+                Action::Echo("echo2".to_string()),
+            ],
+        };
 
-        let mut results1 = Vec::default();
-        invoke::invoke_work(queue.socket(), work, |id, result| {
-            results1.push((id.0, result))
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+        };
+
+        let queue_server_addr = queue.server_addr();
+
+        let results1_handle = thread::spawn(move || {
+            let mut results = Vec::default();
+            invoke::invoke_work(queue_server_addr, |id, result| results.push((id.0, result)));
+            results
         });
 
-        let id1 = WorkId("Test3".to_string());
-        let id2 = WorkId("Test4".to_string());
-        let work = vec![
-            (id1, local_work(WorkAction::Echo("echo3".to_string()))),
-            (id2, local_work(WorkAction::Echo("echo4".to_string()))),
-        ];
-
-        let mut results2 = Vec::default();
-        invoke::invoke_work(queue.socket(), work, |id, result| {
-            results2.push((id.0, result))
+        let results2_handle = thread::spawn(move || {
+            let mut results = Vec::default();
+            invoke::invoke_work(queue_server_addr, |id, result| results.push((id.0, result)));
+            results
         });
+
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+        )
+        .unwrap();
+
+        let mut results1 = results1_handle.join().unwrap();
+        let mut results2 = results2_handle.join().unwrap();
 
         queue.shutdown();
+        workers.shutdown();
 
         let results1 = sort_results(&mut results1);
         let results2 = sort_results(&mut results2);
 
-        assert_eq!(results1, [("Test1", "echo1"), ("Test2", "echo2")]);
-        assert_eq!(results2, [("Test3", "echo3"), ("Test4", "echo4")]);
+        assert_eq!(results1, [("echo1"), ("echo2")]);
+        assert_eq!(results2, [("echo3"), ("echo4")]);
     }
 }

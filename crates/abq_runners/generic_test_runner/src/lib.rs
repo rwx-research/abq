@@ -2,8 +2,9 @@ use std::{
     collections::HashMap, io::Read, net::TcpListener, path::PathBuf, process, sync::mpsc, thread,
 };
 
-use abq_runner_protocol::{NextTest, TestManifest, TestResult};
 use abq_utils::net_protocol;
+use abq_utils::net_protocol::runners::{Action, Manifest, TestResult};
+use abq_utils::net_protocol::workers::NextWork;
 use serde_derive::{Deserialize, Serialize};
 
 pub struct WorkInput {
@@ -22,20 +23,20 @@ struct TestIds {
 }
 
 enum NativeWorkerMsg {
-    Manifest(TestManifest),
+    Manifest(Manifest),
     TestResult(TestResult),
     EndOfTests,
 }
 
 impl GenericTestRunner {
-    pub fn run<SendManifest, GetNextTest, SendTestResult>(
+    pub fn run<SendManifest, GetNextWork, SendTestResult>(
         input: WorkInput,
         mut send_manifest: SendManifest,
-        get_next_test: GetNextTest,
+        get_next_test: GetNextWork,
         mut send_test_result: SendTestResult,
     ) where
-        SendManifest: FnMut(TestManifest),
-        GetNextTest: Fn() -> NextTest + std::marker::Send + 'static,
+        SendManifest: FnMut(Manifest),
+        GetNextWork: Fn() -> NextWork + std::marker::Send + 'static,
         SendTestResult: FnMut(TestResult),
     {
         let our_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -61,17 +62,30 @@ impl GenericTestRunner {
                     // We need to generate the test manifest
                     let mut msg_buf = String::new();
                     stream.read_to_string(&mut msg_buf).unwrap();
-                    let manifest: TestManifest =
-                        serde_json::from_slice(msg_buf.as_bytes()).unwrap();
+                    let TestIds { test_ids } = serde_json::from_slice(msg_buf.as_bytes()).unwrap();
+
+                    let manifest = Manifest {
+                        actions: test_ids.into_iter().map(Action::TestId).collect(),
+                    };
                     NativeWorkerMsg::Manifest(manifest)
                 } else {
                     match get_next_test() {
-                        NextTest::EndOfTests => NativeWorkerMsg::EndOfTests,
-                        NextTest::Id(test_id) => {
-                            net_protocol::write(&mut stream, test_id).unwrap();
-                            let results = net_protocol::read(&mut stream).unwrap();
-                            NativeWorkerMsg::TestResult(results)
-                        }
+                        NextWork::EndOfWork => NativeWorkerMsg::EndOfTests,
+                        NextWork::Work {
+                            action,
+                            context: _,
+                            invocation_id: _,
+                            work_id: _,
+                        } => match action {
+                            Action::TestId(test_id) => {
+                                net_protocol::write(&mut stream, test_id).unwrap();
+                                let results = net_protocol::read(&mut stream).unwrap();
+                                NativeWorkerMsg::TestResult(results)
+                            }
+                            _ => {
+                                unreachable!("Invalid action for generic test runner: {:?}", action)
+                            }
+                        },
                     }
                 };
 
@@ -119,7 +133,10 @@ mod test {
     #[cfg(feature = "test-abq-jest")]
     fn get_manifest_from_jest() {
         use crate::{GenericTestRunner, WorkInput};
-        use abq_runner_protocol::{NextTest, TestManifest};
+        use abq_utils::net_protocol::{
+            runners::{Action, Manifest},
+            workers::NextWork,
+        };
 
         let input = WorkInput {
             cmd: "npm".to_string(),
@@ -133,13 +150,22 @@ mod test {
         let mut test_results = vec![];
 
         let send_manifest = |real_manifest| manifest = Some(real_manifest);
-        let get_next_test = || NextTest::EndOfTests;
+        let get_next_test = || NextWork::EndOfWork;
         let send_test_result = |test_result| test_results.push(test_result);
 
         GenericTestRunner::run(input, send_manifest, get_next_test, send_test_result);
 
         assert!(test_results.is_empty());
-        let TestManifest { mut test_ids } = manifest.unwrap();
+        let Manifest { actions } = manifest.unwrap();
+
+        let mut test_ids = actions
+            .into_iter()
+            .map(|action| match action {
+                Action::TestId(id) => id,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+
         test_ids.sort();
         assert_eq!(test_ids.len(), 2);
         assert!(test_ids[0].ends_with("add.test.js"));

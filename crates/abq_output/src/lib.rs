@@ -1,8 +1,10 @@
 use std::fmt::Write;
 use std::time::Duration;
 
-use abq_runner_protocol::Output;
-use abq_workers::protocol::{WorkId, WorkerResult};
+use abq_utils::net_protocol::{
+    runners::Output,
+    workers::{WorkId, WorkerResult},
+};
 
 pub fn format_results(mut results: Vec<(WorkId, WorkerResult)>) -> String {
     results.sort_by(|(id1, _), (id_2, _)| id1.cmp(id_2));
