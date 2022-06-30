@@ -7,7 +7,7 @@ use std::{sync::mpsc, thread};
 use abq_echo_worker as echo;
 use abq_exec_worker as exec;
 use abq_runner_protocol::Runner;
-use abq_utils::net_protocol::runners::{Action, Manifest};
+use abq_utils::net_protocol::runners::{ManifestMessage, TestId};
 use abq_utils::net_protocol::workers::TestLikeRunner;
 use abq_utils::net_protocol::{
     runners::Output,
@@ -23,7 +23,7 @@ enum MessageFromPool {
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type GetNextWork = Box<dyn Fn() -> NextWork + Send + Sync + 'static>;
-pub type NotifyManifest = Box<dyn Fn(InvocationId, Manifest) + Send + Sync + 'static>;
+pub type NotifyManifest = Box<dyn Fn(InvocationId, ManifestMessage) + Send + Sync + 'static>;
 pub type NotifyResult = Box<dyn Fn(InvocationId, WorkId, WorkerResult) + Send + Sync + 'static>;
 
 #[derive(Clone)]
@@ -232,7 +232,7 @@ impl ThreadWorker {
     }
 }
 
-fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Manifest) {
+fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: ManifestMessage) {
     let WorkerEnv {
         msg_from_pool_rx,
         get_next_work,
@@ -252,38 +252,38 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         // First, check if we have a message from our owner.
         let parent_message = msg_from_pool_rx.lock().unwrap().try_recv();
 
-        let (action, work_context, invocation_id, work_id) = match parent_message {
+        let (test_id, work_context, invocation_id, work_id) = match parent_message {
             Ok(MessageFromPool::Shutdown) => {
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => panic!("Pool died before worker did"),
             Err(mpsc::TryRecvError::Empty) => {
-                // No message from the parent. Wait for the next action to come in.
+                // No message from the parent. Wait for the next test_id to come in.
                 //
                 // TODO: add a timeout here, in case we get a message from the parent while
-                // blocking on the next action from the queue.
+                // blocking on the next test_id from the queue.
                 match get_next_work() {
                     NextWork::EndOfWork => {
                         // Shut down the worker
                         return;
                     }
                     NextWork::Work {
-                        action,
+                        test_id,
                         context,
                         invocation_id,
                         work_id,
-                    } => (action, context, invocation_id, work_id),
+                    } => (test_id, context, invocation_id, work_id),
                 }
             }
         };
 
-        // Try the action once + how ever many retries were requested.
+        // Try the test_id once + how ever many retries were requested.
         let allowed_attempts = 1 + work_retries;
         'attempts: for attempt_number in 1.. {
-            let attempt_result = attempt_action_for_test_like_runner(
+            let attempt_result = attempt_test_id_for_test_like_runner(
                 &context,
                 runner,
-                action.clone(),
+                test_id.clone(),
                 &work_context,
                 work_timeout,
                 attempt_number,
@@ -304,10 +304,10 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
 }
 
 #[inline(always)]
-fn attempt_action_for_test_like_runner(
+fn attempt_test_id_for_test_like_runner(
     my_context: &WorkerContext,
     runner: TestLikeRunner,
-    action: Action,
+    test_id: TestId,
     requested_context: &WorkContext,
     timeout: Duration,
     attempt: u8,
@@ -315,32 +315,39 @@ fn attempt_action_for_test_like_runner(
 ) -> AttemptResult {
     let working_dir = resolve_context(my_context, requested_context).to_owned();
 
-    use Action as A;
     use TestLikeRunner as R;
 
     let result_handle = proc::spawn!(
-        (runner, action, working_dir, attempt) || {
+        (runner, test_id, working_dir, attempt) || {
             std::env::set_current_dir(working_dir).unwrap();
             let _attempt = attempt;
-            match (runner, action) {
-                (R::Echo, A::Echo(s)) => echo::EchoWorker::run(echo::EchoWork { message: s }),
-                (R::Exec, A::Exec { cmd, args }) => exec::ExecWorker::run(exec::Work { cmd, args }),
-                #[cfg(feature = "test-actions")]
+            match (runner, test_id) {
+                (R::Echo, s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
+                (R::Exec, cmd_and_args) => {
+                    let mut args = cmd_and_args
+                        .split(' ')
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<String>>();
+                    let cmd = args.remove(0);
+                    exec::ExecWorker::run(exec::Work { cmd, args })
+                }
+                #[cfg(feature = "test-test_ids")]
                 (R::InduceTimeout, _) => {
                     thread::sleep(Duration::MAX);
                     unreachable!()
                 }
-                #[cfg(feature = "test-actions")]
-                (R::EchoOnRetry(succeed_on), A::Echo(s)) => {
+                #[cfg(feature = "test-test_ids")]
+                (R::EchoOnRetry(succeed_on), s) => {
                     if succeed_on == _attempt {
                         echo::EchoWorker::run(echo::EchoWork { message: s })
                     } else {
                         panic!("Failed to echo!");
                     }
                 }
-                (runner, action) => unreachable!(
-                    "Invalid runner/action combination: {:?} and {:?}",
-                    runner, action
+                #[cfg(feature = "test-actions")]
+                (runner, test_id) => unreachable!(
+                    "Invalid runner/test_id combination: {:?} and {:?}",
+                    runner, test_id
                 ),
             }
         }
@@ -398,7 +405,8 @@ mod test {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use abq_utils::net_protocol::runners::{Action, Manifest};
+    use abq_utils::flatten_manifest;
+    use abq_utils::net_protocol::runners::{Manifest, ManifestMessage, Test, TestId, TestOrGroup};
     use abq_utils::net_protocol::workers::{NextWork, TestLikeRunner};
     use tempfile::TempDir;
 
@@ -410,7 +418,7 @@ mod test {
     };
 
     type ResultsCollector = Arc<Mutex<HashMap<String, WorkerResult>>>;
-    type ManifestCollector = Arc<Mutex<Option<Manifest>>>;
+    type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
 
     fn work_writer() -> (impl Fn(NextWork), GetNextWork) {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
@@ -449,7 +457,7 @@ mod test {
     fn setup_pool(
         runner: TestLikeRunner,
         invocation_id: InvocationId,
-        manifest: Manifest,
+        manifest: ManifestMessage,
         get_next_work: GetNextWork,
         notify_result: NotifyResult,
     ) -> (WorkerPoolConfig, ManifestCollector) {
@@ -470,9 +478,9 @@ mod test {
         (config, manifest_collector)
     }
 
-    fn local_work(action: Action, invocation_id: InvocationId, work_id: WorkId) -> NextWork {
+    fn local_work(test_id: TestId, invocation_id: InvocationId, work_id: WorkId) -> NextWork {
         NextWork::Work {
-            action,
+            test_id,
             context: WorkContext {
                 working_dir: std::env::current_dir().unwrap(),
             },
@@ -481,10 +489,31 @@ mod test {
         }
     }
 
-    fn await_manifest_actions(manifest: ManifestCollector) -> Vec<Action> {
+    pub fn echo_test(echo_msg: String) -> TestOrGroup {
+        TestOrGroup::Test(Test {
+            id: echo_msg,
+            tags: Default::default(),
+            meta: Default::default(),
+        })
+    }
+
+    pub fn exec_test(cmd: &str, args: &[&str]) -> TestOrGroup {
+        let exec_str = std::iter::once(cmd)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        TestOrGroup::Test(Test {
+            id: exec_str,
+            tags: Default::default(),
+            meta: Default::default(),
+        })
+    }
+
+    fn await_manifest_test_ids(manifest: ManifestCollector) -> Vec<TestId> {
         loop {
             match manifest.lock().unwrap().take() {
-                Some(manifest) => return manifest.actions,
+                Some(manifest) => return flatten_manifest(manifest.manifest),
                 None => continue,
             }
         }
@@ -513,16 +542,18 @@ mod test {
 
         let invocation_id = InvocationId::new();
         let mut expected_results = HashMap::new();
-        let actions = (0..num_echos)
+        let tests = (0..num_echos)
             .into_iter()
             .map(|i| {
                 let echo_string = format!("echo {}", i);
                 expected_results.insert(i.to_string(), echo_string.clone());
 
-                Action::Echo(echo_string)
+                echo_test(echo_string)
             })
             .collect();
-        let manifest = Manifest { actions };
+        let manifest = ManifestMessage {
+            manifest: Manifest { members: tests },
+        };
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::Echo,
@@ -540,10 +571,10 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         // Write the work
-        let actions = await_manifest_actions(manifest_collector);
+        let test_ids = await_manifest_test_ids(manifest_collector);
 
-        for (i, action) in actions.into_iter().enumerate() {
-            write_work(local_work(action, invocation_id, WorkId(i.to_string())))
+        for (i, test_id) in test_ids.into_iter().enumerate() {
+            write_work(local_work(test_id, invocation_id, WorkId(i.to_string())))
         }
 
         for _ in 0..num_workers {
@@ -600,14 +631,14 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "test-actions")]
+    #[cfg(feature = "test-test_ids")]
     fn test_timeout() {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result) = results_collector();
 
         let invocation_id = InvocationId::new();
-        let manifest = Manifest {
-            actions: vec![Action::Echo("mona lisa".to_string())],
+        let manifest = ManifestMessage {
+            test_ids: vec![TestId::Echo("mona lisa".to_string())],
         };
 
         let (default_config, manifest_collector) = setup_pool(
@@ -626,8 +657,12 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for action in await_manifest_actions(manifest_collector) {
-            write_work(local_work(action, invocation_id, WorkId("id1".to_string())));
+        for test_id in await_manifest_test_ids(manifest_collector) {
+            write_work(local_work(
+                test_id,
+                invocation_id,
+                WorkId("id1".to_string()),
+            ));
         }
 
         write_work(NextWork::EndOfWork);
@@ -645,14 +680,14 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "test-actions")]
+    #[cfg(feature = "test-test_ids")]
     fn test_panic_no_retries() {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result) = results_collector();
 
         let invocation_id = InvocationId::new();
-        let manifest = Manifest {
-            actions: vec![Action::Echo("".to_string())],
+        let manifest = ManifestMessage {
+            test_ids: vec![TestId::Echo("".to_string())],
         };
 
         let (default_config, manifest_collector) = setup_pool(
@@ -669,8 +704,12 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for action in await_manifest_actions(manifest_collector) {
-            write_work(local_work(action, invocation_id, WorkId("id1".to_string())));
+        for test_id in await_manifest_test_ids(manifest_collector) {
+            write_work(local_work(
+                test_id,
+                invocation_id,
+                WorkId("id1".to_string()),
+            ));
         }
         write_work(NextWork::EndOfWork);
 
@@ -687,14 +726,14 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "test-actions")]
+    #[cfg(feature = "test-test_ids")]
     fn test_panic_succeed_after_retry() {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result) = results_collector();
 
         let invocation_id = InvocationId::new();
-        let manifest = Manifest {
-            actions: vec![Action::Echo("okay".to_string())],
+        let manifest = ManifestMessage {
+            test_ids: vec![TestId::Echo("okay".to_string())],
         };
 
         let (default_config, manifest_collector) = setup_pool(
@@ -711,8 +750,12 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for action in await_manifest_actions(manifest_collector) {
-            write_work(local_work(action, invocation_id, WorkId("id1".to_string())));
+        for test_id in await_manifest_test_ids(manifest_collector) {
+            write_work(local_work(
+                test_id,
+                invocation_id,
+                WorkId("id1".to_string()),
+            ));
         }
         write_work(NextWork::EndOfWork);
 
@@ -745,11 +788,10 @@ mod test {
         };
 
         let invocation_id = InvocationId::new();
-        let manifest = Manifest {
-            actions: vec![Action::Exec {
-                cmd: "cat".to_string(),
-                args: vec!["testfile".to_string()],
-            }],
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![exec_test("cat", &["testfile"])],
+            },
         };
 
         let (default_config, manifest_collector) = setup_pool(
@@ -775,9 +817,9 @@ mod test {
             working_dir: fake_working_dir_of_work,
         };
 
-        for action in await_manifest_actions(manifest_collector) {
+        for test_id in await_manifest_test_ids(manifest_collector) {
             write_work(NextWork::Work {
-                action,
+                test_id,
                 context: context.clone(),
                 invocation_id,
                 work_id: WorkId("id1".to_string()),

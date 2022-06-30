@@ -1,32 +1,85 @@
-//! Simple read/write protocol for abq-related messages across networks.
-//! The first 4 bytes of any message is the size of the message (in big-endian order).
-//! The rest of the message are the contents, which are serde-serialized json.
+//! The protocol is described at
+//!
+//! https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-IPQ-Interface-0959f5a9144741d798ac122566a3d887#f480d133e2c942719b1a0c0a9e76fb3a
 
 use std::io::{Read, Write};
 
 pub mod runners {
     use serde_derive::{Deserialize, Serialize};
 
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    pub enum Action {
-        TestId(TestId),
-        // The following are mostly for testing
-        Echo(String),
-        Exec { cmd: String, args: Vec<String> },
+    pub type MetadataMap = serde_json::Map<String, serde_json::Value>;
+
+    #[derive(Serialize, Deserialize)]
+    pub struct TestCaseMessage {
+        pub test_case: TestCase,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct TestCase {
+        pub id: String,
+        pub meta: MetadataMap,
+    }
+
+    pub type Milliseconds = f64;
+
+    #[derive(Serialize, Deserialize)]
+    pub enum Status {
+        #[serde(rename = "failure")]
+        Failure,
+        #[serde(rename = "success")]
+        Success,
+        #[serde(rename = "error")]
+        Error,
+        #[serde(rename = "pending")]
+        Pending,
+        #[serde(rename = "skipped")]
+        Skipped,
     }
 
     #[derive(Serialize, Deserialize)]
     pub struct TestResult {
-        test_id: TestId,
-        success: bool,
-        message: String,
+        pub status: Status,
+        pub id: TestId,
+        pub display_name: String,
+        pub output: String,
+        pub runtime: Milliseconds,
+        pub meta: MetadataMap,
     }
 
     pub type TestId = String;
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct ManifestMessage {
+        pub manifest: Manifest,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[serde(tag = "type")]
+    pub enum TestOrGroup {
+        #[serde(rename = "test")]
+        Test(Test),
+        #[serde(rename = "group")]
+        Group(Group),
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct Test {
+        pub id: TestId,
+        pub tags: Vec<String>,
+        pub meta: MetadataMap,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct Group {
+        pub name: String,
+        pub members: Vec<TestOrGroup>,
+        pub tags: Vec<String>,
+        pub meta: MetadataMap,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct Manifest {
-        pub actions: Vec<Action>,
+        pub members: Vec<TestOrGroup>,
     }
 
     #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
@@ -37,7 +90,7 @@ pub mod runners {
 }
 
 pub mod workers {
-    use super::runners::{Action, Manifest, Output};
+    use super::runners::{ManifestMessage, Output, TestId};
     use serde_derive::{Deserialize, Serialize};
     use std::{path::PathBuf, time::Duration};
 
@@ -77,7 +130,7 @@ pub mod workers {
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum RunnerKind {
         GenericTestRunner,
-        TestLikeRunner(TestLikeRunner, Manifest),
+        TestLikeRunner(TestLikeRunner, ManifestMessage),
     }
 
     /// Context for a unit of work.
@@ -90,7 +143,7 @@ pub mod workers {
     #[derive(Serialize, Deserialize)]
     pub enum NextWork {
         Work {
-            action: Action,
+            test_id: TestId,
             context: WorkContext,
             invocation_id: InvocationId,
             work_id: WorkId,
@@ -111,7 +164,7 @@ pub mod queue {
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
-        runners::Manifest,
+        runners::ManifestMessage,
         workers::{InvocationId, WorkId, WorkerResult},
     };
 
@@ -139,7 +192,7 @@ pub mod queue {
         /// An ask to run some work by an invoker.
         InvokeWork(InvokeWork),
         /// A work manifest for a given invocation.
-        Manifest(InvocationId, Manifest),
+        Manifest(InvocationId, ManifestMessage),
         /// The result of some work from the queue.
         WorkerResult(InvocationId, WorkId, WorkerResult),
         /// An ask to shutdown the queue.

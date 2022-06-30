@@ -3,9 +3,8 @@ use std::{
 };
 
 use abq_utils::net_protocol;
-use abq_utils::net_protocol::runners::{Action, Manifest, TestResult};
+use abq_utils::net_protocol::runners::{ManifestMessage, TestResult};
 use abq_utils::net_protocol::workers::NextWork;
-use serde_derive::{Deserialize, Serialize};
 
 pub struct WorkInput {
     pub cmd: String,
@@ -17,13 +16,8 @@ pub struct WorkInput {
 
 pub struct GenericTestRunner;
 
-#[derive(Serialize, Deserialize)]
-struct TestIds {
-    test_ids: Vec<String>,
-}
-
 enum NativeWorkerMsg {
-    Manifest(Manifest),
+    Manifest(ManifestMessage),
     TestResult(TestResult),
     EndOfTests,
 }
@@ -35,7 +29,7 @@ impl GenericTestRunner {
         get_next_test: GetNextWork,
         mut send_test_result: SendTestResult,
     ) where
-        SendManifest: FnMut(Manifest),
+        SendManifest: FnMut(ManifestMessage),
         GetNextWork: Fn() -> NextWork + std::marker::Send + 'static,
         SendTestResult: FnMut(TestResult),
     {
@@ -62,30 +56,23 @@ impl GenericTestRunner {
                     // We need to generate the test manifest
                     let mut msg_buf = String::new();
                     stream.read_to_string(&mut msg_buf).unwrap();
-                    let TestIds { test_ids } = serde_json::from_slice(msg_buf.as_bytes()).unwrap();
+                    let manifest: ManifestMessage =
+                        serde_json::from_slice(msg_buf.as_bytes()).unwrap();
 
-                    let manifest = Manifest {
-                        actions: test_ids.into_iter().map(Action::TestId).collect(),
-                    };
                     NativeWorkerMsg::Manifest(manifest)
                 } else {
                     match get_next_test() {
                         NextWork::EndOfWork => NativeWorkerMsg::EndOfTests,
                         NextWork::Work {
-                            action,
+                            test_id,
                             context: _,
                             invocation_id: _,
                             work_id: _,
-                        } => match action {
-                            Action::TestId(test_id) => {
-                                net_protocol::write(&mut stream, test_id).unwrap();
-                                let results = net_protocol::read(&mut stream).unwrap();
-                                NativeWorkerMsg::TestResult(results)
-                            }
-                            _ => {
-                                unreachable!("Invalid action for generic test runner: {:?}", action)
-                            }
-                        },
+                        } => {
+                            net_protocol::write(&mut stream, test_id).unwrap();
+                            let results = net_protocol::read(&mut stream).unwrap();
+                            NativeWorkerMsg::TestResult(results)
+                        }
                     }
                 };
 
@@ -133,9 +120,9 @@ mod test {
     #[cfg(feature = "test-abq-jest")]
     fn get_manifest_from_jest() {
         use crate::{GenericTestRunner, WorkInput};
-        use abq_utils::net_protocol::{
-            runners::{Action, Manifest},
-            workers::NextWork,
+        use abq_utils::{
+            flatten_manifest,
+            net_protocol::{runners::ManifestMessage, workers::NextWork},
         };
 
         let input = WorkInput {
@@ -156,16 +143,9 @@ mod test {
         GenericTestRunner::run(input, send_manifest, get_next_test, send_test_result);
 
         assert!(test_results.is_empty());
-        let Manifest { actions } = manifest.unwrap();
+        let ManifestMessage { manifest } = manifest.unwrap();
 
-        let mut test_ids = actions
-            .into_iter()
-            .map(|action| match action {
-                Action::TestId(id) => id,
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>();
-
+        let mut test_ids = flatten_manifest(manifest);
         test_ids.sort();
         assert_eq!(test_ids.len(), 2);
         assert!(test_ids[0].ends_with("add.test.js"));
