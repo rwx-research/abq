@@ -6,8 +6,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use abq_utils::flatten_manifest;
 use abq_utils::net_protocol::queue::InvokerResponse;
-use abq_utils::net_protocol::runners::Manifest;
+use abq_utils::net_protocol::runners::TestId;
 use abq_utils::net_protocol::workers::WorkContext;
 use abq_utils::net_protocol::{
     self,
@@ -56,15 +57,15 @@ impl InvocationQueues {
         debug_assert!(old_queue.is_none());
     }
 
-    pub fn add_manifest(&mut self, invocation_id: InvocationId, manifest: Manifest) {
+    pub fn add_manifest(&mut self, invocation_id: InvocationId, flat_manifest: Vec<TestId>) {
         let state = self
             .queues
             .get_mut(&invocation_id)
             .expect("no queue for invocation");
 
-        let work_from_manifest = manifest.actions.into_iter().map(|action| {
+        let work_from_manifest = flat_manifest.into_iter().map(|test_id| {
             NextWork::Work {
-                action,
+                test_id,
                 invocation_id,
                 // TODO: populate correctly
                 work_id: WorkId("".to_string()),
@@ -315,8 +316,13 @@ fn start_queue_server(server_listener: TcpListener, queues: SharedInvocationQueu
                     }
                     Message::Manifest(invocation_id, manifest) => {
                         // Record the manifest for this invocation in its appropriate queue.
-                        work_left_for_invocations.insert(invocation_id, manifest.actions.len());
-                        queues.lock().unwrap().add_manifest(invocation_id, manifest);
+                        // TODO: actually record the manifest metadata
+                        let flat_manifest = flatten_manifest(manifest.manifest);
+                        work_left_for_invocations.insert(invocation_id, flat_manifest.len());
+                        queues
+                            .lock()
+                            .unwrap()
+                            .add_manifest(invocation_id, flat_manifest);
                     }
                     Message::WorkerResult(invocation_id, work_id, result) => {
                         let (results_tx, _) = active_invocations
@@ -477,7 +483,7 @@ mod test {
     use super::Abq;
     use crate::invoke;
     use abq_utils::net_protocol::{
-        runners::{Action, Manifest},
+        runners::{Manifest, ManifestMessage, Test, TestOrGroup},
         workers::{RunnerKind, TestLikeRunner, WorkerResult},
     };
     use abq_workers::{
@@ -498,16 +504,26 @@ mod test {
         results
     }
 
+    fn echo_test(echo_msg: String) -> TestOrGroup {
+        TestOrGroup::Test(Test {
+            id: echo_msg,
+            tags: Default::default(),
+            meta: Default::default(),
+        })
+    }
+
     #[test]
     #[timeout(1000)] // 1 second
     fn multiple_jobs_complete() {
         let mut queue = Abq::start();
 
-        let manifest = Manifest {
-            actions: vec![
-                Action::Echo("echo1".to_string()),
-                Action::Echo("echo2".to_string()),
-            ],
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![
+                    echo_test("echo1".to_string()),
+                    echo_test("echo2".to_string()),
+                ],
+            },
         };
 
         let workers_config = WorkersConfig {
@@ -547,11 +563,13 @@ mod test {
     fn multiple_invokers() {
         let mut queue = Abq::start();
 
-        let manifest = Manifest {
-            actions: vec![
-                Action::Echo("echo1".to_string()),
-                Action::Echo("echo2".to_string()),
-            ],
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![
+                    echo_test("echo1".to_string()),
+                    echo_test("echo2".to_string()),
+                ],
+            },
         };
 
         let workers_config = WorkersConfig {

@@ -286,15 +286,15 @@ mod test {
     use super::{QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
-    use abq_utils::net_protocol;
     use abq_utils::net_protocol::queue::Shutdown;
-    use abq_utils::net_protocol::runners::{Action, Manifest, Output};
+    use abq_utils::net_protocol::runners::{Manifest, ManifestMessage, Output, Test, TestOrGroup};
     use abq_utils::net_protocol::workers::{
         InvocationId, NextWork, RunnerKind, TestLikeRunner, WorkContext, WorkId, WorkerResult,
     };
+    use abq_utils::{flatten_manifest, net_protocol};
 
     type Messages = Arc<Mutex<Vec<net_protocol::workers::WorkerResult>>>;
-    type ManifestCollector = Arc<Mutex<Option<Manifest>>>;
+    type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
 
     type QueueNextWork = (SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
     type QueueResults = (Messages, SocketAddr, JoinHandle<()>);
@@ -309,12 +309,11 @@ mod test {
             let mut work_to_write = loop {
                 match manifest_collector.lock().unwrap().take() {
                     Some(man) => {
-                        let work: Vec<_> = man
-                            .actions
+                        let work: Vec<_> = flatten_manifest(man.manifest)
                             .into_iter()
                             .enumerate()
-                            .map(|(i, action)| NextWork::Work {
-                                action,
+                            .map(|(i, test_id)| NextWork::Work {
+                                test_id,
                                 context: WorkContext {
                                     working_dir: PathBuf::from("/"),
                                 },
@@ -425,10 +424,20 @@ mod test {
         }
     }
 
+    fn echo_test(echo_msg: String) -> TestOrGroup {
+        TestOrGroup::Test(Test {
+            id: echo_msg,
+            tags: Default::default(),
+            meta: Default::default(),
+        })
+    }
+
     #[test]
     fn queue_and_workers_lifecycle() {
-        let manifest = Manifest {
-            actions: vec![Action::Echo("hello".to_string())],
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![echo_test("hello".to_string())],
+            },
         };
 
         let manifest_collector = ManifestCollector::default();
