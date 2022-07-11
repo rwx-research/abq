@@ -96,8 +96,8 @@ jobs:
               -Z unstable-options --format json --report-time \
               | cargo2junit > cargo-tests.xml
 
-      - name: Upload artifacts to vanguard production
-        uses: rwx-research/upload-vanguard-artifact@main
+      - name: Upload artifacts to captain
+        uses: rwx-research/upload-captain-artifact@main
         with:
           artifacts: |
             [
@@ -109,4 +109,4 @@ jobs:
             ]
           job-name: "Lint, test"
           job-matrix: "${{ toJSON(matrix) }}"
-          vanguard-token: "${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}"
+          captain-token: "${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}"
