@@ -24,6 +24,7 @@ use abq_utils::net_protocol::{
 /// when an individual result for a unit of work is received.
 pub fn invoke_work<OnResult>(
     abq_server_addr: SocketAddr,
+    invocation_id: InvocationId,
     runner: RunnerKind,
     mut on_result: OnResult,
 ) where
@@ -31,7 +32,6 @@ pub fn invoke_work<OnResult>(
 {
     let mut stream = TcpStream::connect(abq_server_addr).expect("socket not available");
 
-    let invocation_id = InvocationId::new();
     let invoke_msg = Message::InvokeWork(InvokeWork {
         invocation_id,
         runner,
