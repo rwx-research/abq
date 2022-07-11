@@ -6,6 +6,8 @@ use signal_hook::iterator::Signals;
 
 use abq_queue::queue::Abq;
 
+use crate::args::unspecified_socket_addr;
+
 fn state_file() -> &'static Path {
     Path::new("/tmp/abq.state")
 }
@@ -21,7 +23,7 @@ fn state_read_addr() -> SocketAddr {
 }
 
 /// Starts an [Abq] instance in the current process forever.
-pub fn start_abq_forever() -> ! {
+pub fn start_abq_forever(bind_addr: SocketAddr) -> ! {
     abq_queue::queue::init();
 
     if state_file().exists() {
@@ -32,7 +34,7 @@ pub fn start_abq_forever() -> ! {
         std::process::exit(1);
     }
 
-    let mut abq = Abq::start();
+    let mut abq = Abq::start(bind_addr);
 
     log::debug!("Queue active at {}", abq.server_addr());
 
@@ -84,7 +86,7 @@ pub fn find_abq() -> AbqInstance {
         // Create a temporary ABQ instance
         abq_queue::queue::init();
 
-        let queue = Abq::start();
+        let queue = Abq::start(unspecified_socket_addr());
         AbqInstance::Temp(queue)
     }
 }

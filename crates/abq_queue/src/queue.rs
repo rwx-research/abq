@@ -150,8 +150,8 @@ impl Abq {
         self.server_addr
     }
 
-    pub fn start() -> Self {
-        start_queue()
+    pub fn start(negoatiator_bind_addr: SocketAddr) -> Self {
+        start_queue(negoatiator_bind_addr)
     }
 
     pub fn wait_forever(&mut self) {
@@ -204,11 +204,15 @@ enum WorkerSchedulerMsg {
     Shutdown,
 }
 
-/// Initializes a queue.
-fn start_queue() -> Abq {
+/// Initializes a queue, binding the queue negotiator to the given address.
+/// All other public channels to the queue (the work and results server) are exposed
+/// on the same host IP address as the negotiator is.
+fn start_queue(negoatiator_bind_addr: SocketAddr) -> Abq {
+    let bind_hostname = negoatiator_bind_addr.ip();
+
     let queues: SharedInvocationQueues = Default::default();
 
-    let server_listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let server_listener = TcpListener::bind((bind_hostname, 0)).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
     let (send_worker, recv_worker) = mpsc::channel();
@@ -217,7 +221,7 @@ fn start_queue() -> Abq {
         move || start_queue_server(server_listener, queues)
     });
 
-    let new_work_server = TcpListener::bind("0.0.0.0:0").unwrap();
+    let new_work_server = TcpListener::bind((bind_hostname, 0)).unwrap();
     let new_work_server_addr = new_work_server.local_addr().unwrap();
 
     let work_scheduler_handle = thread::spawn({
@@ -247,6 +251,7 @@ fn start_queue() -> Abq {
         }
     };
     let negotiator = QueueNegotiator::new(
+        negoatiator_bind_addr,
         new_work_server_addr,
         server_addr,
         choose_invocation_queue_for_worker,
@@ -515,7 +520,7 @@ mod test {
     #[test]
     #[timeout(1000)] // 1 second
     fn multiple_jobs_complete() {
-        let mut queue = Abq::start();
+        let mut queue = Abq::start("0.0.0.0:0".parse().unwrap());
 
         let manifest = ManifestMessage {
             manifest: Manifest {
@@ -561,7 +566,7 @@ mod test {
     #[timeout(1000)] // 1 second
     #[ignore = "TODO: this doesn't work yet because we don't keep track of which workers are doing what invocations, nor do we schedule work for various invocations correctly."]
     fn multiple_invokers() {
-        let mut queue = Abq::start();
+        let mut queue = Abq::start("0.0.0.0:0".parse().unwrap());
 
         let manifest = ManifestMessage {
             manifest: Manifest {
