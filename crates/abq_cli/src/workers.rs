@@ -28,7 +28,7 @@ pub fn start_workers(
 
     let queue_negotiator = QueueNegotiatorHandle::from_raw_address(queue_negotiator_addr).unwrap();
 
-    log::debug!(
+    tracing::debug!(
         "Workers attaching to queue negotiator {}",
         queue_negotiator.get_address()
     );
@@ -40,7 +40,7 @@ pub fn start_workers(
     )
     .unwrap();
 
-    log::debug!("Workers attached");
+    tracing::debug!("Workers attached");
 
     // Make sure the queue shuts down and the socket is unliked when the process dies.
     let mut term_signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
@@ -48,7 +48,7 @@ pub fn start_workers(
         #[allow(unused_must_use)]
         {
             worker_pool.shutdown();
-            log::debug!("Workers shutdown");
+            tracing::debug!("Workers shutdown");
             std::process::exit(0);
         }
     }

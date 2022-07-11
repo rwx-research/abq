@@ -24,7 +24,7 @@ pub type GetNextWork = Arc<dyn Fn() -> NextWork + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(InvocationId, ManifestMessage) + Send + Sync + 'static>;
 pub type NotifyResult = Arc<dyn Fn(InvocationId, WorkId, TestResult) + Send + Sync + 'static>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum WorkerContext {
     /// Assume all context needed to run a unit of work is available in the local filesystem/network namespace.
     AssumeLocal,

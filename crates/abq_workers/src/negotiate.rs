@@ -8,6 +8,7 @@ use std::{
     thread,
     time::Duration,
 };
+use tracing::instrument;
 
 use crate::workers::{
     GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
@@ -69,7 +70,7 @@ enum MessageToQueueNegotiator {
     Shutdown,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WorkersConfig {
     pub num_workers: NonZeroUsize,
     /// Context under which workers should operate.
@@ -91,6 +92,9 @@ pub struct WorkersNegotiator(TcpListener, WorkerContext);
 impl WorkersNegotiator {
     /// Runs the workers-side of the negotiation, returning the configured worker pool once
     /// negotiation is complete.
+    #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle), fields(
+        num_workers = workers_config.num_workers
+    ))]
     pub fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
@@ -122,6 +126,9 @@ impl WorkersNegotiator {
         } = workers_config;
 
         let notify_result: NotifyResult = Arc::new(move |invocation_id, work_id, result| {
+            let span = tracing::trace_span!("notify_result", invocation_id=?invocation_id, work_id=?work_id, queue_server=?queue_results_addr);
+            let _notify_result = span.enter();
+
             // TODO: error handling
             let mut stream =
                 TcpStream::connect(queue_results_addr).expect("results server not available");
@@ -135,6 +142,9 @@ impl WorkersNegotiator {
         });
 
         let get_next_work: GetNextWork = Arc::new(move || {
+            let span = tracing::trace_span!("get_next_work", invocation_id=?invocation_id, new_work_server=?queue_new_work_addr);
+            let _get_next_work = span.enter();
+
             // TODO: error handling
             // In particular, the work server may have shut down and we can't connect. In that
             // case the worker should shutdown too.
@@ -151,6 +161,9 @@ impl WorkersNegotiator {
 
         let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
             Some(Box::new(move |invocation_id, manifest| {
+                let span = tracing::trace_span!("notify_manifest", invocation_id=?invocation_id, queue_server=?queue_results_addr);
+                let _notify_manifest = span.enter();
+
                 // TODO: error handling
                 let mut stream =
                     TcpStream::connect(queue_results_addr).expect("results server not available");

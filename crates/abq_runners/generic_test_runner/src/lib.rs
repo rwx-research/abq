@@ -7,6 +7,7 @@ use abq_utils::net_protocol::runners::{
     ManifestMessage, TestCaseMessage, TestResult, TestResultMessage,
 };
 use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, WorkId};
+use tracing::instrument;
 
 static ABQ_SOCKET: &str = "ABQ_SOCKET";
 static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
@@ -14,6 +15,7 @@ static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
 pub struct GenericTestRunner;
 
 /// Retrieves the test manifest from native test runner.
+#[instrument(level = "trace", skip(additional_env, working_dir))]
 fn retrieve_manifest<'a>(
     cmd: &str,
     args: &[String],
