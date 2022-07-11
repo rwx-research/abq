@@ -9,8 +9,14 @@ use clap::Parser;
 
 use args::{CargoCmd, Cli, Command};
 
+use tracing_subscriber::{fmt, EnvFilter};
+
 fn main() {
-    env_logger::Builder::from_env("ABQ_LOG").init();
+    let tracing_fmt = fmt()
+        .with_span_events(fmt::format::FmtSpan::ACTIVE)
+        .with_env_filter(EnvFilter::from_env("ABQ_LOG"))
+        .finish();
+    tracing::subscriber::set_global_default(tracing_fmt).unwrap();
 
     let args = Cli::parse();
 
@@ -44,6 +50,7 @@ fn main() {
                 extra_env: Default::default(),
             });
             let invocation_id = InvocationId::new();
+            println!("Starting test run with ID {}", invocation_id);
             invoke_work(abq.server_addr(), invocation_id, jest_runner, on_result);
         }
     }

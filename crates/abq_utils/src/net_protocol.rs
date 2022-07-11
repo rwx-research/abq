@@ -91,7 +91,7 @@ pub mod runners {
 pub mod workers {
     use super::runners::{ManifestMessage, TestCase};
     use serde_derive::{Deserialize, Serialize};
-    use std::{collections::HashMap, path::PathBuf, str::FromStr};
+    use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
     /// ID for a particular invocation of the queue, which sends many units of work.
@@ -116,6 +116,12 @@ pub mod workers {
                 .map_err(|_| format!("{} is not a valid invocation ID", s))?;
 
             Ok(Self(id.into_bytes()))
+        }
+    }
+
+    impl Display for InvocationId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
         }
     }
 
@@ -189,7 +195,7 @@ pub mod queue {
     pub struct Shutdown {}
 
     /// An ask to run some work by an invoker.
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug)]
     pub struct InvokeWork {
         pub invocation_id: InvocationId,
         pub runner: RunnerKind,

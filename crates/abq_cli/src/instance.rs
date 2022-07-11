@@ -36,7 +36,7 @@ pub fn start_abq_forever(bind_addr: SocketAddr) -> ! {
 
     let mut abq = Abq::start(bind_addr);
 
-    log::debug!("Queue active at {}", abq.server_addr());
+    tracing::debug!("Queue active at {}", abq.server_addr());
 
     println!("Run the following to start workers and attach to the queue:");
     println!(
@@ -53,7 +53,7 @@ pub fn start_abq_forever(bind_addr: SocketAddr) -> ! {
         {
             std::fs::remove_file(state_file());
             abq.shutdown();
-            log::debug!("Queue shutdown");
+            tracing::debug!("Queue shutdown");
             std::process::exit(0);
         }
     }
@@ -79,10 +79,10 @@ impl AbqInstance {
 #[allow(unused)] // TODO: remove when CLI plugins are added back
 pub fn find_abq() -> AbqInstance {
     if state_file().exists() {
-        log::debug!("using ephemeral queue");
+        tracing::debug!("using ephemeral queue");
         AbqInstance::Ephemeral(state_read_addr())
     } else {
-        log::debug!("using temporary queue");
+        tracing::debug!("using temporary queue");
         // Create a temporary ABQ instance
         abq_queue::queue::init();
 

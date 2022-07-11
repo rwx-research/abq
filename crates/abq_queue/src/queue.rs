@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use abq_utils::flatten_manifest;
 use abq_utils::net_protocol::queue::InvokerResponse;
-use abq_utils::net_protocol::runners::{TestCase, TestResult};
+use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
 use abq_utils::net_protocol::workers::{RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
     self,
@@ -16,6 +16,7 @@ use abq_utils::net_protocol::{
     workers::{InvocationId, NextWork, WorkId},
 };
 use abq_workers::negotiate::{AssignedRun, QueueNegotiator, QueueNegotiatorHandle};
+use tracing::instrument;
 
 // TODO: we probably want something more sophisticated here, in particular a concurrent
 // work-stealing queue.
@@ -204,6 +205,7 @@ impl Abq {
     }
 
     /// Sends a signal to shutdown immediately.
+    #[instrument(level = "trace", skip(self))]
     pub fn shutdown(&mut self) {
         debug_assert!(self.active);
 
@@ -261,20 +263,19 @@ fn start_queue(negoatiator_bind_addr: SocketAddr) -> Abq {
 
     let (send_worker, recv_worker) = mpsc::channel();
     let server_handle = thread::spawn({
-        let queues = Arc::clone(&queues);
-        move || start_queue_server(server_listener, queues)
+        let queue_server = QueueServer::new(Arc::clone(&queues));
+        move || queue_server.start_on(server_listener)
     });
 
     let new_work_server = TcpListener::bind((bind_hostname, 0)).unwrap();
     let new_work_server_addr = new_work_server.local_addr().unwrap();
 
     let work_scheduler_handle = thread::spawn({
-        let queues = Arc::clone(&queues);
-        let scheduler_config = SchedulerConfig {
-            queues,
+        let scheduler = WorkScheduler {
+            queues: Arc::clone(&queues),
             msg_recv: recv_worker,
         };
-        move || start_work_scheduler(scheduler_config, new_work_server)
+        move || scheduler.start_on(new_work_server)
     });
 
     // Chooses a test run for a set of workers to attach to.
@@ -317,115 +318,162 @@ fn start_queue(negoatiator_bind_addr: SocketAddr) -> Abq {
 
 static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 
-fn start_queue_server(server_listener: TcpListener, queues: SharedInvocationQueues) {
-    // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
-    // there are no active connections into the queue.
-    server_listener
-        .set_nonblocking(true)
-        .expect("Failed to set stream as non-blocking");
+// invocation -> (results sender, responder thread handle)
+type ActiveInvocations =
+    HashMap<InvocationId, (mpsc::Sender<InvocationResponderMsg>, JoinHandle<()>)>;
 
-    // invocation -> (results sender, responder thread handle)
-    type ActiveInvocations =
-        HashMap<InvocationId, (mpsc::Sender<InvocationResponderMsg>, JoinHandle<()>)>;
+/// Central server listening for new test run invocations and results.
+struct QueueServer {
+    queues: SharedInvocationQueues,
+    /// When all results for a particular invocation are communicated, we want to make sure that the
+    /// responder thread is closed and that the entry here is dropped.
+    active_invocations: ActiveInvocations,
+    /// Cache of how much is left in the queue for a particular invocation, so that we don't have to
+    /// lock the queue all the time.
+    work_left_for_invocations: HashMap<InvocationId, usize>,
+}
 
-    // When all results for a particular invocation are communicated, we want to make sure that the
-    // responder thread is closed and that the entry here is dropped.
-    let mut active_invocations: ActiveInvocations = Default::default();
-    // Cache of how much is left in the queue for a particular invocation, so that we don't have to
-    // lock the queue all the time.
-    let mut work_left_for_invocations: HashMap<InvocationId, usize> = Default::default();
+impl QueueServer {
+    fn new(queues: SharedInvocationQueues) -> Self {
+        Self {
+            queues,
+            active_invocations: Default::default(),
+            work_left_for_invocations: Default::default(),
+        }
+    }
 
-    for client in server_listener.incoming() {
-        match client {
-            Ok(mut client) => {
-                // Reads and writes to the client will be buffered, so we must make sure
-                // the stream is blocking. Note that we inherit non-blocking from the server
-                // listener, but that this adjustment does not affect the server.
-                client
-                    .set_nonblocking(false)
-                    .expect("Failed to set client stream as blocking");
+    fn start_on(mut self, server_listener: TcpListener) {
+        // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
+        // there are no active connections into the queue.
+        server_listener
+            .set_nonblocking(true)
+            .expect("Failed to set stream as non-blocking");
 
-                let msg = net_protocol::read(&mut client).expect("Failed to read message");
+        for client in server_listener.incoming() {
+            match client {
+                Ok(mut client) => {
+                    // Reads and writes to the client will be buffered, so we must make sure
+                    // the stream is blocking. Note that we inherit non-blocking from the server
+                    // listener, but that this adjustment does not affect the server.
+                    client
+                        .set_nonblocking(false)
+                        .expect("Failed to set client stream as blocking");
 
-                match msg {
-                    Message::InvokeWork(InvokeWork {
-                        invocation_id,
-                        runner,
-                    }) => {
-                        // Spawn a new thread to communicate work results back to the invoker. The
-                        // main queue (in this thread) will use a channel to communicate relevant
-                        // results as they come in.
-                        let (results_tx, results_rx) = mpsc::channel();
-                        let responder_handle =
-                            thread::spawn(move || start_invocation_responder(client, results_rx));
+                    let msg = net_protocol::read(&mut client).expect("Failed to read message");
 
-                        let old_tx = active_invocations
-                            .insert(invocation_id, (results_tx, responder_handle));
-                        debug_assert!(
-                            old_tx.is_none(),
-                            "Existing transmitter for expected unique invocation id"
-                        );
-
-                        // Create a new work queue for this invocation.
-                        queues.lock().unwrap().create_queue(invocation_id, runner);
-                    }
-                    Message::Manifest(invocation_id, manifest) => {
-                        // Record the manifest for this invocation in its appropriate queue.
-                        // TODO: actually record the manifest metadata
-                        let flat_manifest = flatten_manifest(manifest.manifest);
-                        work_left_for_invocations.insert(invocation_id, flat_manifest.len());
-                        queues
-                            .lock()
-                            .unwrap()
-                            .add_manifest(invocation_id, flat_manifest);
-                    }
-                    Message::WorkerResult(invocation_id, work_id, result) => {
-                        let (results_tx, _) = active_invocations
-                            .get_mut(&invocation_id)
-                            .expect("invocation is not active");
-
-                        results_tx
-                            .send(InvocationResponderMsg::WorkResult(work_id, result))
-                            .unwrap();
-
-                        let work_left = work_left_for_invocations
-                            .get_mut(&invocation_id)
-                            .expect("invocation id not recorded, but we got a result for it?");
-
-                        *work_left -= 1;
-                        if *work_left == 0 {
-                            // Results for this invocation are all done. Let the notifier thread
-                            // know, and clean up all remenants of this invocation so as to avoid
-                            // memory leaks.
-                            let (results_tx, responder_handle) =
-                                active_invocations.remove(&invocation_id).unwrap();
-
-                            results_tx.send(InvocationResponderMsg::EndOfWork).unwrap();
-                            responder_handle.join().unwrap();
-
-                            work_left_for_invocations.remove(&invocation_id);
-                            queues.lock().unwrap().mark_complete(invocation_id);
+                    match msg {
+                        Message::InvokeWork(invoke_work) => {
+                            self.handle_invoked_work(client, invoke_work);
+                        }
+                        Message::Manifest(invocation_id, manifest) => {
+                            self.handle_manifest(invocation_id, manifest);
+                        }
+                        Message::WorkerResult(invocation_id, work_id, result) => {
+                            self.handle_worker_result(invocation_id, work_id, result);
+                        }
+                        Message::Shutdown(Shutdown {}) => {
+                            break;
                         }
                     }
-                    Message::Shutdown(Shutdown {}) => {
-                        break;
+                }
+                Err(ref e) => {
+                    match e.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            // Sleep and wait for the next message.
+                            //
+                            // Idea for (much) later: if it's been a long time since the last Work
+                            // message, it's likely that there are a burst of pending jobs that need to
+                            // be completed. In this case we may want to consider sleeping longer than
+                            // the default timeout.
+                            thread::sleep(POLL_WAIT_TIME);
+                        }
+                        _ => panic!("Unhandled IO error: {e:?}"),
                     }
                 }
             }
-            Err(ref e) => {
-                match e.kind() {
-                    io::ErrorKind::WouldBlock => {
-                        // Sleep and wait for the next message.
-                        //
-                        // Idea for (much) later: if it's been a long time since the last Work
-                        // message, it's likely that there are a burst of pending jobs that need to
-                        // be completed. In this case we may want to consider sleeping longer than
-                        // the default timeout.
-                        thread::sleep(POLL_WAIT_TIME);
-                    }
-                    _ => panic!("Unhandled IO error: {e:?}"),
-                }
-            }
+        }
+    }
+
+    #[instrument(level = "trace", skip(self, invoker))]
+    fn handle_invoked_work(&mut self, invoker: TcpStream, invoke_work: InvokeWork) {
+        let InvokeWork {
+            invocation_id,
+            runner,
+        } = invoke_work;
+
+        // Spawn a new thread to communicate work results back to the invoker. The
+        // main queue (in this thread) will use a channel to communicate relevant
+        // results as they come in.
+        //
+        // Note that keeps the invoking stream open until all work results are sent
+        // back to the invoker.
+        let (results_tx, results_rx) = mpsc::channel();
+        let responder_handle =
+            thread::spawn(move || start_invocation_responder(invoker, results_rx));
+
+        let old_tx = self
+            .active_invocations
+            .insert(invocation_id, (results_tx, responder_handle));
+        debug_assert!(
+            old_tx.is_none(),
+            "Existing transmitter for expected unique invocation id"
+        );
+
+        // Create a new work queue for this invocation.
+        self.queues
+            .lock()
+            .unwrap()
+            .create_queue(invocation_id, runner);
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    fn handle_manifest(&mut self, invocation_id: InvocationId, manifest: ManifestMessage) {
+        // Record the manifest for this invocation in its appropriate queue.
+        // TODO: actually record the manifest metadata
+        let flat_manifest = flatten_manifest(manifest.manifest);
+        self.work_left_for_invocations
+            .insert(invocation_id, flat_manifest.len());
+
+        self.queues
+            .lock()
+            .unwrap()
+            .add_manifest(invocation_id, flat_manifest);
+    }
+
+    #[instrument(level = "trace", skip(self))]
+    fn handle_worker_result(
+        &mut self,
+        invocation_id: InvocationId,
+        work_id: WorkId,
+        result: TestResult,
+    ) {
+        let (results_tx, _) = self
+            .active_invocations
+            .get_mut(&invocation_id)
+            .expect("invocation is not active");
+
+        results_tx
+            .send(InvocationResponderMsg::WorkResult(work_id, result))
+            .unwrap();
+
+        let work_left = self
+            .work_left_for_invocations
+            .get_mut(&invocation_id)
+            .expect("invocation id not recorded, but we got a result for it?");
+
+        *work_left -= 1;
+        if *work_left == 0 {
+            // Results for this invocation are all done. Let the notifier thread
+            // know, and clean up all remenants of this invocation so as to avoid
+            // memory leaks.
+            let (results_tx, responder_handle) =
+                self.active_invocations.remove(&invocation_id).unwrap();
+
+            results_tx.send(InvocationResponderMsg::EndOfWork).unwrap();
+            responder_handle.join().unwrap();
+
+            self.work_left_for_invocations.remove(&invocation_id);
+            self.queues.lock().unwrap().mark_complete(invocation_id);
         }
     }
 }
@@ -462,72 +510,78 @@ fn start_invocation_responder(
     invoker.shutdown(std::net::Shutdown::Write).unwrap();
 }
 
-struct SchedulerConfig {
+/// Sends work as workers request it.
+/// This does not schedule work in any interesting way today, but it may in the future.
+struct WorkScheduler {
     queues: SharedInvocationQueues,
     /// Channel on which the scheduler itself will receive messages from the parent queue.
     msg_recv: mpsc::Receiver<WorkerSchedulerMsg>,
 }
 
-/// Starts an out-of-band work scheduler to send work as workers request it.
-fn start_work_scheduler(config: SchedulerConfig, listener: TcpListener) {
-    let SchedulerConfig { queues, msg_recv } = config;
+impl WorkScheduler {
+    fn start_on(mut self, listener: TcpListener) {
+        // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
+        // there are no active connections into the queue.
+        listener
+            .set_nonblocking(true)
+            .expect("Failed to set stream as non-blocking");
 
-    // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
-    // there are no active connections into the queue.
-    listener
-        .set_nonblocking(true)
-        .expect("Failed to set stream as non-blocking");
+        for client in listener.incoming() {
+            match client {
+                Ok(client) => {
+                    // Reads and writes to the client will be buffered, so we must make sure
+                    // the stream is blocking. Note that we inherit non-blocking from the server
+                    // listener, but that this adjustment does not affect the server.
+                    client
+                        .set_nonblocking(false)
+                        .expect("Failed to set client stream as blocking");
 
-    for client in listener.incoming() {
-        match client {
-            Ok(mut client) => {
-                // Reads and writes to the client will be buffered, so we must make sure
-                // the stream is blocking. Note that we inherit non-blocking from the server
-                // listener, but that this adjustment does not affect the server.
-                client
-                    .set_nonblocking(false)
-                    .expect("Failed to set client stream as blocking");
-
-                // Get the invocation this worker wants work for.
-                // TODO: error handling
-                let invocation_id: InvocationId =
-                    net_protocol::read(&mut client).expect("Failed to read message");
-
-                // Pull the next work item.
-                let next_work = loop {
-                    let opt_work = { queues.lock().unwrap().next_work(invocation_id) };
-                    match opt_work {
-                        Ok(work) => break work,
-                        Err(WaitingForManifestError) => {
-                            // Nothing yet; release control and sleep for a bit in case the
-                            // manifest comes in.
-                            thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                    }
-                };
-
-                // TODO: error handling
-                net_protocol::write(&mut client, next_work).unwrap();
-            }
-            Err(ref e) => {
-                match e.kind() {
-                    io::ErrorKind::WouldBlock => {
-                        match msg_recv.try_recv() {
-                            Ok(WorkerSchedulerMsg::Shutdown) => return,
-                            Err(TryRecvError::Empty) => {
-                                // Sleep before polling for the next work connection.
-                                thread::sleep(POLL_WAIT_TIME);
-                            }
-                            Err(TryRecvError::Disconnected) => {
-                                todo!("disconnected from parent queue")
+                    self.handle_work_conn(client);
+                }
+                Err(ref e) => {
+                    match e.kind() {
+                        io::ErrorKind::WouldBlock => {
+                            match self.msg_recv.try_recv() {
+                                Ok(WorkerSchedulerMsg::Shutdown) => return,
+                                Err(TryRecvError::Empty) => {
+                                    // Sleep before polling for the next work connection.
+                                    thread::sleep(POLL_WAIT_TIME);
+                                }
+                                Err(TryRecvError::Disconnected) => {
+                                    todo!("disconnected from parent queue")
+                                }
                             }
                         }
+                        _ => todo!("Unhandled IO error: {e:?}"),
                     }
-                    _ => todo!("Unhandled IO error: {e:?}"),
                 }
             }
         }
+    }
+
+    #[instrument(level = "trace", skip(self, worker))]
+    fn handle_work_conn(&mut self, mut worker: TcpStream) {
+        // Get the invocation this worker wants work for.
+        // TODO: error handling
+        let invocation_id: InvocationId =
+            net_protocol::read(&mut worker).expect("Failed to read message");
+
+        // Pull the next work item.
+        let next_work = loop {
+            let opt_work = { self.queues.lock().unwrap().next_work(invocation_id) };
+            match opt_work {
+                Ok(work) => break work,
+                Err(WaitingForManifestError) => {
+                    // Nothing yet; release control and sleep for a bit in case the
+                    // manifest comes in.
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+            }
+        };
+
+        // TODO: error handling
+        net_protocol::write(&mut worker, next_work).unwrap();
     }
 }
 
