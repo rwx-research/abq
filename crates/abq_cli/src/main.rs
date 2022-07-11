@@ -12,7 +12,7 @@ fn main() {
     let args = Cli::parse();
 
     match args.command {
-        Command::Start {} => instance::start_abq_forever(),
+        Command::Start { bind } => instance::start_abq_forever(bind),
         Command::Work {
             working_dir,
             queue_addr,

@@ -206,6 +206,7 @@ pub enum QueueNegotiateError {
 impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
     pub fn new<InvocationToWorkFor>(
+        bind_addr: SocketAddr,
         queue_next_work_addr: SocketAddr,
         queue_results_addr: SocketAddr,
         mut invocation_to_work_for: InvocationToWorkFor,
@@ -213,7 +214,8 @@ impl QueueNegotiator {
     where
         InvocationToWorkFor: FnMut() -> InvocationId + Send + 'static,
     {
-        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        // TODO: error handling when `bind_addr` is taken.
+        let listener = TcpListener::bind(bind_addr).unwrap();
         let addr = listener.local_addr().unwrap();
 
         let listener_handle = thread::spawn(move || {
@@ -445,8 +447,12 @@ mod test {
             mock_queue_next_work_server(Arc::clone(&manifest_collector));
         let (msgs, results_addr, results_handle) = mock_queue_results_server(manifest_collector);
 
-        let mut queue_negotiator =
-            QueueNegotiator::new(next_work_addr, results_addr, InvocationId::new);
+        let mut queue_negotiator = QueueNegotiator::new(
+            "0.0.0.0:0".parse().unwrap(),
+            next_work_addr,
+            results_addr,
+            InvocationId::new,
+        );
         let workers_config = WorkersConfig {
             runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
             num_workers: NonZeroUsize::new(1).unwrap(),
