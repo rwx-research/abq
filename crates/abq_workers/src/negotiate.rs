@@ -61,10 +61,15 @@ enum MessageFromQueueNegotiator {
 
 #[derive(Serialize, Deserialize)]
 enum MessageToQueueNegotiator {
-    WantsToAttach,
+    WantsToAttach {
+        /// The invocation the worker wants to run tests for. The queue must respect assignment of
+        /// work related to this invocation, or return an error.
+        invocation: InvocationId,
+    },
     Shutdown,
 }
 
+#[derive(Clone)]
 pub struct WorkersConfig {
     pub num_workers: NonZeroUsize,
     /// Context under which workers should operate.
@@ -89,14 +94,17 @@ impl WorkersNegotiator {
     pub fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
+        wanted_invocation_id: InvocationId,
     ) -> Result<WorkerPool, WorkersNegotiateError> {
         use WorkersNegotiateError::*;
 
         let mut conn =
             TcpStream::connect(&queue_negotiator_handle.0).map_err(|_| CouldNotConnect)?;
 
-        net_protocol::write(&mut conn, MessageToQueueNegotiator::WantsToAttach)
-            .map_err(|_| CouldNotConnect)?;
+        let wants_to_attach = MessageToQueueNegotiator::WantsToAttach {
+            invocation: wanted_invocation_id,
+        };
+        net_protocol::write(&mut conn, wants_to_attach).map_err(|_| CouldNotConnect)?;
 
         let MessageFromQueueNegotiator::ExecutionContext {
             invocation_id,
@@ -221,7 +229,7 @@ impl QueueNegotiator {
         mut get_assigned_run: GetAssignedRun,
     ) -> Self
     where
-        GetAssignedRun: FnMut() -> AssignedRun + Send + 'static,
+        GetAssignedRun: FnMut(InvocationId) -> AssignedRun + Send + 'static,
     {
         // TODO: error handling when `bind_addr` is taken.
         let listener = TcpListener::bind(bind_addr).unwrap();
@@ -235,7 +243,9 @@ impl QueueNegotiator {
 
                 use MessageToQueueNegotiator::*;
                 match msg {
-                    WantsToAttach => {
+                    WantsToAttach {
+                        invocation: wanted_invocation_id,
+                    } => {
                         // Choose an `abq test ...` invocation the workers should perform work
                         // for.
                         // TODO: this fully blocks the negotiator, so nothing else can connect
@@ -245,7 +255,9 @@ impl QueueNegotiator {
                             invocation_id,
                             runner_kind,
                             should_generate_manifest,
-                        } = get_assigned_run();
+                        } = get_assigned_run(wanted_invocation_id);
+
+                        debug_assert_eq!(invocation_id, wanted_invocation_id);
 
                         let execution_context = MessageFromQueueNegotiator::ExecutionContext {
                             queue_new_work_addr: queue_next_work_addr,
@@ -456,14 +468,16 @@ mod test {
             mock_queue_next_work_server(Arc::clone(&manifest_collector));
         let (msgs, results_addr, results_handle) = mock_queue_results_server(manifest_collector);
 
-        let get_assigned_run = || {
+        let invocation_id = InvocationId::new();
+
+        let get_assigned_run = |invocation_id| {
             let manifest = ManifestMessage {
                 manifest: Manifest {
                     members: vec![echo_test("hello".to_string())],
                 },
             };
             AssignedRun {
-                invocation_id: InvocationId::new(),
+                invocation_id,
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
                 should_generate_manifest: true,
             }
@@ -484,6 +498,7 @@ mod test {
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue_negotiator.get_handle(),
+            invocation_id,
         )
         .unwrap();
 

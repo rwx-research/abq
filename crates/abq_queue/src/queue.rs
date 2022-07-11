@@ -42,12 +42,6 @@ enum InvocationState {
     Done,
 }
 
-impl InvocationState {
-    fn is_done(&self) -> bool {
-        matches!(self, InvocationState::Done)
-    }
-}
-
 struct InvocationData {
     runner: RunnerKind,
 }
@@ -74,19 +68,19 @@ impl InvocationQueues {
         debug_assert!(old_invocation_data.is_none());
     }
 
-    // Chooses a run for a set of workers to attach to. Returns `None` if there are none.
-    pub fn get_run_for_worker(&mut self) -> Option<AssignedRun> {
-        let (invocation_id, invocation_state) =
-            self.queues.iter_mut().find(|(_, state)| !state.is_done())?;
+    // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
+    // found.
+    pub fn get_run_for_worker(&mut self, invocation_id: InvocationId) -> Option<AssignedRun> {
+        let invocation_state = self.queues.get_mut(&invocation_id)?;
 
-        let InvocationData { runner } = self.invocation_data.get(invocation_id).unwrap();
+        let InvocationData { runner } = self.invocation_data.get(&invocation_id).unwrap();
 
         let assigned_run = match invocation_state {
             InvocationState::WaitingForFirstWorker => {
                 // This is the first worker to attach; ask it to generate the manifest.
                 *invocation_state = InvocationState::WaitingForManifest;
                 AssignedRun {
-                    invocation_id: *invocation_id,
+                    invocation_id,
                     runner_kind: runner.clone(),
                     should_generate_manifest: true,
                 }
@@ -95,7 +89,7 @@ impl InvocationQueues {
                 // Otherwise we are already waiting for the manifest, or already have it; just tell
                 // the worker what runner it should set up.
                 AssignedRun {
-                    invocation_id: *invocation_id,
+                    invocation_id,
                     runner_kind: runner.clone(),
                     should_generate_manifest: false,
                 }
@@ -285,8 +279,13 @@ fn start_queue(negoatiator_bind_addr: SocketAddr) -> Abq {
 
     // Chooses a test run for a set of workers to attach to.
     // This blocks until there is an invocation available.
-    let choose_run_for_worker = move || loop {
-        let opt_assigned = { queues.lock().unwrap().get_run_for_worker() };
+    let choose_run_for_worker = move |wanted_invocation_id| loop {
+        let opt_assigned = {
+            queues
+                .lock()
+                .unwrap()
+                .get_run_for_worker(wanted_invocation_id)
+        };
         match opt_assigned {
             None => {
                 // Nothing yet; release control and sleep for a bit in case something comes.
@@ -540,7 +539,7 @@ mod test {
     use crate::invoke;
     use abq_utils::net_protocol::{
         runners::{Manifest, ManifestMessage, Test, TestOrGroup, TestResult},
-        workers::{RunnerKind, TestLikeRunner},
+        workers::{InvocationId, RunnerKind, TestLikeRunner},
     };
     use abq_workers::{
         negotiate::{WorkersConfig, WorkersNegotiator},
@@ -589,9 +588,11 @@ mod test {
         };
 
         let queue_server_addr = queue.server_addr();
+
+        let invocation_id = InvocationId::new();
         let results_handle = thread::spawn(move || {
             let mut results = Vec::default();
-            invoke::invoke_work(queue_server_addr, runner, |id, result| {
+            invoke::invoke_work(queue_server_addr, invocation_id, runner, |id, result| {
                 results.push((id.0, result))
             });
             results
@@ -600,6 +601,7 @@ mod test {
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue.get_negotiator_handle(),
+            invocation_id,
         )
         .unwrap();
 
@@ -615,11 +617,10 @@ mod test {
 
     #[test]
     #[timeout(1000)] // 1 second
-    #[ignore = "TODO: this doesn't work yet because we don't keep track of which workers are doing what invocations, nor do we schedule work for various invocations correctly."]
     fn multiple_invokers() {
         let mut queue = Abq::start("0.0.0.0:0".parse().unwrap());
 
-        let manifest = ManifestMessage {
+        let manifest1 = ManifestMessage {
             manifest: Manifest {
                 members: vec![
                     echo_test("echo1".to_string()),
@@ -628,7 +629,19 @@ mod test {
             },
         };
 
-        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
+        let runner1 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest1);
+
+        let manifest2 = ManifestMessage {
+            manifest: Manifest {
+                members: vec![
+                    echo_test("echo3".to_string()),
+                    echo_test("echo4".to_string()),
+                    echo_test("echo5".to_string()),
+                ],
+            },
+        };
+
+        let runner2 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest2);
 
         let workers_config = WorkersConfig {
             num_workers: 4.try_into().unwrap(),
@@ -639,28 +652,35 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let results1_handle = thread::spawn({
-            let runner = runner.clone();
-            move || {
-                let mut results = Vec::default();
-                invoke::invoke_work(queue_server_addr, runner, |id, result| {
-                    results.push((id.0, result))
-                });
-                results
-            }
-        });
-
-        let results2_handle = thread::spawn(move || {
+        let invocation1 = InvocationId::new();
+        let results1_handle = thread::spawn(move || {
             let mut results = Vec::default();
-            invoke::invoke_work(queue_server_addr, runner, |id, result| {
+            invoke::invoke_work(queue_server_addr, invocation1, runner1, |id, result| {
                 results.push((id.0, result))
             });
             results
         });
 
-        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+        let invocation2 = InvocationId::new();
+        let results2_handle = thread::spawn(move || {
+            let mut results = Vec::default();
+            invoke::invoke_work(queue_server_addr, invocation2, runner2, |id, result| {
+                results.push((id.0, result))
+            });
+            results
+        });
+
+        let mut workers_for_run1 = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config.clone(),
+            queue.get_negotiator_handle(),
+            invocation1,
+        )
+        .unwrap();
+
+        let mut workers_for_run2 = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue.get_negotiator_handle(),
+            invocation2,
         )
         .unwrap();
 
@@ -668,12 +688,13 @@ mod test {
         let mut results2 = results2_handle.join().unwrap();
 
         queue.shutdown();
-        workers.shutdown();
+        workers_for_run1.shutdown();
+        workers_for_run2.shutdown();
 
         let results1 = sort_results(&mut results1);
         let results2 = sort_results(&mut results2);
 
         assert_eq!(results1, [("echo1"), ("echo2")]);
-        assert_eq!(results2, [("echo3"), ("echo4")]);
+        assert_eq!(results2, [("echo3"), ("echo4"), "echo5"]);
     }
 }

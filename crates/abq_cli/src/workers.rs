@@ -3,12 +3,17 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use abq_utils::net_protocol::workers::InvocationId;
 use abq_workers::negotiate::{QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator};
 use abq_workers::workers::WorkerContext;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-pub fn start_workers(working_dir: PathBuf, queue_negotiator_addr: SocketAddr) -> ! {
+pub fn start_workers(
+    working_dir: PathBuf,
+    queue_negotiator_addr: SocketAddr,
+    invocation_id: InvocationId,
+) -> ! {
     abq_workers::workers::init();
 
     let context = WorkerContext::AlwaysWorkIn { working_dir };
@@ -28,8 +33,12 @@ pub fn start_workers(working_dir: PathBuf, queue_negotiator_addr: SocketAddr) ->
         queue_negotiator.get_address()
     );
 
-    let mut worker_pool =
-        WorkersNegotiator::negotiate_and_start_pool(workers_config, queue_negotiator).unwrap();
+    let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(
+        workers_config,
+        queue_negotiator,
+        invocation_id,
+    )
+    .unwrap();
 
     log::debug!("Workers attached");
 

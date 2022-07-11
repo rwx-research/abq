@@ -91,16 +91,31 @@ pub mod runners {
 pub mod workers {
     use super::runners::{ManifestMessage, TestCase};
     use serde_derive::{Deserialize, Serialize};
-    use std::{collections::HashMap, path::PathBuf};
+    use std::{collections::HashMap, path::PathBuf, str::FromStr};
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
     /// ID for a particular invocation of the queue, which sends many units of work.
+    ///
+    // TODO: consider supporting arbitrary strings, to ease the generation of in some contexts
+    // (like a CI server that wants to use the build number to identify the test run). Note that we
+    // need uniqueness checking either way, which we don't do yet.
     pub struct InvocationId(pub [u8; 16]);
 
     impl InvocationId {
         #[allow(clippy::new_without_default)] // Invocation IDs should be fresh, not defaulted
         pub fn new() -> Self {
             Self(uuid::Uuid::new_v4().into_bytes())
+        }
+    }
+
+    impl FromStr for InvocationId {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let id = uuid::Uuid::from_str(s)
+                .map_err(|_| format!("{} is not a valid invocation ID", s))?;
+
+            Ok(Self(id.into_bytes()))
         }
     }
 

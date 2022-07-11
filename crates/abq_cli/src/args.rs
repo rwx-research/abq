@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
 };
 
+use abq_utils::net_protocol::workers::InvocationId;
 use clap::{Parser, Subcommand};
 
 pub(crate) fn unspecified_socket_addr() -> SocketAddr {
@@ -41,6 +42,9 @@ pub enum Command {
         /// Working directory of the workers.
         #[clap(long, required = true)]
         working_dir: PathBuf,
+
+        /// The ID of the test run to pull work for.
+        test_run: InvocationId,
     },
     /// Echoes one or more strings.
     /// If the abq queue is not running, a short-lived one is used.

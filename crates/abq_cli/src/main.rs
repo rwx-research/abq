@@ -4,7 +4,7 @@ mod workers;
 
 use abq_output::format_result;
 use abq_queue::invoke::invoke_work;
-use abq_utils::net_protocol::workers::{NativeTestRunnerParams, RunnerKind};
+use abq_utils::net_protocol::workers::{InvocationId, NativeTestRunnerParams, RunnerKind};
 use clap::Parser;
 
 use args::{CargoCmd, Cli, Command};
@@ -19,7 +19,8 @@ fn main() {
         Command::Work {
             working_dir,
             queue_addr,
-        } => workers::start_workers(working_dir, queue_addr),
+            test_run,
+        } => workers::start_workers(working_dir, queue_addr, test_run),
         Command::Echo { strings: _ } => {
             todo!();
             // let abq = instance::find_abq();
@@ -42,7 +43,8 @@ fn main() {
                 args: vec!["jest".to_string()],
                 extra_env: Default::default(),
             });
-            invoke_work(abq.server_addr(), jest_runner, on_result);
+            let invocation_id = InvocationId::new();
+            invoke_work(abq.server_addr(), invocation_id, jest_runner, on_result);
         }
     }
 }
