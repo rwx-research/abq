@@ -1,4 +1,3 @@
-use crate::workers::ConfiguredWorker;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -35,10 +34,6 @@ pub enum Command {
     /// You should use this to start workers on a remote machine that you'd like to connect to an
     /// instance of `abq start`.
     Work {
-        /// The kind of workers to start
-        #[clap(long, required = true)]
-        kind: ConfiguredWorker,
-
         /// Address of the queue to connect to.
         #[clap(long, required = true)]
         queue_addr: SocketAddr,

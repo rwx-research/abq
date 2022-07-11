@@ -167,7 +167,7 @@ pub mod queue {
 
     use super::{
         runners::{ManifestMessage, TestResult},
-        workers::{InvocationId, WorkId},
+        workers::{InvocationId, RunnerKind, WorkId},
     };
 
     #[derive(Serialize, Deserialize)]
@@ -177,6 +177,7 @@ pub mod queue {
     #[derive(Serialize, Deserialize)]
     pub struct InvokeWork {
         pub invocation_id: InvocationId,
+        pub runner: RunnerKind,
     }
 
     /// An incremental response to an invoker.

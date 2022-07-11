@@ -50,6 +50,8 @@ enum MessageFromQueueNegotiator {
         queue_new_work_addr: SocketAddr,
         /// Where workers should send results to.
         queue_results_addr: SocketAddr,
+        /// The kind of native runner workers should start.
+        runner_kind: RunnerKind,
         /// Whether the queue wants a worker to generate the work manifest.
         worker_should_generate_manifest: bool,
         // TODO: do we want the queue to be able to modify the # workers configured and their
@@ -65,7 +67,6 @@ enum MessageToQueueNegotiator {
 
 pub struct WorkersConfig {
     pub num_workers: NonZeroUsize,
-    pub runner_kind: RunnerKind,
     /// Context under which workers should operate.
     /// TODO: should this be user specified, or inferred, or either-or?
     pub worker_context: WorkerContext,
@@ -101,12 +102,12 @@ impl WorkersNegotiator {
             invocation_id,
             queue_new_work_addr,
             queue_results_addr,
+            runner_kind,
             worker_should_generate_manifest,
         } = net_protocol::read(&mut conn).map_err(|_| BadQueueMessage)?;
 
         let WorkersConfig {
             num_workers,
-            runner_kind,
             worker_context,
             work_timeout,
             work_retries,
@@ -204,16 +205,23 @@ pub enum QueueNegotiateError {
     BadWorkersMessage,
 }
 
+/// The test run a worker should ask for work on.
+pub struct AssignedRun {
+    pub invocation_id: InvocationId,
+    pub runner_kind: RunnerKind,
+    pub should_generate_manifest: bool,
+}
+
 impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
-    pub fn new<InvocationToWorkFor>(
+    pub fn new<GetAssignedRun>(
         bind_addr: SocketAddr,
         queue_next_work_addr: SocketAddr,
         queue_results_addr: SocketAddr,
-        mut invocation_to_work_for: InvocationToWorkFor,
+        mut get_assigned_run: GetAssignedRun,
     ) -> Self
     where
-        InvocationToWorkFor: FnMut() -> InvocationId + Send + 'static,
+        GetAssignedRun: FnMut() -> AssignedRun + Send + 'static,
     {
         // TODO: error handling when `bind_addr` is taken.
         let listener = TcpListener::bind(bind_addr).unwrap();
@@ -228,24 +236,25 @@ impl QueueNegotiator {
                 use MessageToQueueNegotiator::*;
                 match msg {
                     WantsToAttach => {
+                        // Choose an `abq test ...` invocation the workers should perform work
+                        // for.
+                        // TODO: this fully blocks the negotiator, so nothing else can connect
+                        // while we wait for an invocation, and moreover we won't respect
+                        // shutdown messages.
+                        let AssignedRun {
+                            invocation_id,
+                            runner_kind,
+                            should_generate_manifest,
+                        } = get_assigned_run();
+
                         let execution_context = MessageFromQueueNegotiator::ExecutionContext {
                             queue_new_work_addr: queue_next_work_addr,
                             queue_results_addr,
-                            // TODO: make this conditional based on the queue state, right now
-                            // we're only assuming there's one worker pool connecting.
-                            worker_should_generate_manifest: true,
-
-                            // Choose an `abq test ...` invocation the workers should perform work
-                            // for.
-                            // TODO: make sure what the worker is configured for actually agrees
-                            // with what the invocation was created for.
-                            // TODO: this fully blocks the negotiator, so nothing else can connect
-                            // while we wait for an invocation, and moreover we won't respect
-                            // shutdown messages.
-                            // TODO: I don't love this API right now, maybe we can make it nicer
-                            // later.
-                            invocation_id: invocation_to_work_for(),
+                            runner_kind,
+                            worker_should_generate_manifest: should_generate_manifest,
+                            invocation_id,
                         };
+
                         // TODO: error handling
                         net_protocol::write(&mut stream, execution_context).unwrap();
                     }
@@ -289,7 +298,7 @@ mod test {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    use super::{QueueNegotiator, WorkersNegotiator};
+    use super::{AssignedRun, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
     use abq_utils::net_protocol::queue::Shutdown;
@@ -442,25 +451,31 @@ mod test {
 
     #[test]
     fn queue_and_workers_lifecycle() {
-        let manifest = ManifestMessage {
-            manifest: Manifest {
-                members: vec![echo_test("hello".to_string())],
-            },
-        };
-
         let manifest_collector = ManifestCollector::default();
         let (next_work_addr, shutdown_next_work_server, next_work_handle) =
             mock_queue_next_work_server(Arc::clone(&manifest_collector));
         let (msgs, results_addr, results_handle) = mock_queue_results_server(manifest_collector);
 
+        let get_assigned_run = || {
+            let manifest = ManifestMessage {
+                manifest: Manifest {
+                    members: vec![echo_test("hello".to_string())],
+                },
+            };
+            AssignedRun {
+                invocation_id: InvocationId::new(),
+                runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
+                should_generate_manifest: true,
+            }
+        };
+
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0:0".parse().unwrap(),
             next_work_addr,
             results_addr,
-            InvocationId::new,
+            get_assigned_run,
         );
         let workers_config = WorkersConfig {
-            runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
             num_workers: NonZeroUsize::new(1).unwrap(),
             worker_context: WorkerContext::AssumeLocal,
             work_timeout: Duration::from_secs(1),

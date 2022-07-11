@@ -17,19 +17,25 @@ use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, InvokerResponse, Message},
     runners::TestResult,
-    workers::{InvocationId, WorkId},
+    workers::{InvocationId, RunnerKind, WorkId},
 };
 
 /// Invokes work on an instance of [Abq]. This function blocks, but cedes control to [on_result]
 /// when an individual result for a unit of work is received.
-pub fn invoke_work<OnResult>(abq_server_addr: SocketAddr, mut on_result: OnResult)
-where
+pub fn invoke_work<OnResult>(
+    abq_server_addr: SocketAddr,
+    runner: RunnerKind,
+    mut on_result: OnResult,
+) where
     OnResult: FnMut(WorkId, TestResult),
 {
     let mut stream = TcpStream::connect(abq_server_addr).expect("socket not available");
 
     let invocation_id = InvocationId::new();
-    let invoke_msg = Message::InvokeWork(InvokeWork { invocation_id });
+    let invoke_msg = Message::InvokeWork(InvokeWork {
+        invocation_id,
+        runner,
+    });
 
     net_protocol::write(&mut stream, invoke_msg).unwrap();
 
