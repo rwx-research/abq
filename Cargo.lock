@@ -102,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "abq_echo_worker",
  "abq_exec_worker",
+ "abq_generic_test_runner",
  "abq_runner_protocol",
  "abq_utils",
  "procspawn",

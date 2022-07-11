@@ -1,18 +1,16 @@
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{sync::mpsc, thread};
 
 use abq_echo_worker as echo;
 use abq_exec_worker as exec;
+use abq_generic_test_runner::GenericTestRunner;
 use abq_runner_protocol::Runner;
-use abq_utils::net_protocol::runners::{ManifestMessage, TestId};
-use abq_utils::net_protocol::workers::TestLikeRunner;
-use abq_utils::net_protocol::{
-    runners::Output,
-    workers::{InvocationId, NextWork, RunnerKind, WorkContext, WorkId, WorkerResult},
-};
+use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestId, TestResult};
+use abq_utils::net_protocol::workers::{InvocationId, NextWork, RunnerKind, WorkContext, WorkId};
+use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
 
 use procspawn as proc;
 
@@ -22,9 +20,9 @@ enum MessageFromPool {
 
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
-pub type GetNextWork = Box<dyn Fn() -> NextWork + Send + Sync + 'static>;
+pub type GetNextWork = Arc<dyn Fn() -> NextWork + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(InvocationId, ManifestMessage) + Send + Sync + 'static>;
-pub type NotifyResult = Box<dyn Fn(InvocationId, WorkId, WorkerResult) + Send + Sync + 'static>;
+pub type NotifyResult = Arc<dyn Fn(InvocationId, WorkId, TestResult) + Send + Sync + 'static>;
 
 #[derive(Clone)]
 pub enum WorkerContext {
@@ -110,10 +108,6 @@ impl WorkerPool {
 
         let (worker_msg_tx, worker_msg_rx) = mpsc::channel();
         let shared_worker_msg_rx = Arc::new(Mutex::new(worker_msg_rx));
-
-        // TODO: can we get rid of ref-counting here?
-        let notify_result = Arc::new(notify_result);
-        let get_next_work = Arc::new(get_next_work);
 
         {
             // Provision the first worker independently, so that if we need to generate a manifest,
@@ -204,14 +198,14 @@ enum AttemptError {
     Timeout(Duration),
 }
 
-type AttemptResult = Result<Output, AttemptError>;
+type AttemptResult = Result<String, AttemptError>;
 
 struct WorkerEnv {
     msg_from_pool_rx: MessageFromPoolRx,
     invocation_id: InvocationId,
     notify_manifest: Option<NotifyManifest>,
-    get_next_work: Arc<GetNextWork>,
-    notify_result: Arc<NotifyResult>,
+    get_next_work: GetNextWork,
+    notify_result: NotifyResult,
     context: WorkerContext,
     work_timeout: Duration,
     work_retries: u8,
@@ -220,7 +214,9 @@ struct WorkerEnv {
 impl ThreadWorker {
     pub fn new(runner_kind: RunnerKind, worker_env: WorkerEnv) -> Self {
         let handle = thread::spawn(move || match runner_kind {
-            RunnerKind::GenericTestRunner => todo!(),
+            RunnerKind::GenericNativeTestRunner(params) => {
+                start_generic_test_runner(worker_env, params)
+            }
             RunnerKind::TestLikeRunner(runner, manifest) => {
                 start_test_like_runner(worker_env, runner, manifest)
             }
@@ -230,6 +226,49 @@ impl ThreadWorker {
             handle: Some(handle),
         }
     }
+}
+
+fn start_generic_test_runner(env: WorkerEnv, native_runner_params: NativeTestRunnerParams) {
+    let WorkerEnv {
+        get_next_work,
+        invocation_id,
+        notify_result,
+        notify_manifest,
+        context,
+        msg_from_pool_rx,
+        // TODO: actually use these
+        work_timeout: _,
+        work_retries: _,
+    } = env;
+
+    let notify_manifest = notify_manifest
+        .map(|notify_manifest| move |manifest| notify_manifest(invocation_id, manifest));
+
+    let get_next_work = move || get_next_work();
+
+    let send_test_result =
+        move |work_id, test_result: TestResult| notify_result(invocation_id, work_id, test_result);
+
+    let polling_should_shutdown = || {
+        matches!(
+            msg_from_pool_rx.lock().unwrap().try_recv(),
+            Ok(MessageFromPool::Shutdown)
+        )
+    };
+
+    let working_dir = match context {
+        WorkerContext::AssumeLocal => std::env::current_dir().unwrap(),
+        WorkerContext::AlwaysWorkIn { working_dir } => working_dir,
+    };
+
+    GenericTestRunner::run(
+        native_runner_params,
+        &working_dir,
+        polling_should_shutdown,
+        notify_manifest,
+        get_next_work,
+        send_test_result,
+    );
 }
 
 fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: ManifestMessage) {
@@ -252,7 +291,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         // First, check if we have a message from our owner.
         let parent_message = msg_from_pool_rx.lock().unwrap().try_recv();
 
-        let (test_id, work_context, invocation_id, work_id) = match parent_message {
+        let (test_case, work_context, invocation_id, work_id) = match parent_message {
             Ok(MessageFromPool::Shutdown) => {
                 return;
             }
@@ -268,11 +307,11 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                         return;
                     }
                     NextWork::Work {
-                        test_id,
+                        test_case,
                         context,
                         invocation_id,
                         work_id,
-                    } => (test_id, context, invocation_id, work_id),
+                    } => (test_case, context, invocation_id, work_id),
                 }
             }
         };
@@ -280,21 +319,33 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         // Try the test_id once + how ever many retries were requested.
         let allowed_attempts = 1 + work_retries;
         'attempts: for attempt_number in 1.. {
+            let start_time = Instant::now();
             let attempt_result = attempt_test_id_for_test_like_runner(
                 &context,
                 runner,
-                test_id.clone(),
+                test_case.id.clone(),
                 &work_context,
                 work_timeout,
                 attempt_number,
                 allowed_attempts,
             );
+            let runtime = start_time.elapsed().as_millis() as f64;
 
-            let result = match attempt_result {
-                Ok(output) => WorkerResult::Output(output),
+            let (status, output) = match attempt_result {
+                Ok(output) => (Status::Success, output),
                 Err(AttemptError::ShouldRetry) => continue 'attempts,
-                Err(AttemptError::Panic(msg)) => WorkerResult::Panic(msg),
-                Err(AttemptError::Timeout(time)) => WorkerResult::Timeout(time),
+                Err(AttemptError::Panic(msg)) => (Status::Error, msg),
+                Err(AttemptError::Timeout(time)) => {
+                    (Status::Error, format!("Timeout: {}ms", time.as_millis()))
+                }
+            };
+            let result = TestResult {
+                status,
+                id: test_case.id.clone(),
+                display_name: test_case.id.clone(),
+                output: Some(output),
+                runtime,
+                meta: Default::default(),
             };
 
             notify_result(invocation_id, work_id.clone(), result);
@@ -406,18 +457,17 @@ mod test {
     use std::time::{Duration, Instant};
 
     use abq_utils::flatten_manifest;
-    use abq_utils::net_protocol::runners::{Manifest, ManifestMessage, Test, TestId, TestOrGroup};
+    use abq_utils::net_protocol::runners::{
+        Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
+    };
     use abq_utils::net_protocol::workers::{NextWork, TestLikeRunner};
     use tempfile::TempDir;
 
     use super::{GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool};
     use crate::workers::WorkerPoolConfig;
-    use abq_utils::net_protocol::{
-        runners::Output,
-        workers::{InvocationId, RunnerKind, WorkContext, WorkId, WorkerResult},
-    };
+    use abq_utils::net_protocol::workers::{InvocationId, RunnerKind, WorkContext, WorkId};
 
-    type ResultsCollector = Arc<Mutex<HashMap<String, WorkerResult>>>;
+    type ResultsCollector = Arc<Mutex<HashMap<String, TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
 
     fn work_writer() -> (impl Fn(NextWork), GetNextWork) {
@@ -426,7 +476,7 @@ mod test {
         let write_work = move |work| {
             writer.lock().unwrap().push_back(work);
         };
-        let get_next_work: GetNextWork = Box::new(move || loop {
+        let get_next_work: GetNextWork = Arc::new(move || loop {
             if let Some(work) = reader.lock().unwrap().pop_front() {
                 return work;
             }
@@ -447,7 +497,7 @@ mod test {
     fn results_collector() -> (ResultsCollector, NotifyResult) {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
-        let notify_result: NotifyResult = Box::new(move |_, work_id, result| {
+        let notify_result: NotifyResult = Arc::new(move |_, work_id, result| {
             let old_result = results2.lock().unwrap().insert(work_id.0, result);
             debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
         });
@@ -478,9 +528,9 @@ mod test {
         (config, manifest_collector)
     }
 
-    fn local_work(test_id: TestId, invocation_id: InvocationId, work_id: WorkId) -> NextWork {
+    fn local_work(test: TestCase, invocation_id: InvocationId, work_id: WorkId) -> NextWork {
         NextWork::Work {
-            test_id,
+            test_case: test,
             context: WorkContext {
                 working_dir: std::env::current_dir().unwrap(),
             },
@@ -510,7 +560,7 @@ mod test {
         })
     }
 
-    fn await_manifest_test_ids(manifest: ManifestCollector) -> Vec<TestId> {
+    fn await_manifest_test_cases(manifest: ManifestCollector) -> Vec<TestCase> {
         loop {
             match manifest.lock().unwrap().take() {
                 Some(manifest) => return flatten_manifest(manifest.manifest),
@@ -571,7 +621,7 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         // Write the work
-        let test_ids = await_manifest_test_ids(manifest_collector);
+        let test_ids = await_manifest_test_cases(manifest_collector);
 
         for (i, test_id) in test_ids.into_iter().enumerate() {
             write_work(local_work(test_id, invocation_id, WorkId(i.to_string())))
@@ -588,15 +638,7 @@ mod test {
                 .unwrap()
                 .clone()
                 .into_iter()
-                .map(|(k, v)| {
-                    (
-                        k,
-                        match v {
-                            WorkerResult::Output(o) => o.message,
-                            res => panic!("unexpected result {res:?}"),
-                        },
-                    )
-                })
+                .map(|(k, v)| (k, v.output.unwrap()))
                 .collect();
 
             results == expected_results
@@ -657,7 +699,7 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for test_id in await_manifest_test_ids(manifest_collector) {
+        for test_id in await_manifest_test_cases(manifest_collector) {
             write_work(local_work(
                 test_id,
                 invocation_id,
@@ -704,7 +746,7 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for test_id in await_manifest_test_ids(manifest_collector) {
+        for test_id in await_manifest_test_cases(manifest_collector) {
             write_work(local_work(
                 test_id,
                 invocation_id,
@@ -750,7 +792,7 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for test_id in await_manifest_test_ids(manifest_collector) {
+        for test_id in await_manifest_test_cases(manifest_collector) {
             write_work(local_work(
                 test_id,
                 invocation_id,
@@ -817,9 +859,9 @@ mod test {
             working_dir: fake_working_dir_of_work,
         };
 
-        for test_id in await_manifest_test_ids(manifest_collector) {
+        for test_case in await_manifest_test_cases(manifest_collector) {
             write_work(NextWork::Work {
-                test_id,
+                test_case,
                 context: context.clone(),
                 invocation_id,
                 work_id: WorkId("id1".to_string()),
@@ -833,11 +875,8 @@ mod test {
                 return false;
             }
 
-            results.get("id1").unwrap()
-                == &WorkerResult::Output(Output {
-                    success: true,
-                    message: "testcontent".to_string(),
-                })
+            let result = results.get("id1").unwrap();
+            result.status == Status::Success && result.output.as_ref().unwrap() == "testcontent"
         });
 
         pool.shutdown();
