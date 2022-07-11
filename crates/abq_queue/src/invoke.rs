@@ -16,14 +16,15 @@ use std::net::{SocketAddr, TcpStream};
 use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, InvokerResponse, Message},
-    workers::{InvocationId, WorkId, WorkerResult},
+    runners::TestResult,
+    workers::{InvocationId, WorkId},
 };
 
 /// Invokes work on an instance of [Abq]. This function blocks, but cedes control to [on_result]
 /// when an individual result for a unit of work is received.
 pub fn invoke_work<OnResult>(abq_server_addr: SocketAddr, mut on_result: OnResult)
 where
-    OnResult: FnMut(WorkId, WorkerResult),
+    OnResult: FnMut(WorkId, TestResult),
 {
     let mut stream = TcpStream::connect(abq_server_addr).expect("socket not available");
 

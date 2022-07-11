@@ -1,7 +1,6 @@
 use std::process;
 
 use abq_runner_protocol::Runner;
-use abq_utils::net_protocol::runners::Output;
 
 pub struct Work {
     pub cmd: String,
@@ -13,7 +12,7 @@ pub struct ExecWorker {}
 impl Runner for ExecWorker {
     type Input = Work;
 
-    fn run(input: Work) -> Output {
+    fn run(input: Work) -> String {
         let output = process::Command::new(input.cmd)
             .args(input.args)
             .output()
@@ -27,8 +26,6 @@ impl Runner for ExecWorker {
             output.stderr
         };
         // TODO: handle not utf8 encodable
-        let message = String::from_utf8(message).unwrap();
-
-        Output { success, message }
+        String::from_utf8(message).unwrap()
     }
 }

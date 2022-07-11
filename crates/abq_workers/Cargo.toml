@@ -5,6 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 abq_runner_protocol = { path = "../abq_runners/protocol" }
+abq_generic_test_runner = { path = "../abq_runners/generic_test_runner" }
 abq_echo_worker = { path = "../abq_runners/echo" }
 abq_exec_worker = { path = "../abq_runners/exec" }
 abq_utils = { path = "../abq_utils" }

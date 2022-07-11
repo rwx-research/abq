@@ -14,7 +14,7 @@ pub mod runners {
         pub test_case: TestCase,
     }
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct TestCase {
         pub id: String,
         pub meta: MetadataMap,
@@ -22,7 +22,7 @@ pub mod runners {
 
     pub type Milliseconds = f64;
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
     pub enum Status {
         #[serde(rename = "failure")]
         Failure,
@@ -37,11 +37,16 @@ pub mod runners {
     }
 
     #[derive(Serialize, Deserialize)]
+    pub struct TestResultMessage {
+        pub test_result: TestResult,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct TestResult {
         pub status: Status,
         pub id: TestId,
         pub display_name: String,
-        pub output: String,
+        pub output: Option<String>,
         pub runtime: Milliseconds,
         pub meta: MetadataMap,
     }
@@ -81,18 +86,12 @@ pub mod runners {
     pub struct Manifest {
         pub members: Vec<TestOrGroup>,
     }
-
-    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
-    pub struct Output {
-        pub success: bool,
-        pub message: String,
-    }
 }
 
 pub mod workers {
-    use super::runners::{ManifestMessage, Output, TestId};
+    use super::runners::{ManifestMessage, TestCase};
     use serde_derive::{Deserialize, Serialize};
-    use std::{path::PathBuf, time::Duration};
+    use std::{collections::HashMap, path::PathBuf};
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
     /// ID for a particular invocation of the queue, which sends many units of work.
@@ -126,10 +125,21 @@ pub mod workers {
         EchoOnRetry(u8),
     }
 
+    /// Environment variables a native test runner is initialized with.
+    // Alias in case we want to change the representation later.
+    pub type EnvironmentVariables = HashMap<String, String>;
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct NativeTestRunnerParams {
+        pub cmd: String,
+        pub args: Vec<String>,
+        pub extra_env: EnvironmentVariables,
+    }
+
     /// The kind of runner that a worker should start.
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum RunnerKind {
-        GenericTestRunner,
+        GenericNativeTestRunner(NativeTestRunnerParams),
         TestLikeRunner(TestLikeRunner, ManifestMessage),
     }
 
@@ -143,20 +153,12 @@ pub mod workers {
     #[derive(Serialize, Deserialize)]
     pub enum NextWork {
         Work {
-            test_id: TestId,
+            test_case: TestCase,
             context: WorkContext,
             invocation_id: InvocationId,
             work_id: WorkId,
         },
         EndOfWork,
-    }
-
-    /// The result of a worker's execution of an action.
-    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-    pub enum WorkerResult {
-        Output(Output),
-        Timeout(Duration),
-        Panic(String),
     }
 }
 
@@ -164,8 +166,8 @@ pub mod queue {
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
-        runners::ManifestMessage,
-        workers::{InvocationId, WorkId, WorkerResult},
+        runners::{ManifestMessage, TestResult},
+        workers::{InvocationId, WorkId},
     };
 
     #[derive(Serialize, Deserialize)]
@@ -181,7 +183,7 @@ pub mod queue {
     #[derive(Serialize, Deserialize)]
     pub enum InvokerResponse {
         /// The result of a requested unit of work.
-        Result(WorkId, WorkerResult),
+        Result(WorkId, TestResult),
         /// No more results are known.
         EndOfResults,
     }
@@ -194,7 +196,7 @@ pub mod queue {
         /// A work manifest for a given invocation.
         Manifest(InvocationId, ManifestMessage),
         /// The result of some work from the queue.
-        WorkerResult(InvocationId, WorkId, WorkerResult),
+        WorkerResult(InvocationId, WorkId, TestResult),
         /// An ask to shutdown the queue.
         Shutdown(Shutdown),
     }

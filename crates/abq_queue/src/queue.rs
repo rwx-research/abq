@@ -8,12 +8,12 @@ use std::time::Duration;
 
 use abq_utils::flatten_manifest;
 use abq_utils::net_protocol::queue::InvokerResponse;
-use abq_utils::net_protocol::runners::TestId;
+use abq_utils::net_protocol::runners::{TestCase, TestResult};
 use abq_utils::net_protocol::workers::WorkContext;
 use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, Message, Shutdown},
-    workers::{InvocationId, NextWork, WorkId, WorkerResult},
+    workers::{InvocationId, NextWork, WorkId},
 };
 use abq_workers::negotiate::{QueueNegotiator, QueueNegotiatorHandle};
 
@@ -57,15 +57,15 @@ impl InvocationQueues {
         debug_assert!(old_queue.is_none());
     }
 
-    pub fn add_manifest(&mut self, invocation_id: InvocationId, flat_manifest: Vec<TestId>) {
+    pub fn add_manifest(&mut self, invocation_id: InvocationId, flat_manifest: Vec<TestCase>) {
         let state = self
             .queues
             .get_mut(&invocation_id)
             .expect("no queue for invocation");
 
-        let work_from_manifest = flat_manifest.into_iter().map(|test_id| {
+        let work_from_manifest = flat_manifest.into_iter().map(|test_case| {
             NextWork::Work {
-                test_id,
+                test_case,
                 invocation_id,
                 // TODO: populate correctly
                 work_id: WorkId("".to_string()),
@@ -382,7 +382,7 @@ fn start_queue_server(server_listener: TcpListener, queues: SharedInvocationQueu
 
 /// Message to send to the invocation responder thread.
 enum InvocationResponderMsg {
-    WorkResult(WorkId, WorkerResult),
+    WorkResult(WorkId, TestResult),
     EndOfWork,
 }
 
@@ -488,8 +488,8 @@ mod test {
     use super::Abq;
     use crate::invoke;
     use abq_utils::net_protocol::{
-        runners::{Manifest, ManifestMessage, Test, TestOrGroup},
-        workers::{RunnerKind, TestLikeRunner, WorkerResult},
+        runners::{Manifest, ManifestMessage, Test, TestOrGroup, TestResult},
+        workers::{RunnerKind, TestLikeRunner},
     };
     use abq_workers::{
         negotiate::{WorkersConfig, WorkersNegotiator},
@@ -497,13 +497,10 @@ mod test {
     };
     use ntest::timeout;
 
-    fn sort_results(results: &mut [(String, WorkerResult)]) -> Vec<&str> {
+    fn sort_results(results: &mut [(String, TestResult)]) -> Vec<&str> {
         let mut results = results
             .iter()
-            .map(|(_id, output)| match output {
-                WorkerResult::Output(o) => (o.message.as_str()),
-                o => panic!("unexpected output {o:?}"),
-            })
+            .map(|(_id, result)| result.output.as_ref().unwrap().as_str())
             .collect::<Vec<_>>();
         results.sort_unstable();
         results

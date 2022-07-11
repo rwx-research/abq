@@ -4,6 +4,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     num::NonZeroUsize,
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -111,7 +112,7 @@ impl WorkersNegotiator {
             work_retries,
         } = workers_config;
 
-        let notify_result: NotifyResult = Box::new(move |invocation_id, work_id, result| {
+        let notify_result: NotifyResult = Arc::new(move |invocation_id, work_id, result| {
             // TODO: error handling
             let mut stream =
                 TcpStream::connect(queue_results_addr).expect("results server not available");
@@ -124,7 +125,7 @@ impl WorkersNegotiator {
             .unwrap();
         });
 
-        let get_next_work: GetNextWork = Box::new(move || {
+        let get_next_work: GetNextWork = Arc::new(move || {
             // TODO: error handling
             // In particular, the work server may have shut down and we can't connect. In that
             // case the worker should shutdown too.
@@ -238,8 +239,11 @@ impl QueueNegotiator {
                             // for.
                             // TODO: make sure what the worker is configured for actually agrees
                             // with what the invocation was created for.
+                            // TODO: this fully blocks the negotiator, so nothing else can connect
+                            // while we wait for an invocation, and moreover we won't respect
+                            // shutdown messages.
                             // TODO: I don't love this API right now, maybe we can make it nicer
-                            // later
+                            // later.
                             invocation_id: invocation_to_work_for(),
                         };
                         // TODO: error handling
@@ -289,13 +293,15 @@ mod test {
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
     use abq_utils::net_protocol::queue::Shutdown;
-    use abq_utils::net_protocol::runners::{Manifest, ManifestMessage, Output, Test, TestOrGroup};
+    use abq_utils::net_protocol::runners::{
+        Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
+    };
     use abq_utils::net_protocol::workers::{
-        InvocationId, NextWork, RunnerKind, TestLikeRunner, WorkContext, WorkId, WorkerResult,
+        InvocationId, NextWork, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
     use abq_utils::{flatten_manifest, net_protocol};
 
-    type Messages = Arc<Mutex<Vec<net_protocol::workers::WorkerResult>>>;
+    type Messages = Arc<Mutex<Vec<TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
 
     type QueueNextWork = (SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
@@ -314,8 +320,8 @@ mod test {
                         let work: Vec<_> = flatten_manifest(man.manifest)
                             .into_iter()
                             .enumerate()
-                            .map(|(i, test_id)| NextWork::Work {
-                                test_id,
+                            .map(|(i, test_case)| NextWork::Work {
+                                test_case,
                                 context: WorkContext {
                                     working_dir: PathBuf::from("/"),
                                 },
@@ -471,11 +477,9 @@ mod test {
             if msgs.len() != 1 {
                 return false;
             }
-            msgs.last().unwrap()
-                == &WorkerResult::Output(Output {
-                    success: true,
-                    message: "hello".to_string(),
-                })
+
+            let result = msgs.last().unwrap();
+            result.status == Status::Success && result.output.as_ref().unwrap() == "hello"
         });
 
         workers.shutdown();
