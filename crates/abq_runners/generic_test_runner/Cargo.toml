@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 abq_runner_protocol = { path = "../protocol" }
 abq_utils = { path = "../../abq_utils" }
-serde = "1.0.137"
+serde = "1.0.139"
 serde_derive = "1.0.137"
 serde_json = "1.0.81"
 
