@@ -3,6 +3,14 @@ name = "abq_generic_test_runner"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "abq_generic_test_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "abq_worker_harness"
+path = "src/test_harness.rs"
+
 [dependencies]
 abq_runner_protocol = { path = "../protocol" }
 abq_utils = { path = "../../abq_utils" }
@@ -11,6 +19,8 @@ serde_derive = "1.0.137"
 serde_json = "1.0.81"
 
 tracing = "0.1.35"
+clap = { version = "3.2.12", features = ["derive"] }
+anyhow = "1.0.58"
 
 [features]
 test-abq-jest = []

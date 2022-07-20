@@ -1,18 +1,28 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::{net::TcpListener, process};
 
-use abq_utils::net_protocol;
 use abq_utils::net_protocol::runners::{
     ManifestMessage, TestCaseMessage, TestResult, TestResultMessage,
 };
-use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, WorkId};
+use abq_utils::net_protocol::workers::{
+    InvocationId, NativeTestRunnerParams, NextWork, WorkContext, WorkId,
+};
+use abq_utils::{flatten_manifest, net_protocol};
 use tracing::instrument;
 
 static ABQ_SOCKET: &str = "ABQ_SOCKET";
 static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
 
 pub struct GenericTestRunner;
+
+pub fn wait_for_manifest(listener: TcpListener) -> io::Result<ManifestMessage> {
+    let (mut stream, _) = listener.accept()?;
+    let manifest: ManifestMessage = net_protocol::read(&mut stream)?;
+
+    Ok(manifest)
+}
 
 /// Retrieves the test manifest from native test runner.
 #[instrument(level = "trace", skip(additional_env, working_dir))]
@@ -36,8 +46,7 @@ fn retrieve_manifest<'a>(
         native_runner.current_dir(working_dir);
         let mut native_runner_handle = native_runner.spawn()?;
 
-        let (mut stream, _) = our_listener.accept()?;
-        let manifest: ManifestMessage = net_protocol::read(&mut stream)?;
+        let manifest = wait_for_manifest(our_listener)?;
 
         let status = native_runner_handle.wait()?;
         debug_assert!(status.success());
@@ -136,18 +145,96 @@ impl GenericTestRunner {
     }
 }
 
+/// Executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.
+/// Returns the manifest and all test results.
+pub fn execute_wrapped_runner(
+    native_runner_params: NativeTestRunnerParams,
+    working_dir: PathBuf,
+) -> (ManifestMessage, Vec<TestResult>) {
+    let mut test_case_index = 0;
+
+    let mut manifest_message = None;
+
+    // Currently, an atomic mutex is used here because `send_manifest`, `get_next_test`, and the
+    // main thread all need access to manifest's memory location. We can get away with unsafe code
+    // here because we know that the manifest must come in before `get_next_test` will be called,
+    // and moreover, `send_manifest` will never be called again. But to avoid bugs, we don't do
+    // that for now.
+    let flat_manifest = Arc::new(Mutex::new(None));
+
+    let mut test_results = vec![];
+
+    let send_manifest = {
+        let flat_manifest = Arc::clone(&flat_manifest);
+        let manifest_message = &mut manifest_message;
+        move |real_manifest: ManifestMessage| {
+            let mut flat_manifest = flat_manifest.lock().unwrap();
+
+            if manifest_message.is_some() || flat_manifest.is_some() {
+                panic!("Manifest has already been defined, but is being sent again");
+            }
+
+            *manifest_message = Some(real_manifest.clone());
+            *flat_manifest = Some(flatten_manifest(real_manifest.manifest));
+        }
+    };
+
+    let get_next_test = {
+        let manifest = Arc::clone(&flat_manifest);
+        let working_dir = working_dir.clone();
+        move || {
+            loop {
+                let manifest = manifest.lock().unwrap();
+                let next_test = match &(*manifest) {
+                    Some(manifest) => manifest.get(test_case_index),
+                    None => {
+                        // still waiting for the manifest, spin
+                        continue;
+                    }
+                };
+                return match next_test {
+                    Some(test_case) => {
+                        test_case_index += 1;
+
+                        NextWork::Work {
+                            test_case: test_case.clone(),
+                            context: WorkContext {
+                                working_dir: working_dir.clone(),
+                            },
+                            invocation_id: InvocationId::new(),
+                            work_id: WorkId(Default::default()),
+                        }
+                    }
+                    None => NextWork::EndOfWork,
+                };
+            }
+        }
+    };
+    let send_test_result = |_, test_result| test_results.push(test_result);
+
+    GenericTestRunner::run(
+        native_runner_params,
+        &working_dir,
+        || false,
+        Some(send_manifest),
+        get_next_test,
+        send_test_result,
+    );
+
+    (
+        manifest_message.expect("manifest never received!"),
+        test_results,
+    )
+}
+
 #[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
-    use crate::GenericTestRunner;
-    use abq_utils::flatten_manifest;
-    use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestCase};
-    use abq_utils::net_protocol::workers::{
-        InvocationId, NativeTestRunnerParams, NextWork, WorkContext, WorkId,
-    };
+    use crate::{execute_wrapped_runner, GenericTestRunner};
+    use abq_utils::net_protocol::runners::{ManifestMessage, Status};
+    use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork};
 
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::path::PathBuf;
 
     fn npm_jest_project_path() -> PathBuf {
         PathBuf::from(std::env::var("ABQ_WORKSPACE_DIR").unwrap())
@@ -184,17 +271,6 @@ mod test_abq_jest {
         insta::assert_json_snapshot!(manifest);
     }
 
-    fn faux_work(test_case: TestCase, working_dir: &Path) -> NextWork {
-        NextWork::Work {
-            test_case,
-            context: WorkContext {
-                working_dir: working_dir.to_path_buf(),
-            },
-            invocation_id: InvocationId::new(),
-            work_id: WorkId(Default::default()),
-        }
-    }
-
     #[test]
     fn get_manifest_and_run_tests() {
         let working_dir = npm_jest_project_path();
@@ -204,56 +280,7 @@ mod test_abq_jest {
             extra_env: Default::default(),
         };
 
-        let mut index = 0;
-        let manifest = Arc::new(Mutex::new(None));
-        let manifest2 = Arc::clone(&manifest);
-        let manifest3 = Arc::clone(&manifest);
-
-        let mut test_results = vec![];
-
-        let send_manifest = |real_manifest: ManifestMessage| {
-            *manifest.lock().unwrap() = Some(flatten_manifest(real_manifest.manifest))
-        };
-        let get_next_test = {
-            let working_dir = working_dir.clone();
-            move || {
-                loop {
-                    let manifest = manifest2.lock().unwrap();
-                    let next_test = match &(*manifest) {
-                        Some(manifest) => manifest.get(index),
-                        None => {
-                            // still waiting for the manifest, spin
-                            continue;
-                        }
-                    };
-                    return match next_test {
-                        Some(test_case) => {
-                            index += 1;
-                            faux_work(test_case.clone(), &working_dir)
-                        }
-                        None => NextWork::EndOfWork,
-                    };
-                }
-            }
-        };
-        let send_test_result = |_, test_result| test_results.push(test_result);
-
-        GenericTestRunner::run(
-            input,
-            &working_dir,
-            || false,
-            Some(send_manifest),
-            get_next_test,
-            send_test_result,
-        );
-
-        let mut guard = manifest3.lock().unwrap();
-        let test_ids = guard.as_mut().unwrap();
-        test_ids.sort_by_key(|r| r.id.clone());
-
-        assert_eq!(test_ids.len(), 2);
-        assert!(test_ids[0].id.ends_with("add.test.js"));
-        assert!(test_ids[1].id.ends_with("names.test.js"));
+        let (_, mut test_results) = execute_wrapped_runner(input, working_dir);
 
         test_results.sort_by_key(|r| r.id.clone());
 
