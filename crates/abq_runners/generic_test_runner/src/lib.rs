@@ -180,12 +180,8 @@ mod test_abq_jest {
 
         assert!(test_results.is_empty());
         let ManifestMessage { manifest } = manifest.unwrap();
-        let mut test_ids = flatten_manifest(manifest);
-        test_ids.sort_by_key(|r| r.id.clone());
 
-        assert_eq!(test_ids.len(), 2);
-        assert!(test_ids[0].id.ends_with("add.test.js"));
-        assert!(test_ids[1].id.ends_with("names.test.js"));
+        insta::assert_json_snapshot!(manifest);
     }
 
     fn faux_work(test_case: TestCase, working_dir: &Path) -> NextWork {
