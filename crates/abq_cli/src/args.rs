@@ -18,6 +18,11 @@ pub(crate) fn unspecified_socket_addr() -> SocketAddr {
 pub struct Cli {
     #[clap(subcommand)]
     pub command: Command,
+
+    /// Create a set of workers in-process when running tests, rather than delegating to external
+    /// workers. (Only relevant for commands that run tests)
+    #[clap(long)]
+    pub auto_workers: bool,
 }
 
 #[derive(Subcommand)]
@@ -46,22 +51,28 @@ pub enum Command {
         /// The ID of the test run to pull work for.
         test_run: InvocationId,
     },
-    /// Echoes one or more strings.
-    /// If the abq queue is not running, a short-lived one is used.
-    #[clap(arg_required_else_help = true)]
-    Echo {
-        /// Strings to echo.
-        #[clap(required = true)]
-        strings: Vec<String>,
-    },
     /// Runs commands related to Rust's `cargo` toolchain.
     #[clap(subcommand)]
     Cargo(CargoCmd),
-    Jest,
+    /// Runs `yarn jest`.
+    Jest {
+        /// Wrapper to run `abq-jest` in. Common ones include `yarn` and `npm`.
+        /// A wrapper of "" will run `jest` standalone.
+        #[clap(long, default_value = "yarn")]
+        wrapper: String,
+
+        /// Extra arguments to pass to `jest`.
+        #[clap(long, multiple_values = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum CargoCmd {
     /// Runs `cargo test` for the project in the current directory.
-    Test,
+    Test {
+        /// Extra arguments to pass to `cargo test`.
+        #[clap(long, multiple_values = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }

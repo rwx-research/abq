@@ -44,6 +44,8 @@ fn retrieve_manifest<'a>(
         native_runner.env(ABQ_GENERATE_MANIFEST, "1");
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
+        native_runner.stdout(process::Stdio::null());
+        native_runner.stderr(process::Stdio::null());
         let mut native_runner_handle = native_runner.spawn()?;
 
         let manifest = wait_for_manifest(our_listener)?;
@@ -111,6 +113,8 @@ impl GenericTestRunner {
         native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
+        native_runner.stdout(process::Stdio::null());
+        native_runner.stderr(process::Stdio::null());
         let mut native_runner_handle = native_runner.spawn().unwrap();
 
         // We establish one connection with the native runner and repeatedly send tests until we're
