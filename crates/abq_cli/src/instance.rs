@@ -16,7 +16,6 @@ fn state_write_addr(addr: SocketAddr) {
     std::fs::write(state_file(), addr.to_string()).unwrap();
 }
 
-#[allow(unused)] // TODO: remove when CLI plugins are added back
 fn state_read_addr() -> SocketAddr {
     let contents = std::fs::read_to_string(state_file()).unwrap();
     contents.parse().unwrap()
@@ -62,31 +61,39 @@ pub fn start_abq_forever(bind_addr: SocketAddr) -> ! {
 }
 
 pub enum AbqInstance {
-    Ephemeral(SocketAddr),
-    Temp(Abq),
+    Global(SocketAddr),
+    Local(Abq),
 }
 
 impl AbqInstance {
-    #[allow(unused)] // TODO: remove when CLI plugins are added back
     pub fn server_addr(&self) -> SocketAddr {
         match self {
-            AbqInstance::Ephemeral(addr) => *addr,
-            AbqInstance::Temp(abq) => abq.server_addr(),
+            AbqInstance::Global(addr) => *addr,
+            AbqInstance::Local(abq) => abq.server_addr(),
+        }
+    }
+
+    pub fn negotiator_addr(&self) -> SocketAddr {
+        match self {
+            AbqInstance::Global(_addr) => todo!(),
+            AbqInstance::Local(abq) => abq.get_negotiator_handle().get_address(),
         }
     }
 }
 
-#[allow(unused)] // TODO: remove when CLI plugins are added back
-pub fn find_abq() -> AbqInstance {
+/// Gets an instnace ABQ (and possibly workers).
+///
+/// If there is a global ABQ instance available, that is used. Otherwise, a local queue is created.
+pub fn get_abq() -> AbqInstance {
     if state_file().exists() {
         tracing::debug!("using ephemeral queue");
-        AbqInstance::Ephemeral(state_read_addr())
+        AbqInstance::Global(state_read_addr())
     } else {
         tracing::debug!("using temporary queue");
         // Create a temporary ABQ instance
         abq_queue::queue::init();
 
         let queue = Abq::start(unspecified_socket_addr());
-        AbqInstance::Temp(queue)
+        AbqInstance::Local(queue)
     }
 }
