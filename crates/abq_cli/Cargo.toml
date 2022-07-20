@@ -11,7 +11,7 @@ abq_workers = { path = "../abq_workers" }
 abq_utils = { path = "../abq_utils" }
 
 anyhow = "1.0.57"
-clap = { version = "3.2.4", features = ["derive"] }
+clap = { version = "3.2.12", features = ["derive"] }
 tempfile = "3.3.0"
 signal-hook = "0.3.14"
 indicatif = "0.16.2"
