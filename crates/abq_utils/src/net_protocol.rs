@@ -24,14 +24,19 @@ pub mod runners {
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
     pub enum Status {
+        /// An explicit test failure.
         #[serde(rename = "failure")]
         Failure,
+        /// An explicit test success.
         #[serde(rename = "success")]
         Success,
+        /// An erroring execution of a test.
         #[serde(rename = "error")]
         Error,
+        /// A test that is not yet implemented.
         #[serde(rename = "pending")]
         Pending,
+        /// A test that was explicitly skipped.
         #[serde(rename = "skipped")]
         Skipped,
     }

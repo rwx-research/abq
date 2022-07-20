@@ -9,4 +9,5 @@ members = [
   "crates/abq_runners/echo",
   "crates/abq_runners/exec",
   "crates/abq_runners/generic_test_runner",
+  "crates/reporters/junit_xml",
 ]

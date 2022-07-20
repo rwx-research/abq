@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "abq_junit_xml"
+version = "0.1.0"
+
+[dependencies]
+abq_utils = { path = "../../abq_utils" }
+junit-report = "0.7.1"
+
+[dev-dependencies]
+insta = "1.15.0"
