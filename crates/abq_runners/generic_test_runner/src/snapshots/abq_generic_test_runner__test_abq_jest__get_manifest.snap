@@ -1,0 +1,24 @@
+---
+source: crates/abq_runners/generic_test_runner/src/lib.rs
+expression: manifest
+---
+{
+  "members": [
+    {
+      "type": "test",
+      "id": "add.test.js",
+      "tags": [],
+      "meta": {
+        "fileName": "add.test.js"
+      }
+    },
+    {
+      "type": "test",
+      "id": "names.test.js",
+      "tags": [],
+      "meta": {
+        "fileName": "names.test.js"
+      }
+    }
+  ]
+}
