@@ -80,16 +80,9 @@ jobs:
 
       # End setup testdata
 
-      - name: Build abq
-        run: |
-            cargo build
-
       - name: Dogfood abq
         run: |
-            target/debug/abq \
-              --auto-workers \
-              --reporter stdout --reporter junit-xml=cargo-tests.xml \
-              cargo test -- --all-features
+            make dogfood
 
       - name: Upload artifacts to captain
         uses: rwx-research/upload-captain-artifact@main
@@ -98,7 +91,7 @@ jobs:
             [
               {
                 "name": "test",
-                "path": "cargo-tests.xml",
+                "path": "abq-test-results.xml",
                 "kind": "test_results"
               }
             ]
