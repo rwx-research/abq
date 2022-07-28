@@ -2,6 +2,7 @@ use std::{fmt::Display, path::PathBuf, str::FromStr};
 
 use abq_output::format_result;
 use abq_utils::net_protocol::runners::TestResult;
+use thiserror::Error;
 
 static DEFAULT_JUNIT_XML_PATH: &str = "abq-test-results.xml";
 
@@ -46,67 +47,114 @@ impl FromStr for ReporterKind {
     }
 }
 
-enum Reporter {
-    Stdout,
-    JUnitXml(PathBuf, abq_junit_xml::Collector),
+#[derive(Debug, Error)]
+pub enum ReportingError {
+    #[error("failed to format a test result in the reporting format")]
+    FailedToFormat,
+    #[error("failed to write a report to an output buffer")]
+    FailedToWrite,
 }
 
-impl Reporter {
-    fn new(kind: ReporterKind, test_suite_name: &str) -> Self {
-        match kind {
-            ReporterKind::Stdout => Self::Stdout,
-            ReporterKind::JUnitXml(path) => {
-                Self::JUnitXml(path, abq_junit_xml::Collector::new(test_suite_name))
-            }
-        }
+/// A [`Reporter`] defines a way to emit abq test results.
+///
+/// A reporter is allowed to be side-effectful.
+trait Reporter: Send {
+    /// Consume the next test result.
+    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError>;
+
+    /// Consume the reporter, and perform any needed finalization steps.
+    ///
+    /// This method is only called when all test results for a run have been consumed.
+    fn finish(self: Box<Self>) -> Result<(), ReportingError>;
+}
+
+/// Streams all test results to standard output.
+struct StdoutReporter;
+
+impl Reporter for StdoutReporter {
+    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
+        println!("{}", format_result(test_result));
+        Ok(())
     }
 
-    fn push_result(&mut self, test_result: &TestResult) {
-        match self {
-            Self::Stdout => println!("{}", format_result(test_result)),
-            Self::JUnitXml(_, collector) => collector.push_result(test_result),
-        }
-    }
-
-    fn finish(self) -> anyhow::Result<()> {
-        match self {
-            Reporter::Stdout => Ok(()),
-            Reporter::JUnitXml(path, collector) => {
-                let fd = std::fs::OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(path)?;
-                collector.write_xml(fd)?;
-                Ok(())
-            }
-        }
+    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
+        Ok(())
     }
 }
 
-pub struct Reporters(Vec<Reporter>);
+/// Writes test results as JUnit XML to a path.
+struct JUnitXmlReporter {
+    path: PathBuf,
+    collector: abq_junit_xml::Collector,
+}
+
+impl Reporter for JUnitXmlReporter {
+    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
+        self.collector.push_result(test_result);
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
+        let fd = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(self.path)
+            .map_err(|_| ReportingError::FailedToWrite)?;
+        self.collector
+            .write_xml(fd)
+            .map_err(|_| ReportingError::FailedToFormat)?;
+        Ok(())
+    }
+}
+
+fn reporter_from_kind(kind: ReporterKind, test_suite_name: &str) -> Box<dyn Reporter> {
+    match kind {
+        ReporterKind::Stdout => Box::new(StdoutReporter),
+        ReporterKind::JUnitXml(path) => Box::new(JUnitXmlReporter {
+            path,
+            collector: abq_junit_xml::Collector::new(test_suite_name),
+        }),
+    }
+}
+
+pub struct Reporters(Vec<Box<dyn Reporter>>);
 
 impl Reporters {
     pub fn new(kinds: impl IntoIterator<Item = ReporterKind>, test_suite_name: &str) -> Self {
         Self(
             kinds
                 .into_iter()
-                .map(|kind| Reporter::new(kind, test_suite_name))
+                .map(|kind| reporter_from_kind(kind, test_suite_name))
                 .collect(),
         )
     }
 
-    pub fn push_result(&mut self, test_result: &TestResult) {
-        self.0
+    pub fn push_result(&mut self, test_result: &TestResult) -> Result<(), Vec<ReportingError>> {
+        let errors: Vec<_> = self
+            .0
             .iter_mut()
-            .for_each(|reporter| reporter.push_result(test_result));
+            .filter_map(|reporter| reporter.push_result(test_result).err())
+            .collect();
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
-    pub fn finish(self) -> anyhow::Result<()> {
-        self.0
+    pub fn finish(self) -> Result<(), Vec<ReportingError>> {
+        let errors: Vec<_> = self
+            .0
             .into_iter()
-            .map(|reporter| reporter.finish())
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(())
+            .filter_map(|reporter| reporter.finish().err())
+            .collect();
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 }
 

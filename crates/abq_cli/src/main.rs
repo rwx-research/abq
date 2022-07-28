@@ -80,7 +80,8 @@ fn run_tests(
         let reporters: &'static mut Reporters = unsafe { std::mem::transmute(&mut reporters) };
 
         move |_, test_result| {
-            reporters.push_result(&test_result);
+            // TODO: is there a reasonable way to surface the error?
+            let _opt_error = reporters.push_result(&test_result);
         }
     };
     let invocation_id = InvocationId::new();
@@ -108,7 +109,8 @@ fn run_tests(
         .join()
         .expect("results thread should always be free");
 
-    reporters.finish()?;
+    // TODO: is there a reasonable way to surface the errors?
+    let _opt_error = reporters.finish();
 
     Ok(())
 }
