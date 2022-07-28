@@ -18,6 +18,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tempfile",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
 ]
