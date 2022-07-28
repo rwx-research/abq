@@ -57,12 +57,12 @@ pub enum Command {
     /// and must resolve to an executable that implements the ABQ protocol.
     Test {
         /// Create a set of workers in-process when running tests, rather than delegating to external
-        /// workers. (Only relevant for commands that run tests)
+        /// workers.
         #[clap(long)]
         auto_workers: bool,
 
-        /// Test result reporter to use for a test run. (Only relevant for commands that run tests)
-        #[clap(long, default_value = "stdout")]
+        /// Test result reporter to use for a test run.
+        #[clap(long, default_value = "line")]
         reporter: Vec<ReporterKind>,
 
         /// Arguments to the test executable.

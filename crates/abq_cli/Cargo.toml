@@ -21,3 +21,6 @@ thiserror = "1.0.31"
 
 tracing = "0.1.35"
 tracing-subscriber = { version = "0.3.15", features = ["env-filter"] }
+
+[dev-dependencies]
+insta = "1.17.0"

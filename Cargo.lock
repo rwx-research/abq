@@ -15,6 +15,7 @@ dependencies = [
  "anyhow",
  "clap",
  "indicatif",
+ "insta",
  "serde_json",
  "signal-hook",
  "tempfile",
