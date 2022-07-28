@@ -1,6 +1,6 @@
 use std::{fmt::Display, path::PathBuf, str::FromStr};
 
-use abq_output::format_result;
+use abq_output::format_result_line;
 use abq_utils::net_protocol::runners::TestResult;
 use thiserror::Error;
 
@@ -73,7 +73,7 @@ struct StdoutReporter;
 
 impl Reporter for StdoutReporter {
     fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
-        println!("{}", format_result(test_result));
+        println!("{}", format_result_line(test_result));
         Ok(())
     }
 

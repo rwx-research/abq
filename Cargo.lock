@@ -84,6 +84,7 @@ dependencies = [
  "abq_runner_protocol",
  "abq_utils",
  "abq_workers",
+ "insta",
 ]
 
 [[package]]
