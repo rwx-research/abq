@@ -39,7 +39,14 @@ fn main() -> anyhow::Result<()> {
             .split(|&c| c == b'\n')
             .filter(|line| !line.is_empty())
             .map(|line| {
-                let test_name = String::from_utf8(line.to_vec())?;
+                let mut test_name = String::from_utf8(line.to_vec())?;
+
+                // cargo outputs "test_name: test"
+                let test_suffix = ": test";
+                debug_assert!(test_name.ends_with(test_suffix));
+                let test_name_len = test_name.len() - test_suffix.len();
+                test_name.truncate(test_name_len);
+
                 let test = TestOrGroup::Test(Test {
                     id: test_name,
                     tags: Default::default(),
@@ -79,7 +86,8 @@ fn main() -> anyhow::Result<()> {
                             let (status, buffer) = if output.status.success() {
                                 (Status::Success, output.stdout)
                             } else {
-                                (Status::Failure, output.stderr)
+                                // cargo writes test failures to stdout
+                                (Status::Failure, output.stdout)
                             };
                             let output = String::from_utf8_lossy(&buffer).to_string();
                             (status, output)

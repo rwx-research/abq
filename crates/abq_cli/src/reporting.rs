@@ -1,15 +1,15 @@
-use std::{fmt::Display, path::PathBuf, str::FromStr};
+use std::{fmt::Display, io, path::PathBuf, str::FromStr};
 
-use abq_output::format_result_line;
-use abq_utils::net_protocol::runners::TestResult;
+use abq_output::{format_result_line, format_result_summary};
+use abq_utils::net_protocol::runners::{Status, TestResult};
 use thiserror::Error;
 
 static DEFAULT_JUNIT_XML_PATH: &str = "abq-test-results.xml";
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum ReporterKind {
-    /// Writes to stdout
-    Stdout,
+    /// Writes results line-by-line to stdout
+    Line,
     /// Writes JUnit XML to a file
     JUnitXml(PathBuf),
 }
@@ -17,7 +17,7 @@ pub enum ReporterKind {
 impl Display for ReporterKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReporterKind::Stdout => write!(f, "stdout"),
+            ReporterKind::Line => write!(f, "line"),
             ReporterKind::JUnitXml(path) => write!(f, "junit-xml={}", path.display()),
         }
     }
@@ -28,7 +28,7 @@ impl FromStr for ReporterKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "stdout" => Ok(Self::Stdout),
+            "line" => Ok(Self::Line),
             other => {
                 if other.starts_with("junit-xml") {
                     let mut splits = other.split("junit-xml=");
@@ -68,16 +68,46 @@ trait Reporter: Send {
     fn finish(self: Box<Self>) -> Result<(), ReportingError>;
 }
 
-/// Streams all test results to standard output.
-struct StdoutReporter;
+/// Streams all test results line-by-line to an output buffer, and prints a summary for failing and
+/// erroring tests at the end.
+struct LineReporter {
+    /// The output buffer.
+    buffer: Box<dyn io::Write + Send>,
 
-impl Reporter for StdoutReporter {
+    /// Failures and errors for which a longer summary should be printed at the end.
+    delayed_failure_reports: Vec<TestResult>,
+}
+
+fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> {
+    writer
+        .write_all(buf)
+        .map_err(|_| ReportingError::FailedToWrite)
+}
+
+impl Reporter for LineReporter {
     fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
-        println!("{}", format_result_line(test_result));
+        write(&mut self.buffer, format_result_line(test_result).as_bytes())?;
+
+        if matches!(test_result.status, Status::Failure | Status::Error) {
+            self.delayed_failure_reports.push(test_result.clone());
+        }
+
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(mut self: Box<Self>) -> Result<(), ReportingError> {
+        for test_result in self.delayed_failure_reports {
+            write(&mut self.buffer, &[b'\n'])?;
+            write(
+                &mut self.buffer,
+                format_result_summary(&test_result).as_bytes(),
+            )?;
+        }
+
+        self.buffer
+            .flush()
+            .map_err(|_| ReportingError::FailedToWrite)?;
+
         Ok(())
     }
 }
@@ -109,7 +139,10 @@ impl Reporter for JUnitXmlReporter {
 
 fn reporter_from_kind(kind: ReporterKind, test_suite_name: &str) -> Box<dyn Reporter> {
     match kind {
-        ReporterKind::Stdout => Box::new(StdoutReporter),
+        ReporterKind::Line => Box::new(LineReporter {
+            buffer: Box::new(std::io::stdout()),
+            delayed_failure_reports: Default::default(),
+        }),
         ReporterKind::JUnitXml(path) => Box::new(JUnitXmlReporter {
             path,
             collector: abq_junit_xml::Collector::new(test_suite_name),
@@ -173,7 +206,7 @@ mod test_reporter_kind {
 
     #[test]
     fn parse_stdout_reporter() {
-        assert_eq!(ReporterKind::from_str("stdout"), Ok(ReporterKind::Stdout));
+        assert_eq!(ReporterKind::from_str("line"), Ok(ReporterKind::Line));
     }
 
     #[test]
@@ -220,5 +253,163 @@ mod test_reporter_kind {
             ReporterKind::from_str("junit-xml=my/test.xml"),
             Ok(ReporterKind::JUnitXml(PathBuf::from("my/test.xml")))
         );
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MockWriter {
+    pub buffer: Vec<u8>,
+    pub num_writes: u64,
+    pub num_flushes: u64,
+}
+
+#[cfg(test)]
+impl io::Write for &mut MockWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.extend(buf);
+        self.num_writes += 1;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.num_flushes += 1;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::identity_op)]
+fn default_result() -> TestResult {
+    TestResult {
+        status: Status::Success,
+        id: "default id".to_owned(),
+        display_name: "default name".to_owned(),
+        output: Some("default output".to_owned()),
+        runtime: (1 * 60 * 1000 + 15 * 1000 + 3) as _,
+        meta: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod test_line_reporter {
+    use abq_utils::net_protocol::runners::{Status, TestResult};
+
+    use super::{default_result, LineReporter, MockWriter, Reporter};
+
+    fn with_reporter(f: impl FnOnce(Box<LineReporter>)) -> MockWriter {
+        let mut mock_writer = MockWriter::default();
+        {
+            // Safety: mock writer only borrowed for duration of `f`, and exists longer than the
+            // reporter.
+            let borrow_writer: &'static mut MockWriter =
+                unsafe { std::mem::transmute(&mut mock_writer) };
+
+            let reporter = LineReporter {
+                buffer: Box::new(borrow_writer),
+                delayed_failure_reports: Default::default(),
+            };
+
+            f(Box::new(reporter));
+        }
+        mock_writer
+    }
+
+    #[test]
+    fn write_on_result() {
+        let MockWriter {
+            buffer,
+            num_writes,
+            num_flushes,
+        } = with_reporter(|mut reporter| {
+            reporter.push_result(&default_result()).unwrap();
+            reporter.push_result(&default_result()).unwrap();
+        });
+
+        assert!(!buffer.is_empty());
+        assert_eq!(num_writes, 2);
+        assert_eq!(num_flushes, 0);
+    }
+
+    #[test]
+    fn flush_buffer_when_test_results_done() {
+        let MockWriter {
+            buffer,
+            num_writes,
+            num_flushes,
+        } = with_reporter(|reporter| reporter.finish().unwrap());
+
+        assert!(buffer.is_empty());
+        assert_eq!(num_writes, 0);
+        assert_eq!(num_flushes, 1);
+    }
+
+    #[test]
+    fn formats_results_as_lines() {
+        let MockWriter {
+            buffer,
+            num_writes: _,
+            num_flushes: _,
+        } = with_reporter(|mut reporter| {
+            reporter
+                .push_result(&TestResult {
+                    status: Status::Success,
+                    display_name: "abq/test1".to_string(),
+                    ..default_result()
+                })
+                .unwrap();
+            reporter
+                .push_result(&TestResult {
+                    status: Status::Failure,
+                    display_name: "abq/test2".to_string(),
+                    output: Some("Assertion failed: 1 != 2".to_string()),
+                    ..default_result()
+                })
+                .unwrap();
+            reporter
+                .push_result(&TestResult {
+                    status: Status::Skipped,
+                    display_name: "abq/test3".to_string(),
+                    output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
+                    ..default_result()
+                })
+                .unwrap();
+            reporter
+                .push_result(&TestResult {
+                    status: Status::Error,
+                    display_name: "abq/test4".to_string(),
+                    output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                    ..default_result()
+                })
+                .unwrap();
+            reporter
+                .push_result(&TestResult {
+                    status: Status::Pending,
+                    display_name: "abq/test5".to_string(),
+                    output: Some(
+                        r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
+                    ),
+                    ..default_result()
+                })
+                .unwrap();
+            reporter.finish().unwrap();
+        });
+
+        let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
+        insta::assert_snapshot!(output, @r###"
+        abq/test1: ok
+        abq/test2: FAILED
+        abq/test3: skipped
+        abq/test4: ERRORED
+        abq/test5: pending
+
+        --- abq/test2: FAILED ---
+        Assertion failed: 1 != 2
+        (completed in 1 m, 15 s, 3 ms)
+
+        --- abq/test4: ERRORED ---
+        Process 28821 terminated early via SIGTERM
+        (completed in 1 m, 15 s, 3 ms)
+        "###);
     }
 }
