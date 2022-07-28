@@ -22,4 +22,4 @@ anyhow = "1.0.58"
 test-abq-jest = []
 
 [dev-dependencies]
-insta = "1.15.0"
+insta = "1.17.0"
