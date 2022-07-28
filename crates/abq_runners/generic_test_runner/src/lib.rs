@@ -4,16 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::{net::TcpListener, process};
 
 use abq_utils::net_protocol::runners::{
-    ManifestMessage, TestCaseMessage, TestResult, TestResultMessage,
+    ManifestMessage, TestCaseMessage, TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST,
+    ABQ_SOCKET,
 };
 use abq_utils::net_protocol::workers::{
     InvocationId, NativeTestRunnerParams, NextWork, WorkContext, WorkId,
 };
 use abq_utils::{flatten_manifest, net_protocol};
 use tracing::instrument;
-
-static ABQ_SOCKET: &str = "ABQ_SOCKET";
-static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
 
 pub struct GenericTestRunner;
 

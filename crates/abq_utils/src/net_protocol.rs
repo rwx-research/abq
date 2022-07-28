@@ -7,6 +7,9 @@ use std::io::{Read, Write};
 pub mod runners {
     use serde_derive::{Deserialize, Serialize};
 
+    pub static ABQ_SOCKET: &str = "ABQ_SOCKET";
+    pub static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
+
     pub type MetadataMap = serde_json::Map<String, serde_json::Value>;
 
     #[derive(Serialize, Deserialize)]

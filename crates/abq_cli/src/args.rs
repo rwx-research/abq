@@ -6,6 +6,8 @@ use std::{
 use abq_utils::net_protocol::workers::InvocationId;
 use clap::{Parser, Subcommand};
 
+use crate::reporting::ReporterKind;
+
 pub(crate) fn unspecified_socket_addr() -> SocketAddr {
     // Can't be a constant due to https://github.com/rust-lang/rust/issues/67390
     SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -23,6 +25,10 @@ pub struct Cli {
     /// workers. (Only relevant for commands that run tests)
     #[clap(long)]
     pub auto_workers: bool,
+
+    /// Test result reporter to use for a test run. (Only relevant for commands that run tests)
+    #[clap(long, default_value = "stdout")]
+    pub reporter: Vec<ReporterKind>,
 }
 
 #[derive(Subcommand)]
@@ -62,7 +68,7 @@ pub enum Command {
         wrapper: String,
 
         /// Extra arguments to pass to `jest`.
-        #[clap(long, multiple_values = true, allow_hyphen_values = true)]
+        #[clap(multiple_values = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 }
@@ -72,7 +78,7 @@ pub enum CargoCmd {
     /// Runs `cargo test` for the project in the current directory.
     Test {
         /// Extra arguments to pass to `cargo test`.
-        #[clap(long, multiple_values = true, allow_hyphen_values = true)]
+        #[clap(multiple_values = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 }

@@ -6,6 +6,7 @@ version = 3
 name = "abq"
 version = "0.1.0"
 dependencies = [
+ "abq_junit_xml",
  "abq_output",
  "abq_queue",
  "abq_runner_protocol",
@@ -19,6 +20,20 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "abq_cargo"
+version = "0.1.0"
+dependencies = [
+ "abq_utils",
+ "anyhow",
+ "clap",
+ "insta",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -124,6 +139,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tracing",
 ]
 

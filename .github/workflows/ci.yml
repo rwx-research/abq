@@ -52,12 +52,6 @@ jobs:
           override: true
           components: clippy
 
-      - name: Install cargo2junit
-        run: |
-          if ! command -v cargo2junit; then
-            cargo install --force cargo2junit
-          fi
-
       - name: Run lints
         uses: actions-rs/cargo@v1.0.3
         with:
@@ -86,15 +80,16 @@ jobs:
 
       # End setup testdata
 
-      - name: Run tests
+      - name: Build abq
         run: |
-            cargo test --all-features
+            cargo build
 
-      - name: Write test XML output
+      - name: Dogfood abq
         run: |
-            cargo test --all-features -- \
-              -Z unstable-options --format json --report-time \
-              | cargo2junit > cargo-tests.xml
+            target/debug/abq \
+              --auto-workers \
+              --reporter stdout --reporter junit-xml=cargo-tests.xml \
+              cargo test -- --all-features
 
       - name: Upload artifacts to captain
         uses: rwx-research/upload-captain-artifact@main
@@ -110,3 +105,7 @@ jobs:
           job-name: "Lint, test"
           job-matrix: "${{ toJSON(matrix) }}"
           captain-token: "${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}"
+
+      - name: Run tests with cargo
+        run: |
+            cargo test --all-features

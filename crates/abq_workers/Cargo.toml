@@ -10,6 +10,7 @@ abq_echo_worker = { path = "../abq_runners/echo" }
 abq_exec_worker = { path = "../abq_runners/exec" }
 abq_utils = { path = "../abq_utils" }
 
+thiserror = "1.0.31"
 procspawn = "0.10.1"
 serde = "1.0.139"
 serde_derive = "1.0.137"
