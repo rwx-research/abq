@@ -20,15 +20,6 @@ pub(crate) fn unspecified_socket_addr() -> SocketAddr {
 pub struct Cli {
     #[clap(subcommand)]
     pub command: Command,
-
-    /// Create a set of workers in-process when running tests, rather than delegating to external
-    /// workers. (Only relevant for commands that run tests)
-    #[clap(long)]
-    pub auto_workers: bool,
-
-    /// Test result reporter to use for a test run. (Only relevant for commands that run tests)
-    #[clap(long, default_value = "stdout")]
-    pub reporter: Vec<ReporterKind>,
 }
 
 #[derive(Subcommand)]
@@ -57,28 +48,25 @@ pub enum Command {
         /// The ID of the test run to pull work for.
         test_run: InvocationId,
     },
-    /// Runs commands related to Rust's `cargo` toolchain.
-    #[clap(subcommand)]
-    Cargo(CargoCmd),
-    /// Runs `yarn jest`.
-    Jest {
-        /// Wrapper to run `abq-jest` in. Common ones include `yarn` and `npm`.
-        /// A wrapper of "" will run `jest` standalone.
-        #[clap(long, default_value = "yarn")]
-        wrapper: String,
-
-        /// Extra arguments to pass to `jest`.
-        #[clap(multiple_values = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum CargoCmd {
-    /// Runs `cargo test` for the project in the current directory.
+    /// Starts an instance of `abq test`. Examples:
+    ///
+    ///   abq test -- yarn jest -t "onboard flow"
+    ///   abq test -- cargo test
+    ///
+    /// The given executable must be available on abq workers fulfilling this test request,
+    /// and must resolve to an executable that implements the ABQ protocol.
     Test {
-        /// Extra arguments to pass to `cargo test`.
-        #[clap(multiple_values = true, allow_hyphen_values = true)]
+        /// Create a set of workers in-process when running tests, rather than delegating to external
+        /// workers. (Only relevant for commands that run tests)
+        #[clap(long)]
+        auto_workers: bool,
+
+        /// Test result reporter to use for a test run. (Only relevant for commands that run tests)
+        #[clap(long, default_value = "stdout")]
+        reporter: Vec<ReporterKind>,
+
+        /// Arguments to the test executable.
+        #[clap(required = true, multiple_values = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
 }

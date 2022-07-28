@@ -9,7 +9,7 @@ use abq_queue::invoke::invoke_work;
 use abq_utils::net_protocol::workers::{InvocationId, NativeTestRunnerParams, RunnerKind};
 use clap::Parser;
 
-use args::{CargoCmd, Cli, Command};
+use args::{Cli, Command};
 
 use reporting::{ReporterKind, Reporters};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -21,11 +21,7 @@ fn main() -> anyhow::Result<()> {
         .finish();
     tracing::subscriber::set_global_default(tracing_fmt).unwrap();
 
-    let Cli {
-        command,
-        auto_workers,
-        reporter: reporters,
-    } = Cli::parse();
+    let Cli { command } = Cli::parse();
 
     match command {
         Command::Start { bind } => instance::start_abq_forever(bind),
@@ -34,33 +30,34 @@ fn main() -> anyhow::Result<()> {
             queue_addr,
             test_run,
         } => workers::start_workers_forever(working_dir, queue_addr, test_run),
-        Command::Cargo(CargoCmd::Test { mut args }) => {
-            let cmd = "target/debug/abq_cargo".to_string();
-            args.insert(0, "test".to_string());
-            let cargo_runner = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
-                cmd,
-                args,
-                extra_env: Default::default(),
-            });
-            run_tests(cargo_runner, auto_workers, reporters)
-        }
-        Command::Jest { wrapper, mut args } => {
-            let (cmd, args) = match wrapper.as_str() {
-                "" => ("jest".to_string(), args),
-                _ => {
-                    args.insert(0, "jest".to_string());
-                    (wrapper, args)
-                }
-            };
-
-            let jest_runner = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
-                cmd,
-                args,
-                extra_env: Default::default(),
-            });
-            run_tests(jest_runner, auto_workers, reporters)
+        Command::Test {
+            args,
+            auto_workers,
+            reporter: reporters,
+        } => {
+            let runner_params = validate_abq_test_args(args)?;
+            let runner = RunnerKind::GenericNativeTestRunner(runner_params);
+            run_tests(runner, auto_workers, reporters)
         }
     }
+}
+
+fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParams, clap::Error> {
+    use clap::{CommandFactory, ErrorKind};
+    if args.is_empty() {
+        let mut cmd = Cli::command();
+        return Err(cmd.error(
+            ErrorKind::InvalidValue,
+            "`abq test` is missing an executable to run!",
+        ));
+    }
+    let cmd = args.remove(0);
+    Ok(NativeTestRunnerParams {
+        cmd,
+        args,
+        // TODO: populate this
+        extra_env: Default::default(),
+    })
 }
 
 fn run_tests(
@@ -113,4 +110,55 @@ fn run_tests(
     let _opt_error = reporters.finish();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use abq_utils::net_protocol::workers::NativeTestRunnerParams;
+    use clap::ErrorKind;
+
+    use super::validate_abq_test_args;
+
+    #[test]
+    fn validate_test_args_empty() {
+        let result = validate_abq_test_args(vec![]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidValue);
+        assert!(err.to_string().contains("missing an executable to run"));
+    }
+
+    #[test]
+    fn validate_one_test_arg() {
+        let result = validate_abq_test_args(vec!["abq-test".to_string()]);
+        assert!(result.is_ok());
+        let NativeTestRunnerParams {
+            cmd,
+            args,
+            extra_env,
+        } = result.unwrap();
+
+        assert_eq!(cmd, "abq-test");
+        assert!(args.is_empty());
+        assert!(extra_env.is_empty());
+    }
+
+    #[test]
+    fn validate_multiple_args() {
+        let result = validate_abq_test_args(vec![
+            "abq-test".to_string(),
+            "--filter".to_string(),
+            "onboarding".to_string(),
+        ]);
+        assert!(result.is_ok());
+        let NativeTestRunnerParams {
+            cmd,
+            args,
+            extra_env,
+        } = result.unwrap();
+
+        assert_eq!(cmd, "abq-test");
+        assert_eq!(args, vec!["--filter", "onboarding"]);
+        assert!(extra_env.is_empty());
+    }
 }
