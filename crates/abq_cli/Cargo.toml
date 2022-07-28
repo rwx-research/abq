@@ -12,7 +12,7 @@ abq_utils = { path = "../abq_utils" }
 abq_junit_xml = { path = "../reporters/junit_xml" }
 
 anyhow = "1.0.57"
-clap = { version = "3.2.12", features = ["derive"] }
+clap = { version = "3.2.15", features = ["derive"] }
 tempfile = "3.3.0"
 signal-hook = "0.3.14"
 indicatif = "0.16.2"
