@@ -8,7 +8,8 @@ use std::{
     thread,
     time::Duration,
 };
-use tracing::instrument;
+use thiserror::Error;
+use tracing::{error, instrument};
 
 use crate::workers::{
     GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
@@ -80,9 +81,11 @@ pub struct WorkersConfig {
     pub work_retries: u8,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum WorkersNegotiateError {
+    #[error("could not connect to queue")]
     CouldNotConnect,
+    #[error("illegal message received from queue")]
     BadQueueMessage,
 }
 
@@ -206,7 +209,8 @@ pub struct QueueNegotiator {
 /// Address of a queue negotiator.
 pub struct QueueNegotiatorHandle(SocketAddr);
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("not an address to a queue negotiator")]
 pub struct NotAQueueNegotiator;
 
 impl QueueNegotiatorHandle {
