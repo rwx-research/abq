@@ -11,7 +11,7 @@ abq_exec_worker = { path = "../abq_runners/exec" }
 abq_utils = { path = "../abq_utils" }
 
 anyhow = "1.0.57"
-serde = "1.0.139"
+serde = "1.0.140"
 serde_derive = "1.0.137"
 serde_json = "1.0.81"
 
