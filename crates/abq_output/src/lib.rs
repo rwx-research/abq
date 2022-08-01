@@ -12,6 +12,18 @@ pub fn format_result_line(result: &TestResult) -> String {
     buf
 }
 
+/// Formats a test result as a single dot.
+pub fn format_result_dot(result: &TestResult) -> String {
+    match result.status {
+        Status::Failure => "F",
+        Status::Success => ".",
+        Status::Error => "E",
+        Status::Pending => "P",
+        Status::Skipped => "S",
+    }
+    .to_string()
+}
+
 /// Formats a test result as a summary, possibly across multiple lines.
 pub fn format_result_summary(result: &TestResult) -> String {
     // --- test/name: {status} ---
