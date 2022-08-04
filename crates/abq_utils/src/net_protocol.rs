@@ -101,6 +101,9 @@ pub mod runners {
         AbqProtocolVersion,
     }
 
+    pub const ACTIVE_PROTOCOL_VERSION_MAJOR: u64 = 0;
+    pub const ACTIVE_PROTOCOL_VERSION_MINOR: u64 = 1;
+
     #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
     pub struct AbqProtocolVersionMessage {
         pub r#type: AbqProtocolVersionTag,
