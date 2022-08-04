@@ -94,6 +94,19 @@ pub mod runners {
     pub struct Manifest {
         pub members: Vec<TestOrGroup>,
     }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AbqProtocolVersionTag {
+        AbqProtocolVersion,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+    pub struct AbqProtocolVersionMessage {
+        pub r#type: AbqProtocolVersionTag,
+        pub major: u64,
+        pub minor: u64,
+    }
 }
 
 pub mod workers {

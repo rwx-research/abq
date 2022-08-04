@@ -1,11 +1,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
 
 use abq_utils::net_protocol::runners::{
-    ManifestMessage, TestCaseMessage, TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST,
-    ABQ_SOCKET,
+    AbqProtocolVersionMessage, ManifestMessage, TestCaseMessage, TestResult, TestResultMessage,
+    ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
 };
 use abq_utils::net_protocol::workers::{
     InvocationId, NativeTestRunnerParams, NextWork, WorkContext, WorkId,
@@ -14,6 +15,62 @@ use abq_utils::{flatten_manifest, net_protocol};
 use tracing::instrument;
 
 pub struct GenericTestRunner;
+
+static TARGET_PROTOCOL_VERSION_MAJOR: u64 = 0;
+static TARGET_PROTOCOL_VERSION_MINOR: u64 = 1;
+
+static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
+
+#[derive(Debug)]
+enum ProtocolVersionMessageError {
+    IoError(io::Error),
+    Timeout,
+    NotCompatible,
+}
+
+#[allow(unused)]
+fn wait_and_validate_protocol_version_message(
+    listener: &mut TcpListener,
+    timeout: Duration,
+) -> Result<(), ProtocolVersionMessageError> {
+    use ProtocolVersionMessageError::*;
+
+    listener.set_nonblocking(true).map_err(IoError)?;
+
+    let start = Instant::now();
+    let AbqProtocolVersionMessage {
+        r#type: _,
+        major,
+        minor,
+    } = loop {
+        if start.elapsed() >= timeout {
+            return Err(Timeout);
+        }
+
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).map_err(IoError)?;
+                listener.set_nonblocking(false).map_err(IoError)?;
+                let version_message: AbqProtocolVersionMessage =
+                    net_protocol::read(&mut stream).map_err(IoError)?;
+                break version_message;
+            }
+            Err(err) => match err.kind() {
+                io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(POLL_WAIT_TIME);
+                    continue;
+                }
+                _ => return Err(IoError(err)),
+            },
+        }
+    };
+
+    if major != TARGET_PROTOCOL_VERSION_MAJOR || minor != TARGET_PROTOCOL_VERSION_MINOR {
+        Err(NotCompatible)
+    } else {
+        Ok(())
+    }
+}
 
 pub fn wait_for_manifest(listener: TcpListener) -> io::Result<ManifestMessage> {
     let (mut stream, _) = listener.accept()?;
@@ -227,6 +284,138 @@ pub fn execute_wrapped_runner(
         manifest_message.expect("manifest never received!"),
         test_results,
     )
+}
+
+#[cfg(test)]
+mod test_validate_protocol_version_message {
+    use std::{
+        net::{TcpListener, TcpStream},
+        thread,
+        time::Duration,
+    };
+
+    use abq_utils::net_protocol::{
+        self,
+        runners::{AbqProtocolVersionMessage, AbqProtocolVersionTag},
+    };
+
+    use super::{
+        wait_and_validate_protocol_version_message, ProtocolVersionMessageError,
+        TARGET_PROTOCOL_VERSION_MAJOR, TARGET_PROTOCOL_VERSION_MINOR,
+    };
+
+    #[test]
+    fn recv_and_validate_protocol_version_message() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+        let () = thread::spawn(move || {
+            let mut stream = TcpStream::connect(socket_addr).unwrap();
+            let version_message = AbqProtocolVersionMessage {
+                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+                major: TARGET_PROTOCOL_VERSION_MAJOR,
+                minor: TARGET_PROTOCOL_VERSION_MINOR,
+            };
+            net_protocol::write(&mut stream, version_message).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        let result =
+            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+
+        assert!(result.is_ok());
+        let ok = result.unwrap();
+        assert_eq!(ok, ());
+    }
+
+    #[test]
+    fn protocol_version_message_incompatible() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+        let () = thread::spawn(move || {
+            let mut stream = TcpStream::connect(socket_addr).unwrap();
+            let version_message = AbqProtocolVersionMessage {
+                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+                major: 999123123,
+                minor: 12312342,
+            };
+            net_protocol::write(&mut stream, version_message).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        let result =
+            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProtocolVersionMessageError::NotCompatible));
+    }
+
+    #[test]
+    fn protocol_version_message_recv_wrong_message() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+        let () = thread::spawn(move || {
+            let mut stream = TcpStream::connect(socket_addr).unwrap();
+            let message = net_protocol::runners::Manifest { members: vec![] };
+            net_protocol::write(&mut stream, message).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        let result =
+            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProtocolVersionMessageError::IoError(_)));
+    }
+
+    #[test]
+    fn protocol_version_message_tunnel_dropped() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+        let () = thread::spawn(move || {
+            let stream = TcpStream::connect(socket_addr).unwrap();
+            drop(stream);
+        })
+        .join()
+        .unwrap();
+
+        let result =
+            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProtocolVersionMessageError::IoError(_)));
+    }
+
+    #[test]
+    fn protocol_version_message_tunnel_timeout() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+
+        let timeout = Duration::from_millis(0);
+        let () = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut stream = TcpStream::connect(socket_addr).unwrap();
+            let version_message = AbqProtocolVersionMessage {
+                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+                major: TARGET_PROTOCOL_VERSION_MAJOR,
+                minor: TARGET_PROTOCOL_VERSION_MINOR,
+            };
+            net_protocol::write(&mut stream, version_message).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        let result = wait_and_validate_protocol_version_message(&mut listener, timeout);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, ProtocolVersionMessageError::Timeout));
+    }
 }
 
 #[cfg(test)]
