@@ -4,11 +4,14 @@
 use std::{
     net::{SocketAddr, TcpListener},
     path::PathBuf,
+    time::Duration,
 };
 
 use clap::{Parser, Subcommand};
 
-use abq_generic_test_runner::{execute_wrapped_runner, wait_for_manifest};
+use abq_generic_test_runner::{
+    execute_wrapped_runner, open_native_runner_connection, wait_for_manifest,
+};
 use abq_utils::net_protocol::workers::NativeTestRunnerParams;
 
 /// Test harness simulating a ABQ worker, for use by native runner implementations.
@@ -77,16 +80,17 @@ fn main() -> anyhow::Result<()> {
             };
 
             let (_manifest, test_results) =
-                execute_wrapped_runner(native_runner_params, working_dir);
+                execute_wrapped_runner(native_runner_params, working_dir)?;
 
             serde_json::to_writer(std::io::stdout(), &test_results)?;
 
             Ok(())
         }
         Command::Manifest { server_addr } => {
-            let server = TcpListener::bind(server_addr)?;
+            let mut server = TcpListener::bind(server_addr)?;
 
-            let manifest = wait_for_manifest(server)?;
+            let runner_conn = open_native_runner_connection(&mut server, Duration::from_secs(1))?;
+            let manifest = wait_for_manifest(runner_conn)?;
 
             serde_json::to_writer(std::io::stdout(), &manifest)?;
 

@@ -11,10 +11,20 @@ use std::{
 use abq_utils::net_protocol::{
     self,
     runners::{
-        Manifest, ManifestMessage, Status, Test, TestCase, TestCaseMessage, TestOrGroup,
-        TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+        AbqProtocolVersionMessage, AbqProtocolVersionTag, Manifest, ManifestMessage, Status, Test,
+        TestCase, TestCaseMessage, TestOrGroup, TestResult, TestResultMessage,
+        ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
+        ACTIVE_PROTOCOL_VERSION_MINOR,
     },
 };
+
+fn protocol_version() -> AbqProtocolVersionMessage {
+    AbqProtocolVersionMessage {
+        r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+        major: ACTIVE_PROTOCOL_VERSION_MAJOR,
+        minor: ACTIVE_PROTOCOL_VERSION_MINOR,
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().peekable();
@@ -28,6 +38,11 @@ fn main() -> anyhow::Result<()> {
         Ok("0") | Err(_) => false,
         Ok(_) => true,
     };
+
+    let mut worker_conn = TcpStream::connect(abq_socket)?;
+
+    // Always send our protocol version up-front.
+    net_protocol::write(&mut worker_conn, protocol_version())?;
 
     if generate_manifest {
         let mut cmd = process::Command::new("cargo");
@@ -60,10 +75,8 @@ fn main() -> anyhow::Result<()> {
             manifest: Manifest { members: tests },
         };
 
-        let mut worker_conn = TcpStream::connect(abq_socket)?;
         net_protocol::write(&mut worker_conn, manifest)?;
     } else {
-        let mut worker_conn = TcpStream::connect(abq_socket)?;
         let args: Vec<_> = args.collect();
 
         #[allow(clippy::while_let_loop)]

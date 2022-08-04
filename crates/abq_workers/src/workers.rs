@@ -6,7 +6,7 @@ use std::{sync::mpsc, thread};
 
 use abq_echo_worker as echo;
 use abq_exec_worker as exec;
-use abq_generic_test_runner::GenericTestRunner;
+use abq_generic_test_runner::{GenericTestRunner, RunnerError};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestId, TestResult};
 use abq_utils::net_protocol::workers::{InvocationId, NextWork, RunnerKind, WorkContext, WorkId};
@@ -175,7 +175,8 @@ impl WorkerPool {
                 .take()
                 .expect("worker thread already stolen")
                 .join()
-                .unwrap();
+                .expect("runner thread panicked rather than erroring")
+                .expect("runner failed, but we didn't catch it");
         }
     }
 }
@@ -189,7 +190,7 @@ impl Drop for WorkerPool {
 }
 
 struct ThreadWorker {
-    handle: Option<thread::JoinHandle<()>>,
+    handle: Option<thread::JoinHandle<Result<(), RunnerError>>>,
 }
 
 enum AttemptError {
@@ -218,7 +219,8 @@ impl ThreadWorker {
                 start_generic_test_runner(worker_env, params)
             }
             RunnerKind::TestLikeRunner(runner, manifest) => {
-                start_test_like_runner(worker_env, runner, manifest)
+                start_test_like_runner(worker_env, runner, manifest);
+                Ok(())
             }
         });
 
@@ -228,7 +230,10 @@ impl ThreadWorker {
     }
 }
 
-fn start_generic_test_runner(env: WorkerEnv, native_runner_params: NativeTestRunnerParams) {
+fn start_generic_test_runner(
+    env: WorkerEnv,
+    native_runner_params: NativeTestRunnerParams,
+) -> Result<(), RunnerError> {
     let WorkerEnv {
         get_next_work,
         invocation_id,
@@ -268,7 +273,7 @@ fn start_generic_test_runner(env: WorkerEnv, native_runner_params: NativeTestRun
         notify_manifest,
         get_next_work,
         send_test_result,
-    );
+    )
 }
 
 fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: ManifestMessage) {

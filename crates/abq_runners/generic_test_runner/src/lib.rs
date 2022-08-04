@@ -1,4 +1,5 @@
 use std::io;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -6,77 +7,112 @@ use std::{net::TcpListener, process};
 
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersionMessage, ManifestMessage, TestCaseMessage, TestResult, TestResultMessage,
-    ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
+    ACTIVE_PROTOCOL_VERSION_MINOR,
 };
 use abq_utils::net_protocol::workers::{
     InvocationId, NativeTestRunnerParams, NextWork, WorkContext, WorkId,
 };
 use abq_utils::{flatten_manifest, net_protocol};
+use thiserror::Error;
 use tracing::instrument;
 
 pub struct GenericTestRunner;
 
-static TARGET_PROTOCOL_VERSION_MAJOR: u64 = 0;
-static TARGET_PROTOCOL_VERSION_MINOR: u64 = 1;
-
 static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 
-#[derive(Debug)]
-enum ProtocolVersionMessageError {
-    IoError(io::Error),
+#[derive(Debug, Error)]
+pub enum ProtocolVersionError {
+    #[error("Timeout while waiting for protocol version")]
     Timeout,
+    #[error("Incompatible native runner protocol version")]
     NotCompatible,
 }
 
-#[allow(unused)]
-fn wait_and_validate_protocol_version_message(
+#[derive(Debug, Error)]
+pub enum ProtocolVersionMessageError {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    Version(#[from] ProtocolVersionError),
+}
+
+type RunnerConnection = TcpStream;
+
+/// Opens a connection with native test runner on the given listener.
+///
+/// Validates that the connected native runner communicates with a compatible ABQ protocol.
+/// Returns an error if the protocols are incompatible, or the process fails to establish a
+/// connection in a suitable time frame.
+pub fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
-) -> Result<(), ProtocolVersionMessageError> {
+) -> Result<RunnerConnection, ProtocolVersionMessageError> {
     use ProtocolVersionMessageError::*;
 
-    listener.set_nonblocking(true).map_err(IoError)?;
+    listener.set_nonblocking(true).map_err(Io)?;
 
     let start = Instant::now();
-    let AbqProtocolVersionMessage {
-        r#type: _,
-        major,
-        minor,
-    } = loop {
+    let (
+        AbqProtocolVersionMessage {
+            r#type: _,
+            major,
+            minor,
+        },
+        runner_conn,
+    ) = loop {
         if start.elapsed() >= timeout {
-            return Err(Timeout);
+            return Err(ProtocolVersionError::Timeout.into());
         }
 
         match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.set_nonblocking(false).map_err(IoError)?;
-                listener.set_nonblocking(false).map_err(IoError)?;
+            Ok((mut conn, _)) => {
+                conn.set_nonblocking(false).map_err(Io)?;
+                listener.set_nonblocking(false).map_err(Io)?;
+
                 let version_message: AbqProtocolVersionMessage =
-                    net_protocol::read(&mut stream).map_err(IoError)?;
-                break version_message;
+                    net_protocol::read(&mut conn).map_err(Io)?;
+
+                break (version_message, conn);
             }
             Err(err) => match err.kind() {
                 io::ErrorKind::WouldBlock => {
                     std::thread::sleep(POLL_WAIT_TIME);
                     continue;
                 }
-                _ => return Err(IoError(err)),
+                _ => return Err(Io(err)),
             },
         }
     };
 
-    if major != TARGET_PROTOCOL_VERSION_MAJOR || minor != TARGET_PROTOCOL_VERSION_MINOR {
-        Err(NotCompatible)
+    if major != ACTIVE_PROTOCOL_VERSION_MAJOR || minor != ACTIVE_PROTOCOL_VERSION_MINOR {
+        Err(ProtocolVersionError::NotCompatible.into())
     } else {
-        Ok(())
+        Ok(runner_conn)
     }
 }
 
-pub fn wait_for_manifest(listener: TcpListener) -> io::Result<ManifestMessage> {
-    let (mut stream, _) = listener.accept()?;
-    let manifest: ManifestMessage = net_protocol::read(&mut stream)?;
+pub fn wait_for_manifest(mut runner_conn: RunnerConnection) -> io::Result<ManifestMessage> {
+    let manifest: ManifestMessage = net_protocol::read(&mut runner_conn)?;
 
     Ok(manifest)
+}
+
+#[derive(Debug, Error)]
+enum RetrieveManifestError {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+    #[error("{0}")]
+    ProtocolVersion(#[from] ProtocolVersionError),
+}
+
+impl From<ProtocolVersionMessageError> for RetrieveManifestError {
+    fn from(e: ProtocolVersionMessageError) -> Self {
+        match e {
+            ProtocolVersionMessageError::Io(e) => Self::Io(e),
+            ProtocolVersionMessageError::Version(e) => Self::ProtocolVersion(e),
+        }
+    }
 }
 
 /// Retrieves the test manifest from native test runner.
@@ -86,11 +122,12 @@ fn retrieve_manifest<'a>(
     args: &[String],
     additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
     working_dir: &Path,
-) -> io::Result<ManifestMessage> {
+    protocol_version_timeout: Duration,
+) -> Result<ManifestMessage, RetrieveManifestError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
     let manifest = {
-        let our_listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut our_listener = TcpListener::bind("127.0.0.1:0")?;
         let our_addr = our_listener.local_addr()?;
 
         let mut native_runner = process::Command::new(cmd);
@@ -103,7 +140,11 @@ fn retrieve_manifest<'a>(
         native_runner.stderr(process::Stdio::null());
         let mut native_runner_handle = native_runner.spawn()?;
 
-        let manifest = wait_for_manifest(our_listener)?;
+        // Wait for and validate the protocol version message, which must always come first.
+        let runner_conn =
+            open_native_runner_connection(&mut our_listener, protocol_version_timeout)?;
+
+        let manifest = wait_for_manifest(runner_conn)?;
 
         let status = native_runner_handle.wait()?;
         debug_assert!(status.success());
@@ -114,6 +155,32 @@ fn retrieve_manifest<'a>(
     Ok(manifest)
 }
 
+#[derive(Debug, Error)]
+pub enum RunnerError {
+    #[error("{0}")]
+    Io(io::Error),
+    #[error("{0}")]
+    ProtocolVersion(ProtocolVersionError),
+}
+
+impl From<RetrieveManifestError> for RunnerError {
+    fn from(e: RetrieveManifestError) -> Self {
+        match e {
+            RetrieveManifestError::Io(e) => Self::Io(e),
+            RetrieveManifestError::ProtocolVersion(e) => Self::ProtocolVersion(e),
+        }
+    }
+}
+
+impl From<ProtocolVersionMessageError> for RunnerError {
+    fn from(e: ProtocolVersionMessageError) -> Self {
+        match e {
+            ProtocolVersionMessageError::Io(e) => Self::Io(e),
+            ProtocolVersionMessageError::Version(e) => Self::ProtocolVersion(e),
+        }
+    }
+}
+
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetNextWork, SendTestResult>(
         input: NativeTestRunnerParams,
@@ -122,7 +189,8 @@ impl GenericTestRunner {
         send_manifest: Option<SendManifest>,
         mut get_next_test: GetNextWork,
         mut send_test_result: SendTestResult,
-    ) where
+    ) -> Result<(), RunnerError>
+    where
         ShouldShutdown: Fn() -> bool,
         SendManifest: FnMut(ManifestMessage),
         GetNextWork: FnMut() -> NextWork + std::marker::Send + 'static,
@@ -134,10 +202,20 @@ impl GenericTestRunner {
             extra_env: additional_env,
         } = input;
 
+        // TODO: get from runner params
+        let protocol_version_timeout = Duration::from_secs(5);
+
         // If we need to retrieve the manifest, do that first.
         if let Some(mut send_manifest) = send_manifest {
             // TODO: error handling
-            let manifest = retrieve_manifest(&cmd, &args, &additional_env, working_dir).unwrap();
+            let manifest = retrieve_manifest(
+                &cmd,
+                &args,
+                &additional_env,
+                working_dir,
+                protocol_version_timeout,
+            )?;
+
             send_manifest(manifest);
         }
 
@@ -160,7 +238,7 @@ impl GenericTestRunner {
         //       | <- send Next-Test -   |             |                           |
         //       | -   recv Done    ->   |             |      <close conn>         |
         // Queue |                       | Worker (us) |                           | Native runner
-        let our_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut our_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let our_addr = our_listener.local_addr().unwrap();
 
         let mut native_runner = process::Command::new(cmd);
@@ -172,13 +250,16 @@ impl GenericTestRunner {
         native_runner.stderr(process::Stdio::null());
         let mut native_runner_handle = native_runner.spawn().unwrap();
 
+        // First, get and validate the protocol version message.
+        let mut runner_conn =
+            open_native_runner_connection(&mut our_listener, protocol_version_timeout)?;
+
         // We establish one connection with the native runner and repeatedly send tests until we're
         // done.
-        let (mut conn, _) = our_listener.accept().unwrap();
         loop {
             match get_next_test() {
                 NextWork::EndOfWork => {
-                    drop(conn);
+                    drop(runner_conn);
                     break;
                 }
                 NextWork::Work {
@@ -190,9 +271,9 @@ impl GenericTestRunner {
                     let test_case_message = TestCaseMessage { test_case };
 
                     // TODO: errors
-                    net_protocol::write(&mut conn, test_case_message).unwrap();
+                    net_protocol::write(&mut runner_conn, test_case_message).unwrap();
                     let test_result_message: TestResultMessage =
-                        net_protocol::read(&mut conn).unwrap();
+                        net_protocol::read(&mut runner_conn).unwrap();
 
                     send_test_result(work_id, test_result_message.test_result);
                 }
@@ -201,6 +282,8 @@ impl GenericTestRunner {
 
         drop(our_listener);
         native_runner_handle.wait().unwrap();
+
+        Ok(())
     }
 }
 
@@ -209,7 +292,7 @@ impl GenericTestRunner {
 pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
     working_dir: PathBuf,
-) -> (ManifestMessage, Vec<TestResult>) {
+) -> Result<(ManifestMessage, Vec<TestResult>), RunnerError> {
     let mut test_case_index = 0;
 
     let mut manifest_message = None;
@@ -278,12 +361,12 @@ pub fn execute_wrapped_runner(
         Some(send_manifest),
         get_next_test,
         send_test_result,
-    );
+    )?;
 
-    (
+    Ok((
         manifest_message.expect("manifest never received!"),
         test_results,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -296,13 +379,13 @@ mod test_validate_protocol_version_message {
 
     use abq_utils::net_protocol::{
         self,
-        runners::{AbqProtocolVersionMessage, AbqProtocolVersionTag},
+        runners::{
+            AbqProtocolVersionMessage, AbqProtocolVersionTag, ACTIVE_PROTOCOL_VERSION_MAJOR,
+            ACTIVE_PROTOCOL_VERSION_MINOR,
+        },
     };
 
-    use super::{
-        wait_and_validate_protocol_version_message, ProtocolVersionMessageError,
-        TARGET_PROTOCOL_VERSION_MAJOR, TARGET_PROTOCOL_VERSION_MINOR,
-    };
+    use super::{open_native_runner_connection, ProtocolVersionError, ProtocolVersionMessageError};
 
     #[test]
     fn recv_and_validate_protocol_version_message() {
@@ -312,20 +395,17 @@ mod test_validate_protocol_version_message {
             let mut stream = TcpStream::connect(socket_addr).unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
-                major: TARGET_PROTOCOL_VERSION_MAJOR,
-                minor: TARGET_PROTOCOL_VERSION_MINOR,
+                major: ACTIVE_PROTOCOL_VERSION_MAJOR,
+                minor: ACTIVE_PROTOCOL_VERSION_MINOR,
             };
             net_protocol::write(&mut stream, version_message).unwrap();
         })
         .join()
         .unwrap();
 
-        let result =
-            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         assert!(result.is_ok());
-        let ok = result.unwrap();
-        assert_eq!(ok, ());
     }
 
     #[test]
@@ -344,12 +424,14 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result =
-            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ProtocolVersionMessageError::NotCompatible));
+        assert!(matches!(
+            err,
+            ProtocolVersionMessageError::Version(ProtocolVersionError::NotCompatible)
+        ));
     }
 
     #[test]
@@ -364,12 +446,11 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result =
-            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ProtocolVersionMessageError::IoError(_)));
+        assert!(matches!(err, ProtocolVersionMessageError::Io(_)));
     }
 
     #[test]
@@ -383,12 +464,11 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result =
-            wait_and_validate_protocol_version_message(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ProtocolVersionMessageError::IoError(_)));
+        assert!(matches!(err, ProtocolVersionMessageError::Io(_)));
     }
 
     #[test]
@@ -402,19 +482,22 @@ mod test_validate_protocol_version_message {
             let mut stream = TcpStream::connect(socket_addr).unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
-                major: TARGET_PROTOCOL_VERSION_MAJOR,
-                minor: TARGET_PROTOCOL_VERSION_MINOR,
+                major: ACTIVE_PROTOCOL_VERSION_MAJOR,
+                minor: ACTIVE_PROTOCOL_VERSION_MINOR,
             };
             net_protocol::write(&mut stream, version_message).unwrap();
         })
         .join()
         .unwrap();
 
-        let result = wait_and_validate_protocol_version_message(&mut listener, timeout);
+        let result = open_native_runner_connection(&mut listener, timeout);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ProtocolVersionMessageError::Timeout));
+        assert!(matches!(
+            err,
+            ProtocolVersionMessageError::Version(ProtocolVersionError::Timeout)
+        ));
     }
 }
 
@@ -454,7 +537,8 @@ mod test_abq_jest {
             Some(send_manifest),
             get_next_test,
             send_test_result,
-        );
+        )
+        .unwrap();
 
         assert!(test_results.is_empty());
         let ManifestMessage { manifest } = manifest.unwrap();
@@ -471,7 +555,7 @@ mod test_abq_jest {
             extra_env: Default::default(),
         };
 
-        let (_, mut test_results) = execute_wrapped_runner(input, working_dir);
+        let (_, mut test_results) = execute_wrapped_runner(input, working_dir).unwrap();
 
         test_results.sort_by_key(|r| r.id.clone());
 
