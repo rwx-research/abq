@@ -10,13 +10,13 @@ abq_echo_worker = { path = "../abq_runners/echo" }
 abq_exec_worker = { path = "../abq_runners/exec" }
 abq_utils = { path = "../abq_utils" }
 
-thiserror = "1.0.31"
+thiserror = "1.0.32"
 procspawn = "0.10.1"
-serde = "1.0.140"
-serde_derive = "1.0.137"
-serde_json = "1.0.81"
+serde = "1.0.142"
+serde_derive = "1.0.142"
+serde_json = "1.0.83"
 
-tracing = "0.1.35"
+tracing = "0.1.36"
 
 [dev-dependencies]
 procspawn = { version = "0.10.1", features = ["test-support"] }
