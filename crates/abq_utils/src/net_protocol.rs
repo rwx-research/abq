@@ -2,7 +2,10 @@
 //!
 //! https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-IPQ-Interface-0959f5a9144741d798ac122566a3d887#f480d133e2c942719b1a0c0a9e76fb3a
 
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    net::{IpAddr, SocketAddr},
+};
 
 pub mod runners {
     use serde_derive::{Deserialize, Serialize};
@@ -246,6 +249,11 @@ pub mod queue {
         /// An ask to shutdown the queue.
         Shutdown(Shutdown),
     }
+}
+
+pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketAddr {
+    socket_addr.set_ip(public_ip);
+    socket_addr
 }
 
 /// Reads a message from a stream communicating with abq.

@@ -2,7 +2,7 @@
 
 use serde_derive::{Deserialize, Serialize};
 use std::{
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     num::NonZeroUsize,
     sync::Arc,
     thread,
@@ -15,7 +15,7 @@ use crate::workers::{
     GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
 };
 use abq_utils::net_protocol::{
-    self,
+    self, publicize_addr,
     workers::{InvocationId, RunnerKind},
 };
 
@@ -111,8 +111,11 @@ impl WorkersNegotiator {
         let wants_to_attach = MessageToQueueNegotiator::WantsToAttach {
             invocation: wanted_invocation_id,
         };
+        tracing::debug!("Writing attach message");
         net_protocol::write(&mut conn, wants_to_attach).map_err(|_| CouldNotConnect)?;
+        tracing::debug!("Wrote attach message");
 
+        tracing::debug!("Awaiting execution message");
         let MessageFromQueueNegotiator::ExecutionContext {
             invocation_id,
             queue_new_work_addr,
@@ -120,6 +123,11 @@ impl WorkersNegotiator {
             runner_kind,
             worker_should_generate_manifest,
         } = net_protocol::read(&mut conn).map_err(|_| BadQueueMessage)?;
+        tracing::debug!(
+            "Recieved execution message. New work addr: {:?}, results addr: {:?}",
+            queue_new_work_addr,
+            queue_results_addr
+        );
 
         let WorkersConfig {
             num_workers,
@@ -194,7 +202,9 @@ impl WorkersNegotiator {
             notify_manifest,
         };
 
+        tracing::debug!("Starting worker pool");
         let pool = WorkerPool::new(pool_config);
+        tracing::debug!("Started worker pool");
 
         Ok(pool)
     }
@@ -240,8 +250,9 @@ pub struct AssignedRun {
 impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
     pub fn new<GetAssignedRun>(
+        public_ip: IpAddr,
         bind_addr: SocketAddr,
-        queue_next_work_addr: SocketAddr,
+        queue_new_work_addr: SocketAddr,
         queue_results_addr: SocketAddr,
         mut get_assigned_run: GetAssignedRun,
     ) -> Self
@@ -249,14 +260,23 @@ impl QueueNegotiator {
         GetAssignedRun: FnMut(InvocationId) -> AssignedRun + Send + 'static,
     {
         // TODO: error handling when `bind_addr` is taken.
+        tracing::debug!("Connecting to {}", bind_addr);
         let listener = TcpListener::bind(bind_addr).unwrap();
         let addr = listener.local_addr().unwrap();
 
+        let advertised_queue_new_work_addr = publicize_addr(queue_new_work_addr, public_ip);
+        let advertised_queue_results_addr = publicize_addr(queue_results_addr, public_ip);
+
         let listener_handle = thread::spawn(move || {
             for stream in listener.incoming() {
+                tracing::debug!("New worker set negotiating");
+
                 let mut stream = stream.unwrap();
+
+                tracing::debug!("Reading connection message");
                 // TODO: error handling
                 let msg: MessageToQueueNegotiator = net_protocol::read(&mut stream).unwrap();
+                tracing::debug!("Read connection message");
 
                 use MessageToQueueNegotiator::*;
                 match msg {
@@ -268,24 +288,29 @@ impl QueueNegotiator {
                         // TODO: this fully blocks the negotiator, so nothing else can connect
                         // while we wait for an invocation, and moreover we won't respect
                         // shutdown messages.
+                        tracing::debug!("Finding assigned run");
                         let AssignedRun {
                             invocation_id,
                             runner_kind,
                             should_generate_manifest,
                         } = get_assigned_run(wanted_invocation_id);
 
+                        tracing::debug!("Found assigned run");
+
                         debug_assert_eq!(invocation_id, wanted_invocation_id);
 
                         let execution_context = MessageFromQueueNegotiator::ExecutionContext {
-                            queue_new_work_addr: queue_next_work_addr,
-                            queue_results_addr,
+                            queue_new_work_addr: advertised_queue_new_work_addr,
+                            queue_results_addr: advertised_queue_results_addr,
                             runner_kind,
                             worker_should_generate_manifest: should_generate_manifest,
                             invocation_id,
                         };
 
                         // TODO: error handling
+                        tracing::debug!("Sending execution context");
                         net_protocol::write(&mut stream, execution_context).unwrap();
+                        tracing::debug!("Sent execution context");
                     }
                     Shutdown => return,
                 }
@@ -501,6 +526,7 @@ mod test {
         };
 
         let mut queue_negotiator = QueueNegotiator::new(
+            "0.0.0.0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
             next_work_addr,
             results_addr,

@@ -3,14 +3,15 @@ mod instance;
 mod reporting;
 mod workers;
 
-use std::thread;
+use std::{net::SocketAddr, thread};
 
 use abq_queue::invoke::invoke_work;
 use abq_utils::net_protocol::workers::{InvocationId, NativeTestRunnerParams, RunnerKind};
 use clap::Parser;
 
-use args::{Cli, Command};
+use args::{default_num_workers, Cli, Command};
 
+use instance::AbqInstance;
 use reporting::{ReporterKind, Reporters};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -24,20 +25,24 @@ fn main() -> anyhow::Result<()> {
     let Cli { command } = Cli::parse();
 
     match command {
-        Command::Start { bind } => instance::start_abq_forever(bind),
+        Command::Start { bind, public_ip } => instance::start_abq_forever(bind, public_ip),
         Command::Work {
             working_dir,
             queue_addr,
             test_run,
-        } => workers::start_workers_forever(working_dir, queue_addr, test_run),
+            num,
+        } => workers::start_workers_forever(num, working_dir, queue_addr, test_run),
         Command::Test {
             args,
-            auto_workers,
+            test_id,
+            queue_addr,
+            negotiator_addr,
             reporter: reporters,
         } => {
             let runner_params = validate_abq_test_args(args)?;
+            let abq = validate_and_find_abq(queue_addr, negotiator_addr)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
-            run_tests(runner, auto_workers, reporters)
+            run_tests(runner, abq, test_id, reporters)
         }
     }
 }
@@ -52,6 +57,7 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
         ));
     }
     let cmd = args.remove(0);
+
     Ok(NativeTestRunnerParams {
         cmd,
         args,
@@ -60,13 +66,32 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
     })
 }
 
+fn validate_and_find_abq(
+    queue_addr: Option<SocketAddr>,
+    negotiator_addr: Option<SocketAddr>,
+) -> Result<AbqInstance, clap::Error> {
+    use clap::{CommandFactory, ErrorKind};
+    match (queue_addr, negotiator_addr) {
+        (Some(queue_addr), Some(negotiator_addr)) => {
+            Ok(instance::get_abq(Some((queue_addr, negotiator_addr))))
+        }
+        (None, None) => Ok(instance::get_abq(None)),
+        _ => {
+            let mut cmd = Cli::command();
+            Err(cmd.error(
+                ErrorKind::MissingRequiredArgument,
+                "queue-addr must be supplied with negotiator-addr",
+            ))
+        }
+    }
+}
+
 fn run_tests(
     runner: RunnerKind,
-    auto_workers: bool,
+    abq: AbqInstance,
+    opt_test_id: Option<InvocationId>,
     reporters: Vec<ReporterKind>,
 ) -> anyhow::Result<()> {
-    let abq = instance::get_abq();
-
     let test_suite_name = "suite"; // TODO: determine this correctly
     let mut reporters = Reporters::new(reporters, test_suite_name);
 
@@ -81,20 +106,23 @@ fn run_tests(
             let _opt_error = reporters.push_result(&test_result);
         }
     };
-    let invocation_id = InvocationId::new();
+
+    let start_in_process_workers = opt_test_id.is_none();
+    let test_id = opt_test_id.unwrap_or_else(InvocationId::new);
 
     let work_results_thread = thread::spawn({
         let server_addr = abq.server_addr();
-        move || invoke_work(server_addr, invocation_id, runner, on_result)
+        move || invoke_work(server_addr, test_id, runner, on_result)
     });
 
-    let opt_workers = if auto_workers {
+    let opt_workers = if start_in_process_workers {
         let working_dir = std::env::current_dir().expect("no working directory");
         let negotiator_addr = abq.negotiator_addr();
-        let workers = workers::start_workers(working_dir, negotiator_addr, invocation_id)?;
+        let workers =
+            workers::start_workers(default_num_workers(), working_dir, negotiator_addr, test_id)?;
         Some(workers)
     } else {
-        println!("Starting test run with ID {}", invocation_id);
+        println!("Starting test run with ID {}", test_id);
         None
     };
 

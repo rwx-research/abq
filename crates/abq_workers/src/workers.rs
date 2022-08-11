@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{self, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{sync::mpsc, thread};
@@ -23,6 +24,8 @@ type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 pub type GetNextWork = Arc<dyn Fn() -> NextWork + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(InvocationId, ManifestMessage) + Send + Sync + 'static>;
 pub type NotifyResult = Arc<dyn Fn(InvocationId, WorkId, TestResult) + Send + Sync + 'static>;
+
+type MarkWorkerComplete = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Clone, Debug)]
 pub enum WorkerContext {
@@ -87,6 +90,28 @@ pub struct WorkerPool {
     active: bool,
     workers: Vec<ThreadWorker>,
     worker_msg_tx: mpsc::Sender<MessageFromPool>,
+    live_count: LiveWorkers,
+}
+
+struct LiveWorkers(Arc<AtomicUsize>);
+
+impl LiveWorkers {
+    fn new(count: usize) -> Self {
+        LiveWorkers(Arc::new(AtomicUsize::new(count)))
+    }
+
+    fn dec(&self) {
+        self.0.fetch_sub(1, atomic::Ordering::SeqCst);
+    }
+
+    /// *Not* guaranteed to be atomic in its answer.
+    fn read(&self) -> usize {
+        self.0.load(atomic::Ordering::SeqCst)
+    }
+
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
 }
 
 impl WorkerPool {
@@ -106,8 +131,20 @@ impl WorkerPool {
         let num_workers = size.get();
         let mut workers = Vec::with_capacity(num_workers);
 
+        let live_count = LiveWorkers::new(num_workers);
+        tracing::debug!("Starting workers with live count {}", live_count.read());
+
         let (worker_msg_tx, worker_msg_rx) = mpsc::channel();
         let shared_worker_msg_rx = Arc::new(Mutex::new(worker_msg_rx));
+
+        let mark_worker_complete = {
+            let live_count: LiveWorkers = live_count.clone();
+            move || {
+                live_count.dec();
+                tracing::debug!("worker done, {} left", live_count.read());
+            }
+        };
+        let mark_worker_complete: MarkWorkerComplete = Arc::new(Box::new(mark_worker_complete));
 
         {
             // Provision the first worker independently, so that if we need to generate a manifest,
@@ -116,6 +153,7 @@ impl WorkerPool {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let notify_result = Arc::clone(&notify_result);
             let get_next_work = Arc::clone(&get_next_work);
+            let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
@@ -126,6 +164,7 @@ impl WorkerPool {
                 work_timeout,
                 work_retries,
                 notify_manifest,
+                mark_worker_complete,
             };
 
             workers.push(ThreadWorker::new(runner_kind.clone(), worker_env));
@@ -136,6 +175,7 @@ impl WorkerPool {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let notify_result = Arc::clone(&notify_result);
             let get_next_work = Arc::clone(&get_next_work);
+            let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
@@ -146,6 +186,7 @@ impl WorkerPool {
                 work_timeout,
                 work_retries,
                 notify_manifest: None,
+                mark_worker_complete,
             };
 
             workers.push(ThreadWorker::new(runner_kind.clone(), worker_env));
@@ -155,7 +196,14 @@ impl WorkerPool {
             active: true,
             workers,
             worker_msg_tx,
+            live_count,
         }
+    }
+
+    /// Answers whether there are any workers that are still alive.
+    /// Not guaranteed to be correct atomically.
+    pub fn workers_alive(&self) -> bool {
+        self.live_count.read() > 0
     }
 
     pub fn shutdown(&mut self) {
@@ -210,6 +258,7 @@ struct WorkerEnv {
     context: WorkerContext,
     work_timeout: Duration,
     work_retries: u8,
+    mark_worker_complete: MarkWorkerComplete,
 }
 
 impl ThreadWorker {
@@ -244,6 +293,7 @@ fn start_generic_test_runner(
         // TODO: actually use these
         work_timeout: _,
         work_retries: _,
+        mark_worker_complete,
     } = env;
 
     let notify_manifest = notify_manifest
@@ -273,7 +323,11 @@ fn start_generic_test_runner(
         notify_manifest,
         get_next_work,
         send_test_result,
-    )
+    )?;
+
+    mark_worker_complete();
+
+    Ok(())
 }
 
 fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: ManifestMessage) {
@@ -286,6 +340,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         work_timeout,
         work_retries,
         notify_manifest,
+        mark_worker_complete,
     } = env;
 
     if let Some(notify_manifest) = notify_manifest {
@@ -298,7 +353,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
 
         let (test_case, work_context, invocation_id, work_id) = match parent_message {
             Ok(MessageFromPool::Shutdown) => {
-                return;
+                break;
             }
             Err(mpsc::TryRecvError::Disconnected) => panic!("Pool died before worker did"),
             Err(mpsc::TryRecvError::Empty) => {
@@ -309,7 +364,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                 match get_next_work() {
                     NextWork::EndOfWork => {
                         // Shut down the worker
-                        return;
+                        break;
                     }
                     NextWork::Work {
                         test_case,
@@ -357,6 +412,8 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
             break 'attempts;
         }
     }
+
+    mark_worker_complete()
 }
 
 #[inline(always)]
