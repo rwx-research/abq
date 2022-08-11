@@ -15,7 +15,8 @@ jobs:
         uses: actions-rs/toolchain@v1.0.7
         with:
           profile: minimal
-          toolchain: stable
+          # Keep up-to-date with rust-toolchain.toml until https://github.com/actions-rs/toolchain/pull/209 lands.
+          toolchain: 1.62.1
           override: true
           components: rustfmt
 
