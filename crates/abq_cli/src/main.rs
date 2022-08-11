@@ -7,6 +7,7 @@ use std::{net::SocketAddr, thread};
 
 use abq_queue::invoke::invoke_work;
 use abq_utils::net_protocol::workers::{InvocationId, NativeTestRunnerParams, RunnerKind};
+use abq_workers::negotiate::QueueNegotiatorHandle;
 use clap::Parser;
 
 use args::{default_num_workers, Cli, Command};
@@ -31,16 +32,18 @@ fn main() -> anyhow::Result<()> {
             queue_addr,
             test_run,
             num,
-        } => workers::start_workers_forever(num, working_dir, queue_addr, test_run),
+        } => {
+            let queue_negotiator = QueueNegotiatorHandle::ask_queue(queue_addr)?;
+            workers::start_workers_forever(num, working_dir, queue_negotiator, test_run)
+        }
         Command::Test {
             args,
             test_id,
             queue_addr,
-            negotiator_addr,
             reporter: reporters,
         } => {
             let runner_params = validate_abq_test_args(args)?;
-            let abq = validate_and_find_abq(queue_addr, negotiator_addr)?;
+            let abq = find_or_create_abq(queue_addr)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
             run_tests(runner, abq, test_id, reporters)
         }
@@ -66,23 +69,13 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
     })
 }
 
-fn validate_and_find_abq(
-    queue_addr: Option<SocketAddr>,
-    negotiator_addr: Option<SocketAddr>,
-) -> Result<AbqInstance, clap::Error> {
-    use clap::{CommandFactory, ErrorKind};
-    match (queue_addr, negotiator_addr) {
-        (Some(queue_addr), Some(negotiator_addr)) => {
-            Ok(instance::get_abq(Some((queue_addr, negotiator_addr))))
+fn find_or_create_abq(opt_queue_addr: Option<SocketAddr>) -> anyhow::Result<AbqInstance> {
+    match opt_queue_addr {
+        Some(queue_addr) => {
+            let instance = AbqInstance::from_remote(queue_addr)?;
+            Ok(instance)
         }
-        (None, None) => Ok(instance::get_abq(None)),
-        _ => {
-            let mut cmd = Cli::command();
-            Err(cmd.error(
-                ErrorKind::MissingRequiredArgument,
-                "queue-addr must be supplied with negotiator-addr",
-            ))
-        }
+        None => Ok(AbqInstance::new_ephemeral()),
     }
 }
 
@@ -117,9 +110,12 @@ fn run_tests(
 
     let opt_workers = if start_in_process_workers {
         let working_dir = std::env::current_dir().expect("no working directory");
-        let negotiator_addr = abq.negotiator_addr();
-        let workers =
-            workers::start_workers(default_num_workers(), working_dir, negotiator_addr, test_id)?;
+        let workers = workers::start_workers(
+            default_num_workers(),
+            working_dir,
+            abq.negotiator_handle(),
+            test_id,
+        )?;
         Some(workers)
     } else {
         println!("Starting test run with ID {}", test_id);

@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::thread;
@@ -13,7 +12,7 @@ use signal_hook::iterator::Signals;
 pub fn start_workers(
     num_workers: NonZeroUsize,
     working_dir: PathBuf,
-    queue_negotiator_addr: SocketAddr,
+    queue_negotiator: QueueNegotiatorHandle,
     invocation_id: InvocationId,
 ) -> anyhow::Result<WorkerPool> {
     abq_workers::workers::init();
@@ -27,8 +26,6 @@ pub fn start_workers(
         work_timeout: Duration::from_secs(30),
         work_retries: 2,
     };
-
-    let queue_negotiator = QueueNegotiatorHandle::from_raw_address(queue_negotiator_addr)?;
 
     tracing::debug!(
         "Workers attaching to queue negotiator {}",
@@ -49,16 +46,11 @@ pub fn start_workers(
 pub fn start_workers_forever(
     num_workers: NonZeroUsize,
     working_dir: PathBuf,
-    queue_negotiator_addr: SocketAddr,
+    queue_negotiator: QueueNegotiatorHandle,
     invocation_id: InvocationId,
 ) -> ! {
-    let mut worker_pool = start_workers(
-        num_workers,
-        working_dir,
-        queue_negotiator_addr,
-        invocation_id,
-    )
-    .unwrap();
+    let mut worker_pool =
+        start_workers(num_workers, working_dir, queue_negotiator, invocation_id).unwrap();
 
     const POLL_WAIT_TIME: Duration = Duration::from_millis(10);
     let mut term_signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();

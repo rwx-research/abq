@@ -240,6 +240,8 @@ pub mod queue {
     /// A message sent to the queue.
     #[derive(Serialize, Deserialize)]
     pub enum Message {
+        /// An ask to return the address of the queue negotiator.
+        NegotiatorAddr,
         /// An ask to run some work by an invoker.
         InvokeWork(InvokeWork),
         /// A work manifest for a given invocation.
