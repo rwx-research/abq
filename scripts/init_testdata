@@ -13,4 +13,8 @@ if [ -z "$NO_ABQ_JEST" ]; then
   pushd testdata/jest/npm-jest-project
   npm install --include=dev
   popd
+
+  pushd testdata/jest/npm-jest-project-with-failures
+  npm install --include=dev
+  popd
 fi

@@ -21,8 +21,8 @@ fn abq_binary() -> PathBuf {
     }
 }
 
-fn npm_jest_project_path() -> PathBuf {
-    PathBuf::from(WORKSPACE).join("testdata/jest/npm-jest-project")
+fn testdata_project(subpath: impl AsRef<Path>) -> PathBuf {
+    PathBuf::from(WORKSPACE).join("testdata").join(subpath)
 }
 
 struct CmdOutput {
@@ -96,7 +96,7 @@ fn yarn_jest_auto_workers_without_failure() {
         exit_status,
     } = run_abq_in(
         ["test", "--reporter", "dot", "--", "yarn", "jest"],
-        &npm_jest_project_path(),
+        &testdata_project("jest/npm-jest-project"),
     );
 
     assert!(exit_status.success());
@@ -110,7 +110,7 @@ fn yarn_jest_separate_queue_workers_test_without_failure() {
     let queue_addr = format!("0.0.0.0:{port}");
     let test_id = InvocationId::new().to_string();
 
-    let npm_jest_project_path = npm_jest_project_path();
+    let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
     let mut queue_proc = spawn_abq(["start", "--bind", &queue_addr]);
 
@@ -134,6 +134,7 @@ fn yarn_jest_separate_queue_workers_test_without_failure() {
         &npm_jest_project_path.display().to_string(),
         &test_id,
     ]);
+
     let CmdOutput {
         stdout,
         stderr,
@@ -164,4 +165,24 @@ fn yarn_jest_separate_queue_workers_test_without_failure() {
 
     // Must kill the queue because it sits around forever, waiting for new requests.
     queue_proc.kill().expect("queue already dead");
+}
+
+#[test]
+fn yarn_jest_auto_workers_with_failing_tests() {
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq_in(
+        ["test", "--reporter", "dot", "--", "yarn", "jest"],
+        &testdata_project("jest/npm-jest-project-with-failures"),
+    );
+
+    let code = exit_status.code().expect("process killed");
+    assert_eq!(code, 1);
+
+    let mut stdout_lines = stdout.lines();
+    assert_eq!(stdout_lines.next().unwrap(), "F");
+
+    assert!(stderr.is_empty());
 }

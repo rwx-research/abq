@@ -13,10 +13,15 @@ use clap::Parser;
 use args::{default_num_workers, Cli, Command};
 
 use instance::AbqInstance;
-use reporting::{ReporterKind, Reporters};
+use reporting::{ExitCode, ReporterKind, SuiteReporters};
 use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> anyhow::Result<()> {
+    let exit_code = abq_main()?;
+    std::process::exit(exit_code.get());
+}
+
+fn abq_main() -> anyhow::Result<ExitCode> {
     let tracing_fmt = fmt()
         .with_span_events(fmt::format::FmtSpan::ACTIVE)
         .with_env_filter(EnvFilter::from_env("ABQ_LOG"))
@@ -84,15 +89,15 @@ fn run_tests(
     abq: AbqInstance,
     opt_test_id: Option<InvocationId>,
     reporters: Vec<ReporterKind>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
-    let mut reporters = Reporters::new(reporters, test_suite_name);
+    let mut reporters = SuiteReporters::new(reporters, test_suite_name);
 
     let on_result = {
         // Safety: rustc wants the `collector` to be live for the lifetime of the program because
         // `work_results_thread` might escape. But, we know that `work_results_thread` won't
         // escape; it vanishes at the end of this function, before `collector` is dropped.
-        let reporters: &'static mut Reporters = unsafe { std::mem::transmute(&mut reporters) };
+        let reporters: &'static mut SuiteReporters = unsafe { std::mem::transmute(&mut reporters) };
 
         move |_, test_result| {
             // TODO: is there a reasonable way to surface the error?
@@ -131,9 +136,9 @@ fn run_tests(
         .expect("results thread should always be free");
 
     // TODO: is there a reasonable way to surface the errors?
-    let _opt_error = reporters.finish();
+    let (suite_result, _errors) = reporters.finish();
 
-    Ok(())
+    Ok(suite_result.suggested_exit_code)
 }
 
 #[cfg(test)]

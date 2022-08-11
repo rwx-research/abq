@@ -59,17 +59,45 @@ pub enum ReportingError {
     FailedToWrite,
 }
 
+pub(crate) struct ExitCode(i32);
+
+impl ExitCode {
+    pub fn get(&self) -> i32 {
+        self.0
+    }
+}
+
+pub(crate) struct SuiteResult {
+    /// On the whole, did this test suite pass or fail?
+    pub success: bool,
+    /// Exit code suggested for the test suite.
+    pub suggested_exit_code: ExitCode,
+}
+
+impl SuiteResult {
+    fn account_result(&mut self, test_result: &TestResult) {
+        match test_result.status {
+            Status::Failure | Status::Error => {
+                self.success = false;
+                self.suggested_exit_code = ExitCode(1);
+            }
+
+            Status::Pending | Status::Skipped | Status::Success => {}
+        }
+    }
+}
+
 /// A [`Reporter`] defines a way to emit abq test results.
 ///
 /// A reporter is allowed to be side-effectful.
-trait Reporter: Send {
+pub(crate) trait Reporter: Send {
     /// Consume the next test result.
     fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError>;
 
     /// Consume the reporter, and perform any needed finalization steps.
     ///
     /// This method is only called when all test results for a run have been consumed.
-    fn finish(self: Box<Self>) -> Result<(), ReportingError>;
+    fn finish(self: Box<Self>, overall_result: &SuiteResult) -> Result<(), ReportingError>;
 }
 
 fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> {
@@ -110,7 +138,7 @@ impl Reporter for LineReporter {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(mut self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
         write_summary_results(&mut self.buffer, self.delayed_failure_reports)?;
 
         self.buffer
@@ -157,7 +185,7 @@ impl Reporter for DotReporter {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(mut self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
         if !self.delayed_failure_reports.is_empty()
             && self.num_results % DOT_REPORTER_LINE_LIMIT != 0
         {
@@ -188,7 +216,7 @@ impl Reporter for JUnitXmlReporter {
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
         let fd = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -219,24 +247,36 @@ fn reporter_from_kind(kind: ReporterKind, test_suite_name: &str) -> Box<dyn Repo
     }
 }
 
-pub struct Reporters(Vec<Box<dyn Reporter>>);
+pub(crate) struct SuiteReporters {
+    reporters: Vec<Box<dyn Reporter>>,
+    overall_result: SuiteResult,
+}
 
-impl Reporters {
-    pub fn new(kinds: impl IntoIterator<Item = ReporterKind>, test_suite_name: &str) -> Self {
-        Self(
-            kinds
+impl SuiteReporters {
+    pub fn new(
+        reporter_kinds: impl IntoIterator<Item = ReporterKind>,
+        test_suite_name: &str,
+    ) -> Self {
+        Self {
+            reporters: reporter_kinds
                 .into_iter()
                 .map(|kind| reporter_from_kind(kind, test_suite_name))
                 .collect(),
-        )
+            overall_result: SuiteResult {
+                success: true,
+                suggested_exit_code: ExitCode(0),
+            },
+        }
     }
 
     pub fn push_result(&mut self, test_result: &TestResult) -> Result<(), Vec<ReportingError>> {
         let errors: Vec<_> = self
-            .0
+            .reporters
             .iter_mut()
             .filter_map(|reporter| reporter.push_result(test_result).err())
             .collect();
+
+        self.overall_result.account_result(test_result);
 
         if errors.is_empty() {
             Ok(())
@@ -245,18 +285,18 @@ impl Reporters {
         }
     }
 
-    pub fn finish(self) -> Result<(), Vec<ReportingError>> {
-        let errors: Vec<_> = self
-            .0
+    pub fn finish(self) -> (SuiteResult, Vec<ReportingError>) {
+        let Self {
+            reporters,
+            overall_result,
+        } = self;
+
+        let errors: Vec<_> = reporters
             .into_iter()
-            .filter_map(|reporter| reporter.finish().err())
+            .filter_map(|reporter| reporter.finish(&overall_result).err())
             .collect();
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        (overall_result, errors)
     }
 }
 
@@ -366,8 +406,26 @@ fn default_result() -> TestResult {
 }
 
 #[cfg(test)]
+fn suite_failure() -> SuiteResult {
+    SuiteResult {
+        success: false,
+        suggested_exit_code: ExitCode(1),
+    }
+}
+
+#[cfg(test)]
+fn suite_success() -> SuiteResult {
+    SuiteResult {
+        success: true,
+        suggested_exit_code: ExitCode(0),
+    }
+}
+
+#[cfg(test)]
 mod test_line_reporter {
     use abq_utils::net_protocol::runners::{Status, TestResult};
+
+    use crate::reporting::{suite_failure, suite_success};
 
     use super::{default_result, LineReporter, MockWriter, Reporter};
 
@@ -411,7 +469,7 @@ mod test_line_reporter {
             buffer,
             num_writes,
             num_flushes,
-        } = with_reporter(|reporter| reporter.finish().unwrap());
+        } = with_reporter(|reporter| reporter.finish(&suite_success()).unwrap());
 
         assert!(buffer.is_empty());
         assert_eq!(num_writes, 0);
@@ -466,7 +524,7 @@ mod test_line_reporter {
                     ..default_result()
                 })
                 .unwrap();
-            reporter.finish().unwrap();
+            reporter.finish(&suite_failure()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -492,7 +550,7 @@ mod test_line_reporter {
 mod test_dot_reporter {
     use abq_utils::net_protocol::runners::{Status, TestResult};
 
-    use crate::reporting::DOT_REPORTER_LINE_LIMIT;
+    use crate::reporting::{suite_failure, suite_success, DOT_REPORTER_LINE_LIMIT};
 
     use super::{default_result, DotReporter, MockWriter, Reporter};
 
@@ -537,7 +595,7 @@ mod test_dot_reporter {
             buffer,
             num_writes,
             num_flushes,
-        } = with_reporter(|reporter| reporter.finish().unwrap());
+        } = with_reporter(|reporter| reporter.finish(&suite_success()).unwrap());
 
         assert!(buffer.is_empty());
         assert_eq!(num_writes, 0);
@@ -592,7 +650,7 @@ mod test_dot_reporter {
                     ..default_result()
                 })
                 .unwrap();
-            reporter.finish().unwrap();
+            reporter.finish(&suite_failure()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -633,7 +691,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&suite_success()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -656,7 +714,7 @@ mod test_dot_reporter {
                 reporter.push_result(&default_result()).unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&suite_success()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -687,7 +745,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&suite_failure()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -724,7 +782,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&suite_failure()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");

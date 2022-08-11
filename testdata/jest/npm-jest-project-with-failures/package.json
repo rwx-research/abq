@@ -1,0 +1,13 @@
+{
+  "name": "npm-jest-project",
+  "version": "0.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest"
+  },
+  "author": "",
+  "devDependencies": {
+    "jest": "file:../../../native-runners/abq-jest/packages/jest"
+  }
+}
