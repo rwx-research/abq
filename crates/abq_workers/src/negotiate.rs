@@ -217,20 +217,30 @@ pub struct QueueNegotiator {
 }
 
 /// Address of a queue negotiator.
+#[derive(Clone, Copy)]
 pub struct QueueNegotiatorHandle(SocketAddr);
 
 #[derive(Debug, Error)]
-#[error("not an address to a queue negotiator")]
-pub struct NotAQueueNegotiator;
+pub enum QueueNegotiatorHandleError {
+    #[error("could not connect to the queue")]
+    CouldNotConnect,
+}
 
 impl QueueNegotiatorHandle {
     pub fn get_address(&self) -> SocketAddr {
         self.0
     }
 
-    pub fn from_raw_address(addr: SocketAddr) -> Result<Self, NotAQueueNegotiator> {
-        // TODO: actually verify that the address is a queue negotiator
-        Ok(Self(addr))
+    pub fn ask_queue(queue_addr: SocketAddr) -> Result<Self, QueueNegotiatorHandleError> {
+        use QueueNegotiatorHandleError::*;
+
+        let mut conn = TcpStream::connect(queue_addr).map_err(|_| CouldNotConnect)?;
+        net_protocol::write(&mut conn, net_protocol::queue::Message::NegotiatorAddr)
+            .map_err(|_| CouldNotConnect)?;
+        let negotiator_addr: SocketAddr =
+            net_protocol::read(&mut conn).map_err(|_| CouldNotConnect)?;
+
+        Ok(Self(negotiator_addr))
     }
 }
 
@@ -251,7 +261,7 @@ impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
     pub fn new<GetAssignedRun>(
         public_ip: IpAddr,
-        bind_addr: SocketAddr,
+        listener: TcpListener,
         queue_new_work_addr: SocketAddr,
         queue_results_addr: SocketAddr,
         mut get_assigned_run: GetAssignedRun,
@@ -259,9 +269,6 @@ impl QueueNegotiator {
     where
         GetAssignedRun: FnMut(InvocationId) -> AssignedRun + Send + 'static,
     {
-        // TODO: error handling when `bind_addr` is taken.
-        tracing::debug!("Connecting to {}", bind_addr);
-        let listener = TcpListener::bind(bind_addr).unwrap();
         let addr = listener.local_addr().unwrap();
 
         let advertised_queue_new_work_addr = publicize_addr(queue_new_work_addr, public_ip);
@@ -527,7 +534,7 @@ mod test {
 
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
-            "0.0.0.0:0".parse().unwrap(),
+            TcpListener::bind("0.0.0.0:0").unwrap(),
             next_work_addr,
             results_addr,
             get_assigned_run,

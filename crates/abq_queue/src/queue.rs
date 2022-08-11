@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use abq_utils::flatten_manifest;
+use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::queue::InvokerResponse;
 use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
 use abq_utils::net_protocol::workers::{RunnerKind, WorkContext};
@@ -195,8 +196,8 @@ impl Abq {
         self.server_addr
     }
 
-    pub fn start(negoatiator_bind_addr: SocketAddr, public_ip: IpAddr) -> Self {
-        start_queue(negoatiator_bind_addr, public_ip)
+    pub fn start(bind_addr: SocketAddr, public_ip: IpAddr) -> Self {
+        start_queue(bind_addr, public_ip)
     }
 
     pub fn wait_forever(&mut self) {
@@ -253,18 +254,22 @@ enum WorkerSchedulerMsg {
 /// Initializes a queue, binding the queue negotiator to the given address.
 /// All other public channels to the queue (the work and results server) are exposed
 /// on the same host IP address as the negotiator is.
-fn start_queue(negoatiator_bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
-    let bind_hostname = negoatiator_bind_addr.ip();
+fn start_queue(bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
+    let bind_hostname = bind_addr.ip();
 
     let queues: SharedInvocationQueues = Default::default();
 
-    let server_listener = TcpListener::bind((bind_hostname, 0)).unwrap();
+    let server_listener = TcpListener::bind(bind_addr).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
+
+    let negotiator_listener = TcpListener::bind((bind_hostname, 0)).unwrap();
+    let negotiator_addr = negotiator_listener.local_addr().unwrap();
+    let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
     let (send_worker, recv_worker) = mpsc::channel();
     let server_handle = thread::spawn({
         let queue_server = QueueServer::new(Arc::clone(&queues));
-        move || queue_server.start_on(server_listener)
+        move || queue_server.start_on(server_listener, public_negotiator_addr)
     });
 
     let new_work_server = TcpListener::bind((bind_hostname, 0)).unwrap();
@@ -300,7 +305,7 @@ fn start_queue(negoatiator_bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
     };
     let negotiator = QueueNegotiator::new(
         public_ip,
-        negoatiator_bind_addr,
+        negotiator_listener,
         new_work_server_addr,
         server_addr,
         choose_run_for_worker,
@@ -343,7 +348,7 @@ impl QueueServer {
         }
     }
 
-    fn start_on(mut self, server_listener: TcpListener) {
+    fn start_on(mut self, server_listener: TcpListener, public_negotiator_addr: SocketAddr) {
         // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
         // there are no active connections into the queue.
         server_listener
@@ -363,6 +368,10 @@ impl QueueServer {
                     let msg = net_protocol::read(&mut client).expect("Failed to read message");
 
                     match msg {
+                        Message::NegotiatorAddr => {
+                            self.handle_negotiator_addr(client, public_negotiator_addr)
+                                .expect("failed to send");
+                        }
                         Message::InvokeWork(invoke_work) => {
                             self.handle_invoked_work(client, invoke_work);
                         }
@@ -393,6 +402,16 @@ impl QueueServer {
                 }
             }
         }
+    }
+
+    #[inline(always)]
+    #[instrument(level = "trace", skip(self, invoker, public_negotiator_addr))]
+    fn handle_negotiator_addr(
+        &self,
+        mut invoker: TcpStream,
+        public_negotiator_addr: SocketAddr,
+    ) -> Result<(), io::Error> {
+        net_protocol::write(&mut invoker, public_negotiator_addr)
     }
 
     #[instrument(level = "trace", skip(self, invoker))]

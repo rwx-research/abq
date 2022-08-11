@@ -77,18 +77,14 @@ pub enum Command {
         #[clap(long, required = false)]
         test_id: Option<InvocationId>,
 
-        // TODO: have folks specify queue-addr, and determine the queue and negotiator based on that
         /// Address of the queue to send the test request to.
         ///
-        /// Must be specified if and only if `queue_addr` is also specified.
+        /// If specified, assumes that abq workers will start as seperate processes connected to
+        /// the same queue.
+        ///
+        /// If not specified, uses an in-process queue and workers.
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
-
-        /// Address workers should use to connect to the queue.
-        ///
-        /// Must be specified if and only if `queue_addr` is also specified.
-        #[clap(long, required = false)]
-        negotiator_addr: Option<SocketAddr>,
 
         /// Test result reporter to use for a test run.
         #[clap(long, default_value = "line")]
