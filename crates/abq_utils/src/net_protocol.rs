@@ -286,3 +286,41 @@ pub fn write<T: serde::Serialize>(writer: &mut impl Write, msg: T) -> Result<(),
     writer.write_all(&msg_buf)?;
     Ok(())
 }
+
+/// Like [read], but async.
+pub async fn async_read<R, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> Result<T, std::io::Error>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    let mut msg_size_buf = [0; 4];
+    reader.read_exact(&mut msg_size_buf).await?;
+    let msg_size = u32::from_be_bytes(msg_size_buf);
+
+    let mut msg_buf = vec![0; msg_size as usize];
+    reader.read_exact(&mut msg_buf).await?;
+
+    let msg = serde_json::from_slice(&msg_buf)?;
+    Ok(msg)
+}
+
+/// Like [write], but async.
+pub async fn async_write<R, T: serde::Serialize>(
+    writer: &mut R,
+    msg: T,
+) -> Result<(), std::io::Error>
+where
+    R: tokio::io::AsyncWriteExt + Unpin,
+{
+    let msg_json = serde_json::to_vec(&msg)?;
+
+    let msg_size = msg_json.len();
+    let msg_size_buf = u32::to_be_bytes(msg_size as u32);
+
+    let mut msg_buf = Vec::new();
+    msg_buf.extend_from_slice(&msg_size_buf);
+    msg_buf.extend_from_slice(&msg_json);
+    writer.write_all(&msg_buf).await?;
+    Ok(())
+}
