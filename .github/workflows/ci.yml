@@ -57,7 +57,7 @@ jobs:
         uses: actions-rs/cargo@v1.0.3
         with:
           command: clippy
-          args: -- -D warnings
+          args: --workspace --tests --release -- --deny warnings
 
       # setup testdata
       - uses: actions/setup-node@v3

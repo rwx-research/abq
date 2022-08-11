@@ -27,4 +27,4 @@ thiserror = "1.0.32"
 test-abq-jest = []
 
 [dev-dependencies]
-insta = "1.18.0"
+insta = { version = "1.18.0", features = ["json"] }
