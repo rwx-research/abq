@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::error::Error;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::TryRecvError;
@@ -17,6 +18,8 @@ use abq_utils::net_protocol::{
     workers::{InvocationId, NextWork, WorkId},
 };
 use abq_workers::negotiate::{AssignedRun, QueueNegotiator, QueueNegotiatorHandle};
+
+use thiserror::Error;
 use tracing::instrument;
 
 // TODO: we probably want something more sophisticated here, in particular a concurrent
@@ -183,7 +186,7 @@ pub fn init() {
 
 pub struct Abq {
     server_addr: SocketAddr,
-    server_handle: Option<JoinHandle<()>>,
+    server_handle: Option<JoinHandle<Result<(), QueueServerError>>>,
     send_worker: mpsc::Sender<WorkerSchedulerMsg>,
     work_scheduler_handle: Option<JoinHandle<()>>,
     negotiator: QueueNegotiator,
@@ -218,7 +221,9 @@ impl Abq {
 
         self.negotiator.shutdown();
 
-        self.server_handle
+        // TODO: do something with the result
+        let _server_result = self
+            .server_handle
             .take()
             .expect("server handle must be available during Drop")
             .join()
@@ -324,9 +329,14 @@ fn start_queue(bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
 
 static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 
-// invocation -> (results sender, responder thread handle)
-type ActiveInvocations =
-    HashMap<InvocationId, (mpsc::Sender<InvocationResponderMsg>, JoinHandle<()>)>;
+/// invocation -> (results sender, responder thread handle)
+// TODO: consider using DashMap
+type ActiveInvocations = Arc<Mutex<HashMap<InvocationId, TcpStream>>>;
+
+/// Cache of how much is left in the queue for a particular invocation, so that we don't have to
+/// lock the queue all the time.
+// TODO: consider using DashMap
+type WorkLeftForInvocations = Arc<Mutex<HashMap<InvocationId, usize>>>;
 
 /// Central server listening for new test run invocations and results.
 struct QueueServer {
@@ -334,9 +344,22 @@ struct QueueServer {
     /// When all results for a particular invocation are communicated, we want to make sure that the
     /// responder thread is closed and that the entry here is dropped.
     active_invocations: ActiveInvocations,
-    /// Cache of how much is left in the queue for a particular invocation, so that we don't have to
-    /// lock the queue all the time.
-    work_left_for_invocations: HashMap<InvocationId, usize>,
+    work_left_for_invocations: WorkLeftForInvocations,
+}
+
+/// An error that happens in the construction or execution of the queue server.
+///
+/// Does not include errors in the handling of requests to the queue, but does include errors in
+/// the acception or dispatch of connections.
+#[derive(Debug, Error)]
+enum QueueServerError {
+    /// An IO-related error.
+    #[error("{0}")]
+    Io(#[from] io::Error),
+
+    /// Any other opaque error that occured.
+    #[error("{0}")]
+    Other(#[from] Box<dyn Error + Send + Sync>),
 }
 
 impl QueueServer {
@@ -348,186 +371,188 @@ impl QueueServer {
         }
     }
 
-    fn start_on(mut self, server_listener: TcpListener, public_negotiator_addr: SocketAddr) {
-        // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
-        // there are no active connections into the queue.
-        server_listener
-            .set_nonblocking(true)
-            .expect("Failed to set stream as non-blocking");
+    fn start_on(
+        self,
+        server_listener: TcpListener,
+        public_negotiator_addr: SocketAddr,
+    ) -> Result<(), QueueServerError> {
+        // Before we hand the server listener over to the async runtime, we must set it into
+        // non-blocking mode (as the async runtime will not block!)
+        server_listener.set_nonblocking(true)?;
 
-        for client in server_listener.incoming() {
-            match client {
-                Ok(mut client) => {
-                    // Reads and writes to the client will be buffered, so we must make sure
-                    // the stream is blocking. Note that we inherit non-blocking from the server
-                    // listener, but that this adjustment does not affect the server.
-                    client
-                        .set_nonblocking(false)
-                        .expect("Failed to set client stream as blocking");
+        // Create a new tokio runtime solely for handling requests that come into the queue server.
+        //
+        // Note that all of the work done by the queue is purely coordination, so we're heavily I/O
+        // bound. As such we put all this work on one thread.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
 
-                    let msg = net_protocol::read(&mut client).expect("Failed to read message");
+        // Start the server in the tokio runtime.
+        let server_result: Result<(), QueueServerError> = rt.block_on(async {
+            // Initialize the async server listener.
+            let server_listener = tokio::net::TcpListener::from_std(server_listener)?;
 
-                    match msg {
-                        Message::NegotiatorAddr => {
-                            self.handle_negotiator_addr(client, public_negotiator_addr)
+            loop {
+                let (client, _) = server_listener.accept().await?;
+                let mut client = client.into_std()?;
+
+                // Reads and writes to the client will be buffered, so we must make sure
+                // the stream is blocking.
+                client
+                    .set_nonblocking(false)
+                    .expect("Failed to set client stream as blocking");
+
+                // First, grab the message - in case it relates to shutdowns, which we need to do
+                // in-band.
+                let msg = net_protocol::read(&mut client)?;
+
+                match msg {
+                    Message::NegotiatorAddr => {
+                        tokio::spawn(async move {
+                            Self::handle_negotiator_addr(client, public_negotiator_addr)
                                 .expect("failed to send");
-                        }
-                        Message::InvokeWork(invoke_work) => {
-                            self.handle_invoked_work(client, invoke_work);
-                        }
-                        Message::Manifest(invocation_id, manifest) => {
-                            self.handle_manifest(invocation_id, manifest);
-                        }
-                        Message::WorkerResult(invocation_id, work_id, result) => {
-                            self.handle_worker_result(invocation_id, work_id, result);
-                        }
-                        Message::Shutdown(Shutdown {}) => {
-                            break;
-                        }
+                        });
                     }
-                }
-                Err(ref e) => {
-                    match e.kind() {
-                        io::ErrorKind::WouldBlock => {
-                            // Sleep and wait for the next message.
-                            //
-                            // Idea for (much) later: if it's been a long time since the last Work
-                            // message, it's likely that there are a burst of pending jobs that need to
-                            // be completed. In this case we may want to consider sleeping longer than
-                            // the default timeout.
-                            thread::sleep(POLL_WAIT_TIME);
-                        }
-                        _ => panic!("Unhandled IO error: {e:?}"),
+                    Message::InvokeWork(invoke_work) => {
+                        let queues = Arc::clone(&self.queues);
+                        let invocations = Arc::clone(&self.active_invocations);
+                        tokio::spawn(async move {
+                            let _result =
+                                Self::handle_invoked_work(invocations, queues, client, invoke_work);
+                        });
+                    }
+                    Message::Manifest(invocation_id, manifest) => {
+                        let queues = Arc::clone(&self.queues);
+                        let work_left = Arc::clone(&self.work_left_for_invocations);
+                        Self::handle_manifest(queues, work_left, invocation_id, manifest);
+                    }
+                    Message::WorkerResult(invocation_id, work_id, result) => {
+                        let queues = Arc::clone(&self.queues);
+                        let invocations = Arc::clone(&self.active_invocations);
+                        let work_left = Arc::clone(&self.work_left_for_invocations);
+                        tokio::spawn(async move {
+                            let _result = Self::handle_worker_result(
+                                queues,
+                                invocations,
+                                work_left,
+                                invocation_id,
+                                work_id,
+                                result,
+                            );
+                        });
+                    }
+                    Message::Shutdown(Shutdown {}) => {
+                        break;
                     }
                 }
             }
-        }
+
+            Ok(())
+        });
+
+        server_result
     }
 
     #[inline(always)]
-    #[instrument(level = "trace", skip(self, invoker, public_negotiator_addr))]
+    #[instrument(level = "trace", skip(invoker, public_negotiator_addr))]
     fn handle_negotiator_addr(
-        &self,
         mut invoker: TcpStream,
         public_negotiator_addr: SocketAddr,
-    ) -> Result<(), io::Error> {
-        net_protocol::write(&mut invoker, public_negotiator_addr)
+    ) -> Result<(), Box<dyn Error>> {
+        net_protocol::write(&mut invoker, public_negotiator_addr)?;
+        Ok(())
     }
 
-    #[instrument(level = "trace", skip(self, invoker))]
-    fn handle_invoked_work(&mut self, invoker: TcpStream, invoke_work: InvokeWork) {
+    #[instrument(level = "trace", skip(active_invocations, queues, invoker))]
+    fn handle_invoked_work(
+        active_invocations: ActiveInvocations,
+        queues: SharedInvocationQueues,
+        invoker: TcpStream,
+        invoke_work: InvokeWork,
+    ) -> Result<(), Box<dyn Error>> {
         let InvokeWork {
             invocation_id,
             runner,
         } = invoke_work;
 
-        // Spawn a new thread to communicate work results back to the invoker. The
-        // main queue (in this thread) will use a channel to communicate relevant
-        // results as they come in.
-        //
-        // Note that keeps the invoking stream open until all work results are sent
-        // back to the invoker.
-        let (results_tx, results_rx) = mpsc::channel();
-        let responder_handle =
-            thread::spawn(move || start_invocation_responder(invoker, results_rx));
-
-        let old_tx = self
-            .active_invocations
-            .insert(invocation_id, (results_tx, responder_handle));
+        let old_invoker = active_invocations
+            .lock()
+            .unwrap()
+            .insert(invocation_id, invoker);
         debug_assert!(
-            old_tx.is_none(),
-            "Existing transmitter for expected unique invocation id"
+            old_invoker.is_none(),
+            "Existing invoker for expected unique invocation id"
         );
 
         // Create a new work queue for this invocation.
-        self.queues
-            .lock()
-            .unwrap()
-            .create_queue(invocation_id, runner);
+        queues.lock().unwrap().create_queue(invocation_id, runner);
+
+        Ok(())
     }
 
-    #[instrument(level = "trace", skip(self))]
-    fn handle_manifest(&mut self, invocation_id: InvocationId, manifest: ManifestMessage) {
+    #[instrument(level = "trace", skip(queues, work_left_for_invocations))]
+    fn handle_manifest(
+        queues: SharedInvocationQueues,
+        work_left_for_invocations: WorkLeftForInvocations,
+        invocation_id: InvocationId,
+        manifest: ManifestMessage,
+    ) {
         // Record the manifest for this invocation in its appropriate queue.
         // TODO: actually record the manifest metadata
         let flat_manifest = flatten_manifest(manifest.manifest);
-        self.work_left_for_invocations
+        work_left_for_invocations
+            .lock()
+            .unwrap()
             .insert(invocation_id, flat_manifest.len());
 
-        self.queues
+        queues
             .lock()
             .unwrap()
             .add_manifest(invocation_id, flat_manifest);
     }
 
-    #[instrument(level = "trace", skip(self))]
+    #[instrument(
+        level = "trace",
+        skip(queues, active_invocations, work_left_for_invocations)
+    )]
     fn handle_worker_result(
-        &mut self,
+        queues: SharedInvocationQueues,
+        active_invocations: ActiveInvocations,
+        work_left_for_invocations: WorkLeftForInvocations,
         invocation_id: InvocationId,
         work_id: WorkId,
         result: TestResult,
-    ) {
-        let (results_tx, _) = self
-            .active_invocations
+    ) -> Result<(), Box<dyn Error>> {
+        let mut active_invocations = active_invocations.lock().unwrap();
+
+        let mut invoker_stream = active_invocations
             .get_mut(&invocation_id)
             .expect("invocation is not active");
 
-        results_tx
-            .send(InvocationResponderMsg::WorkResult(work_id, result))
-            .unwrap();
+        net_protocol::write(
+            &mut invoker_stream,
+            InvokerResponse::Result(work_id, result),
+        )?;
 
-        let work_left = self
-            .work_left_for_invocations
+        let mut work_left_for_invocations = work_left_for_invocations.lock().unwrap();
+        let work_left = work_left_for_invocations
             .get_mut(&invocation_id)
             .expect("invocation id not recorded, but we got a result for it?");
 
         *work_left -= 1;
         if *work_left == 0 {
-            // Results for this invocation are all done. Let the notifier thread
-            // know, and clean up all remenants of this invocation so as to avoid
-            // memory leaks.
-            let (results_tx, responder_handle) =
-                self.active_invocations.remove(&invocation_id).unwrap();
+            let mut invoker_stream = active_invocations.remove(&invocation_id).unwrap();
 
-            results_tx.send(InvocationResponderMsg::EndOfWork).unwrap();
-            responder_handle.join().unwrap();
+            net_protocol::write(&mut invoker_stream, InvokerResponse::EndOfResults)?;
+            invoker_stream.shutdown(std::net::Shutdown::Write).unwrap();
 
-            self.work_left_for_invocations.remove(&invocation_id);
-            self.queues.lock().unwrap().mark_complete(invocation_id);
+            work_left_for_invocations.remove(&invocation_id);
+            queues.lock().unwrap().mark_complete(invocation_id);
         }
-    }
-}
 
-/// Message to send to the invocation responder thread.
-enum InvocationResponderMsg {
-    WorkResult(WorkId, TestResult),
-    EndOfWork,
-}
-
-/// Communicates results of work back to an invoker as they are received by the queue.
-/// Once all the work submitted is sent back, the connection to the invoker is terminated.
-fn start_invocation_responder(
-    mut invoker: TcpStream,
-    results_rx: mpsc::Receiver<InvocationResponderMsg>,
-) {
-    loop {
-        match results_rx.recv() {
-            Ok(InvocationResponderMsg::WorkResult(work_id, work_result)) => {
-                net_protocol::write(&mut invoker, InvokerResponse::Result(work_id, work_result))
-                    .unwrap();
-            }
-            Ok(InvocationResponderMsg::EndOfWork) => break,
-            Err(_) => {
-                // TODO: there are many reasonable cases why there might be a receive error,
-                // including the invoker process was terminated.
-                // This needs to be handled gracefully, and we must tell the parent that it
-                // should drop the channel results are being sent over when it happens.
-                panic!("Invoker shutdown before all our messages were received")
-            }
-        }
+        Ok(())
     }
-    net_protocol::write(&mut invoker, InvokerResponse::EndOfResults).unwrap();
-    invoker.shutdown(std::net::Shutdown::Write).unwrap();
 }
 
 /// Sends work as workers request it.
