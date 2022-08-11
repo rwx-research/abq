@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::thread;
 use std::time::Duration;
 
 use abq_utils::net_protocol::workers::InvocationId;
@@ -10,6 +11,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 pub fn start_workers(
+    num_workers: NonZeroUsize,
     working_dir: PathBuf,
     queue_negotiator_addr: SocketAddr,
     invocation_id: InvocationId,
@@ -20,7 +22,7 @@ pub fn start_workers(
 
     // TODO: make this configurable
     let workers_config = WorkersConfig {
-        num_workers: NonZeroUsize::new(4).unwrap(),
+        num_workers,
         worker_context: context,
         work_timeout: Duration::from_secs(30),
         work_retries: 2,
@@ -45,22 +47,35 @@ pub fn start_workers(
 }
 
 pub fn start_workers_forever(
+    num_workers: NonZeroUsize,
     working_dir: PathBuf,
     queue_negotiator_addr: SocketAddr,
     invocation_id: InvocationId,
 ) -> ! {
-    let mut worker_pool = start_workers(working_dir, queue_negotiator_addr, invocation_id).unwrap();
+    let mut worker_pool = start_workers(
+        num_workers,
+        working_dir,
+        queue_negotiator_addr,
+        invocation_id,
+    )
+    .unwrap();
 
-    // Make sure the queue shuts down and the socket is unliked when the process dies.
+    const POLL_WAIT_TIME: Duration = Duration::from_millis(10);
     let mut term_signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
-    for _ in term_signals.forever() {
-        #[allow(unused_must_use)]
-        {
+
+    // Shut down the pool when
+    //   - all its workers are done
+    //   - we get a signal to shutdown
+    loop {
+        thread::sleep(POLL_WAIT_TIME);
+
+        let should_shutdown =
+            term_signals.pending().next().is_some() || !worker_pool.workers_alive();
+
+        if should_shutdown {
             worker_pool.shutdown();
             tracing::debug!("Workers shutdown");
             std::process::exit(0);
         }
     }
-
-    std::process::exit(102);
 }
