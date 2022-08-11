@@ -218,9 +218,6 @@ pub mod queue {
         workers::{InvocationId, RunnerKind, WorkId},
     };
 
-    #[derive(Serialize, Deserialize)]
-    pub struct Shutdown {}
-
     /// An ask to run some work by an invoker.
     #[derive(Serialize, Deserialize, Debug)]
     pub struct InvokeWork {
@@ -248,8 +245,6 @@ pub mod queue {
         Manifest(InvocationId, ManifestMessage),
         /// The result of some work from the queue.
         WorkerResult(InvocationId, WorkId, TestResult),
-        /// An ask to shutdown the queue.
-        Shutdown(Shutdown),
     }
 }
 

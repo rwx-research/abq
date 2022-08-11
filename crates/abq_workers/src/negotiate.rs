@@ -352,7 +352,7 @@ impl Drop for QueueNegotiator {
 
 #[cfg(test)]
 mod test {
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener};
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
@@ -362,7 +362,6 @@ mod test {
     use super::{AssignedRun, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
-    use abq_utils::net_protocol::queue::Shutdown;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
@@ -375,7 +374,7 @@ mod test {
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
 
     type QueueNextWork = (SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
-    type QueueResults = (Messages, SocketAddr, JoinHandle<()>);
+    type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
 
     fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
         let server = TcpListener::bind("0.0.0.0:0").unwrap();
@@ -441,47 +440,52 @@ mod test {
         let server = TcpListener::bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let handle = thread::spawn(move || {
-            for client in server.incoming() {
-                let mut client = client.unwrap();
-                let message = net_protocol::read(&mut client).unwrap();
-                match message {
-                    net_protocol::queue::Message::WorkerResult(_, _, result) => {
-                        msgs2.lock().unwrap().push(result);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        server.set_nonblocking(true).unwrap();
+
+        let handle = thread::spawn(move || loop {
+            let mut client = match server.accept() {
+                Ok((client, _)) => client,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    match shutdown_rx.try_recv() {
+                        Ok(()) => return,
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
                     }
-                    net_protocol::queue::Message::Manifest(_, manifest) => {
-                        let old_manifest = manifest_collector.lock().unwrap().replace(manifest);
-                        debug_assert!(
-                            old_manifest.is_none(),
-                            "replacing existing manifest! This is a bug in our tests."
-                        );
-                    }
-                    net_protocol::queue::Message::Shutdown(_) => {
-                        return;
-                    }
-                    _ => unreachable!(),
                 }
+                Err(_) => unreachable!(),
+            };
+
+            let message = net_protocol::read(&mut client).unwrap();
+            match message {
+                net_protocol::queue::Message::WorkerResult(_, _, result) => {
+                    msgs2.lock().unwrap().push(result);
+                }
+                net_protocol::queue::Message::Manifest(_, manifest) => {
+                    let old_manifest = manifest_collector.lock().unwrap().replace(manifest);
+                    debug_assert!(
+                        old_manifest.is_none(),
+                        "replacing existing manifest! This is a bug in our tests."
+                    );
+                }
+                _ => unreachable!(),
             }
         });
 
-        (msgs, server_addr, handle)
+        (msgs, server_addr, shutdown_tx, handle)
     }
 
     fn close_queue_servers(
         shutdown_next_work_server: mpsc::Sender<()>,
         next_work_handle: JoinHandle<()>,
-        results_addr: SocketAddr,
+        shutdown_results_server: mpsc::Sender<()>,
         results_handle: JoinHandle<()>,
     ) {
         shutdown_next_work_server.send(()).unwrap();
         next_work_handle.join().unwrap();
-
-        let mut stream = TcpStream::connect(results_addr).unwrap();
-        net_protocol::write(
-            &mut stream,
-            net_protocol::queue::Message::Shutdown(Shutdown {}),
-        )
-        .unwrap();
+        shutdown_results_server.send(()).unwrap();
         results_handle.join().unwrap();
     }
 
@@ -515,7 +519,8 @@ mod test {
         let manifest_collector = ManifestCollector::default();
         let (next_work_addr, shutdown_next_work_server, next_work_handle) =
             mock_queue_next_work_server(Arc::clone(&manifest_collector));
-        let (msgs, results_addr, results_handle) = mock_queue_results_server(manifest_collector);
+        let (msgs, results_addr, shutdown_results_server, results_handle) =
+            mock_queue_results_server(manifest_collector);
 
         let invocation_id = InvocationId::new();
 
@@ -568,7 +573,7 @@ mod test {
         close_queue_servers(
             shutdown_next_work_server,
             next_work_handle,
-            results_addr,
+            shutdown_results_server,
             results_handle,
         );
     }

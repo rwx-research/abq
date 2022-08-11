@@ -14,7 +14,7 @@ use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
 use abq_utils::net_protocol::workers::{RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
     self,
-    queue::{InvokeWork, Message, Shutdown},
+    queue::{InvokeWork, Message},
     workers::{InvocationId, NextWork, WorkId},
 };
 use abq_workers::negotiate::{AssignedRun, QueueNegotiator, QueueNegotiatorHandle};
@@ -187,6 +187,8 @@ pub fn init() {
 pub struct Abq {
     server_addr: SocketAddr,
     server_handle: Option<JoinHandle<Result<(), QueueServerError>>>,
+    server_shutdown_tx: tokio::sync::mpsc::Sender<()>,
+
     send_worker: mpsc::Sender<WorkerSchedulerMsg>,
     work_scheduler_handle: Option<JoinHandle<()>>,
     negotiator: QueueNegotiator,
@@ -215,9 +217,7 @@ impl Abq {
 
         self.active = false;
 
-        let mut queue_server =
-            TcpStream::connect(self.server_addr()).expect("server not available");
-        net_protocol::write(&mut queue_server, Message::Shutdown(Shutdown {})).unwrap();
+        self.server_shutdown_tx.blocking_send(()).unwrap();
 
         self.negotiator.shutdown();
 
@@ -271,10 +271,12 @@ fn start_queue(bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
+    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
+
     let (send_worker, recv_worker) = mpsc::channel();
     let server_handle = thread::spawn({
-        let queue_server = QueueServer::new(Arc::clone(&queues));
-        move || queue_server.start_on(server_listener, public_negotiator_addr)
+        let queue_server = QueueServer::new(Arc::clone(&queues), public_negotiator_addr);
+        move || queue_server.start_on(server_listener, server_shutdown_rx)
     });
 
     let new_work_server = TcpListener::bind((bind_hostname, 0)).unwrap();
@@ -319,6 +321,8 @@ fn start_queue(bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
     Abq {
         server_addr,
         server_handle: Some(server_handle),
+        server_shutdown_tx,
+
         send_worker,
         work_scheduler_handle: Some(work_scheduler_handle),
         negotiator,
@@ -330,8 +334,10 @@ fn start_queue(bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
 static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 
 /// invocation -> (results sender, responder thread handle)
-// TODO: consider using DashMap
-type ActiveInvocations = Arc<Mutex<HashMap<InvocationId, TcpStream>>>;
+///
+// TODO: certainly we can be smarter here, for example we have an invariant that a stream will only
+// ever be added and removed for an invocation ID once. Can we use that to get rid of the mutex?
+type ActiveInvocations = Arc<tokio::sync::Mutex<HashMap<InvocationId, tokio::net::TcpStream>>>;
 
 /// Cache of how much is left in the queue for a particular invocation, so that we don't have to
 /// lock the queue all the time.
@@ -345,6 +351,8 @@ struct QueueServer {
     /// responder thread is closed and that the entry here is dropped.
     active_invocations: ActiveInvocations,
     work_left_for_invocations: WorkLeftForInvocations,
+
+    public_negotiator_addr: SocketAddr,
 }
 
 /// An error that happens in the construction or execution of the queue server.
@@ -363,18 +371,28 @@ enum QueueServerError {
 }
 
 impl QueueServer {
-    fn new(queues: SharedInvocationQueues) -> Self {
+    fn new(queues: SharedInvocationQueues, public_negotiator_addr: SocketAddr) -> Self {
         Self {
             queues,
             active_invocations: Default::default(),
             work_left_for_invocations: Default::default(),
+            public_negotiator_addr,
+        }
+    }
+
+    fn clone(&self) -> Self {
+        Self {
+            queues: Arc::clone(&self.queues),
+            active_invocations: Arc::clone(&self.active_invocations),
+            work_left_for_invocations: Arc::clone(&self.work_left_for_invocations),
+            public_negotiator_addr: self.public_negotiator_addr,
         }
     }
 
     fn start_on(
         self,
         server_listener: TcpListener,
-        public_negotiator_addr: SocketAddr,
+        mut server_shutdown: tokio::sync::mpsc::Receiver<()>,
     ) -> Result<(), QueueServerError> {
         // Before we hand the server listener over to the async runtime, we must set it into
         // non-blocking mode (as the async runtime will not block!)
@@ -394,58 +412,22 @@ impl QueueServer {
             let server_listener = tokio::net::TcpListener::from_std(server_listener)?;
 
             loop {
-                let (client, _) = server_listener.accept().await?;
-                let mut client = client.into_std()?;
-
-                // Reads and writes to the client will be buffered, so we must make sure
-                // the stream is blocking.
-                client
-                    .set_nonblocking(false)
-                    .expect("Failed to set client stream as blocking");
-
-                // First, grab the message - in case it relates to shutdowns, which we need to do
-                // in-band.
-                let msg = net_protocol::read(&mut client)?;
-
-                match msg {
-                    Message::NegotiatorAddr => {
-                        tokio::spawn(async move {
-                            Self::handle_negotiator_addr(client, public_negotiator_addr)
-                                .expect("failed to send");
-                        });
-                    }
-                    Message::InvokeWork(invoke_work) => {
-                        let queues = Arc::clone(&self.queues);
-                        let invocations = Arc::clone(&self.active_invocations);
-                        tokio::spawn(async move {
-                            let _result =
-                                Self::handle_invoked_work(invocations, queues, client, invoke_work);
-                        });
-                    }
-                    Message::Manifest(invocation_id, manifest) => {
-                        let queues = Arc::clone(&self.queues);
-                        let work_left = Arc::clone(&self.work_left_for_invocations);
-                        Self::handle_manifest(queues, work_left, invocation_id, manifest);
-                    }
-                    Message::WorkerResult(invocation_id, work_id, result) => {
-                        let queues = Arc::clone(&self.queues);
-                        let invocations = Arc::clone(&self.active_invocations);
-                        let work_left = Arc::clone(&self.work_left_for_invocations);
-                        tokio::spawn(async move {
-                            let _result = Self::handle_worker_result(
-                                queues,
-                                invocations,
-                                work_left,
-                                invocation_id,
-                                work_id,
-                                result,
-                            );
-                        });
-                    }
-                    Message::Shutdown(Shutdown {}) => {
+                let (client, _) = tokio::select! {
+                    conn = server_listener.accept() => conn?,
+                    _ = server_shutdown.recv() => {
                         break;
                     }
-                }
+                };
+
+                tokio::spawn({
+                    let this = self.clone();
+                    async move {
+                        let result = this.handle(client).await;
+                        if let Err(err) = result {
+                            tracing::error!("error handling connection: {:?}", err);
+                        }
+                    }
+                });
             }
 
             Ok(())
@@ -455,22 +437,59 @@ impl QueueServer {
     }
 
     #[inline(always)]
+    async fn handle(
+        self,
+        mut client: tokio::net::TcpStream,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let msg = net_protocol::async_read(&mut client).await?;
+
+        let result: Result<(), Box<dyn Error + Send + Sync>> = match msg {
+            Message::NegotiatorAddr => {
+                Self::handle_negotiator_addr(client, self.public_negotiator_addr).await
+            }
+            Message::InvokeWork(invoke_work) => {
+                Self::handle_invoked_work(self.active_invocations, self.queues, client, invoke_work)
+                    .await
+            }
+            Message::Manifest(invocation_id, manifest) => Self::handle_manifest(
+                self.queues,
+                self.work_left_for_invocations,
+                invocation_id,
+                manifest,
+            ),
+            Message::WorkerResult(invocation_id, work_id, result) => {
+                Self::handle_worker_result(
+                    self.queues,
+                    self.active_invocations,
+                    self.work_left_for_invocations,
+                    invocation_id,
+                    work_id,
+                    result,
+                )
+                .await
+            }
+        };
+
+        result
+    }
+
+    #[inline(always)]
     #[instrument(level = "trace", skip(invoker, public_negotiator_addr))]
-    fn handle_negotiator_addr(
-        mut invoker: TcpStream,
+    async fn handle_negotiator_addr(
+        mut invoker: tokio::net::TcpStream,
         public_negotiator_addr: SocketAddr,
-    ) -> Result<(), Box<dyn Error>> {
-        net_protocol::write(&mut invoker, public_negotiator_addr)?;
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        net_protocol::async_write(&mut invoker, public_negotiator_addr).await?;
         Ok(())
     }
 
     #[instrument(level = "trace", skip(active_invocations, queues, invoker))]
-    fn handle_invoked_work(
+    async fn handle_invoked_work(
         active_invocations: ActiveInvocations,
         queues: SharedInvocationQueues,
-        invoker: TcpStream,
+        invoker: tokio::net::TcpStream,
         invoke_work: InvokeWork,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let InvokeWork {
             invocation_id,
             runner,
@@ -478,7 +497,7 @@ impl QueueServer {
 
         let old_invoker = active_invocations
             .lock()
-            .unwrap()
+            .await
             .insert(invocation_id, invoker);
         debug_assert!(
             old_invoker.is_none(),
@@ -497,7 +516,7 @@ impl QueueServer {
         work_left_for_invocations: WorkLeftForInvocations,
         invocation_id: InvocationId,
         manifest: ManifestMessage,
-    ) {
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Record the manifest for this invocation in its appropriate queue.
         // TODO: actually record the manifest metadata
         let flat_manifest = flatten_manifest(manifest.manifest);
@@ -510,44 +529,72 @@ impl QueueServer {
             .lock()
             .unwrap()
             .add_manifest(invocation_id, flat_manifest);
+
+        Ok(())
     }
 
-    #[instrument(
-        level = "trace",
-        skip(queues, active_invocations, work_left_for_invocations)
-    )]
-    fn handle_worker_result(
+    //#[instrument(
+    //    level = "trace",
+    //    skip(queues, active_invocations, work_left_for_invocations)
+    //)]
+    async fn handle_worker_result(
         queues: SharedInvocationQueues,
         active_invocations: ActiveInvocations,
         work_left_for_invocations: WorkLeftForInvocations,
         invocation_id: InvocationId,
         work_id: WorkId,
         result: TestResult,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut active_invocations = active_invocations.lock().unwrap();
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        {
+            // First up, chuck the test result back over to `abq test`. Make sure we don't steal
+            // the lock on active_invocations for any longer than it takes to send that request.
+            let mut active_invocations = active_invocations.lock().await;
 
-        let mut invoker_stream = active_invocations
-            .get_mut(&invocation_id)
-            .expect("invocation is not active");
+            let mut invoker_stream = active_invocations
+                .get_mut(&invocation_id)
+                .expect("invocation is not active");
 
-        net_protocol::write(
-            &mut invoker_stream,
-            InvokerResponse::Result(work_id, result),
-        )?;
+            net_protocol::async_write(
+                &mut invoker_stream,
+                InvokerResponse::Result(work_id, result),
+            )
+            .await?;
+        }
 
-        let mut work_left_for_invocations = work_left_for_invocations.lock().unwrap();
-        let work_left = work_left_for_invocations
-            .get_mut(&invocation_id)
-            .expect("invocation id not recorded, but we got a result for it?");
+        let no_more_work = {
+            // Update the amount of work we have left; again, steal the map of work for only as
+            // long is it takes for us to do that.
+            let mut work_left_for_invocations = work_left_for_invocations.lock().unwrap();
+            let work_left = work_left_for_invocations
+                .get_mut(&invocation_id)
+                .expect("invocation id not recorded, but we got a result for it?");
 
-        *work_left -= 1;
-        if *work_left == 0 {
-            let mut invoker_stream = active_invocations.remove(&invocation_id).unwrap();
+            *work_left -= 1;
+            *work_left == 0
+        };
 
-            net_protocol::write(&mut invoker_stream, InvokerResponse::EndOfResults)?;
-            invoker_stream.shutdown(std::net::Shutdown::Write).unwrap();
+        if no_more_work {
+            // Now, we have to take both the active invocations, and the map of work left, to mark
+            // the work for the current invocation as complete in both cases. It's okay for this to
+            // be slow(er), since it happens only once per test run.
+            //
+            // Note however that this does block requests indexing into the maps for other `abq
+            // test` invocations.
+            // We may want to use concurrent hashmaps that index into partitioned buckets for that
+            // use case (e.g. DashMap).
+            let mut invoker_stream = active_invocations
+                .lock()
+                .await
+                .remove(&invocation_id)
+                .unwrap();
 
-            work_left_for_invocations.remove(&invocation_id);
+            net_protocol::async_write(&mut invoker_stream, InvokerResponse::EndOfResults).await?;
+            tokio::io::AsyncWriteExt::shutdown(&mut invoker_stream).await?;
+
+            work_left_for_invocations
+                .lock()
+                .unwrap()
+                .remove(&invocation_id);
             queues.lock().unwrap().mark_complete(invocation_id);
         }
 
@@ -633,14 +680,15 @@ impl WorkScheduler {
 #[cfg(test)]
 mod test {
     use std::{
-        net::{IpAddr, Ipv4Addr},
+        net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
         thread,
         time::Duration,
     };
 
     use super::Abq;
-    use crate::invoke;
+    use crate::{invoke, queue::QueueServer};
     use abq_utils::net_protocol::{
+        self,
         runners::{Manifest, ManifestMessage, Test, TestOrGroup, TestResult},
         workers::{InvocationId, RunnerKind, TestLikeRunner},
     };
@@ -649,6 +697,7 @@ mod test {
         workers::WorkerContext,
     };
     use ntest::timeout;
+    use tracing_test::{internal::logs_with_scope_contain, traced_test};
 
     fn sort_results(results: &mut [(String, TestResult)]) -> Vec<&str> {
         let mut results = results
@@ -805,5 +854,26 @@ mod test {
 
         assert_eq!(results1, [("echo1"), ("echo2")]);
         assert_eq!(results2, [("echo3"), ("echo4"), "echo5"]);
+    }
+
+    #[test]
+    #[traced_test]
+    fn bad_message_doesnt_take_down_server() {
+        let server = QueueServer::new(Default::default(), "0.0.0.0:0".parse().unwrap());
+
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        let mut conn = TcpStream::connect(server_addr).unwrap();
+        net_protocol::write(&mut conn, "bad message").unwrap();
+
+        shutdown_tx.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
+
+        logs_with_scope_contain("", "error handling connection");
     }
 }
