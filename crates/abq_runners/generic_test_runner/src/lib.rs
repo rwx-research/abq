@@ -391,7 +391,7 @@ mod test_validate_protocol_version_message {
     fn recv_and_validate_protocol_version_message() {
         let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        let () = thread::spawn(move || {
+        thread::spawn(move || {
             let mut stream = TcpStream::connect(socket_addr).unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
@@ -412,7 +412,7 @@ mod test_validate_protocol_version_message {
     fn protocol_version_message_incompatible() {
         let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        let () = thread::spawn(move || {
+        thread::spawn(move || {
             let mut stream = TcpStream::connect(socket_addr).unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
@@ -438,7 +438,7 @@ mod test_validate_protocol_version_message {
     fn protocol_version_message_recv_wrong_message() {
         let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        let () = thread::spawn(move || {
+        thread::spawn(move || {
             let mut stream = TcpStream::connect(socket_addr).unwrap();
             let message = net_protocol::runners::Manifest { members: vec![] };
             net_protocol::write(&mut stream, message).unwrap();
@@ -457,7 +457,7 @@ mod test_validate_protocol_version_message {
     fn protocol_version_message_tunnel_dropped() {
         let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        let () = thread::spawn(move || {
+        thread::spawn(move || {
             let stream = TcpStream::connect(socket_addr).unwrap();
             drop(stream);
         })
@@ -477,7 +477,7 @@ mod test_validate_protocol_version_message {
         let socket_addr = listener.local_addr().unwrap();
 
         let timeout = Duration::from_millis(0);
-        let () = thread::spawn(move || {
+        thread::spawn(move || {
             thread::sleep(Duration::from_millis(100));
             let mut stream = TcpStream::connect(socket_addr).unwrap();
             let version_message = AbqProtocolVersionMessage {
@@ -505,7 +505,7 @@ mod test_validate_protocol_version_message {
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
     use crate::{execute_wrapped_runner, GenericTestRunner};
-    use abq_utils::net_protocol::runners::{ManifestMessage, Status};
+    use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestOrGroup};
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork};
 
     use std::path::PathBuf;
@@ -541,7 +541,13 @@ mod test_abq_jest {
         .unwrap();
 
         assert!(test_results.is_empty());
-        let ManifestMessage { manifest } = manifest.unwrap();
+
+        let ManifestMessage { mut manifest } = manifest.unwrap();
+
+        manifest.members.sort_by_key(|member| match member {
+            TestOrGroup::Test(test) => test.id.clone(),
+            TestOrGroup::Group(group) => group.name.clone(),
+        });
 
         insta::assert_json_snapshot!(manifest);
     }
