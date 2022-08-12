@@ -150,6 +150,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           name: ABQ Nightly
+          tag_name: init
           prerelease: true
           body: ""
           fail_on_unmatched_files: true
