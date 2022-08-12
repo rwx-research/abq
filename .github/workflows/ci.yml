@@ -3,6 +3,10 @@ name: CI
 on:
   - push
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   fmt:
     name: Source formatting check
@@ -49,7 +53,8 @@ jobs:
         uses: actions-rs/toolchain@v1.0.7
         with:
           profile: minimal
-          toolchain: stable
+          # Keep up-to-date with rust-toolchain.toml until https://github.com/actions-rs/toolchain/pull/209 lands.
+          toolchain: 1.62.1
           override: true
           components: clippy
 
@@ -103,3 +108,52 @@ jobs:
       - name: Run tests with cargo
         run: |
             cargo test --all-features
+
+  deploy-main:
+    name: Deploy abq and release nightlies
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy abq
+        run: flyctl deploy --remote-only
+
+      - name: Restore cargo cache
+        uses: actions/cache@v3.0.6
+        env:
+          cache-name: ci
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ hashFiles('Cargo.lock') }}
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1.0.7
+        with:
+          profile: minimal
+          # Keep up-to-date with rust-toolchain.toml until https://github.com/actions-rs/toolchain/pull/209 lands.
+          toolchain: 1.62.1
+          override: true
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: ABQ Nightly
+          prerelease: true
+          body: ""
+          fail_on_unmatched_files: true
+          files: |
+            target/release/abq
+            target/release/abq_cargo
+            target/release/abq_worker_harness

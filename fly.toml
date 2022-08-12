@@ -1,0 +1,50 @@
+app = "abq"
+
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[env]
+ABQ_FILE_LOG_DIR = "."
+ABQ_LOG = "debug,trace"
+
+[experimental]
+cmd = [
+  "./abq", "start",
+  "--bind", "0.0.0.0",
+  "--public-ip", "168.220.85.45",
+  "--port", "8080",
+  "--work-port", "8081",
+  "--negotiator-port", "8082",
+]
+
+[[services]]
+internal_port = 8080
+protocol = "tcp"
+
+  [[services.ports]]
+     port = "8080"
+
+[[services]]
+internal_port = 8081
+protocol = "tcp"
+
+  [[services.ports]]
+     port = "8081"
+
+[[services]]
+internal_port = 8082
+protocol = "tcp"
+
+  [[services.ports]]
+     port = "8082"
+
+[services.concurrency]
+hard_limit = 25
+soft_limit = 20
+
+[[services.tcp_checks]]
+grace_period = "1s"
+interval = "15s"
+port = "8080"
+restart_limit = 6
+timeout = "2s"
