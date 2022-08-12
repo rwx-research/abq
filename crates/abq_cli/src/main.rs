@@ -64,7 +64,15 @@ fn abq_main() -> anyhow::Result<ExitCode> {
     let Cli { command } = Cli::parse();
 
     match command {
-        Command::Start { bind, public_ip } => instance::start_abq_forever(bind, public_ip),
+        Command::Start {
+            bind: bind_ip,
+            public_ip,
+            port: server_port,
+            work_port,
+            negotiator_port,
+        } => {
+            instance::start_abq_forever(public_ip, bind_ip, server_port, work_port, negotiator_port)
+        }
         Command::Work {
             working_dir,
             queue_addr,

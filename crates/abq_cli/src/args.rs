@@ -9,11 +9,6 @@ use clap::{Parser, Subcommand};
 
 use crate::reporting::ReporterKind;
 
-pub(crate) fn unspecified_socket_addr() -> SocketAddr {
-    // Can't be a constant due to https://github.com/rust-lang/rust/issues/67390
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-}
-
 pub(crate) fn default_num_workers() -> NonZeroUsize {
     let cpus = num_cpus::get();
     NonZeroUsize::new(cpus).expect("No CPUs detected on this machine")
@@ -32,11 +27,31 @@ pub struct Cli {
 pub enum Command {
     /// Starts the "abq" ephemeral queue.
     Start {
-        /// Host/port IP address to bind the queue to.
-        /// When not specified, an arbitrary open port on the unspecified address 0.0.0.0 is
-        /// chosen.
-        #[clap(long, required = false, default_value_t = unspecified_socket_addr())]
-        bind: SocketAddr,
+        /// Host IP address to bind the queue to.
+        /// When not specified, the unspecified address 0.0.0.0 is chosen.
+        #[clap(long, required = false, default_value_t = IpAddr::V4(Ipv4Addr::UNSPECIFIED))]
+        bind: IpAddr,
+
+        /// Port to bind the queue server to.
+        /// When not specified, an arbitrary port is chosen.
+        #[clap(long, required = false, default_value_t = 0)]
+        port: u16,
+
+        /// Port to bind the queue's worker server to.
+        ///
+        /// When possible, you should avoid configuring this, as it is used for abq-internal
+        /// communication only. However, you may need to specify it if you are limited in the ports
+        /// you can expose.
+        #[clap(long, required = false, default_value_t = 0)]
+        work_port: u16,
+
+        /// Port to bind the queue's negotiation server to.
+        ///
+        /// When possible, you should avoid configuring this, as it is used for abq-internal
+        /// communication only. However, you may need to specify it if you are limited in the ports
+        /// you can expose.
+        #[clap(long, required = false, default_value_t = 0)]
+        negotiator_port: u16,
 
         /// Host IP address to advertise the queue as running on.
         /// When not specified, falls back on `bin`; otherwise, the unspecified address 0.0.0.0 is

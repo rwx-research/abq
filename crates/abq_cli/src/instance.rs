@@ -4,32 +4,43 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::net::{IpAddr, SocketAddr};
 
-use abq_queue::queue::Abq;
-
-use crate::args::unspecified_socket_addr;
+use abq_queue::queue::{Abq, QueueConfig};
 
 use thiserror::Error;
 
 /// Starts an [Abq] instance in the current process forever.
-pub fn start_abq_forever(bind_addr: SocketAddr, public_ip: Option<IpAddr>) -> ! {
+pub fn start_abq_forever(
+    public_ip: Option<IpAddr>,
+    bind_ip: IpAddr,
+    server_port: u16,
+    work_port: u16,
+    negotiator_port: u16,
+) -> ! {
     abq_queue::queue::init();
 
-    let public_ip = public_ip.unwrap_or_else(|| bind_addr.ip());
+    // Public IP defaults to the binding IP.
+    let public_ip = public_ip.unwrap_or(bind_ip);
 
-    let mut abq = Abq::start(bind_addr, public_ip);
+    let queue_config = QueueConfig {
+        public_ip,
+        bind_ip,
+        server_port,
+        work_port,
+        negotiator_port,
+    };
+    let mut abq = Abq::start(queue_config);
 
     tracing::debug!("Queue active at {}", abq.server_addr());
 
     println!("Run the following to start workers and attach to the queue:");
     println!(
         "\tabq work --queue-addr={}",
-        publicize_addr(abq.get_negotiator_handle().get_address(), public_ip)
+        publicize_addr(abq.server_addr(), public_ip)
     );
     println!("Run the following to invoke a test run:");
     println!(
-        "\tabq test --queue-addr={} --negotiator-addr={} -- <your test args here>",
+        "\tabq test --queue-addr={} -- <your test args here>",
         publicize_addr(abq.server_addr(), public_ip),
-        publicize_addr(abq.get_negotiator_handle().get_address(), public_ip)
     );
 
     // Make sure the queue shuts down and the socket is unliked when the process dies.
@@ -86,7 +97,7 @@ impl AbqInstance {
 
         abq_queue::queue::init();
 
-        let queue = Abq::start(unspecified_socket_addr(), unspecified_socket_addr().ip());
+        let queue = Abq::start(Default::default());
         AbqInstance::Local(queue)
     }
 

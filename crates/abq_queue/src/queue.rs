@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -201,8 +201,8 @@ impl Abq {
         self.server_addr
     }
 
-    pub fn start(bind_addr: SocketAddr, public_ip: IpAddr) -> Self {
-        start_queue(bind_addr, public_ip)
+    pub fn start(config: QueueConfig) -> Self {
+        start_queue(config)
     }
 
     pub fn wait_forever(&mut self) {
@@ -256,18 +256,53 @@ enum WorkerSchedulerMsg {
     Shutdown,
 }
 
+/// Configures initialization of the queue.
+pub struct QueueConfig {
+    /// The IP address of sockets the queue should advertise, e.g. when negotiating with a worker.
+    pub public_ip: IpAddr,
+    /// The IP address sockets the queue creates should actually bind to. This can be different
+    /// than [public_ip], but is not required to be.
+    pub bind_ip: IpAddr,
+    /// The port the mainline queue server should bind to. Binds to any port if `0`.
+    pub server_port: u16,
+    /// The port the work-scheduling server should bind to. Binds to any port if `0`.
+    pub work_port: u16,
+    /// The port the negotiator server should bind to. Binds to any port if `0`.
+    pub negotiator_port: u16,
+}
+
+impl Default for QueueConfig {
+    /// Creates a [`QueueConfig`] that always binds and advertises on INADDR_ANY, with arbitrary
+    /// ports for its servers.
+    fn default() -> Self {
+        Self {
+            public_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            server_port: 0,
+            work_port: 0,
+            negotiator_port: 0,
+        }
+    }
+}
+
 /// Initializes a queue, binding the queue negotiator to the given address.
 /// All other public channels to the queue (the work and results server) are exposed
 /// on the same host IP address as the negotiator is.
-fn start_queue(bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
-    let bind_hostname = bind_addr.ip();
+fn start_queue(config: QueueConfig) -> Abq {
+    let QueueConfig {
+        public_ip,
+        bind_ip,
+        server_port,
+        work_port,
+        negotiator_port,
+    } = config;
 
     let queues: SharedInvocationQueues = Default::default();
 
-    let server_listener = TcpListener::bind(bind_addr).unwrap();
+    let server_listener = TcpListener::bind((bind_ip, server_port)).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
-    let negotiator_listener = TcpListener::bind((bind_hostname, 0)).unwrap();
+    let negotiator_listener = TcpListener::bind((bind_ip, negotiator_port)).unwrap();
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
@@ -279,7 +314,7 @@ fn start_queue(bind_addr: SocketAddr, public_ip: IpAddr) -> Abq {
         move || queue_server.start_on(server_listener, server_shutdown_rx)
     });
 
-    let new_work_server = TcpListener::bind((bind_hostname, 0)).unwrap();
+    let new_work_server = TcpListener::bind((bind_ip, work_port)).unwrap();
     let new_work_server_addr = new_work_server.local_addr().unwrap();
 
     let work_scheduler_handle = thread::spawn({
@@ -680,7 +715,7 @@ impl WorkScheduler {
 #[cfg(test)]
 mod test {
     use std::{
-        net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
+        net::{TcpListener, TcpStream},
         thread,
         time::Duration,
     };
@@ -719,10 +754,7 @@ mod test {
     #[test]
     #[timeout(1000)] // 1 second
     fn multiple_jobs_complete() {
-        let mut queue = Abq::start(
-            "0.0.0.0:0".parse().unwrap(),
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        );
+        let mut queue = Abq::start(Default::default());
 
         let manifest = ManifestMessage {
             manifest: Manifest {
@@ -773,10 +805,7 @@ mod test {
     #[test]
     #[timeout(1000)] // 1 second
     fn multiple_invokers() {
-        let mut queue = Abq::start(
-            "0.0.0.0:0".parse().unwrap(),
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        );
+        let mut queue = Abq::start(Default::default());
 
         let manifest1 = ManifestMessage {
             manifest: Manifest {
