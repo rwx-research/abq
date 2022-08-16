@@ -11,8 +11,8 @@ abq_workers = { path = "../abq_workers" }
 abq_utils = { path = "../abq_utils" }
 abq_junit_xml = { path = "../reporters/junit_xml" }
 
-anyhow = "1.0.60"
-clap = { version = "3.2.16", features = ["derive"] }
+anyhow = "1.0.62"
+clap = { version = "3.2.17", features = ["derive"] }
 tempfile = "3.3.0"
 signal-hook = "0.3.14"
 indicatif = "0.17.0"
@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3.15", features = ["env-filter"] }
 tracing-appender = "0.2.2"
 
 [dev-dependencies]
-insta = "1.18.0"
+insta = "1.18.2"
 
 [features]
 test-abq-jest = []
