@@ -112,7 +112,7 @@ fn yarn_jest_auto_workers_without_failure() {
 
     assert!(exit_status.success());
     assert_eq!(stdout, "..");
-    assert!(stderr.is_empty());
+    assert!(stderr.is_empty(), "{:?}", stderr);
 }
 
 #[test]

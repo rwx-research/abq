@@ -226,7 +226,7 @@ pub mod queue {
     }
 
     /// An incremental response to an invoker.
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug)]
     pub enum InvokerResponse {
         /// The result of a requested unit of work.
         Result(WorkId, TestResult),
@@ -241,11 +241,21 @@ pub mod queue {
         NegotiatorAddr,
         /// An ask to run some work by an invoker.
         InvokeWork(InvokeWork),
+        /// An invoker of a test run would like to reconnect to the queue for results streaming.
+        Reconnect(InvocationId),
         /// A work manifest for a given invocation.
         Manifest(InvocationId, ManifestMessage),
         /// The result of some work from the queue.
         WorkerResult(InvocationId, WorkId, TestResult),
     }
+}
+
+pub mod client {
+    use serde_derive::{Deserialize, Serialize};
+
+    /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
+    #[derive(Serialize, Deserialize)]
+    pub struct AckTestResult {}
 }
 
 pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketAddr {
@@ -303,12 +313,12 @@ where
 /// Like [write], but async.
 pub async fn async_write<R, T: serde::Serialize>(
     writer: &mut R,
-    msg: T,
+    msg: &T,
 ) -> Result<(), std::io::Error>
 where
     R: tokio::io::AsyncWriteExt + Unpin,
 {
-    let msg_json = serde_json::to_vec(&msg)?;
+    let msg_json = serde_json::to_vec(msg)?;
 
     let msg_size = msg_json.len();
     let msg_size_buf = u32::to_be_bytes(msg_size as u32);

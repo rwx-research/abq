@@ -368,11 +368,95 @@ fn start_queue(config: QueueConfig) -> Abq {
 
 static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 
-/// invocation -> (results sender, responder thread handle)
+/// Handler for sending test results back to the abq client that issued a test run.
+#[derive(Debug)]
+enum ClientResponder {
+    /// We have an open stream upon which to send back the test results.
+    DirectStream(tokio::net::TcpStream),
+    /// There is not yet an open connection we can stream the test results back on.
+    /// This state may be reached during the time a client is disconnected.
+    Disconnected {
+        buffered_results: Vec<InvokerResponse>,
+    },
+}
+
+impl ClientResponder {
+    fn new(stream: tokio::net::TcpStream) -> Self {
+        Self::DirectStream(stream)
+    }
+
+    async fn send_and_ack_one_test_result(&mut self, test_result: InvokerResponse) {
+        use net_protocol::client::AckTestResult;
+
+        match self {
+            ClientResponder::DirectStream(conn) => {
+                // Send the test result and wait for an ack. If either fails, suppose the client is
+                // disconnected.
+                let write_result = net_protocol::async_write(conn, &test_result).await;
+                let client_disconnected = match write_result {
+                    Err(_) => true,
+                    Ok(()) => {
+                        let ack = net_protocol::async_read(conn).await;
+                        match ack {
+                            Err(_) => true,
+                            Ok(AckTestResult {}) => false,
+                        }
+                    }
+                };
+
+                if client_disconnected {
+                    // Demote ourselves to the disconnected state until reconnection happens.
+                    *self = Self::Disconnected {
+                        buffered_results: vec![test_result],
+                    }
+                }
+            }
+            ClientResponder::Disconnected { buffered_results } => {
+                buffered_results.push(test_result);
+            }
+        }
+    }
+
+    /// Updates the responder with a new connection. If there are any pending test results that
+    /// failed to be sent from a previous connections, they are streamed to the new connection
+    /// before the future returned from this function completes.
+    async fn reconnect_with(&mut self, new_conn: tokio::net::TcpStream) {
+        // There's no great way for us to check whether the existing client connection is,
+        // in fact, closed. Instead we accept all faithful reconnection requests, and
+        // assume that the client is well-behaved (it will not attempt to reconnect unless
+        // it is explicitly disconnected).
+        //
+        // Even if we could detect closed connections at this point, we'd have an TOCTOU race -
+        // it may be the case that a stream closes between the time that we check it is closed,
+        // and when we issue an error for the reconnection attempt.
+
+        let old_conn = {
+            let mut new_stream = Self::DirectStream(new_conn);
+            std::mem::swap(self, &mut new_stream);
+            new_stream
+        };
+
+        match old_conn {
+            ClientResponder::Disconnected { buffered_results } => {
+                // We need to send back all the buffered results to the new stream.
+                // Must send all test results in sequence, since each writes to the
+                // same stream back to the client.
+                for test_result in buffered_results {
+                    self.send_and_ack_one_test_result(test_result).await;
+                }
+            }
+            ClientResponder::DirectStream(_) => {
+                // nothing more to do
+            }
+        }
+    }
+}
+
+/// invocation -> (results sender, responder handle)
 ///
 // TODO: certainly we can be smarter here, for example we have an invariant that a stream will only
 // ever be added and removed for an invocation ID once. Can we use that to get rid of the mutex?
-type ActiveInvocations = Arc<tokio::sync::Mutex<HashMap<InvocationId, tokio::net::TcpStream>>>;
+type ActiveInvocations = Arc<tokio::sync::Mutex<HashMap<InvocationId, ClientResponder>>>;
 
 /// Cache of how much is left in the queue for a particular invocation, so that we don't have to
 /// lock the queue all the time.
@@ -403,6 +487,14 @@ enum QueueServerError {
     /// Any other opaque error that occured.
     #[error("{0}")]
     Other(#[from] Box<dyn Error + Send + Sync>),
+}
+
+/// An error that occurs when an abq client attempts to re-connect to the queue.
+#[derive(Debug, Error, PartialEq)]
+enum ClientReconnectionError {
+    /// The client sent an initial test invocation request to the queue.
+    #[error("{0} was never used to invoke work on the queue")]
+    NeverInvoked(InvocationId),
 }
 
 impl QueueServer {
@@ -486,6 +578,12 @@ impl QueueServer {
                 Self::handle_invoked_work(self.active_invocations, self.queues, client, invoke_work)
                     .await
             }
+            Message::Reconnect(invocation_id) => {
+                Self::handle_invoker_reconnection(self.active_invocations, client, invocation_id)
+                    .await
+                    // Upcast the reconnection error into a generic error
+                    .map_err(|e| Box::new(e) as _)
+            }
             Message::Manifest(invocation_id, manifest) => Self::handle_manifest(
                 self.queues,
                 self.work_left_for_invocations,
@@ -514,7 +612,7 @@ impl QueueServer {
         mut invoker: tokio::net::TcpStream,
         public_negotiator_addr: SocketAddr,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        net_protocol::async_write(&mut invoker, public_negotiator_addr).await?;
+        net_protocol::async_write(&mut invoker, &public_negotiator_addr).await?;
         Ok(())
     }
 
@@ -530,12 +628,14 @@ impl QueueServer {
             runner,
         } = invoke_work;
 
-        let old_invoker = active_invocations
+        let results_responder = ClientResponder::new(invoker);
+        let old_responder = active_invocations
             .lock()
             .await
-            .insert(invocation_id, invoker);
+            .insert(invocation_id, results_responder);
+
         debug_assert!(
-            old_invoker.is_none(),
+            old_responder.is_none(),
             "Existing invoker for expected unique invocation id"
         );
 
@@ -543,6 +643,39 @@ impl QueueServer {
         queues.lock().unwrap().create_queue(invocation_id, runner);
 
         Ok(())
+    }
+
+    #[instrument(level = "trace", skip(active_invocations, new_invoker))]
+    async fn handle_invoker_reconnection(
+        active_invocations: ActiveInvocations,
+        new_invoker: tokio::net::TcpStream,
+        invocation_id: InvocationId,
+    ) -> Result<(), ClientReconnectionError> {
+        use std::collections::hash_map::Entry;
+
+        // When an abq client loses connection with the queue, they may attempt to reconnect.
+        // We'll need to update the connection from streaming results to the client to the new one.
+        let mut active_invocations = active_invocations.lock().await;
+        let active_conn_entry = active_invocations.entry(invocation_id);
+        match active_conn_entry {
+            Entry::Occupied(mut occupied) => {
+                let new_invoker_addr = new_invoker.peer_addr();
+
+                occupied.get_mut().reconnect_with(new_invoker).await;
+
+                tracing::debug!(
+                    "rerouted connection for {:?} to {:?}",
+                    invocation_id,
+                    new_invoker_addr
+                );
+
+                Ok(())
+            }
+            Entry::Vacant(_) => {
+                // There was never a connection for this invocation ID!
+                Err(ClientReconnectionError::NeverInvoked(invocation_id))
+            }
+        }
     }
 
     #[instrument(level = "trace", skip(queues, work_left_for_invocations))]
@@ -568,10 +701,10 @@ impl QueueServer {
         Ok(())
     }
 
-    //#[instrument(
-    //    level = "trace",
-    //    skip(queues, active_invocations, work_left_for_invocations)
-    //)]
+    #[instrument(
+        level = "trace",
+        skip(queues, active_invocations, work_left_for_invocations)
+    )]
     async fn handle_worker_result(
         queues: SharedInvocationQueues,
         active_invocations: ActiveInvocations,
@@ -585,15 +718,13 @@ impl QueueServer {
             // the lock on active_invocations for any longer than it takes to send that request.
             let mut active_invocations = active_invocations.lock().await;
 
-            let mut invoker_stream = active_invocations
+            let invoker_stream = active_invocations
                 .get_mut(&invocation_id)
                 .expect("invocation is not active");
 
-            net_protocol::async_write(
-                &mut invoker_stream,
-                InvokerResponse::Result(work_id, result),
-            )
-            .await?;
+            invoker_stream
+                .send_and_ack_one_test_result(InvokerResponse::Result(work_id, result))
+                .await;
         }
 
         let no_more_work = {
@@ -617,14 +748,29 @@ impl QueueServer {
             // test` invocations.
             // We may want to use concurrent hashmaps that index into partitioned buckets for that
             // use case (e.g. DashMap).
-            let mut invoker_stream = active_invocations
+            let responder = active_invocations
                 .lock()
                 .await
                 .remove(&invocation_id)
                 .unwrap();
 
-            net_protocol::async_write(&mut invoker_stream, InvokerResponse::EndOfResults).await?;
-            tokio::io::AsyncWriteExt::shutdown(&mut invoker_stream).await?;
+            match responder {
+                ClientResponder::DirectStream(mut stream) => {
+                    net_protocol::async_write(&mut stream, &InvokerResponse::EndOfResults).await?;
+                    tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
+                }
+                ClientResponder::Disconnected { buffered_results } => {
+                    // Unfortunately, since we still don't have an active connection to the abq
+                    // client, we can't send any buffered test results or end-of-tests anywhere.
+                    // To avoid leaking memory we assume the client is dead and drop the results.
+                    //
+                    // TODO: rather than dropping any pending results, consider attaching any
+                    // pending results back to the queue. If the client re-connects, send them all
+                    // back at that point. The queue can run a weep to cleanup any uncolleted
+                    // results on some time interval.
+                    let _ = buffered_results;
+                }
+            }
 
             work_left_for_invocations
                 .lock()
@@ -716,16 +862,24 @@ impl WorkScheduler {
 mod test {
     use std::{
         net::{TcpListener, TcpStream},
+        sync::Arc,
         thread,
         time::Duration,
     };
 
     use super::Abq;
-    use crate::{invoke, queue::QueueServer};
+    use crate::{
+        invoke,
+        queue::{
+            ActiveInvocations, ClientReconnectionError, ClientResponder, QueueServer,
+            SharedInvocationQueues, WorkLeftForInvocations,
+        },
+    };
     use abq_utils::net_protocol::{
         self,
-        runners::{Manifest, ManifestMessage, Test, TestOrGroup, TestResult},
-        workers::{InvocationId, RunnerKind, TestLikeRunner},
+        queue::InvokerResponse,
+        runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
+        workers::{InvocationId, RunnerKind, TestLikeRunner, WorkId},
     };
     use abq_workers::{
         negotiate::{WorkersConfig, WorkersNegotiator},
@@ -749,6 +903,17 @@ mod test {
             tags: Default::default(),
             meta: Default::default(),
         })
+    }
+
+    fn fake_test_result() -> TestResult {
+        TestResult {
+            status: Status::Success,
+            id: "".to_string(),
+            display_name: "".to_string(),
+            output: None,
+            runtime: 0.,
+            meta: Default::default(),
+        }
     }
 
     #[test]
@@ -904,5 +1069,195 @@ mod test {
         server_thread.join().unwrap();
 
         logs_with_scope_contain("", "error handling connection");
+    }
+
+    #[tokio::test]
+    async fn invoker_reconnection_succeeds() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let invocation_id = InvocationId::new();
+        let active_invocations = ActiveInvocations::default();
+
+        // Set up an initial connection for streaming test results targetting the given invocation ID
+        let fake_server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server_addr = fake_server.local_addr().unwrap();
+
+        {
+            // Register the initial connection
+            let client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+            let (server_conn, _) = fake_server.accept().await.unwrap();
+            let mut active_invocations = active_invocations.lock().await;
+            active_invocations
+                .entry(invocation_id)
+                .or_insert(ClientResponder::DirectStream(server_conn));
+            // Drop the connection
+            drop(client_conn);
+        };
+
+        // Attempt to reconnect
+        let new_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+        let new_conn_addr = new_conn.local_addr().unwrap();
+
+        let reconnection_result = QueueServer::handle_invoker_reconnection(
+            Arc::clone(&active_invocations),
+            new_conn,
+            invocation_id,
+        )
+        .await;
+
+        // Validate that the reconnection was granted
+        assert!(reconnection_result.is_ok());
+        let active_conn_addr = {
+            let active_invocations = active_invocations.lock().await;
+            match active_invocations.get(&invocation_id).unwrap() {
+                ClientResponder::DirectStream(conn) => conn.local_addr().unwrap(),
+                ClientResponder::Disconnected { .. } => unreachable!(),
+            }
+        };
+        assert_eq!(active_conn_addr, new_conn_addr);
+    }
+
+    #[tokio::test]
+    async fn invoker_reconnection_fails_never_invoked() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let invocation_id = InvocationId::new();
+        let active_invocations = ActiveInvocations::default();
+
+        let fake_server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server_addr = fake_server.local_addr().unwrap();
+
+        let conn = TcpStream::connect(fake_server_addr).await.unwrap();
+
+        let reconnection_result = QueueServer::handle_invoker_reconnection(
+            Arc::clone(&active_invocations),
+            conn,
+            invocation_id,
+        )
+        .await;
+
+        // Validate that the reconnection was granted
+        assert!(reconnection_result.is_err());
+        let err = reconnection_result.unwrap_err();
+        assert_eq!(err, ClientReconnectionError::NeverInvoked(invocation_id));
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_then_connect_gets_buffered_results() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let invocation_id = InvocationId::new();
+        let active_invocations = ActiveInvocations::default();
+        let invocation_queues = SharedInvocationQueues::default();
+        let work_left = WorkLeftForInvocations::default();
+
+        // Pretend we have infinite work so the queue always streams back results to the client.
+        work_left.lock().unwrap().insert(invocation_id, usize::MAX);
+
+        let fake_server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server_addr = fake_server.local_addr().unwrap();
+
+        {
+            // Register the initial connection
+            let client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+            let (server_conn, _) = fake_server.accept().await.unwrap();
+            let mut active_invocations = active_invocations.lock().await;
+            let _responder = active_invocations
+                .entry(invocation_id)
+                .or_insert(ClientResponder::DirectStream(server_conn));
+
+            // Drop the client connection
+            drop(client_conn);
+        };
+
+        let buffered_work_id = WorkId("test1".to_string());
+        {
+            // Send a test result, will force the responder to go into disconnected mode
+            QueueServer::handle_worker_result(
+                Arc::clone(&invocation_queues),
+                Arc::clone(&active_invocations),
+                Arc::clone(&work_left),
+                invocation_id,
+                buffered_work_id.clone(),
+                fake_test_result(),
+            )
+            .await
+            .unwrap();
+
+            // Check the internal state of the responder - it should be in disconnected mode.
+            let responders = active_invocations.lock().await;
+            let responder = responders.get(&invocation_id).unwrap();
+            assert!(
+                matches!(responder, ClientResponder::Disconnected { .. }),
+                "{:?}",
+                responder
+            );
+            match responder {
+                ClientResponder::Disconnected { buffered_results } => {
+                    assert_eq!(buffered_results.len(), 1)
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Reconnect back to the queue
+        let mut client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+        {
+            let (server_conn, _) = fake_server.accept().await.unwrap();
+            let reconnection_future = tokio::spawn({
+                let active_invocations = Arc::clone(&active_invocations);
+                async move {
+                    QueueServer::handle_invoker_reconnection(
+                        active_invocations,
+                        server_conn,
+                        invocation_id,
+                    )
+                    .await
+                }
+            });
+
+            // The new connection should now have a test result waiting for us.
+            let test_result = net_protocol::async_read(&mut client_conn).await.unwrap();
+            match test_result {
+                InvokerResponse::Result(work_id, _) => {
+                    assert_eq!(work_id, buffered_work_id);
+                }
+                InvokerResponse::EndOfResults => unreachable!(),
+            }
+            // Send an ack
+            net_protocol::async_write(&mut client_conn, &net_protocol::client::AckTestResult {})
+                .await
+                .unwrap();
+
+            let reconnection_result = reconnection_future.await.unwrap();
+            assert!(reconnection_result.is_ok());
+        }
+
+        {
+            // Make sure that new test results also get send to the new client connectiion.
+            let second_work_id = WorkId("test2".to_string());
+            let worker_result_future = tokio::spawn(QueueServer::handle_worker_result(
+                invocation_queues,
+                Arc::clone(&active_invocations),
+                work_left,
+                invocation_id,
+                second_work_id.clone(),
+                fake_test_result(),
+            ));
+
+            let test_result = net_protocol::async_read(&mut client_conn).await.unwrap();
+            net_protocol::async_write(&mut client_conn, &net_protocol::client::AckTestResult {})
+                .await
+                .unwrap();
+
+            worker_result_future.await.unwrap().unwrap();
+
+            match test_result {
+                InvokerResponse::Result(work_id, _) => {
+                    assert_eq!(work_id, second_work_id);
+                }
+                InvokerResponse::EndOfResults => unreachable!(),
+            }
+        }
     }
 }

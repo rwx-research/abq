@@ -42,6 +42,8 @@ pub fn invoke_work<OnResult>(
     while let InvokerResponse::Result(work_id, work_result) =
         net_protocol::read(&mut stream).expect("failed to read message")
     {
+        net_protocol::write(&mut stream, net_protocol::client::AckTestResult {})
+            .expect("failed to send ack");
         on_result(work_id, work_result);
     }
 }
