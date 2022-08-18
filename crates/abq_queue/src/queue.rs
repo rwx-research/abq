@@ -869,7 +869,7 @@ mod test {
 
     use super::Abq;
     use crate::{
-        invoke,
+        invoke::Client,
         queue::{
             ActiveInvocations, ClientReconnectionError, ClientResponder, QueueServer,
             SharedInvocationQueues, WorkLeftForInvocations,
@@ -877,7 +877,6 @@ mod test {
     };
     use abq_utils::net_protocol::{
         self,
-        queue::InvokerResponse,
         runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
         workers::{InvocationId, RunnerKind, TestLikeRunner, WorkId},
     };
@@ -885,6 +884,7 @@ mod test {
         negotiate::{WorkersConfig, WorkersNegotiator},
         workers::WorkerContext,
     };
+    use futures::future;
     use ntest::timeout;
     use tracing_test::{internal::logs_with_scope_contain, traced_test};
 
@@ -943,11 +943,24 @@ mod test {
 
         let invocation_id = InvocationId::new();
         let results_handle = thread::spawn(move || {
-            let mut results = Vec::default();
-            invoke::invoke_work(queue_server_addr, invocation_id, runner, |id, result| {
-                results.push((id.0, result))
-            });
-            results
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let mut results = Vec::default();
+                let client = Client::invoke_work(queue_server_addr, invocation_id, runner)
+                    .await
+                    .unwrap();
+                client
+                    .stream_results(|id, result| {
+                        results.push((id.0, result));
+                    })
+                    .await
+                    .unwrap();
+                results
+            })
         });
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
@@ -1005,21 +1018,37 @@ mod test {
         let queue_server_addr = queue.server_addr();
 
         let invocation1 = InvocationId::new();
-        let results1_handle = thread::spawn(move || {
-            let mut results = Vec::default();
-            invoke::invoke_work(queue_server_addr, invocation1, runner1, |id, result| {
-                results.push((id.0, result))
-            });
-            results
-        });
-
         let invocation2 = InvocationId::new();
-        let results2_handle = thread::spawn(move || {
-            let mut results = Vec::default();
-            invoke::invoke_work(queue_server_addr, invocation2, runner2, |id, result| {
-                results.push((id.0, result))
-            });
-            results
+        let results_handle = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let mut results1 = Vec::default();
+                let mut results2 = Vec::default();
+
+                let client1 = Client::invoke_work(queue_server_addr, invocation1, runner1)
+                    .await
+                    .unwrap();
+                let client2 = Client::invoke_work(queue_server_addr, invocation2, runner2)
+                    .await
+                    .unwrap();
+
+                let fut1 = client1.stream_results(|id, result| {
+                    results1.push((id.0, result));
+                });
+                let fut2 = client2.stream_results(|id, result| {
+                    results2.push((id.0, result));
+                });
+
+                let (res1, res2) = future::join(fut1, fut2).await;
+                res1.unwrap();
+                res2.unwrap();
+
+                (results1, results2)
+            })
         });
 
         let mut workers_for_run1 = WorkersNegotiator::negotiate_and_start_pool(
@@ -1036,8 +1065,7 @@ mod test {
         )
         .unwrap();
 
-        let mut results1 = results1_handle.join().unwrap();
-        let mut results2 = results2_handle.join().unwrap();
+        let (mut results1, mut results2) = results_handle.join().unwrap();
 
         queue.shutdown();
         workers_for_run1.shutdown();
@@ -1201,33 +1229,22 @@ mod test {
         }
 
         // Reconnect back to the queue
-        let mut client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+        let client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+        let mut client = Client {
+            abq_server_addr: fake_server_addr,
+            invocation_id,
+            stream: client_conn,
+        };
         {
             let (server_conn, _) = fake_server.accept().await.unwrap();
-            let reconnection_future = tokio::spawn({
-                let active_invocations = Arc::clone(&active_invocations);
-                async move {
-                    QueueServer::handle_invoker_reconnection(
-                        active_invocations,
-                        server_conn,
-                        invocation_id,
-                    )
-                    .await
-                }
-            });
+            let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
+                Arc::clone(&active_invocations),
+                server_conn,
+                invocation_id,
+            ));
 
-            // The new connection should now have a test result waiting for us.
-            let test_result = net_protocol::async_read(&mut client_conn).await.unwrap();
-            match test_result {
-                InvokerResponse::Result(work_id, _) => {
-                    assert_eq!(work_id, buffered_work_id);
-                }
-                InvokerResponse::EndOfResults => unreachable!(),
-            }
-            // Send an ack
-            net_protocol::async_write(&mut client_conn, &net_protocol::client::AckTestResult {})
-                .await
-                .unwrap();
+            let (work_id, _) = client.next().await.unwrap().unwrap();
+            assert_eq!(work_id, buffered_work_id);
 
             let reconnection_result = reconnection_future.await.unwrap();
             assert!(reconnection_result.is_ok());
@@ -1245,19 +1262,10 @@ mod test {
                 fake_test_result(),
             ));
 
-            let test_result = net_protocol::async_read(&mut client_conn).await.unwrap();
-            net_protocol::async_write(&mut client_conn, &net_protocol::client::AckTestResult {})
-                .await
-                .unwrap();
+            let (work_id, _) = client.next().await.unwrap().unwrap();
+            assert_eq!(work_id, second_work_id);
 
             worker_result_future.await.unwrap().unwrap();
-
-            match test_result {
-                InvokerResponse::Result(work_id, _) => {
-                    assert_eq!(work_id, second_work_id);
-                }
-                InvokerResponse::EndOfResults => unreachable!(),
-            }
         }
     }
 }

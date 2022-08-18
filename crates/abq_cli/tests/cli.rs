@@ -215,7 +215,7 @@ fn yarn_jest_separate_queue_workers_test_without_failure() {
         "jest",
     ]);
 
-    assert!(exit_status.success());
+    assert!(exit_status.success(), "{:?}", (stdout, stderr));
 
     let mut lines = stdout.lines();
     assert!(lines.next().unwrap().contains("Starting test run"));

@@ -11,7 +11,7 @@
 //!    the stream is closed.
 //! 1. Once it's done reading, the invoker closes its side of the stream.
 
-use std::net::{SocketAddr, TcpStream};
+use std::{io, net::SocketAddr};
 
 use abq_utils::net_protocol::{
     self,
@@ -20,30 +20,96 @@ use abq_utils::net_protocol::{
     workers::{InvocationId, RunnerKind, WorkId},
 };
 
-/// Invokes work on an instance of [Abq]. This function blocks, but cedes control to [on_result]
-/// when an individual result for a unit of work is received.
-pub fn invoke_work<OnResult>(
-    abq_server_addr: SocketAddr,
-    invocation_id: InvocationId,
-    runner: RunnerKind,
-    mut on_result: OnResult,
-) where
-    OnResult: FnMut(WorkId, TestResult),
-{
-    let mut stream = TcpStream::connect(abq_server_addr).expect("socket not available");
+/// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
+pub struct Client {
+    pub(crate) abq_server_addr: SocketAddr,
+    /// The test invocation this client is responsible for.
+    pub(crate) invocation_id: InvocationId,
+    /// The stream to the queue server.
+    pub(crate) stream: tokio::net::TcpStream,
+}
 
-    let invoke_msg = Message::InvokeWork(InvokeWork {
-        invocation_id,
-        runner,
-    });
+impl Client {
+    /// Invokes work on an instance of [Abq], returning a [Client].
+    pub async fn invoke_work(
+        abq_server_addr: SocketAddr,
+        invocation_id: InvocationId,
+        runner: RunnerKind,
+    ) -> Result<Self, io::Error> {
+        let mut stream = tokio::net::TcpStream::connect(abq_server_addr).await?;
 
-    net_protocol::write(&mut stream, invoke_msg).unwrap();
+        let invoke_msg = Message::InvokeWork(InvokeWork {
+            invocation_id,
+            runner,
+        });
 
-    while let InvokerResponse::Result(work_id, work_result) =
-        net_protocol::read(&mut stream).expect("failed to read message")
-    {
-        net_protocol::write(&mut stream, net_protocol::client::AckTestResult {})
-            .expect("failed to send ack");
-        on_result(work_id, work_result);
+        net_protocol::async_write(&mut stream, &invoke_msg).await?;
+
+        Ok(Client {
+            abq_server_addr,
+            invocation_id,
+            stream,
+        })
+    }
+
+    /// Attempts to reconnect the client to the abq server.
+    pub(crate) async fn reconnect(&mut self) -> Result<(), io::Error> {
+        let mut new_stream = tokio::net::TcpStream::connect(self.abq_server_addr).await?;
+
+        net_protocol::async_write(
+            &mut new_stream,
+            &net_protocol::queue::Message::Reconnect(self.invocation_id),
+        )
+        .await?;
+
+        self.stream = new_stream;
+        Ok(())
+    }
+
+    /// Yields the next test result, as it streams in.
+    /// Returns [None] when there are no more test results.
+    pub async fn next(&mut self) -> Option<Result<(WorkId, TestResult), io::Error>> {
+        loop {
+            match net_protocol::async_read(&mut self.stream).await {
+                Ok(InvokerResponse::Result(work_id, test_result)) => {
+                    // Send an acknowledgement of the result to the server. If it fails, attempt to reconnect once.
+                    let ack_result = net_protocol::async_write(
+                        &mut self.stream,
+                        &net_protocol::client::AckTestResult {},
+                    )
+                    .await;
+                    if ack_result.is_err() {
+                        if let Err(err) = self.reconnect().await {
+                            return Some(Err(err));
+                        }
+                    }
+
+                    return Some(Ok((work_id, test_result)));
+                }
+                Ok(InvokerResponse::EndOfResults) => return None,
+                Err(err) => {
+                    // Attempt to reconnect once. If it's successful, just re-read the next message.
+                    // If it's unsuccessful, return the original error.
+                    match self.reconnect().await {
+                        Ok(()) => continue,
+                        Err(_) => return Some(Err(err)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Blockingly calls [Self::next] until the are no more test results, or we failed to retrieve
+    /// test results from the queue and cannot reconnect. Cedes control to `on_result` when a
+    /// result is received.
+    pub async fn stream_results(
+        mut self,
+        mut on_result: impl FnMut(WorkId, TestResult),
+    ) -> Result<(), io::Error> {
+        while let Some(maybe_result) = self.next().await {
+            let (work_id, test_result) = maybe_result?;
+            on_result(work_id, test_result);
+        }
+        Ok(())
     }
 }
