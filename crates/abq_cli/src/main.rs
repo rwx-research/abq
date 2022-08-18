@@ -3,10 +3,17 @@ mod instance;
 mod reporting;
 mod workers;
 
-use std::{net::SocketAddr, thread};
+use std::{
+    io,
+    net::SocketAddr,
+    thread::{self, JoinHandle},
+};
 
-use abq_queue::invoke::invoke_work;
-use abq_utils::net_protocol::workers::{InvocationId, NativeTestRunnerParams, RunnerKind};
+use abq_queue::invoke::Client;
+use abq_utils::net_protocol::{
+    runners::TestResult,
+    workers::{InvocationId, NativeTestRunnerParams, RunnerKind, WorkId},
+};
 use abq_workers::negotiate::QueueNegotiatorHandle;
 use clap::Parser;
 
@@ -149,10 +156,8 @@ fn run_tests(
     let start_in_process_workers = opt_test_id.is_none();
     let test_id = opt_test_id.unwrap_or_else(InvocationId::new);
 
-    let work_results_thread = thread::spawn({
-        let server_addr = abq.server_addr();
-        move || invoke_work(server_addr, test_id, runner, on_result)
-    });
+    let work_results_thread =
+        start_test_result_reporter(abq.server_addr(), test_id, runner, on_result);
 
     let opt_workers = if start_in_process_workers {
         let working_dir = std::env::current_dir().expect("no working directory");
@@ -172,14 +177,29 @@ fn run_tests(
         workers.shutdown();
     }
 
-    work_results_thread
-        .join()
-        .expect("results thread should always be free");
+    work_results_thread.join().unwrap()?;
 
     // TODO: is there a reasonable way to surface the errors?
     let (suite_result, _errors) = reporters.finish();
 
     Ok(suite_result.suggested_exit_code)
+}
+
+fn start_test_result_reporter(
+    abq_server_addr: SocketAddr,
+    test_id: InvocationId,
+    runner: RunnerKind,
+    on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
+) -> JoinHandle<Result<(), io::Error>> {
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move {
+            let abq_test_client = Client::invoke_work(abq_server_addr, test_id, runner).await?;
+            abq_test_client.stream_results(on_result).await
+        })
+    })
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ serde_json = "1.0.83"
 thiserror = "1.0.32"
 tracing = "0.1.36"
 
-tokio = { version = "1.20.1", features = ["net", "rt", "sync", "macros"] }
+tokio = { version = "1.20.1", features = ["net", "rt", "rt-multi-thread", "sync", "macros"] }
 
 [dependencies.uuid]
 version = "1.1.2"
@@ -35,3 +35,4 @@ ntest = "0.8.1"
 procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile = "3.3.0"
 tracing-test = "0.2.3"
+futures = "0.3.23"
