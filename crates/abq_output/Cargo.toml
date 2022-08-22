@@ -9,4 +9,4 @@ abq_runner_protocol = { path = "../abq_runners/protocol" }
 abq_utils = { path = "../abq_utils" }
 
 [dev-dependencies]
-insta = "1.18.2"
+insta = "1.19.0"
