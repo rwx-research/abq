@@ -12,9 +12,9 @@ abq_utils = { path = "../abq_utils" }
 
 thiserror = "1.0.32"
 procspawn = "0.10.1"
-serde = "1.0.143"
-serde_derive = "1.0.143"
-serde_json = "1.0.83"
+serde = "1.0.144"
+serde_derive = "1.0.144"
+serde_json = "1.0.85"
 
 tracing = "0.1.36"
 
