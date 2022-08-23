@@ -67,9 +67,9 @@ jobs:
       # setup testdata
       - uses: actions/setup-node@v3
         with:
-          node-version: '14'
-          cache: 'npm'
-          cache-dependency-path: 'testdata/**/package-lock.json'
+          node-version: "14"
+          cache: "npm"
+          cache-dependency-path: "testdata/**/package-lock.json"
 
       - name: Pull native test runners
         run: |
@@ -82,13 +82,13 @@ jobs:
 
       - name: Load test dependencies
         run: |
-            scripts/init_testdata
+          scripts/init_testdata
 
       # End setup testdata
 
       - name: Dogfood abq
         run: |
-            make dogfood
+          make dogfood
 
       - name: Upload artifacts to captain
         uses: rwx-research/upload-captain-artifact@main
@@ -107,22 +107,29 @@ jobs:
 
       - name: Run tests with cargo
         run: |
-            cargo test --all-features
+          cargo test --all-features
 
   deploy-main:
-    name: Deploy abq and release nightlies
+    name: Deploy abq
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    needs: test
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Install flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy abq
         run: flyctl deploy --remote-only
 
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: test
+    steps:
       - name: Restore cargo cache
         uses: actions/cache@v3.0.7
         env:
