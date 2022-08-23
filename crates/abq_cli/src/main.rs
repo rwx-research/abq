@@ -5,6 +5,7 @@ mod reporting;
 mod workers;
 
 use std::{
+    collections::HashMap,
     io,
     net::SocketAddr,
     thread::{self, JoinHandle},
@@ -154,7 +155,11 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
         cmd,
         args,
         // TODO: populate this
-        extra_env: Default::default(),
+        extra_env: HashMap::from([
+            // TODO: This is a hack to get chalk.js to add color codes
+            // We probably should instead supply a PTY to the child process
+            (String::from("FORCE_COLOR"), String::from("1")),
+        ]),
     })
 }
 
@@ -261,12 +266,11 @@ mod test {
         let NativeTestRunnerParams {
             cmd,
             args,
-            extra_env,
+            extra_env: _,
         } = result.unwrap();
 
         assert_eq!(cmd, "abq-test");
         assert!(args.is_empty());
-        assert!(extra_env.is_empty());
     }
 
     #[test]
@@ -280,11 +284,10 @@ mod test {
         let NativeTestRunnerParams {
             cmd,
             args,
-            extra_env,
+            extra_env: _,
         } = result.unwrap();
 
         assert_eq!(cmd, "abq-test");
         assert_eq!(args, vec!["--filter", "onboarding"]);
-        assert!(extra_env.is_empty());
     }
 }
