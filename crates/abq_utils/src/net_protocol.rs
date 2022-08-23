@@ -7,6 +7,11 @@ use std::{
     net::{IpAddr, SocketAddr},
 };
 
+pub mod health {
+    pub type HEALTH = String;
+    pub static HEALTHY: &str = "HEALTHY";
+}
+
 pub mod runners {
     use serde_derive::{Deserialize, Serialize};
 
@@ -237,6 +242,7 @@ pub mod queue {
     /// A message sent to the queue.
     #[derive(Serialize, Deserialize)]
     pub enum Message {
+        HealthCheck,
         /// An ask to return the address of the queue negotiator.
         NegotiatorAddr,
         /// An ask to run some work by an invoker.
@@ -247,6 +253,21 @@ pub mod queue {
         Manifest(InvocationId, ManifestMessage),
         /// The result of some work from the queue.
         WorkerResult(InvocationId, WorkId, TestResult),
+    }
+}
+
+pub mod work_server {
+    use serde_derive::{Deserialize, Serialize};
+
+    use super::workers::InvocationId;
+
+    #[derive(Serialize, Deserialize)]
+    pub enum WorkServerRequest {
+        HealthCheck,
+        /// An ask to get the next test for a particular invocation for the queue.
+        NextTest {
+            invocation_id: InvocationId,
+        },
     }
 }
 
@@ -266,6 +287,10 @@ pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketA
 /// Reads a message from a stream communicating with abq.
 ///
 /// Note that [Read::read_exact] is used, and so the stream cannot be non-blocking.
+///
+/// NOTE: this is susceptible to DoS by sending a message size that is larger than what can be
+/// allocated. It's possible we'll be able to remove this as a plausible attack vector after adding
+/// TLS + auth.
 pub fn read<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<T, std::io::Error> {
     let mut msg_size_buf = [0; 4];
     reader.read_exact(&mut msg_size_buf)?;
@@ -311,6 +336,10 @@ where
 }
 
 /// Like [write], but async.
+///
+/// NOTE: this is susceptible to DoS by sending a message size that is larger than what can be
+/// allocated. It's possible we'll be able to remove this as a plausible attack vector after adding
+/// TLS + auth.
 pub async fn async_write<R, T: serde::Serialize>(
     writer: &mut R,
     msg: &T,

@@ -1,4 +1,5 @@
 mod args;
+mod health;
 mod instance;
 mod reporting;
 mod workers;
@@ -22,6 +23,8 @@ use args::{default_num_workers, Cli, Command};
 use instance::AbqInstance;
 use reporting::{ExitCode, ReporterKind, SuiteReporters};
 use tracing_subscriber::{fmt, layer, prelude::*, EnvFilter, Registry};
+
+use crate::health::HealthCheckKind;
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
@@ -66,6 +69,8 @@ fn setup_tracing() -> TracingGuards {
 }
 
 fn abq_main() -> anyhow::Result<ExitCode> {
+    use clap::{CommandFactory, ErrorKind};
+
     let _tracing_guards = setup_tracing();
 
     let Cli { command } = Cli::parse();
@@ -99,6 +104,37 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let abq = find_or_create_abq(queue_addr)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
             run_tests(runner, abq, test_id, reporters)
+        }
+        Command::Health {
+            queue,
+            work_scheduler,
+            negotiator,
+        } => {
+            let mut to_check = (queue.into_iter().map(HealthCheckKind::Queue))
+                .chain(
+                    work_scheduler
+                        .into_iter()
+                        .map(HealthCheckKind::WorkScheduler),
+                )
+                .chain(negotiator.into_iter().map(HealthCheckKind::Negotiator))
+                .peekable();
+            if to_check.peek().is_none() {
+                let mut cmd = Cli::command();
+                Err(cmd.error(
+                    ErrorKind::TooFewValues,
+                    "no services provided to healthcheck!",
+                ))?;
+            }
+
+            let mut all_healthy = true;
+            for service in to_check {
+                if !service.is_healthy() {
+                    all_healthy = false;
+                    println!("{service}: unhealthy");
+                }
+            }
+            let exit = if all_healthy { 0 } else { 1 };
+            Ok(reporting::ExitCode::new(exit))
         }
     }
 }

@@ -65,6 +65,10 @@ impl ExitCode {
     pub fn get(&self) -> i32 {
         self.0
     }
+
+    pub fn new(code: i32) -> Self {
+        Self(code)
+    }
 }
 
 pub(crate) struct SuiteResult {

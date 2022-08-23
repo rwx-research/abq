@@ -11,6 +11,7 @@ use abq_utils::flatten_manifest;
 use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::queue::InvokerResponse;
 use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
+use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
     self,
@@ -571,6 +572,7 @@ impl QueueServer {
         let msg = net_protocol::async_read(&mut client).await?;
 
         let result: Result<(), Box<dyn Error + Send + Sync>> = match msg {
+            Message::HealthCheck => Self::handle_healthcheck(client).await,
             Message::NegotiatorAddr => {
                 Self::handle_negotiator_addr(client, self.public_negotiator_addr).await
             }
@@ -604,6 +606,16 @@ impl QueueServer {
         };
 
         result
+    }
+
+    #[inline(always)]
+    #[instrument(level = "trace", skip(invoker))]
+    async fn handle_healthcheck(
+        mut invoker: tokio::net::TcpStream,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // Right now nothing interesting is owned by the queue, so nothing extra to check.
+        net_protocol::async_write(&mut invoker, &net_protocol::health::HEALTHY).await?;
+        Ok(())
     }
 
     #[inline(always)]
@@ -836,25 +848,35 @@ impl WorkScheduler {
     fn handle_work_conn(&mut self, mut worker: TcpStream) {
         // Get the invocation this worker wants work for.
         // TODO: error handling
-        let invocation_id: InvocationId =
+        let request: WorkServerRequest =
             net_protocol::read(&mut worker).expect("Failed to read message");
 
-        // Pull the next work item.
-        let next_work = loop {
-            let opt_work = { self.queues.lock().unwrap().next_work(invocation_id) };
-            match opt_work {
-                Ok(work) => break work,
-                Err(WaitingForManifestError) => {
-                    // Nothing yet; release control and sleep for a bit in case the
-                    // manifest comes in.
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
+        match request {
+            WorkServerRequest::HealthCheck => {
+                let write_result = net_protocol::write(&mut worker, net_protocol::health::HEALTHY);
+                if let Err(err) = write_result {
+                    tracing::debug!("error sending health check: {}", err.to_string());
                 }
             }
-        };
+            WorkServerRequest::NextTest { invocation_id } => {
+                // Pull the next work item.
+                let next_work = loop {
+                    let opt_work = { self.queues.lock().unwrap().next_work(invocation_id) };
+                    match opt_work {
+                        Ok(work) => break work,
+                        Err(WaitingForManifestError) => {
+                            // Nothing yet; release control and sleep for a bit in case the
+                            // manifest comes in.
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    }
+                };
 
-        // TODO: error handling
-        net_protocol::write(&mut worker, next_work).unwrap();
+                // TODO: error handling
+                net_protocol::write(&mut worker, next_work).unwrap();
+            }
+        }
     }
 }
 
@@ -872,7 +894,7 @@ mod test {
         invoke::Client,
         queue::{
             ActiveInvocations, ClientReconnectionError, ClientResponder, QueueServer,
-            SharedInvocationQueues, WorkLeftForInvocations,
+            SharedInvocationQueues, WorkLeftForInvocations, WorkScheduler, WorkerSchedulerMsg,
         },
     };
     use abq_utils::net_protocol::{
@@ -1267,5 +1289,61 @@ mod test {
 
             worker_result_future.await.unwrap().unwrap();
         }
+    }
+
+    #[test]
+    fn queue_server_healthcheck() {
+        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        let queue_server = QueueServer {
+            queues: Default::default(),
+            active_invocations: Default::default(),
+            work_left_for_invocations: Default::default(),
+            public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
+        };
+        let queue_handle = thread::spawn(|| {
+            queue_server.start_on(server, server_shutdown_rx).unwrap();
+        });
+
+        let mut conn = TcpStream::connect(server_addr).unwrap();
+        net_protocol::write(&mut conn, net_protocol::queue::Message::HealthCheck).unwrap();
+        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+
+        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+
+        server_shutdown_tx.blocking_send(()).unwrap();
+        queue_handle.join().unwrap();
+    }
+
+    #[test]
+    fn work_server_healthcheck() {
+        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let (work_server_tx, work_server_rx) = std::sync::mpsc::channel();
+
+        let work_scheduler = WorkScheduler {
+            queues: Default::default(),
+            msg_recv: work_server_rx,
+        };
+        let work_server_handle = thread::spawn(|| {
+            work_scheduler.start_on(server);
+        });
+
+        let mut conn = TcpStream::connect(server_addr).unwrap();
+        net_protocol::write(
+            &mut conn,
+            net_protocol::work_server::WorkServerRequest::HealthCheck,
+        )
+        .unwrap();
+        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+
+        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+
+        work_server_tx.send(WorkerSchedulerMsg::Shutdown).unwrap();
+        work_server_handle.join().unwrap();
     }
 }
