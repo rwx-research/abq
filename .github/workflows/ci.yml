@@ -130,6 +130,8 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: test
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
       - name: Restore cargo cache
         uses: actions/cache@v3.0.7
         env:
