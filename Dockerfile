@@ -27,3 +27,4 @@ WORKDIR /app
 
 # Get compiled binaries from the builder
 COPY --from=builder /usr/local/cargo/bin/abq /app/abq
+COPY --from=builder /usr/src/app/bin/health /app/health

@@ -8,7 +8,8 @@ serde = "1.0.144"
 serde_derive = "1.0.144"
 serde_json = "1.0.85"
 
-tokio = { version = "1.20.1", features = ["io-util"] }
+tokio = { version = "1.20.1", features = ["io-util", "net", "rt", "macros"] }
+tracing = "0.1.36"
 
 [dependencies.uuid]
 version = "1.1.2"
