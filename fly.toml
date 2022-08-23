@@ -20,6 +20,7 @@ cmd = [
 [[services]]
 internal_port = 8080
 protocol = "tcp"
+tcp_checks = []
 
   [[services.ports]]
      port = "8080"
@@ -27,6 +28,7 @@ protocol = "tcp"
 [[services]]
 internal_port = 8081
 protocol = "tcp"
+tcp_checks = []
 
   [[services.ports]]
      port = "8081"
@@ -34,6 +36,7 @@ protocol = "tcp"
 [[services]]
 internal_port = 8082
 protocol = "tcp"
+tcp_checks = []
 
   [[services.ports]]
      port = "8082"
@@ -42,9 +45,9 @@ protocol = "tcp"
 hard_limit = 25
 soft_limit = 20
 
-[[services.tcp_checks]]
-grace_period = "1s"
-interval = "15s"
-port = "8080"
-restart_limit = 6
-timeout = "2s"
+[[services.script_checks]]
+command = "/app/health"
+grace_period  = "5s"
+interval      = "15s"
+restart_limit = 0
+timeout       = "1s"

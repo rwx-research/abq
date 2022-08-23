@@ -284,6 +284,18 @@ pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketA
     socket_addr
 }
 
+fn validate_max_message_size(message_size: u32) -> Result<(), std::io::Error> {
+    const MAX_MESSAGE_SIZE: u32 = 1_000_000; // 1MB
+    if message_size > MAX_MESSAGE_SIZE {
+        tracing::warn!("Refusing to read message of size {message_size} bytes");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("message size {message_size} bytes exceeds the maximum"),
+        ));
+    }
+    Ok(())
+}
+
 /// Reads a message from a stream communicating with abq.
 ///
 /// Note that [Read::read_exact] is used, and so the stream cannot be non-blocking.
@@ -295,6 +307,7 @@ pub fn read<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<T,
     let mut msg_size_buf = [0; 4];
     reader.read_exact(&mut msg_size_buf)?;
     let msg_size = u32::from_be_bytes(msg_size_buf);
+    validate_max_message_size(msg_size)?;
 
     let mut msg_buf = vec![0; msg_size as usize];
     reader.read_exact(&mut msg_buf)?;
@@ -327,6 +340,7 @@ where
     let mut msg_size_buf = [0; 4];
     reader.read_exact(&mut msg_size_buf).await?;
     let msg_size = u32::from_be_bytes(msg_size_buf);
+    validate_max_message_size(msg_size)?;
 
     let mut msg_buf = vec![0; msg_size as usize];
     reader.read_exact(&mut msg_buf).await?;
@@ -357,4 +371,55 @@ where
     msg_buf.extend_from_slice(&msg_json);
     writer.write_all(&msg_buf).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Write;
+
+    use tokio::io::AsyncWriteExt;
+
+    use super::{async_read, read};
+
+    #[test]
+    fn error_reads_that_are_too_large() {
+        use std::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        let (mut server_conn, _) = server.accept().unwrap();
+
+        let two_mb_msg_size = 2_000_000_u32.to_be_bytes();
+        client_conn.write_all(&two_mb_msg_size).unwrap();
+
+        let read_result: Result<(), _> = read(&mut server_conn);
+        assert!(read_result.is_err());
+        let err = read_result.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "message size 2000000 bytes exceeds the maximum"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_reads_that_are_too_large_async() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_conn, _) = server.accept().await.unwrap();
+
+        let two_mb_msg_size = 2_000_000_u32.to_be_bytes();
+        client_conn.write_all(&two_mb_msg_size).await.unwrap();
+
+        let read_result: Result<(), _> = async_read(&mut server_conn).await;
+        assert!(read_result.is_err());
+        let err = read_result.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "message size 2000000 bytes exceeds the maximum"
+        );
+    }
 }
