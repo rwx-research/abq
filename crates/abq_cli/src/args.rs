@@ -109,4 +109,20 @@ pub enum Command {
         #[clap(required = true, multiple_values = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Checks the health of an abq instance.
+    ///
+    /// Exits with 0 if all provided services to check are health; exits with 1 otherwise.
+    Health {
+        /// The addresses of one or more queue servers to check.
+        #[clap(required = false, long)]
+        queue: Vec<SocketAddr>,
+
+        /// The addresses of one or more work-scheduling servers to check.
+        #[clap(required = false, long)]
+        work_scheduler: Vec<SocketAddr>,
+
+        /// The addresses of one or more negotiator servers to check.
+        #[clap(required = false, long)]
+        negotiator: Vec<SocketAddr>,
+    },
 }

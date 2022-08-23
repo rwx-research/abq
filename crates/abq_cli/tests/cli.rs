@@ -1,6 +1,5 @@
 #![cfg(test)]
 
-#[cfg(feature = "test-abq-jest")]
 use std::process::{ExitStatus, Output};
 use std::{
     ffi::OsStr,
@@ -28,14 +27,12 @@ fn testdata_project(subpath: impl AsRef<Path>) -> PathBuf {
     PathBuf::from(WORKSPACE).join("testdata").join(subpath)
 }
 
-#[cfg(feature = "test-abq-jest")]
 struct CmdOutput {
     stdout: String,
     stderr: String,
     exit_status: ExitStatus,
 }
 
-#[cfg(feature = "test-abq-jest")]
 fn run_abq<S>(args: impl IntoIterator<Item = S>) -> CmdOutput
 where
     S: AsRef<OsStr>,
@@ -43,7 +40,6 @@ where
     run_abq_in(args, &std::env::current_dir().unwrap())
 }
 
-#[cfg(feature = "test-abq-jest")]
 fn run_abq_in<S>(args: impl IntoIterator<Item = S>, working_dir: &Path) -> CmdOutput
 where
     S: AsRef<OsStr>,
@@ -248,5 +244,113 @@ fn yarn_jest_auto_workers_with_failing_tests() {
     let mut stdout_lines = stdout.lines();
     assert_eq!(stdout_lines.next().unwrap(), "F");
 
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn healthcheck_queue_success() {
+    let server_port = find_free_port();
+    let work_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+    let work_scheduler_addr = format!("0.0.0.0:{work_port}");
+    let negotiator_addr = format!("0.0.0.0:{negotiator_port}");
+
+    let mut queue_proc = spawn_abq([
+        "start",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        &server_port.to_string(),
+        "--work-port",
+        &work_port.to_string(),
+        "--negotiator-port",
+        &negotiator_port.to_string(),
+    ]);
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start workers") {
+                break;
+            }
+        }
+    }
+
+    // Check health
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq([
+        "health",
+        "--queue",
+        &queue_addr,
+        "--work-scheduler",
+        &work_scheduler_addr,
+        "--negotiator",
+        &negotiator_addr,
+    ]);
+
+    assert!(exit_status.success(), "{}\n{}", stdout, stderr);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+
+    queue_proc.kill().expect("queue already dead");
+}
+
+#[test]
+fn healthcheck_queue_failure() {
+    let server_port = find_free_port();
+    let work_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+    let work_scheduler_addr = format!("0.0.0.0:{work_port}");
+    let negotiator_addr = format!("0.0.0.0:{negotiator_port}");
+
+    let mut queue_proc = spawn_abq([
+        "start",
+        "--bind",
+        "0.0.0.0",
+        "--port",
+        &server_port.to_string(),
+        "--work-port",
+        &work_port.to_string(),
+        "--negotiator-port",
+        &negotiator_port.to_string(),
+    ]);
+
+    queue_proc.kill().expect("queue already dead");
+
+    // Check health
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq([
+        "health",
+        "--queue",
+        &queue_addr,
+        "--work-scheduler",
+        &work_scheduler_addr,
+        "--negotiator",
+        &negotiator_addr,
+    ]);
+
+    assert_eq!(exit_status.code().unwrap(), 1);
+    assert_eq!(
+        stdout,
+        format!(
+            r#"Queue at {queue_addr}: unhealthy
+Work scheduler at {work_scheduler_addr}: unhealthy
+Negotiator at {negotiator_addr}: unhealthy
+"#
+        )
+    );
     assert!(stderr.is_empty());
 }

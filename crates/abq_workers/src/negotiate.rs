@@ -62,7 +62,8 @@ enum MessageFromQueueNegotiator {
 }
 
 #[derive(Serialize, Deserialize)]
-enum MessageToQueueNegotiator {
+pub enum MessageToQueueNegotiator {
+    HealthCheck,
     WantsToAttach {
         /// The invocation the worker wants to run tests for. The queue must respect assignment of
         /// work related to this invocation, or return an error.
@@ -164,7 +165,11 @@ impl WorkersNegotiator {
 
             // Write the invocation ID we want work for
             // TODO: error handling
-            net_protocol::write(&mut stream, invocation_id).unwrap();
+            net_protocol::write(
+                &mut stream,
+                net_protocol::work_server::WorkServerRequest::NextTest { invocation_id },
+            )
+            .unwrap();
 
             // TODO: error handling
             net_protocol::read(&mut stream).unwrap()
@@ -287,6 +292,13 @@ impl QueueNegotiator {
 
                 use MessageToQueueNegotiator::*;
                 match msg {
+                    HealthCheck => {
+                        let write_result =
+                            net_protocol::write(&mut stream, net_protocol::health::HEALTHY);
+                        if let Err(err) = write_result {
+                            tracing::debug!("error sending health check: {}", err.to_string());
+                        }
+                    }
                     WantsToAttach {
                         invocation: wanted_invocation_id,
                     } => {
@@ -352,19 +364,20 @@ impl Drop for QueueNegotiator {
 
 #[cfg(test)]
 mod test {
-    use std::net::{SocketAddr, TcpListener};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
-    use super::{AssignedRun, QueueNegotiator, WorkersNegotiator};
+    use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
+    use abq_utils::net_protocol::work_server::WorkServerRequest;
     use abq_utils::net_protocol::workers::{
         InvocationId, NextWork, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
@@ -412,7 +425,7 @@ mod test {
                         worker.set_nonblocking(false).unwrap();
                         let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
 
-                        let _invocation_id: InvocationId = net_protocol::read(&mut worker).unwrap();
+                        let _msg: WorkServerRequest = net_protocol::read(&mut worker).unwrap();
                         net_protocol::write(&mut worker, work).unwrap();
                     }
 
@@ -576,5 +589,37 @@ mod test {
             shutdown_results_server,
             results_handle,
         );
+    }
+
+    #[test]
+    fn queue_negotiator_healthcheck() {
+        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let mut queue_negotiator = QueueNegotiator::new(
+            "0.0.0.0".parse().unwrap(),
+            server,
+            // Below parameters are faux because they are unnecessary for healthchecks.
+            "0.0.0.0:0".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            |_| AssignedRun {
+                invocation_id: InvocationId::new(),
+                runner_kind: RunnerKind::TestLikeRunner(
+                    TestLikeRunner::Echo,
+                    ManifestMessage {
+                        manifest: Manifest { members: vec![] },
+                    },
+                ),
+                should_generate_manifest: true,
+            },
+        );
+
+        let mut conn = TcpStream::connect(server_addr).unwrap();
+        net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
+        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+
+        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+
+        queue_negotiator.shutdown();
     }
 }
