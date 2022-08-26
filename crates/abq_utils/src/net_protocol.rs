@@ -20,7 +20,7 @@ pub mod runners {
 
     pub type MetadataMap = serde_json::Map<String, serde_json::Value>;
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize)]
     pub struct TestCaseMessage {
         pub test_case: TestCase,
     }
