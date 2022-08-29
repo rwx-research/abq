@@ -203,7 +203,7 @@ impl GenericTestRunner {
         } = input;
 
         // TODO: get from runner params
-        let protocol_version_timeout = Duration::from_secs(5);
+        let protocol_version_timeout = Duration::from_secs(30);
 
         // If we need to retrieve the manifest, do that first.
         if let Some(mut send_manifest) = send_manifest {
