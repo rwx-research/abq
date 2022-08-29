@@ -279,6 +279,7 @@ impl QueueNegotiator {
         let advertised_queue_new_work_addr = publicize_addr(queue_new_work_addr, public_ip);
         let advertised_queue_results_addr = publicize_addr(queue_results_addr, public_ip);
 
+        tracing::debug!("Starting negotiator on {}", addr);
         let listener_handle = thread::spawn(move || {
             for stream in listener.incoming() {
                 tracing::debug!("New worker set negotiating");
