@@ -606,6 +606,16 @@ impl QueueServer {
                 manifest,
             ),
             Message::WorkerResult(invocation_id, work_id, result) => {
+                // Recording and sending the test result back to the abq test client may
+                // be expensive, with multiple IO transactions. There is no reason to block the
+                // client connection on that; recall that the worker side of the connection will
+                // move on to the next test as soon as it sends a test result back.
+                //
+                // So, we have no use for the connection as soon as we've parsed the test result out,
+                // and we'd prefer to close it immediately.
+                drop(client);
+
+                // Record the test result and notify the test client out-of-band.
                 Self::handle_worker_result(
                     self.queues,
                     self.active_invocations,
