@@ -12,6 +12,28 @@ pub mod health {
     pub static HEALTHY: &str = "HEALTHY";
 }
 
+pub mod entity {
+    use serde::{Deserialize, Serialize};
+
+    /// Identifies a unique instance of an entity participating in the ABQ network ecosystem.
+    /// The queue, workers, and abq test clients are all entities.
+    #[derive(Serialize, Deserialize, Clone, Copy)]
+    pub struct EntityId(pub [u8; 16]);
+
+    impl EntityId {
+        #[allow(clippy::new_without_default)] // Entity IDs should be fresh, not defaulted
+        pub fn new() -> Self {
+            Self(uuid::Uuid::new_v4().into_bytes())
+        }
+    }
+
+    impl std::fmt::Debug for EntityId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+        }
+    }
+}
+
 pub mod runners {
     use serde_derive::{Deserialize, Serialize};
 
@@ -123,9 +145,14 @@ pub mod runners {
 pub mod workers {
     use super::runners::{ManifestMessage, TestCase};
     use serde_derive::{Deserialize, Serialize};
-    use std::{collections::HashMap, fmt::Display, path::PathBuf, str::FromStr};
+    use std::{
+        collections::HashMap,
+        fmt::{self, Display},
+        path::PathBuf,
+        str::FromStr,
+    };
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
     /// ID for a particular invocation of the queue, which sends many units of work.
     ///
     // TODO: consider supporting arbitrary strings, to ease the generation of in some contexts
@@ -152,6 +179,12 @@ pub mod workers {
     }
 
     impl Display for InvocationId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+        }
+    }
+
+    impl fmt::Debug for InvocationId {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
         }
@@ -219,6 +252,7 @@ pub mod queue {
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
+        entity::EntityId,
         runners::{ManifestMessage, TestResult},
         workers::{InvocationId, RunnerKind, WorkId},
     };
@@ -237,6 +271,13 @@ pub mod queue {
         Result(WorkId, TestResult),
         /// No more results are known.
         EndOfResults,
+    }
+
+    /// A request sent to the queue.
+    #[derive(Serialize, Deserialize)]
+    pub struct Request {
+        pub entity: EntityId,
+        pub message: Message,
     }
 
     /// A message sent to the queue.

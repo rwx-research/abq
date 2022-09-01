@@ -8,8 +8,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use abq_utils::flatten_manifest;
+use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
-use abq_utils::net_protocol::queue::InvokerResponse;
+use abq_utils::net_protocol::queue::{InvokerResponse, Request};
 use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{RunnerKind, WorkContext};
@@ -569,26 +570,38 @@ impl QueueServer {
         self,
         mut client: tokio::net::TcpStream,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let msg = net_protocol::async_read(&mut client).await?;
+        let Request { entity, message } = net_protocol::async_read(&mut client).await?;
 
-        let result: Result<(), Box<dyn Error + Send + Sync>> = match msg {
-            Message::HealthCheck => Self::handle_healthcheck(client).await,
+        let result: Result<(), Box<dyn Error + Send + Sync>> = match message {
+            Message::HealthCheck => Self::handle_healthcheck(entity, client).await,
             Message::NegotiatorAddr => {
-                Self::handle_negotiator_addr(client, self.public_negotiator_addr).await
+                Self::handle_negotiator_addr(entity, client, self.public_negotiator_addr).await
             }
             Message::InvokeWork(invoke_work) => {
-                Self::handle_invoked_work(self.active_invocations, self.queues, client, invoke_work)
-                    .await
+                Self::handle_invoked_work(
+                    self.active_invocations,
+                    self.queues,
+                    entity,
+                    client,
+                    invoke_work,
+                )
+                .await
             }
             Message::Reconnect(invocation_id) => {
-                Self::handle_invoker_reconnection(self.active_invocations, client, invocation_id)
-                    .await
-                    // Upcast the reconnection error into a generic error
-                    .map_err(|e| Box::new(e) as _)
+                Self::handle_invoker_reconnection(
+                    self.active_invocations,
+                    entity,
+                    client,
+                    invocation_id,
+                )
+                .await
+                // Upcast the reconnection error into a generic error
+                .map_err(|e| Box::new(e) as _)
             }
             Message::Manifest(invocation_id, manifest) => Self::handle_manifest(
                 self.queues,
                 self.work_left_for_invocations,
+                entity,
                 invocation_id,
                 manifest,
             ),
@@ -597,6 +610,7 @@ impl QueueServer {
                     self.queues,
                     self.active_invocations,
                     self.work_left_for_invocations,
+                    entity,
                     invocation_id,
                     work_id,
                     result,
@@ -611,6 +625,7 @@ impl QueueServer {
     #[inline(always)]
     #[instrument(level = "trace", skip(invoker))]
     async fn handle_healthcheck(
+        entity: EntityId,
         mut invoker: tokio::net::TcpStream,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Right now nothing interesting is owned by the queue, so nothing extra to check.
@@ -621,6 +636,7 @@ impl QueueServer {
     #[inline(always)]
     #[instrument(level = "trace", skip(invoker, public_negotiator_addr))]
     async fn handle_negotiator_addr(
+        entity: EntityId,
         mut invoker: tokio::net::TcpStream,
         public_negotiator_addr: SocketAddr,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -632,6 +648,7 @@ impl QueueServer {
     async fn handle_invoked_work(
         active_invocations: ActiveInvocations,
         queues: SharedInvocationQueues,
+        entity: EntityId,
         invoker: tokio::net::TcpStream,
         invoke_work: InvokeWork,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -660,6 +677,7 @@ impl QueueServer {
     #[instrument(level = "trace", skip(active_invocations, new_invoker))]
     async fn handle_invoker_reconnection(
         active_invocations: ActiveInvocations,
+        entity: EntityId,
         new_invoker: tokio::net::TcpStream,
         invocation_id: InvocationId,
     ) -> Result<(), ClientReconnectionError> {
@@ -694,6 +712,7 @@ impl QueueServer {
     fn handle_manifest(
         queues: SharedInvocationQueues,
         work_left_for_invocations: WorkLeftForInvocations,
+        entity: EntityId,
         invocation_id: InvocationId,
         manifest: ManifestMessage,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -721,6 +740,7 @@ impl QueueServer {
         queues: SharedInvocationQueues,
         active_invocations: ActiveInvocations,
         work_left_for_invocations: WorkLeftForInvocations,
+        entity: EntityId,
         invocation_id: InvocationId,
         work_id: WorkId,
         result: TestResult,
@@ -899,6 +919,7 @@ mod test {
     };
     use abq_utils::net_protocol::{
         self,
+        entity::EntityId,
         runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
         workers::{InvocationId, RunnerKind, TestLikeRunner, WorkId},
     };
@@ -972,9 +993,10 @@ mod test {
 
             runtime.block_on(async {
                 let mut results = Vec::default();
-                let client = Client::invoke_work(queue_server_addr, invocation_id, runner)
-                    .await
-                    .unwrap();
+                let client =
+                    Client::invoke_work(EntityId::new(), queue_server_addr, invocation_id, runner)
+                        .await
+                        .unwrap();
                 client
                     .stream_results(|id, result| {
                         results.push((id.0, result));
@@ -1051,12 +1073,14 @@ mod test {
                 let mut results1 = Vec::default();
                 let mut results2 = Vec::default();
 
-                let client1 = Client::invoke_work(queue_server_addr, invocation1, runner1)
-                    .await
-                    .unwrap();
-                let client2 = Client::invoke_work(queue_server_addr, invocation2, runner2)
-                    .await
-                    .unwrap();
+                let client1 =
+                    Client::invoke_work(EntityId::new(), queue_server_addr, invocation1, runner1)
+                        .await
+                        .unwrap();
+                let client2 =
+                    Client::invoke_work(EntityId::new(), queue_server_addr, invocation2, runner2)
+                        .await
+                        .unwrap();
 
                 let fut1 = client1.stream_results(|id, result| {
                     results1.push((id.0, result));
@@ -1150,6 +1174,7 @@ mod test {
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
             Arc::clone(&active_invocations),
+            EntityId::new(),
             new_conn,
             invocation_id,
         )
@@ -1181,6 +1206,7 @@ mod test {
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
             Arc::clone(&active_invocations),
+            EntityId::new(),
             conn,
             invocation_id,
         )
@@ -1200,6 +1226,8 @@ mod test {
         let active_invocations = ActiveInvocations::default();
         let invocation_queues = SharedInvocationQueues::default();
         let work_left = WorkLeftForInvocations::default();
+
+        let client_entity = EntityId::new();
 
         // Pretend we have infinite work so the queue always streams back results to the client.
         work_left.lock().unwrap().insert(invocation_id, usize::MAX);
@@ -1227,6 +1255,7 @@ mod test {
                 Arc::clone(&invocation_queues),
                 Arc::clone(&active_invocations),
                 Arc::clone(&work_left),
+                EntityId::new(),
                 invocation_id,
                 buffered_work_id.clone(),
                 fake_test_result(),
@@ -1253,6 +1282,7 @@ mod test {
         // Reconnect back to the queue
         let client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
         let mut client = Client {
+            entity: client_entity,
             abq_server_addr: fake_server_addr,
             invocation_id,
             stream: client_conn,
@@ -1261,6 +1291,7 @@ mod test {
             let (server_conn, _) = fake_server.accept().await.unwrap();
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
                 Arc::clone(&active_invocations),
+                EntityId::new(),
                 server_conn,
                 invocation_id,
             ));
@@ -1279,6 +1310,7 @@ mod test {
                 invocation_queues,
                 Arc::clone(&active_invocations),
                 work_left,
+                EntityId::new(),
                 invocation_id,
                 second_work_id.clone(),
                 fake_test_result(),
@@ -1309,7 +1341,15 @@ mod test {
         });
 
         let mut conn = TcpStream::connect(server_addr).unwrap();
-        net_protocol::write(&mut conn, net_protocol::queue::Message::HealthCheck).unwrap();
+
+        net_protocol::write(
+            &mut conn,
+            net_protocol::queue::Request {
+                entity: EntityId::new(),
+                message: net_protocol::queue::Message::HealthCheck,
+            },
+        )
+        .unwrap();
         let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
 
         assert_eq!(health_msg, net_protocol::health::HEALTHY);

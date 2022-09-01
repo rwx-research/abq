@@ -15,7 +15,9 @@ use crate::workers::{
     GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
 };
 use abq_utils::net_protocol::{
-    self, publicize_addr,
+    self,
+    entity::EntityId,
+    publicize_addr,
     workers::{InvocationId, RunnerKind},
 };
 
@@ -137,21 +139,28 @@ impl WorkersNegotiator {
             work_retries,
         } = workers_config;
 
-        let notify_result: NotifyResult = Arc::new(move |invocation_id, work_id, result| {
-            let span = tracing::trace_span!("notify_result", invocation_id=?invocation_id, work_id=?work_id, queue_server=?queue_results_addr);
-            let _notify_result = span.enter();
+        let notify_result: NotifyResult = Arc::new(
+            move |entity, invocation_id, work_id, result| {
+                let span = tracing::trace_span!("notify_result", invocation_id=?invocation_id, work_id=?work_id, queue_server=?queue_results_addr);
+                let _notify_result = span.enter();
 
-            // TODO: error handling
-            let mut stream =
-                TcpStream::connect(queue_results_addr).expect("results server not available");
+                // TODO: error handling
+                let mut stream =
+                    TcpStream::connect(queue_results_addr).expect("results server not available");
 
-            // TODO: error handling
-            net_protocol::write(
-                &mut stream,
-                net_protocol::queue::Message::WorkerResult(invocation_id, work_id, result),
-            )
-            .unwrap();
-        });
+                let request = net_protocol::queue::Request {
+                    entity,
+                    message: net_protocol::queue::Message::WorkerResult(
+                        invocation_id,
+                        work_id,
+                        result,
+                    ),
+                };
+
+                // TODO: error handling
+                net_protocol::write(&mut stream, request).unwrap();
+            },
+        );
 
         let get_next_work: GetNextWork = Arc::new(move || {
             let span = tracing::trace_span!("get_next_work", invocation_id=?invocation_id, new_work_server=?queue_new_work_addr);
@@ -176,20 +185,21 @@ impl WorkersNegotiator {
         });
 
         let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
-            Some(Box::new(move |invocation_id, manifest| {
-                let span = tracing::trace_span!("notify_manifest", invocation_id=?invocation_id, queue_server=?queue_results_addr);
+            Some(Box::new(move |entity, invocation_id, manifest| {
+                let span = tracing::trace_span!("notify_manifest", ?entity, invocation_id=?invocation_id, queue_server=?queue_results_addr);
                 let _notify_manifest = span.enter();
 
                 // TODO: error handling
                 let mut stream =
                     TcpStream::connect(queue_results_addr).expect("results server not available");
 
+                let request = net_protocol::queue::Request {
+                    entity,
+                    message: net_protocol::queue::Message::Manifest(invocation_id, manifest),
+                };
+
                 // TODO: error handling
-                net_protocol::write(
-                    &mut stream,
-                    net_protocol::queue::Message::Manifest(invocation_id, manifest),
-                )
-                .unwrap();
+                net_protocol::write(&mut stream, request).unwrap();
             }))
         } else {
             None
@@ -236,12 +246,20 @@ impl QueueNegotiatorHandle {
         self.0
     }
 
-    pub fn ask_queue(queue_addr: SocketAddr) -> Result<Self, QueueNegotiatorHandleError> {
+    pub fn ask_queue(
+        entity: EntityId,
+        queue_addr: SocketAddr,
+    ) -> Result<Self, QueueNegotiatorHandleError> {
         use QueueNegotiatorHandleError::*;
 
         let mut conn = TcpStream::connect(queue_addr).map_err(|_| CouldNotConnect)?;
-        net_protocol::write(&mut conn, net_protocol::queue::Message::NegotiatorAddr)
-            .map_err(|_| CouldNotConnect)?;
+
+        let request = net_protocol::queue::Request {
+            entity,
+            message: net_protocol::queue::Message::NegotiatorAddr,
+        };
+
+        net_protocol::write(&mut conn, request).map_err(|_| CouldNotConnect)?;
         let negotiator_addr: SocketAddr =
             net_protocol::read(&mut conn).map_err(|_| CouldNotConnect)?;
 
@@ -472,8 +490,8 @@ mod test {
                 Err(_) => unreachable!(),
             };
 
-            let message = net_protocol::read(&mut client).unwrap();
-            match message {
+            let request: net_protocol::queue::Request = net_protocol::read(&mut client).unwrap();
+            match request.message {
                 net_protocol::queue::Message::WorkerResult(_, _, result) => {
                     msgs2.lock().unwrap().push(result);
                 }
