@@ -16,11 +16,14 @@ serde = "1.0.144"
 serde_derive = "1.0.144"
 serde_json = "1.0.85"
 
+parking_lot = "0.12.1"
+tokio = { version = "1.20.1", features = ["net", "rt", "rt-multi-thread", "sync", "macros", "time"] }
 tracing = "0.1.36"
 
 [dev-dependencies]
 procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile = "3.3.0"
+tracing-test = "0.2.3"
 
 [features]
 default = []

@@ -2,6 +2,8 @@
 
 use serde_derive::{Deserialize, Serialize};
 use std::{
+    error::Error,
+    io,
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     num::NonZeroUsize,
     sync::Arc,
@@ -71,7 +73,6 @@ pub enum MessageToQueueNegotiator {
         /// work related to this invocation, or return an error.
         invocation: InvocationId,
     },
-    Shutdown,
 }
 
 #[derive(Clone, Debug)]
@@ -228,7 +229,8 @@ impl WorkersNegotiator {
 /// The queue side of the negotiation.
 pub struct QueueNegotiator {
     addr: SocketAddr,
-    listener_handle: Option<thread::JoinHandle<()>>,
+    shutdown_tx: tokio::sync::mpsc::Sender<()>,
+    listener_handle: Option<thread::JoinHandle<Result<(), QueueNegotiatorServerError>>>,
 }
 
 /// Address of a queue negotiator.
@@ -280,85 +282,167 @@ pub struct AssignedRun {
     pub should_generate_manifest: bool,
 }
 
+/// An error that happens in the construction or execution of the queue negotiation server.
+///
+/// Does not include errors in the handling of requests to the server, but does include errors in
+/// the acception or dispatch of connections.
+#[derive(Debug, Error)]
+pub enum QueueNegotiatorServerError {
+    /// An IO-related error.
+    #[error("{0}")]
+    Io(#[from] io::Error),
+
+    /// Any other opaque error that occured.
+    #[error("{0}")]
+    Other(#[from] Box<dyn Error + Send + Sync>),
+}
+
+struct QueueNegotiatorCtx<GetAssignedRun>
+where
+    GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
+{
+    get_assigned_run: Arc<GetAssignedRun>,
+    advertised_queue_work_scheduler_addr: SocketAddr,
+    advertised_queue_results_addr: SocketAddr,
+}
+
+impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
+where
+    GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        Self {
+            get_assigned_run: Arc::clone(&self.get_assigned_run),
+            advertised_queue_work_scheduler_addr: self.advertised_queue_work_scheduler_addr,
+            advertised_queue_results_addr: self.advertised_queue_results_addr,
+        }
+    }
+}
+
 impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
     pub fn new<GetAssignedRun>(
         public_ip: IpAddr,
         listener: TcpListener,
-        queue_new_work_addr: SocketAddr,
+        queue_work_scheduler_addr: SocketAddr,
         queue_results_addr: SocketAddr,
-        mut get_assigned_run: GetAssignedRun,
-    ) -> Self
+        get_assigned_run: GetAssignedRun,
+    ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: FnMut(InvocationId) -> AssignedRun + Send + 'static,
+        GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
     {
-        let addr = listener.local_addr().unwrap();
+        let addr = listener.local_addr()?;
 
-        let advertised_queue_new_work_addr = publicize_addr(queue_new_work_addr, public_ip);
+        let advertised_queue_work_scheduler_addr =
+            publicize_addr(queue_work_scheduler_addr, public_ip);
         let advertised_queue_results_addr = publicize_addr(queue_results_addr, public_ip);
 
         tracing::debug!("Starting negotiator on {}", addr);
+
+        let (server_shutdown_tx, mut server_shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        let ctx = QueueNegotiatorCtx {
+            get_assigned_run: Arc::new(get_assigned_run),
+            advertised_queue_work_scheduler_addr,
+            advertised_queue_results_addr,
+        };
+
         let listener_handle = thread::spawn(move || {
-            for stream in listener.incoming() {
-                tracing::debug!("New worker set negotiating");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
 
-                let mut stream = stream.unwrap();
+            let server_result: Result<(), QueueNegotiatorServerError> = rt.block_on(async {
+                // Initialize the listener in the async context.
+                listener.set_nonblocking(true)?;
+                let listener = tokio::net::TcpListener::from_std(listener)?;
 
-                tracing::debug!("Reading connection message");
-                // TODO: error handling
-                let msg: MessageToQueueNegotiator = net_protocol::read(&mut stream).unwrap();
-                tracing::debug!("Read connection message");
-
-                use MessageToQueueNegotiator::*;
-                match msg {
-                    HealthCheck => {
-                        let write_result =
-                            net_protocol::write(&mut stream, net_protocol::health::HEALTHY);
-                        if let Err(err) = write_result {
-                            tracing::debug!("error sending health check: {}", err.to_string());
+                loop {
+                    let (client, _) = tokio::select! {
+                        conn = listener.accept() => conn?,
+                        _ = server_shutdown_rx.recv() => {
+                            break;
                         }
-                    }
-                    WantsToAttach {
-                        invocation: wanted_invocation_id,
-                    } => {
-                        // Choose an `abq test ...` invocation the workers should perform work
-                        // for.
-                        // TODO: this fully blocks the negotiator, so nothing else can connect
-                        // while we wait for an invocation, and moreover we won't respect
-                        // shutdown messages.
-                        tracing::debug!("Finding assigned run");
-                        let AssignedRun {
-                            invocation_id,
-                            runner_kind,
-                            should_generate_manifest,
-                        } = get_assigned_run(wanted_invocation_id);
+                    };
 
-                        tracing::debug!("Found assigned run");
-
-                        debug_assert_eq!(invocation_id, wanted_invocation_id);
-
-                        let execution_context = MessageFromQueueNegotiator::ExecutionContext {
-                            queue_new_work_addr: advertised_queue_new_work_addr,
-                            queue_results_addr: advertised_queue_results_addr,
-                            runner_kind,
-                            worker_should_generate_manifest: should_generate_manifest,
-                            invocation_id,
-                        };
-
-                        // TODO: error handling
-                        tracing::debug!("Sending execution context");
-                        net_protocol::write(&mut stream, execution_context).unwrap();
-                        tracing::debug!("Sent execution context");
-                    }
-                    Shutdown => return,
+                    tokio::spawn({
+                        let ctx = ctx.clone();
+                        async move {
+                            let result = Self::handle_conn(ctx, client).await;
+                            if let Err(err) = result {
+                                tracing::error!("error handling connection: {:?}", err);
+                            }
+                        }
+                    });
                 }
-            }
+
+                Ok(())
+            });
+
+            server_result
         });
 
-        Self {
+        Ok(Self {
             addr,
+            shutdown_tx: server_shutdown_tx,
             listener_handle: Some(listener_handle),
+        })
+    }
+
+    async fn handle_conn<GetAssignedRun>(
+        ctx: QueueNegotiatorCtx<GetAssignedRun>,
+        mut client: tokio::net::TcpStream,
+    ) -> io::Result<()>
+    where
+        GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
+    {
+        let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut client).await?;
+
+        use MessageToQueueNegotiator::*;
+        match msg {
+            HealthCheck => {
+                let write_result =
+                    net_protocol::async_write(&mut client, &net_protocol::health::HEALTHY).await;
+                if let Err(err) = write_result {
+                    tracing::debug!("error sending health check: {}", err.to_string());
+                }
+            }
+            WantsToAttach {
+                invocation: wanted_invocation_id,
+            } => {
+                tracing::debug!("New worker set negotiating");
+
+                // Choose an `abq test ...` invocation the workers should perform work
+                // for.
+                // TODO: this fully blocks the negotiator, so nothing else can connect
+                // while we wait for an invocation, and moreover we won't respect
+                // shutdown messages.
+                tracing::debug!("Finding assigned run");
+                let AssignedRun {
+                    invocation_id,
+                    runner_kind,
+                    should_generate_manifest,
+                } = (ctx.get_assigned_run)(wanted_invocation_id);
+
+                tracing::debug!("Found assigned run");
+
+                debug_assert_eq!(invocation_id, wanted_invocation_id);
+
+                let execution_context = MessageFromQueueNegotiator::ExecutionContext {
+                    queue_new_work_addr: ctx.advertised_queue_work_scheduler_addr,
+                    queue_results_addr: ctx.advertised_queue_results_addr,
+                    runner_kind,
+                    worker_should_generate_manifest: should_generate_manifest,
+                    invocation_id,
+                };
+
+                tracing::debug!("Sending execution context");
+                net_protocol::async_write(&mut client, &execution_context).await?;
+                tracing::debug!("Sent execution context");
+            }
         }
+
+        Ok(())
     }
 
     pub fn get_handle(&self) -> QueueNegotiatorHandle {
@@ -366,9 +450,13 @@ impl QueueNegotiator {
     }
 
     pub fn shutdown(&mut self) {
-        let mut conn = TcpStream::connect(self.addr).unwrap();
-        net_protocol::write(&mut conn, MessageToQueueNegotiator::Shutdown).unwrap();
-        self.listener_handle.take().unwrap().join().unwrap();
+        self.shutdown_tx.blocking_send(()).unwrap();
+        self.listener_handle
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
     }
 }
 
@@ -575,7 +663,8 @@ mod test {
             next_work_addr,
             results_addr,
             get_assigned_run,
-        );
+        )
+        .unwrap();
         let workers_config = WorkersConfig {
             num_workers: NonZeroUsize::new(1).unwrap(),
             worker_context: WorkerContext::AssumeLocal,
@@ -631,7 +720,8 @@ mod test {
                 ),
                 should_generate_manifest: true,
             },
-        );
+        )
+        .unwrap();
 
         let mut conn = TcpStream::connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();

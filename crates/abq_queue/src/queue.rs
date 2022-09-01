@@ -1,9 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::TryRecvError;
-use std::sync::{mpsc, Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -191,11 +190,20 @@ pub struct Abq {
     server_handle: Option<JoinHandle<Result<(), QueueServerError>>>,
     server_shutdown_tx: tokio::sync::mpsc::Sender<()>,
 
-    send_worker: mpsc::Sender<WorkerSchedulerMsg>,
-    work_scheduler_handle: Option<JoinHandle<()>>,
+    work_scheduler_handle: Option<JoinHandle<Result<(), WorkSchedulerError>>>,
+    work_scheduler_shutdown_tx: tokio::sync::mpsc::Sender<()>,
     negotiator: QueueNegotiator,
 
     active: bool,
+}
+
+#[derive(Debug, Error)]
+pub enum AbqError {
+    #[error("{0}")]
+    Queue(#[from] QueueServerError),
+
+    #[error("{0}")]
+    WorkScheduler(#[from] WorkSchedulerError),
 }
 
 impl Abq {
@@ -214,30 +222,34 @@ impl Abq {
 
     /// Sends a signal to shutdown immediately.
     #[instrument(level = "trace", skip(self))]
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) -> Result<(), AbqError> {
         debug_assert!(self.active);
 
         self.active = false;
 
-        self.server_shutdown_tx.blocking_send(()).unwrap();
+        // Shut down all of our servers.
+        self.server_shutdown_tx
+            .blocking_send(())
+            .map_err(|_| QueueServerError::Other("queue server channels have died".into()))?;
+        self.work_scheduler_shutdown_tx
+            .blocking_send(())
+            .map_err(|_| WorkSchedulerError::Other("work scheduler channels have died".into()))?;
 
         self.negotiator.shutdown();
 
-        // TODO: do something with the result
-        let _server_result = self
-            .server_handle
+        self.server_handle
             .take()
-            .expect("server handle must be available during Drop")
+            .expect("server handle must be available during shutdown")
             .join()
-            .unwrap();
+            .unwrap()?;
 
-        // Server has closed; shut down all workers.
-        self.send_worker.send(WorkerSchedulerMsg::Shutdown).unwrap();
         self.work_scheduler_handle
             .take()
-            .expect("worker handle must be available during Drop")
+            .expect("worker handle must be available during shutdown")
             .join()
-            .unwrap();
+            .unwrap()?;
+
+        Ok(())
     }
 
     pub fn get_negotiator_handle(&self) -> QueueNegotiatorHandle {
@@ -249,13 +261,10 @@ impl Drop for Abq {
     fn drop(&mut self) {
         if self.active {
             // Our user never called shutdown; try to perform a clean exit.
-            self.shutdown();
+            // We can't do anything with an error, since this is a drop.
+            let _ = self.shutdown();
         }
     }
-}
-
-enum WorkerSchedulerMsg {
-    Shutdown,
 }
 
 /// Configures initialization of the queue.
@@ -310,7 +319,6 @@ fn start_queue(config: QueueConfig) -> Abq {
 
     let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
 
-    let (send_worker, recv_worker) = mpsc::channel();
     let server_handle = thread::spawn({
         let queue_server = QueueServer::new(Arc::clone(&queues), public_negotiator_addr);
         move || queue_server.start_on(server_listener, server_shutdown_rx)
@@ -319,16 +327,20 @@ fn start_queue(config: QueueConfig) -> Abq {
     let new_work_server = TcpListener::bind((bind_ip, work_port)).unwrap();
     let new_work_server_addr = new_work_server.local_addr().unwrap();
 
+    let (work_scheduler_shutdown_tx, work_scheduler_shutdown_rx) = tokio::sync::mpsc::channel(1);
+
     let work_scheduler_handle = thread::spawn({
         let scheduler = WorkScheduler {
             queues: Arc::clone(&queues),
-            msg_recv: recv_worker,
         };
-        move || scheduler.start_on(new_work_server)
+        move || scheduler.start_on(new_work_server, work_scheduler_shutdown_rx)
     });
 
     // Chooses a test run for a set of workers to attach to.
-    // This blocks until there is an invocation available.
+    // This blocks until there is an invocation available for the particular worker.
+    // TODO: blocking is not good; workers that can connect fast may be blocked on workers waiting
+    // for a test run to be established. Make this cede control to a runtime if the worker's run is
+    // not yet available.
     let choose_run_for_worker = move |wanted_invocation_id| loop {
         let opt_assigned = {
             queues
@@ -353,15 +365,16 @@ fn start_queue(config: QueueConfig) -> Abq {
         new_work_server_addr,
         server_addr,
         choose_run_for_worker,
-    );
+    )
+    .unwrap();
 
     Abq {
         server_addr,
         server_handle: Some(server_handle),
         server_shutdown_tx,
 
-        send_worker,
         work_scheduler_handle: Some(work_scheduler_handle),
+        work_scheduler_shutdown_tx,
         negotiator,
 
         active: true,
@@ -481,7 +494,7 @@ struct QueueServer {
 /// Does not include errors in the handling of requests to the queue, but does include errors in
 /// the acception or dispatch of connections.
 #[derive(Debug, Error)]
-enum QueueServerError {
+pub enum QueueServerError {
     /// An IO-related error.
     #[error("{0}")]
     Io(#[from] io::Error),
@@ -829,61 +842,80 @@ impl QueueServer {
 /// This does not schedule work in any interesting way today, but it may in the future.
 struct WorkScheduler {
     queues: SharedInvocationQueues,
-    /// Channel on which the scheduler itself will receive messages from the parent queue.
-    msg_recv: mpsc::Receiver<WorkerSchedulerMsg>,
+}
+
+/// An error that happens in the construction or execution of the work-scheduling server.
+///
+/// Does not include errors in the handling of requests to the server, but does include errors in
+/// the acception or dispatch of connections.
+#[derive(Debug, Error)]
+pub enum WorkSchedulerError {
+    /// An IO-related error.
+    #[error("{0}")]
+    Io(#[from] io::Error),
+
+    /// Any other opaque error that occured.
+    #[error("{0}")]
+    Other(#[from] Box<dyn Error + Send + Sync>),
 }
 
 impl WorkScheduler {
-    fn start_on(mut self, listener: TcpListener) {
-        // Make `accept()` non-blocking so that we have time to check whether we should shutdown, if
-        // there are no active connections into the queue.
-        listener
-            .set_nonblocking(true)
-            .expect("Failed to set stream as non-blocking");
-
-        for client in listener.incoming() {
-            match client {
-                Ok(client) => {
-                    // Reads and writes to the client will be buffered, so we must make sure
-                    // the stream is blocking. Note that we inherit non-blocking from the server
-                    // listener, but that this adjustment does not affect the server.
-                    client
-                        .set_nonblocking(false)
-                        .expect("Failed to set client stream as blocking");
-
-                    self.handle_work_conn(client);
-                }
-                Err(ref e) => {
-                    match e.kind() {
-                        io::ErrorKind::WouldBlock => {
-                            match self.msg_recv.try_recv() {
-                                Ok(WorkerSchedulerMsg::Shutdown) => return,
-                                Err(TryRecvError::Empty) => {
-                                    // Sleep before polling for the next work connection.
-                                    thread::sleep(POLL_WAIT_TIME);
-                                }
-                                Err(TryRecvError::Disconnected) => {
-                                    todo!("disconnected from parent queue")
-                                }
-                            }
-                        }
-                        _ => todo!("Unhandled IO error: {e:?}"),
-                    }
-                }
-            }
+    fn clone(&self) -> Self {
+        Self {
+            queues: Arc::clone(&self.queues),
         }
     }
 
-    #[instrument(level = "trace", skip(self, worker))]
-    fn handle_work_conn(&mut self, mut worker: TcpStream) {
+    fn start_on(
+        self,
+        listener: TcpListener,
+        mut shutdown: tokio::sync::mpsc::Receiver<()>,
+    ) -> Result<(), WorkSchedulerError> {
+        // Before we hand the server over to the async runtime, we must set it into non-blocking
+        // mode, because the runtime doesn't block!
+        listener.set_nonblocking(true)?;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let server_result: Result<(), WorkSchedulerError> = rt.block_on(async {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+
+            loop {
+                let (client, _) = tokio::select! {
+                    conn = listener.accept() => conn?,
+                    _ = shutdown.recv() => {
+                        break;
+                    }
+                };
+
+                tokio::spawn({
+                    let mut this = self.clone();
+                    async move {
+                        let result = this.handle_work_conn(client).await;
+                        if let Err(err) = result {
+                            tracing::error!("error handling connection: {:?}", err);
+                        }
+                    }
+                });
+            }
+
+            Ok(())
+        });
+
+        server_result
+    }
+
+    #[instrument(level = "trace", skip(self, client))]
+    async fn handle_work_conn(&mut self, mut client: tokio::net::TcpStream) -> io::Result<()> {
         // Get the invocation this worker wants work for.
-        // TODO: error handling
-        let request: WorkServerRequest =
-            net_protocol::read(&mut worker).expect("Failed to read message");
+        let request: WorkServerRequest = net_protocol::async_read(&mut client).await?;
 
         match request {
             WorkServerRequest::HealthCheck => {
-                let write_result = net_protocol::write(&mut worker, net_protocol::health::HEALTHY);
+                let write_result =
+                    net_protocol::async_write(&mut client, &net_protocol::health::HEALTHY).await;
                 if let Err(err) = write_result {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
@@ -897,16 +929,17 @@ impl WorkScheduler {
                         Err(WaitingForManifestError) => {
                             // Nothing yet; release control and sleep for a bit in case the
                             // manifest comes in.
-                            thread::sleep(Duration::from_millis(10));
+                            tokio::time::sleep(POLL_WAIT_TIME).await;
                             continue;
                         }
                     }
                 };
 
-                // TODO: error handling
-                net_protocol::write(&mut worker, next_work).unwrap();
+                net_protocol::async_write(&mut client, &next_work).await?;
             }
         }
+
+        Ok(())
     }
 }
 
@@ -924,7 +957,7 @@ mod test {
         invoke::Client,
         queue::{
             ActiveInvocations, ClientReconnectionError, ClientResponder, QueueServer,
-            SharedInvocationQueues, WorkLeftForInvocations, WorkScheduler, WorkerSchedulerMsg,
+            SharedInvocationQueues, WorkLeftForInvocations, WorkScheduler,
         },
     };
     use abq_utils::net_protocol::{
@@ -1026,8 +1059,8 @@ mod test {
 
         let mut results = results_handle.join().unwrap();
 
-        queue.shutdown();
         workers.shutdown();
+        queue.shutdown().unwrap();
 
         let results = sort_results(&mut results);
 
@@ -1123,9 +1156,9 @@ mod test {
 
         let (mut results1, mut results2) = results_handle.join().unwrap();
 
-        queue.shutdown();
         workers_for_run1.shutdown();
         workers_for_run2.shutdown();
+        queue.shutdown().unwrap();
 
         let results1 = sort_results(&mut results1);
         let results2 = sort_results(&mut results2);
@@ -1373,14 +1406,13 @@ mod test {
         let server = TcpListener::bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (work_server_tx, work_server_rx) = std::sync::mpsc::channel();
+        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
 
         let work_scheduler = WorkScheduler {
             queues: Default::default(),
-            msg_recv: work_server_rx,
         };
         let work_server_handle = thread::spawn(|| {
-            work_scheduler.start_on(server);
+            work_scheduler.start_on(server, server_shutdown_rx).unwrap();
         });
 
         let mut conn = TcpStream::connect(server_addr).unwrap();
@@ -1393,7 +1425,30 @@ mod test {
 
         assert_eq!(health_msg, net_protocol::health::HEALTHY);
 
-        work_server_tx.send(WorkerSchedulerMsg::Shutdown).unwrap();
+        server_shutdown_tx.blocking_send(()).unwrap();
         work_server_handle.join().unwrap();
+    }
+
+    #[test]
+    #[traced_test]
+    fn bad_message_doesnt_take_down_work_scheduling_server() {
+        let server = WorkScheduler {
+            queues: Default::default(),
+        };
+
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        let mut conn = TcpStream::connect(server_addr).unwrap();
+        net_protocol::write(&mut conn, "bad message").unwrap();
+
+        shutdown_tx.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
+
+        logs_with_scope_contain("", "error handling connection");
     }
 }
