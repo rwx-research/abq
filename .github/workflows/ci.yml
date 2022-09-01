@@ -98,7 +98,8 @@ jobs:
               {
                 "name": "test",
                 "path": "abq-test-results.xml",
-                "kind": "test_results"
+                "kind": "test_results",
+                "parser": "junit_xml"
               }
             ]
           job-name: "Lint, test"
