@@ -1,3 +1,4 @@
+use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
 use abq_workers::negotiate::{QueueNegotiatorHandle, QueueNegotiatorHandleError};
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -101,10 +102,10 @@ impl AbqInstance {
         AbqInstance::Local(queue)
     }
 
-    pub fn from_remote(queue_addr: SocketAddr) -> Result<Self, AbqInstanceError> {
+    pub fn from_remote(entity: EntityId, queue_addr: SocketAddr) -> Result<Self, AbqInstanceError> {
         tracing::debug!("Creating instance from remote {}", queue_addr);
 
-        let queue_negotiator = QueueNegotiatorHandle::ask_queue(queue_addr)?;
+        let queue_negotiator = QueueNegotiatorHandle::ask_queue(entity, queue_addr)?;
         Ok(AbqInstance::Remote {
             server_addr: queue_addr,
             queue_negotiator,

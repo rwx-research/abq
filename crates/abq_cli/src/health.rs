@@ -1,6 +1,6 @@
 use std::net::{SocketAddr, TcpStream};
 
-use abq_utils::net_protocol;
+use abq_utils::net_protocol::{self, entity::EntityId, queue};
 
 pub(crate) enum HealthCheckKind {
     Queue(SocketAddr),
@@ -43,12 +43,19 @@ impl HealthCheckKind {
             };
         }
 
+        let entity = EntityId::new();
+
+        tracing::debug!(?entity, "starting healthchecks");
+
         let mut conn = bail!(TcpStream::connect(self.addr()));
         match self {
             HealthCheckKind::Queue(_) => {
                 bail!(net_protocol::write(
                     &mut conn,
-                    net_protocol::queue::Message::HealthCheck,
+                    queue::Request {
+                        entity,
+                        message: queue::Message::HealthCheck,
+                    }
                 ));
             }
             HealthCheckKind::WorkScheduler(_) => {

@@ -9,6 +9,7 @@ use abq_echo_worker as echo;
 use abq_exec_worker as exec;
 use abq_generic_test_runner::{GenericTestRunner, RunnerError};
 use abq_runner_protocol::Runner;
+use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestId, TestResult};
 use abq_utils::net_protocol::workers::{InvocationId, NextWork, RunnerKind, WorkContext, WorkId};
 use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
@@ -22,8 +23,10 @@ enum MessageFromPool {
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type GetNextWork = Arc<dyn Fn() -> NextWork + Send + Sync + 'static>;
-pub type NotifyManifest = Box<dyn Fn(InvocationId, ManifestMessage) + Send + Sync + 'static>;
-pub type NotifyResult = Arc<dyn Fn(InvocationId, WorkId, TestResult) + Send + Sync + 'static>;
+pub type NotifyManifest =
+    Box<dyn Fn(EntityId, InvocationId, ManifestMessage) + Send + Sync + 'static>;
+pub type NotifyResult =
+    Arc<dyn Fn(EntityId, InvocationId, WorkId, TestResult) + Send + Sync + 'static>;
 
 type MarkWorkerComplete = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -296,13 +299,18 @@ fn start_generic_test_runner(
         mark_worker_complete,
     } = env;
 
+    let entity = EntityId::new();
+
+    tracing::debug!(?entity, "Starting new generic test runner");
+
     let notify_manifest = notify_manifest
-        .map(|notify_manifest| move |manifest| notify_manifest(invocation_id, manifest));
+        .map(|notify_manifest| move |manifest| notify_manifest(entity, invocation_id, manifest));
 
     let get_next_work = move || get_next_work();
 
-    let send_test_result =
-        move |work_id, test_result: TestResult| notify_result(invocation_id, work_id, test_result);
+    let send_test_result = move |work_id, test_result: TestResult| {
+        notify_result(entity, invocation_id, work_id, test_result)
+    };
 
     let polling_should_shutdown = || {
         matches!(
@@ -343,8 +351,10 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         mark_worker_complete,
     } = env;
 
+    let entity = EntityId::new();
+
     if let Some(notify_manifest) = notify_manifest {
-        notify_manifest(invocation_id, manifest);
+        notify_manifest(entity, invocation_id, manifest);
     }
 
     loop {
@@ -408,7 +418,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                 meta: Default::default(),
             };
 
-            notify_result(invocation_id, work_id.clone(), result);
+            notify_result(entity, invocation_id, work_id.clone(), result);
             break 'attempts;
         }
     }
@@ -549,7 +559,7 @@ mod test {
     fn manifest_collector() -> (ManifestCollector, NotifyManifest) {
         let man: ManifestCollector = Arc::new(Mutex::new(None));
         let man2 = Arc::clone(&man);
-        let notify_result: NotifyManifest = Box::new(move |_, man| {
+        let notify_result: NotifyManifest = Box::new(move |_, _, man| {
             let old_manifest = man2.lock().unwrap().replace(man);
             debug_assert!(old_manifest.is_none(), "Overwriting a manifest! This is either a bug in your test, or the worker pool implementation.");
         });
@@ -559,7 +569,7 @@ mod test {
     fn results_collector() -> (ResultsCollector, NotifyResult) {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
-        let notify_result: NotifyResult = Arc::new(move |_, work_id, result| {
+        let notify_result: NotifyResult = Arc::new(move |_, _, work_id, result| {
             let old_result = results2.lock().unwrap().insert(work_id.0, result);
             debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
         });
