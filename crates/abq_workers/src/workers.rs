@@ -523,19 +523,23 @@ fn resolve_context<'a>(
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, VecDeque};
+    use std::net::{TcpListener, TcpStream};
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use abq_utils::flatten_manifest;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::workers::{NextWork, TestLikeRunner};
+    use abq_utils::{flatten_manifest, net_protocol};
     use tempfile::TempDir;
+    use tracing_test::internal::logs_with_scope_contain;
+    use tracing_test::traced_test;
 
     use super::{GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool};
+    use crate::negotiate::QueueNegotiator;
     use crate::workers::WorkerPoolConfig;
     use abq_utils::net_protocol::workers::{InvocationId, RunnerKind, WorkContext, WorkId};
 
@@ -952,5 +956,27 @@ mod test {
         });
 
         pool.shutdown();
+    }
+
+    #[test]
+    #[traced_test]
+    fn bad_message_doesnt_take_down_queue_negotiator_server() {
+        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let mut negotiator = QueueNegotiator::new(
+            listener_addr.ip(),
+            listener,
+            "0.0.0.0:0".parse().unwrap(),
+            "0.0.0.0:0".parse().unwrap(),
+            |_| panic!("should not ask for assigned run in this test"),
+        )
+        .unwrap();
+
+        let mut conn = TcpStream::connect(listener_addr).unwrap();
+        net_protocol::write(&mut conn, "bad message").unwrap();
+
+        negotiator.shutdown();
+
+        logs_with_scope_contain("", "error handling connection");
     }
 }
