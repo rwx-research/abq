@@ -8,4 +8,4 @@ abq_utils = { path = "../../abq_utils" }
 junit-report = "0.7.1"
 
 [dev-dependencies]
-insta = "1.19.0"
+insta = "1.19.1"
