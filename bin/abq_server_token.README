@@ -1,0 +1,7 @@
+Our deployments of ABQ expect a constant authorization token from workers and
+`abq test` clients connecting to it.
+
+In the future, authorization tokens likely won't be constant, and definitely not
+checked into version control, but for ease of iteration the current constant one
+is checked in at `bin/abq_server_token`. The secrets used in GitHub Actions and
+similar interfaces should be kept up-to-date with this token.

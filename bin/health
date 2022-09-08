@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
 
-/app/abq health --queue=0.0.0.0:8080 --work-scheduler=0.0.0.0:8081 --negotiator=0.0.0.0:8082
+/app/abq health \
+  --queue=0.0.0.0:8080 \
+  --work-scheduler=0.0.0.0:8081 \
+  --negotiator=0.0.0.0:8082 \
+  --token "$(cat /app/abq_server_token)"

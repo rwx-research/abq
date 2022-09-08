@@ -9,12 +9,7 @@ ABQ_LOG = "debug,trace"
 
 [experimental]
 cmd = [
-  "./abq", "start",
-  "--bind", "0.0.0.0",
-  "--public-ip", "168.220.85.45",
-  "--port", "8080",
-  "--work-port", "8081",
-  "--negotiator-port", "8082",
+  "/app/deploy_prod",
 ]
 
 [[services]]
