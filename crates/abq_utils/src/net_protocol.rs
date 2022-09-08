@@ -13,7 +13,7 @@ pub mod health {
 }
 
 pub mod entity {
-    use serde::{Deserialize, Serialize};
+    use serde_derive::{Deserialize, Serialize};
 
     /// Identifies a unique instance of an entity participating in the ABQ network ecosystem.
     /// The queue, workers, and abq test clients are all entities.

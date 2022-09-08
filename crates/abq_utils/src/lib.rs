@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use net_protocol::runners::{Group, Manifest, Test, TestCase, TestOrGroup};
 
+pub mod net;
+pub mod net_async;
 pub mod net_protocol;
 
 /// Flattens a manifest into only [TestId]s, preserving the manifest order.

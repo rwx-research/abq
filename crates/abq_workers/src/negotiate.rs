@@ -4,7 +4,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
     io,
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     sync::Arc,
     thread,
@@ -16,11 +16,14 @@ use tracing::{error, instrument};
 use crate::workers::{
     GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
 };
-use abq_utils::net_protocol::{
-    self,
-    entity::EntityId,
-    publicize_addr,
-    workers::{InvocationId, RunnerKind},
+use abq_utils::{
+    net, net_async,
+    net_protocol::{
+        self,
+        entity::EntityId,
+        publicize_addr,
+        workers::{InvocationId, RunnerKind},
+    },
 };
 
 // TODO: send negotiation protocol versions
@@ -91,10 +94,12 @@ pub enum WorkersNegotiateError {
     CouldNotConnect,
     #[error("illegal message received from queue")]
     BadQueueMessage,
+    #[error("{0}")]
+    Io(#[from] io::Error),
 }
 
 /// The worker pool side of the negotiation.
-pub struct WorkersNegotiator(TcpListener, WorkerContext);
+pub struct WorkersNegotiator(net::ClientStream, WorkerContext);
 
 impl WorkersNegotiator {
     /// Runs the workers-side of the negotiation, returning the configured worker pool once
@@ -109,8 +114,10 @@ impl WorkersNegotiator {
     ) -> Result<WorkerPool, WorkersNegotiateError> {
         use WorkersNegotiateError::*;
 
-        let mut conn =
-            TcpStream::connect(&queue_negotiator_handle.0).map_err(|_| CouldNotConnect)?;
+        let client = net::ConfiguredClient::new()?;
+        let mut conn = client
+            .connect(queue_negotiator_handle.0)
+            .map_err(|_| CouldNotConnect)?;
 
         let wants_to_attach = MessageToQueueNegotiator::WantsToAttach {
             invocation: wanted_invocation_id,
@@ -146,8 +153,9 @@ impl WorkersNegotiator {
                 let _notify_result = span.enter();
 
                 // TODO: error handling
-                let mut stream =
-                    TcpStream::connect(queue_results_addr).expect("results server not available");
+                let mut stream = client
+                    .connect(queue_results_addr)
+                    .expect("results server not available");
 
                 let request = net_protocol::queue::Request {
                     entity,
@@ -170,8 +178,9 @@ impl WorkersNegotiator {
             // TODO: error handling
             // In particular, the work server may have shut down and we can't connect. In that
             // case the worker should shutdown too.
-            let mut stream =
-                TcpStream::connect(queue_new_work_addr).expect("work server not available");
+            let mut stream = client
+                .connect(queue_new_work_addr)
+                .expect("work server not available");
 
             // Write the invocation ID we want work for
             // TODO: error handling
@@ -191,8 +200,9 @@ impl WorkersNegotiator {
                 let _notify_manifest = span.enter();
 
                 // TODO: error handling
-                let mut stream =
-                    TcpStream::connect(queue_results_addr).expect("results server not available");
+                let mut stream = client
+                    .connect(queue_results_addr)
+                    .expect("results server not available");
 
                 let request = net_protocol::queue::Request {
                     entity,
@@ -241,6 +251,8 @@ pub struct QueueNegotiatorHandle(SocketAddr);
 pub enum QueueNegotiatorHandleError {
     #[error("could not connect to the queue")]
     CouldNotConnect,
+    #[error("{0}")]
+    Io(#[from] io::Error),
 }
 
 impl QueueNegotiatorHandle {
@@ -254,7 +266,8 @@ impl QueueNegotiatorHandle {
     ) -> Result<Self, QueueNegotiatorHandleError> {
         use QueueNegotiatorHandleError::*;
 
-        let mut conn = TcpStream::connect(queue_addr).map_err(|_| CouldNotConnect)?;
+        let client = net::ConfiguredClient::new()?;
+        let mut conn = client.connect(queue_addr).map_err(|_| CouldNotConnect)?;
 
         let request = net_protocol::queue::Request {
             entity,
@@ -323,7 +336,7 @@ impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
     pub fn new<GetAssignedRun>(
         public_ip: IpAddr,
-        listener: TcpListener,
+        listener: net::ServerListener,
         queue_work_scheduler_addr: SocketAddr,
         queue_results_addr: SocketAddr,
         get_assigned_run: GetAssignedRun,
@@ -354,8 +367,7 @@ impl QueueNegotiator {
 
             let server_result: Result<(), QueueNegotiatorServerError> = rt.block_on(async {
                 // Initialize the listener in the async context.
-                listener.set_nonblocking(true)?;
-                let listener = tokio::net::TcpListener::from_std(listener)?;
+                let listener = net_async::ServerListener::from_sync(listener)?;
 
                 loop {
                     let (client, _) = tokio::select! {
@@ -391,18 +403,18 @@ impl QueueNegotiator {
 
     async fn handle_conn<GetAssignedRun>(
         ctx: QueueNegotiatorCtx<GetAssignedRun>,
-        mut client: tokio::net::TcpStream,
+        mut stream: net_async::ServerStream,
     ) -> io::Result<()>
     where
         GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
     {
-        let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut client).await?;
+        let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut stream).await?;
 
         use MessageToQueueNegotiator::*;
         match msg {
             HealthCheck => {
                 let write_result =
-                    net_protocol::async_write(&mut client, &net_protocol::health::HEALTHY).await;
+                    net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await;
                 if let Err(err) = write_result {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
@@ -437,7 +449,7 @@ impl QueueNegotiator {
                 };
 
                 tracing::debug!("Sending execution context");
-                net_protocol::async_write(&mut client, &execution_context).await?;
+                net_protocol::async_write(&mut stream, &execution_context).await?;
                 tracing::debug!("Sent execution context");
             }
         }
@@ -471,7 +483,7 @@ impl Drop for QueueNegotiator {
 
 #[cfg(test)]
 mod test {
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::SocketAddr;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
@@ -488,7 +500,7 @@ mod test {
     use abq_utils::net_protocol::workers::{
         InvocationId, NextWork, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
-    use abq_utils::{flatten_manifest, net_protocol};
+    use abq_utils::{flatten_manifest, net, net_protocol};
 
     type Messages = Arc<Mutex<Vec<TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
@@ -497,7 +509,7 @@ mod test {
     type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
 
     fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
-        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -557,7 +569,7 @@ mod test {
         let msgs = Arc::new(Mutex::new(Vec::new()));
         let msgs2 = Arc::clone(&msgs);
 
-        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -659,7 +671,7 @@ mod test {
 
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
-            TcpListener::bind("0.0.0.0:0").unwrap(),
+            net::ServerListener::bind("0.0.0.0:0").unwrap(),
             next_work_addr,
             results_addr,
             get_assigned_run,
@@ -701,7 +713,7 @@ mod test {
 
     #[test]
     fn queue_negotiator_healthcheck() {
-        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let mut queue_negotiator = QueueNegotiator::new(
@@ -723,7 +735,8 @@ mod test {
         )
         .unwrap();
 
-        let mut conn = TcpStream::connect(server_addr).unwrap();
+        let client = net::ConfiguredClient::new().unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
         let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
 
