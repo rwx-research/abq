@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use abq_utils::net_protocol::workers::InvocationId;
+use abq_utils::{auth::AuthToken, net_protocol::workers::InvocationId};
 use clap::{Parser, Subcommand};
 
 use crate::reporting::ReporterKind;
@@ -61,6 +61,15 @@ pub enum Command {
         /// used.
         #[clap(long, required = false)]
         public_ip: Option<IpAddr>,
+
+        /// A token against which messages to the queue will be authorized.
+        /// When provided, the same token must be provided to invocations of the `work` and `test`
+        /// commands.
+        /// When not provided, the queue will start without assuming enforcing authorization.
+        ///
+        /// Need a token? Use `abq token new`!
+        #[clap(long)]
+        token: Option<AuthToken>,
     },
     /// Starts a pool of abq workers in a working directory.
     ///
@@ -82,6 +91,11 @@ pub enum Command {
         /// CPUs - 1.
         #[clap(long, short = 'n', required = false, default_value_t = default_num_workers())]
         num: NonZeroUsize,
+
+        /// Token to authorize messages sent to the queue with.
+        /// Usually, this should be the same token that `abq start` initialized with.
+        #[clap(long, required = false)]
+        token: Option<AuthToken>,
     },
     /// Starts an instance of `abq test`. Examples:
     ///
@@ -103,6 +117,11 @@ pub enum Command {
         /// If not specified, uses an in-process queue and workers.
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
+
+        /// Token to authorize messages sent to the queue with.
+        /// Usually, this should be the same token that `abq start` initialized with.
+        #[clap(long, required = false)]
+        token: Option<AuthToken>,
 
         /// Test result reporter to use for a test run.
         #[clap(long, default_value = "line")]
@@ -127,5 +146,22 @@ pub enum Command {
         /// The addresses of one or more negotiator servers to check.
         #[clap(required = false, long)]
         negotiator: Vec<SocketAddr>,
+
+        /// Token to authorize messages sent to the services.
+        /// Usually, this should be the same token that `abq start` initialized with.
+        #[clap(long, required = false)]
+        token: Option<AuthToken>,
     },
+    /// Utilities related to auth tokens.
+    #[clap(subcommand)]
+    Token(Token),
+}
+
+#[derive(Subcommand)]
+pub enum Token {
+    /// Generate a new auth token for a queue to authenticate against, and for workers and `abq test` to authenticate with.
+    ///
+    /// This only generates a well-formed token; you must still pass it when instantiating
+    /// `abq start`, `abq work`, or `abq test` for it to be used.
+    New,
 }

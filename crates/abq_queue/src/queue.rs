@@ -590,7 +590,11 @@ impl QueueServer {
         let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
 
         let result: Result<(), Box<dyn Error + Send + Sync>> = match message {
-            Message::HealthCheck => Self::handle_healthcheck(entity, stream).await,
+            Message::HealthCheck => {
+                // TODO here and in other servers - healthchecks currently require auth, whenever
+                // auth is configured. Should they?
+                Self::handle_healthcheck(entity, stream).await
+            }
             Message::NegotiatorAddr => {
                 Self::handle_negotiator_addr(entity, stream, self.public_negotiator_addr).await
             }
@@ -956,7 +960,7 @@ mod test {
         },
     };
     use abq_utils::{
-        auth::{ClientAuthStrategy, ServerAuthStrategy},
+        auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
         net, net_async,
         net_protocol::{
             self,
@@ -1488,6 +1492,133 @@ mod test {
         let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
+
+        shutdown_tx.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
+
+        logs_with_scope_contain("", "error handling connection");
+    }
+
+    #[test]
+    #[traced_test]
+    fn connecting_to_queue_server_with_auth_okay() {
+        let negotiator_addr = "0.0.0.0:0".parse().unwrap();
+        let server = QueueServer::new(Default::default(), negotiator_addr);
+
+        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+
+        let listener = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        let client = net::ConfiguredClient::new(client_auth).unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
+        net_protocol::write(
+            &mut conn,
+            net_protocol::queue::Request {
+                entity: EntityId::new(),
+                message: net_protocol::queue::Message::NegotiatorAddr,
+            },
+        )
+        .unwrap();
+
+        let recv_negotiator_addr = net_protocol::read(&mut conn).unwrap();
+        assert_eq!(negotiator_addr, recv_negotiator_addr);
+
+        shutdown_tx.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    #[traced_test]
+    fn connecting_to_queue_server_with_no_auth_fails() {
+        let negotiator_addr = "0.0.0.0:0".parse().unwrap();
+        let server = QueueServer::new(Default::default(), negotiator_addr);
+
+        let (server_auth, _) = AuthToken::new_random().build_strategies();
+
+        let listener = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
+        net_protocol::write(
+            &mut conn,
+            net_protocol::queue::Request {
+                entity: EntityId::new(),
+                message: net_protocol::queue::Message::NegotiatorAddr,
+            },
+        )
+        .unwrap();
+
+        shutdown_tx.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
+
+        logs_with_scope_contain("", "error handling connection");
+    }
+
+    #[test]
+    #[traced_test]
+    fn connecting_to_work_server_with_auth_okay() {
+        let server = WorkScheduler {
+            queues: Default::default(),
+        };
+
+        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+
+        let listener = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        let client = net::ConfiguredClient::new(client_auth).unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
+        net_protocol::write(
+            &mut conn,
+            net_protocol::work_server::WorkServerRequest::HealthCheck,
+        )
+        .unwrap();
+
+        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+
+        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+
+        shutdown_tx.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    #[traced_test]
+    fn connecting_to_work_server_with_no_auth_fails() {
+        let server = WorkScheduler {
+            queues: Default::default(),
+        };
+
+        let (server_auth, _) = AuthToken::new_random().build_strategies();
+
+        let listener = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
+        net_protocol::write(
+            &mut conn,
+            net_protocol::work_server::WorkServerRequest::HealthCheck,
+        )
+        .unwrap();
 
         shutdown_tx.blocking_send(()).unwrap();
         server_thread.join().unwrap();
