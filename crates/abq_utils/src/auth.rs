@@ -57,6 +57,13 @@ impl AuthToken {
 
         Ok(Self(buf))
     }
+
+    pub fn build_strategies(&self) -> (ServerAuthStrategy, ClientAuthStrategy) {
+        (
+            ServerAuthStrategy::Token(*self),
+            ClientAuthStrategy::Token(*self),
+        )
+    }
 }
 
 impl fmt::Display for AuthToken {
@@ -139,6 +146,15 @@ impl ClientAuthStrategy {
     }
 }
 
+impl From<Option<AuthToken>> for ClientAuthStrategy {
+    fn from(opt_token: Option<AuthToken>) -> Self {
+        match opt_token {
+            Some(token) => ClientAuthStrategy::Token(token),
+            None => ClientAuthStrategy::NoAuth,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub enum ServerAuthStrategy {
     /// Expects no authentication header.
@@ -200,6 +216,15 @@ impl ServerAuthStrategy {
             ));
         }
         Ok(())
+    }
+}
+
+impl From<Option<AuthToken>> for ServerAuthStrategy {
+    fn from(opt_token: Option<AuthToken>) -> Self {
+        match opt_token {
+            Some(token) => ServerAuthStrategy::Token(token),
+            None => ServerAuthStrategy::NoAuth,
+        }
     }
 }
 

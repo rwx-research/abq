@@ -504,7 +504,7 @@ mod test {
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
-    use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
+    use abq_utils::auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
@@ -513,6 +513,8 @@ mod test {
         InvocationId, NextWork, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
     use abq_utils::{flatten_manifest, net, net_protocol};
+    use tracing_test::internal::logs_with_scope_contain;
+    use tracing_test::traced_test;
 
     type Messages = Arc<Mutex<Vec<TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
@@ -725,12 +727,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn queue_negotiator_healthcheck() {
-        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
-        let server_addr = server.local_addr().unwrap();
-
-        let mut queue_negotiator = QueueNegotiator::new(
+    fn test_negotiator(server: net::ServerListener) -> QueueNegotiator {
+        QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
             server,
             // Below parameters are faux because they are unnecessary for healthchecks.
@@ -747,7 +745,15 @@ mod test {
                 should_generate_manifest: true,
             },
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn queue_negotiator_healthcheck() {
+        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let mut queue_negotiator = test_negotiator(server);
 
         let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(server_addr).unwrap();
@@ -757,5 +763,46 @@ mod test {
         assert_eq!(health_msg, net_protocol::health::HEALTHY);
 
         queue_negotiator.shutdown();
+    }
+
+    #[test]
+    #[traced_test]
+    fn queue_negotiator_with_auth_okay() {
+        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+
+        let server = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let mut queue_negotiator = test_negotiator(server);
+
+        let client = net::ConfiguredClient::new(client_auth).unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
+        net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
+        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+
+        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+
+        queue_negotiator.shutdown();
+
+        logs_with_scope_contain("", "error handling connection");
+    }
+
+    #[test]
+    #[traced_test]
+    fn queue_negotiator_connect_with_no_auth_fails() {
+        let (server_auth, _) = AuthToken::new_random().build_strategies();
+
+        let server = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let mut queue_negotiator = test_negotiator(server);
+
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
+        net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
+
+        queue_negotiator.shutdown();
+
+        logs_with_scope_contain("", "error handling connection");
     }
 }

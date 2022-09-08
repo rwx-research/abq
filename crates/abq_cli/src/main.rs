@@ -13,7 +13,7 @@ use std::{
 
 use abq_queue::invoke::Client;
 use abq_utils::{
-    auth::{ClientAuthStrategy, ServerAuthStrategy},
+    auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
     net_protocol::{
         entity::EntityId,
         runners::TestResult,
@@ -30,7 +30,7 @@ use reporting::{ExitCode, ReporterKind, SuiteReporters};
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::{fmt, layer, prelude::*, EnvFilter, Registry};
 
-use crate::health::HealthCheckKind;
+use crate::{args::Token, health::HealthCheckKind};
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
@@ -91,10 +91,6 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
     tracing::debug!(?entity, "new abq client");
 
-    // TODO: configure based on CLI options
-    let client_auth = ClientAuthStrategy::NoAuth;
-    let server_auth = ServerAuthStrategy::NoAuth;
-
     match command {
         Command::Start {
             bind: bind_ip,
@@ -102,20 +98,23 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             port: server_port,
             work_port,
             negotiator_port,
+            token,
         } => instance::start_abq_forever(
             public_ip,
             bind_ip,
             server_port,
             work_port,
             negotiator_port,
-            server_auth,
+            ServerAuthStrategy::from(token),
         ),
         Command::Work {
             working_dir,
             queue_addr,
             test_run,
             num,
+            token,
         } => {
+            let client_auth = ClientAuthStrategy::from(token);
             let queue_negotiator =
                 QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_auth)?;
             workers::start_workers_forever(
@@ -131,7 +130,10 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             test_id,
             queue_addr,
             reporter: reporters,
+            token,
         } => {
+            let (server_auth, client_auth) = (token.into(), token.into());
+
             let runner_params = validate_abq_test_args(args)?;
             let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
@@ -141,6 +143,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             queue,
             work_scheduler,
             negotiator,
+            token,
         } => {
             let mut to_check = (queue.into_iter().map(HealthCheckKind::Queue))
                 .chain(
@@ -158,6 +161,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 ))?;
             }
 
+            let client_auth = token.into();
             let mut all_healthy = true;
             for service in to_check {
                 if !service.is_healthy(client_auth) {
@@ -167,6 +171,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             }
             let exit = if all_healthy { 0 } else { 1 };
             Ok(reporting::ExitCode::new(exit))
+        }
+        Command::Token(Token::New) => {
+            let token = AuthToken::new_random();
+            println!("{token}");
+            Ok(ExitCode::new(0))
         }
     }
 }
