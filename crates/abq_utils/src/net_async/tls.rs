@@ -10,6 +10,8 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::ToSocketAddrs;
 
+use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
+
 #[derive(Debug)]
 pub struct ServerStream(tokio_tls::server::TlsStream<tokio::net::TcpStream>);
 
@@ -58,28 +60,41 @@ impl AsyncWrite for ServerStream {
 pub struct ServerListener {
     listener: tokio::net::TcpListener,
     acceptor: tokio_tls::TlsAcceptor,
+    auth_strategy: ServerAuthStrategy,
 }
 
 impl ServerListener {
-    pub async fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    pub async fn bind(
+        auth_strategy: ServerAuthStrategy,
+        addr: impl ToSocketAddrs,
+    ) -> io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let tls_config = crate::tls::get_server_config()?;
         let acceptor = tokio_tls::TlsAcceptor::from(tls_config);
 
-        Ok(Self { listener, acceptor })
+        Ok(Self {
+            listener,
+            acceptor,
+            auth_strategy,
+        })
     }
 
     pub fn from_sync(listener: crate::net::tls::ServerListener) -> io::Result<Self> {
         let crate::net::tls::ServerListener {
             listener,
             tls_config,
+            auth_strategy,
         } = listener;
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
 
         let acceptor = tokio_tls::TlsAcceptor::from(tls_config);
 
-        Ok(Self { listener, acceptor })
+        Ok(Self {
+            listener,
+            acceptor,
+            auth_strategy,
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -89,7 +104,13 @@ impl ServerListener {
     pub async fn accept(&self) -> io::Result<(ServerStream, SocketAddr)> {
         let (stream, addr) = self.listener.accept().await?;
         let stream = self.acceptor.accept(stream).await?;
-        Ok((ServerStream(stream), addr))
+        let mut stream = ServerStream(stream);
+
+        // We now have a stream talking TLS, and we need to validate any auth header
+        // before handing the connection over.
+        self.auth_strategy.async_verify_header(&mut stream).await?;
+
+        Ok((stream, addr))
     }
 }
 
@@ -139,14 +160,18 @@ impl AsyncWrite for ClientStream {
 
 pub struct ConfiguredClient {
     connector: tokio_tls::TlsConnector,
+    auth_strategy: ClientAuthStrategy,
 }
 
 impl ConfiguredClient {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(auth_strategy: ClientAuthStrategy) -> io::Result<Self> {
         let tls_config = crate::tls::get_client_config()?;
         let connector = tokio_tls::TlsConnector::from(tls_config);
 
-        Ok(Self { connector })
+        Ok(Self {
+            connector,
+            auth_strategy,
+        })
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<ClientStream> {
@@ -156,7 +181,11 @@ impl ConfiguredClient {
         let dns_name = crate::tls::get_server_name();
 
         let stream = self.connector.connect(dns_name, sock).await?;
+        let mut stream = ClientStream(stream);
 
-        Ok(ClientStream(stream))
+        // Send any auth header over immediately.
+        self.auth_strategy.async_send(&mut stream).await?;
+
+        Ok(stream)
     }
 }

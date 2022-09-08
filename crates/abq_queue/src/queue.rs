@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use abq_utils::auth::ServerAuthStrategy;
 use abq_utils::flatten_manifest;
 use abq_utils::net;
 use abq_utils::net_async;
@@ -282,6 +283,8 @@ pub struct QueueConfig {
     pub work_port: u16,
     /// The port the negotiator server should bind to. Binds to any port if `0`.
     pub negotiator_port: u16,
+    /// How the queue should authenticate and authorize incoming connections.
+    pub auth_strategy: ServerAuthStrategy,
 }
 
 impl Default for QueueConfig {
@@ -294,6 +297,7 @@ impl Default for QueueConfig {
             server_port: 0,
             work_port: 0,
             negotiator_port: 0,
+            auth_strategy: ServerAuthStrategy::NoAuth,
         }
     }
 }
@@ -308,14 +312,16 @@ fn start_queue(config: QueueConfig) -> Abq {
         server_port,
         work_port,
         negotiator_port,
+        auth_strategy,
     } = config;
 
     let queues: SharedInvocationQueues = Default::default();
 
-    let server_listener = net::ServerListener::bind((bind_ip, server_port)).unwrap();
+    let server_listener = net::ServerListener::bind(auth_strategy, (bind_ip, server_port)).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
-    let negotiator_listener = net::ServerListener::bind((bind_ip, negotiator_port)).unwrap();
+    let negotiator_listener =
+        net::ServerListener::bind(auth_strategy, (bind_ip, negotiator_port)).unwrap();
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
@@ -326,7 +332,7 @@ fn start_queue(config: QueueConfig) -> Abq {
         move || queue_server.start_on(server_listener, server_shutdown_rx)
     });
 
-    let new_work_server = net::ServerListener::bind((bind_ip, work_port)).unwrap();
+    let new_work_server = net::ServerListener::bind(auth_strategy, (bind_ip, work_port)).unwrap();
     let new_work_server_addr = new_work_server.local_addr().unwrap();
 
     let (work_scheduler_shutdown_tx, work_scheduler_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -950,6 +956,7 @@ mod test {
         },
     };
     use abq_utils::{
+        auth::{ClientAuthStrategy, ServerAuthStrategy},
         net, net_async,
         net_protocol::{
             self,
@@ -1028,10 +1035,15 @@ mod test {
 
             runtime.block_on(async {
                 let mut results = Vec::default();
-                let client =
-                    Client::invoke_work(EntityId::new(), queue_server_addr, invocation_id, runner)
-                        .await
-                        .unwrap();
+                let client = Client::invoke_work(
+                    EntityId::new(),
+                    queue_server_addr,
+                    ClientAuthStrategy::NoAuth,
+                    invocation_id,
+                    runner,
+                )
+                .await
+                .unwrap();
                 client
                     .stream_results(|id, result| {
                         results.push((id.0, result));
@@ -1045,6 +1057,7 @@ mod test {
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue.get_negotiator_handle(),
+            ClientAuthStrategy::NoAuth,
             invocation_id,
         )
         .unwrap();
@@ -1108,14 +1121,24 @@ mod test {
                 let mut results1 = Vec::default();
                 let mut results2 = Vec::default();
 
-                let client1 =
-                    Client::invoke_work(EntityId::new(), queue_server_addr, invocation1, runner1)
-                        .await
-                        .unwrap();
-                let client2 =
-                    Client::invoke_work(EntityId::new(), queue_server_addr, invocation2, runner2)
-                        .await
-                        .unwrap();
+                let client1 = Client::invoke_work(
+                    EntityId::new(),
+                    queue_server_addr,
+                    ClientAuthStrategy::NoAuth,
+                    invocation1,
+                    runner1,
+                )
+                .await
+                .unwrap();
+                let client2 = Client::invoke_work(
+                    EntityId::new(),
+                    queue_server_addr,
+                    ClientAuthStrategy::NoAuth,
+                    invocation2,
+                    runner2,
+                )
+                .await
+                .unwrap();
 
                 let fut1 = client1.stream_results(|id, result| {
                     results1.push((id.0, result));
@@ -1135,6 +1158,7 @@ mod test {
         let mut workers_for_run1 = WorkersNegotiator::negotiate_and_start_pool(
             workers_config.clone(),
             queue.get_negotiator_handle(),
+            ClientAuthStrategy::NoAuth,
             invocation1,
         )
         .unwrap();
@@ -1142,6 +1166,7 @@ mod test {
         let mut workers_for_run2 = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue.get_negotiator_handle(),
+            ClientAuthStrategy::NoAuth,
             invocation2,
         )
         .unwrap();
@@ -1164,14 +1189,14 @@ mod test {
     fn bad_message_doesnt_take_down_server() {
         let server = QueueServer::new(Default::default(), "0.0.0.0:0".parse().unwrap());
 
-        let listener = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let listener = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
 
-        let client = net::ConfiguredClient::new().unwrap();
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
@@ -1189,10 +1214,12 @@ mod test {
         let active_invocations = ActiveInvocations::default();
 
         // Set up an initial connection for streaming test results targetting the given invocation ID
-        let fake_server = ServerListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server = ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0")
+            .await
+            .unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
 
-        let client = ConfiguredClient::new().unwrap();
+        let client = ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
 
         {
             // Register the initial connection
@@ -1241,10 +1268,12 @@ mod test {
         let invocation_id = InvocationId::new();
         let active_invocations = ActiveInvocations::default();
 
-        let fake_server = ServerListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server = ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0")
+            .await
+            .unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
 
-        let client = ConfiguredClient::new().unwrap();
+        let client = ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
 
         let (client_res, server_res) =
             futures::join!(client.connect(fake_server_addr), fake_server.accept());
@@ -1278,10 +1307,12 @@ mod test {
         // Pretend we have infinite work so the queue always streams back results to the client.
         work_left.lock().unwrap().insert(invocation_id, usize::MAX);
 
-        let fake_server = ServerListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server = ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0")
+            .await
+            .unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
 
-        let client = ConfiguredClient::new().unwrap();
+        let client = ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
 
         {
             // Register the initial connection
@@ -1336,6 +1367,7 @@ mod test {
         let mut client = Client {
             entity: client_entity,
             abq_server_addr: fake_server_addr,
+            auth_strategy: ClientAuthStrategy::NoAuth,
             invocation_id,
             stream: client_conn,
         };
@@ -1376,7 +1408,7 @@ mod test {
 
     #[test]
     fn queue_server_healthcheck() {
-        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -1391,7 +1423,7 @@ mod test {
             queue_server.start_on(server, server_shutdown_rx).unwrap();
         });
 
-        let client = net::ConfiguredClient::new().unwrap();
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(server_addr).unwrap();
 
         net_protocol::write(
@@ -1412,7 +1444,7 @@ mod test {
 
     #[test]
     fn work_server_healthcheck() {
-        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -1424,7 +1456,7 @@ mod test {
             work_scheduler.start_on(server, server_shutdown_rx).unwrap();
         });
 
-        let client = net::ConfiguredClient::new().unwrap();
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(
             &mut conn,
@@ -1446,14 +1478,14 @@ mod test {
             queues: Default::default(),
         };
 
-        let listener = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let listener = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
 
-        let client = net::ConfiguredClient::new().unwrap();
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 

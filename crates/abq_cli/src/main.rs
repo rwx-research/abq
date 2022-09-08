@@ -12,10 +12,13 @@ use std::{
 };
 
 use abq_queue::invoke::Client;
-use abq_utils::net_protocol::{
-    entity::EntityId,
-    runners::TestResult,
-    workers::{InvocationId, NativeTestRunnerParams, RunnerKind, WorkId},
+use abq_utils::{
+    auth::{ClientAuthStrategy, ServerAuthStrategy},
+    net_protocol::{
+        entity::EntityId,
+        runners::TestResult,
+        workers::{InvocationId, NativeTestRunnerParams, RunnerKind, WorkId},
+    },
 };
 use abq_workers::negotiate::QueueNegotiatorHandle;
 use clap::Parser;
@@ -88,6 +91,10 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
     tracing::debug!(?entity, "new abq client");
 
+    // TODO: configure based on CLI options
+    let client_auth = ClientAuthStrategy::NoAuth;
+    let server_auth = ServerAuthStrategy::NoAuth;
+
     match command {
         Command::Start {
             bind: bind_ip,
@@ -95,17 +102,29 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             port: server_port,
             work_port,
             negotiator_port,
-        } => {
-            instance::start_abq_forever(public_ip, bind_ip, server_port, work_port, negotiator_port)
-        }
+        } => instance::start_abq_forever(
+            public_ip,
+            bind_ip,
+            server_port,
+            work_port,
+            negotiator_port,
+            server_auth,
+        ),
         Command::Work {
             working_dir,
             queue_addr,
             test_run,
             num,
         } => {
-            let queue_negotiator = QueueNegotiatorHandle::ask_queue(entity, queue_addr)?;
-            workers::start_workers_forever(num, working_dir, queue_negotiator, test_run)
+            let queue_negotiator =
+                QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_auth)?;
+            workers::start_workers_forever(
+                num,
+                working_dir,
+                queue_negotiator,
+                client_auth,
+                test_run,
+            )
         }
         Command::Test {
             args,
@@ -114,7 +133,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             reporter: reporters,
         } => {
             let runner_params = validate_abq_test_args(args)?;
-            let abq = find_or_create_abq(entity, queue_addr)?;
+            let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
             run_tests(entity, runner, abq, test_id, reporters)
         }
@@ -141,7 +160,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             let mut all_healthy = true;
             for service in to_check {
-                if !service.is_healthy() {
+                if !service.is_healthy(client_auth) {
                     all_healthy = false;
                     println!("{service}: unhealthy");
                 }
@@ -178,13 +197,15 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
 fn find_or_create_abq(
     entity: EntityId,
     opt_queue_addr: Option<SocketAddr>,
+    server_auth: ServerAuthStrategy,
+    client_auth: ClientAuthStrategy,
 ) -> anyhow::Result<AbqInstance> {
     match opt_queue_addr {
         Some(queue_addr) => {
-            let instance = AbqInstance::from_remote(entity, queue_addr)?;
+            let instance = AbqInstance::from_remote(entity, queue_addr, client_auth)?;
             Ok(instance)
         }
-        None => Ok(AbqInstance::new_ephemeral()),
+        None => Ok(AbqInstance::new_ephemeral(server_auth, client_auth)),
     }
 }
 
@@ -213,8 +234,14 @@ fn run_tests(
     let start_in_process_workers = opt_test_id.is_none();
     let test_id = opt_test_id.unwrap_or_else(InvocationId::new);
 
-    let work_results_thread =
-        start_test_result_reporter(entity, abq.server_addr(), test_id, runner, on_result);
+    let work_results_thread = start_test_result_reporter(
+        entity,
+        abq.server_addr(),
+        abq.client_auth(),
+        test_id,
+        runner,
+        on_result,
+    );
 
     let opt_workers = if start_in_process_workers {
         let working_dir = std::env::current_dir().expect("no working directory");
@@ -222,6 +249,7 @@ fn run_tests(
             default_num_workers(),
             working_dir,
             abq.negotiator_handle(),
+            abq.client_auth(),
             test_id,
         )?;
         Some(workers)
@@ -245,6 +273,7 @@ fn run_tests(
 fn start_test_result_reporter(
     entity: EntityId,
     abq_server_addr: SocketAddr,
+    auth: ClientAuthStrategy,
     test_id: InvocationId,
     runner: RunnerKind,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
@@ -255,7 +284,7 @@ fn start_test_result_reporter(
             .build()?;
         runtime.block_on(async move {
             let abq_test_client =
-                Client::invoke_work(entity, abq_server_addr, test_id, runner).await?;
+                Client::invoke_work(entity, abq_server_addr, auth, test_id, runner).await?;
             abq_test_client.stream_results(on_result).await
         })
     })
