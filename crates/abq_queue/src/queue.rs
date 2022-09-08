@@ -1,12 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use abq_utils::flatten_manifest;
+use abq_utils::net;
+use abq_utils::net_async;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::queue::{InvokerResponse, Request};
@@ -310,10 +312,10 @@ fn start_queue(config: QueueConfig) -> Abq {
 
     let queues: SharedInvocationQueues = Default::default();
 
-    let server_listener = TcpListener::bind((bind_ip, server_port)).unwrap();
+    let server_listener = net::ServerListener::bind((bind_ip, server_port)).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
-    let negotiator_listener = TcpListener::bind((bind_ip, negotiator_port)).unwrap();
+    let negotiator_listener = net::ServerListener::bind((bind_ip, negotiator_port)).unwrap();
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
@@ -324,7 +326,7 @@ fn start_queue(config: QueueConfig) -> Abq {
         move || queue_server.start_on(server_listener, server_shutdown_rx)
     });
 
-    let new_work_server = TcpListener::bind((bind_ip, work_port)).unwrap();
+    let new_work_server = net::ServerListener::bind((bind_ip, work_port)).unwrap();
     let new_work_server_addr = new_work_server.local_addr().unwrap();
 
     let (work_scheduler_shutdown_tx, work_scheduler_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -387,7 +389,7 @@ static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 #[derive(Debug)]
 enum ClientResponder {
     /// We have an open stream upon which to send back the test results.
-    DirectStream(tokio::net::TcpStream),
+    DirectStream(net_async::ServerStream),
     /// There is not yet an open connection we can stream the test results back on.
     /// This state may be reached during the time a client is disconnected.
     Disconnected {
@@ -396,7 +398,7 @@ enum ClientResponder {
 }
 
 impl ClientResponder {
-    fn new(stream: tokio::net::TcpStream) -> Self {
+    fn new(stream: net_async::ServerStream) -> Self {
         Self::DirectStream(stream)
     }
 
@@ -435,7 +437,7 @@ impl ClientResponder {
     /// Updates the responder with a new connection. If there are any pending test results that
     /// failed to be sent from a previous connections, they are streamed to the new connection
     /// before the future returned from this function completes.
-    async fn reconnect_with(&mut self, new_conn: tokio::net::TcpStream) {
+    async fn reconnect_with(&mut self, new_conn: net_async::ServerStream) {
         // There's no great way for us to check whether the existing client connection is,
         // in fact, closed. Instead we accept all faithful reconnection requests, and
         // assume that the client is well-behaved (it will not attempt to reconnect unless
@@ -533,13 +535,9 @@ impl QueueServer {
 
     fn start_on(
         self,
-        server_listener: TcpListener,
+        server_listener: net::ServerListener,
         mut server_shutdown: tokio::sync::mpsc::Receiver<()>,
     ) -> Result<(), QueueServerError> {
-        // Before we hand the server listener over to the async runtime, we must set it into
-        // non-blocking mode (as the async runtime will not block!)
-        server_listener.set_nonblocking(true)?;
-
         // Create a new tokio runtime solely for handling requests that come into the queue server.
         //
         // Note that all of the work done by the queue is purely coordination, so we're heavily I/O
@@ -551,7 +549,7 @@ impl QueueServer {
         // Start the server in the tokio runtime.
         let server_result: Result<(), QueueServerError> = rt.block_on(async {
             // Initialize the async server listener.
-            let server_listener = tokio::net::TcpListener::from_std(server_listener)?;
+            let server_listener = net_async::ServerListener::from_sync(server_listener)?;
 
             loop {
                 let (client, _) = tokio::select! {
@@ -581,21 +579,21 @@ impl QueueServer {
     #[inline(always)]
     async fn handle(
         self,
-        mut client: tokio::net::TcpStream,
+        mut stream: net_async::ServerStream,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let Request { entity, message } = net_protocol::async_read(&mut client).await?;
+        let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
 
         let result: Result<(), Box<dyn Error + Send + Sync>> = match message {
-            Message::HealthCheck => Self::handle_healthcheck(entity, client).await,
+            Message::HealthCheck => Self::handle_healthcheck(entity, stream).await,
             Message::NegotiatorAddr => {
-                Self::handle_negotiator_addr(entity, client, self.public_negotiator_addr).await
+                Self::handle_negotiator_addr(entity, stream, self.public_negotiator_addr).await
             }
             Message::InvokeWork(invoke_work) => {
                 Self::handle_invoked_work(
                     self.active_invocations,
                     self.queues,
                     entity,
-                    client,
+                    stream,
                     invoke_work,
                 )
                 .await
@@ -604,7 +602,7 @@ impl QueueServer {
                 Self::handle_invoker_reconnection(
                     self.active_invocations,
                     entity,
-                    client,
+                    stream,
                     invocation_id,
                 )
                 .await
@@ -626,7 +624,7 @@ impl QueueServer {
                 //
                 // So, we have no use for the connection as soon as we've parsed the test result out,
                 // and we'd prefer to close it immediately.
-                drop(client);
+                drop(stream);
 
                 // Record the test result and notify the test client out-of-band.
                 Self::handle_worker_result(
@@ -646,33 +644,33 @@ impl QueueServer {
     }
 
     #[inline(always)]
-    #[instrument(level = "trace", skip(invoker))]
+    #[instrument(level = "trace", skip(stream))]
     async fn handle_healthcheck(
         entity: EntityId,
-        mut invoker: tokio::net::TcpStream,
+        mut stream: net_async::ServerStream,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Right now nothing interesting is owned by the queue, so nothing extra to check.
-        net_protocol::async_write(&mut invoker, &net_protocol::health::HEALTHY).await?;
+        net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await?;
         Ok(())
     }
 
     #[inline(always)]
-    #[instrument(level = "trace", skip(invoker, public_negotiator_addr))]
+    #[instrument(level = "trace", skip(stream, public_negotiator_addr))]
     async fn handle_negotiator_addr(
         entity: EntityId,
-        mut invoker: tokio::net::TcpStream,
+        mut stream: net_async::ServerStream,
         public_negotiator_addr: SocketAddr,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        net_protocol::async_write(&mut invoker, &public_negotiator_addr).await?;
+        net_protocol::async_write(&mut stream, &public_negotiator_addr).await?;
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(active_invocations, queues, invoker))]
+    #[instrument(level = "trace", skip(active_invocations, queues, stream))]
     async fn handle_invoked_work(
         active_invocations: ActiveInvocations,
         queues: SharedInvocationQueues,
         entity: EntityId,
-        invoker: tokio::net::TcpStream,
+        stream: net_async::ServerStream,
         invoke_work: InvokeWork,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let InvokeWork {
@@ -680,7 +678,7 @@ impl QueueServer {
             runner,
         } = invoke_work;
 
-        let results_responder = ClientResponder::new(invoker);
+        let results_responder = ClientResponder::new(stream);
         let old_responder = active_invocations
             .lock()
             .await
@@ -688,7 +686,7 @@ impl QueueServer {
 
         debug_assert!(
             old_responder.is_none(),
-            "Existing invoker for expected unique invocation id"
+            "Existing stream for expected unique invocation id"
         );
 
         // Create a new work queue for this invocation.
@@ -697,11 +695,11 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(active_invocations, new_invoker))]
+    #[instrument(level = "trace", skip(active_invocations, new_stream))]
     async fn handle_invoker_reconnection(
         active_invocations: ActiveInvocations,
         entity: EntityId,
-        new_invoker: tokio::net::TcpStream,
+        new_stream: net_async::ServerStream,
         invocation_id: InvocationId,
     ) -> Result<(), ClientReconnectionError> {
         use std::collections::hash_map::Entry;
@@ -712,14 +710,14 @@ impl QueueServer {
         let active_conn_entry = active_invocations.entry(invocation_id);
         match active_conn_entry {
             Entry::Occupied(mut occupied) => {
-                let new_invoker_addr = new_invoker.peer_addr();
+                let new_stream_addr = new_stream.peer_addr();
 
-                occupied.get_mut().reconnect_with(new_invoker).await;
+                occupied.get_mut().reconnect_with(new_stream).await;
 
                 tracing::debug!(
                     "rerouted connection for {:?} to {:?}",
                     invocation_id,
-                    new_invoker_addr
+                    new_stream_addr
                 );
 
                 Ok(())
@@ -868,19 +866,15 @@ impl WorkScheduler {
 
     fn start_on(
         self,
-        listener: TcpListener,
+        listener: net::ServerListener,
         mut shutdown: tokio::sync::mpsc::Receiver<()>,
     ) -> Result<(), WorkSchedulerError> {
-        // Before we hand the server over to the async runtime, we must set it into non-blocking
-        // mode, because the runtime doesn't block!
-        listener.set_nonblocking(true)?;
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
 
         let server_result: Result<(), WorkSchedulerError> = rt.block_on(async {
-            let listener = tokio::net::TcpListener::from_std(listener)?;
+            let listener = net_async::ServerListener::from_sync(listener)?;
 
             loop {
                 let (client, _) = tokio::select! {
@@ -907,15 +901,15 @@ impl WorkScheduler {
         server_result
     }
 
-    #[instrument(level = "trace", skip(self, client))]
-    async fn handle_work_conn(&mut self, mut client: tokio::net::TcpStream) -> io::Result<()> {
+    #[instrument(level = "trace", skip(self, stream))]
+    async fn handle_work_conn(&mut self, mut stream: net_async::ServerStream) -> io::Result<()> {
         // Get the invocation this worker wants work for.
-        let request: WorkServerRequest = net_protocol::async_read(&mut client).await?;
+        let request: WorkServerRequest = net_protocol::async_read(&mut stream).await?;
 
         match request {
             WorkServerRequest::HealthCheck => {
                 let write_result =
-                    net_protocol::async_write(&mut client, &net_protocol::health::HEALTHY).await;
+                    net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await;
                 if let Err(err) = write_result {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
@@ -935,7 +929,7 @@ impl WorkScheduler {
                     }
                 };
 
-                net_protocol::async_write(&mut client, &next_work).await?;
+                net_protocol::async_write(&mut stream, &next_work).await?;
             }
         }
 
@@ -945,12 +939,7 @@ impl WorkScheduler {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        net::{TcpListener, TcpStream},
-        sync::Arc,
-        thread,
-        time::Duration,
-    };
+    use std::{sync::Arc, thread, time::Duration};
 
     use super::Abq;
     use crate::{
@@ -960,11 +949,14 @@ mod test {
             SharedInvocationQueues, WorkLeftForInvocations, WorkScheduler,
         },
     };
-    use abq_utils::net_protocol::{
-        self,
-        entity::EntityId,
-        runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
-        workers::{InvocationId, RunnerKind, TestLikeRunner, WorkId},
+    use abq_utils::{
+        net, net_async,
+        net_protocol::{
+            self,
+            entity::EntityId,
+            runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
+            workers::{InvocationId, RunnerKind, TestLikeRunner, WorkId},
+        },
     };
     use abq_workers::{
         negotiate::{WorkersConfig, WorkersNegotiator},
@@ -1172,14 +1164,15 @@ mod test {
     fn bad_message_doesnt_take_down_server() {
         let server = QueueServer::new(Default::default(), "0.0.0.0:0".parse().unwrap());
 
-        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let listener = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
 
-        let mut conn = TcpStream::connect(server_addr).unwrap();
+        let client = net::ConfiguredClient::new().unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
         shutdown_tx.blocking_send(()).unwrap();
@@ -1190,18 +1183,20 @@ mod test {
 
     #[tokio::test]
     async fn invoker_reconnection_succeeds() {
-        use tokio::net::{TcpListener, TcpStream};
+        use net_async::{ConfiguredClient, ServerListener};
 
         let invocation_id = InvocationId::new();
         let active_invocations = ActiveInvocations::default();
 
         // Set up an initial connection for streaming test results targetting the given invocation ID
-        let fake_server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server = ServerListener::bind("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
+
+        let client = ConfiguredClient::new().unwrap();
 
         {
             // Register the initial connection
-            let client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+            let client_conn = client.connect(fake_server_addr).await.unwrap();
             let (server_conn, _) = fake_server.accept().await.unwrap();
             let mut active_invocations = active_invocations.lock().await;
             active_invocations
@@ -1212,7 +1207,7 @@ mod test {
         };
 
         // Attempt to reconnect
-        let new_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+        let new_conn = client.connect(fake_server_addr).await.unwrap();
         let new_conn_addr = new_conn.local_addr().unwrap();
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
@@ -1237,15 +1232,17 @@ mod test {
 
     #[tokio::test]
     async fn invoker_reconnection_fails_never_invoked() {
-        use tokio::net::{TcpListener, TcpStream};
+        use net_async::{ConfiguredClient, ServerListener};
 
         let invocation_id = InvocationId::new();
         let active_invocations = ActiveInvocations::default();
 
-        let fake_server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server = ServerListener::bind("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
 
-        let conn = TcpStream::connect(fake_server_addr).await.unwrap();
+        let client = ConfiguredClient::new().unwrap();
+
+        let conn = client.connect(fake_server_addr).await.unwrap();
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
             Arc::clone(&active_invocations),
@@ -1263,7 +1260,7 @@ mod test {
 
     #[tokio::test]
     async fn client_disconnect_then_connect_gets_buffered_results() {
-        use tokio::net::{TcpListener, TcpStream};
+        use net_async::{ConfiguredClient, ServerListener};
 
         let invocation_id = InvocationId::new();
         let active_invocations = ActiveInvocations::default();
@@ -1275,12 +1272,14 @@ mod test {
         // Pretend we have infinite work so the queue always streams back results to the client.
         work_left.lock().unwrap().insert(invocation_id, usize::MAX);
 
-        let fake_server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let fake_server = ServerListener::bind("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
+
+        let client = ConfiguredClient::new().unwrap();
 
         {
             // Register the initial connection
-            let client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+            let client_conn = client.connect(fake_server_addr).await.unwrap();
             let (server_conn, _) = fake_server.accept().await.unwrap();
             let mut active_invocations = active_invocations.lock().await;
             let _responder = active_invocations
@@ -1323,7 +1322,7 @@ mod test {
         }
 
         // Reconnect back to the queue
-        let client_conn = TcpStream::connect(fake_server_addr).await.unwrap();
+        let client_conn = client.connect(fake_server_addr).await.unwrap();
         let mut client = Client {
             entity: client_entity,
             abq_server_addr: fake_server_addr,
@@ -1368,7 +1367,7 @@ mod test {
 
     #[test]
     fn queue_server_healthcheck() {
-        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -1383,7 +1382,8 @@ mod test {
             queue_server.start_on(server, server_shutdown_rx).unwrap();
         });
 
-        let mut conn = TcpStream::connect(server_addr).unwrap();
+        let client = net::ConfiguredClient::new().unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
 
         net_protocol::write(
             &mut conn,
@@ -1403,7 +1403,7 @@ mod test {
 
     #[test]
     fn work_server_healthcheck() {
-        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
@@ -1415,7 +1415,8 @@ mod test {
             work_scheduler.start_on(server, server_shutdown_rx).unwrap();
         });
 
-        let mut conn = TcpStream::connect(server_addr).unwrap();
+        let client = net::ConfiguredClient::new().unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(
             &mut conn,
             net_protocol::work_server::WorkServerRequest::HealthCheck,
@@ -1436,14 +1437,15 @@ mod test {
             queues: Default::default(),
         };
 
-        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let listener = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
 
-        let mut conn = TcpStream::connect(server_addr).unwrap();
+        let client = net::ConfiguredClient::new().unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
         shutdown_tx.blocking_send(()).unwrap();

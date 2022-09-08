@@ -13,12 +13,15 @@
 
 use std::{io, net::SocketAddr};
 
-use abq_utils::net_protocol::{
-    self,
-    entity::EntityId,
-    queue::{self, InvokeWork, InvokerResponse, Message},
-    runners::TestResult,
-    workers::{InvocationId, RunnerKind, WorkId},
+use abq_utils::{
+    net_async,
+    net_protocol::{
+        self,
+        entity::EntityId,
+        queue::{self, InvokeWork, InvokerResponse, Message},
+        runners::TestResult,
+        workers::{InvocationId, RunnerKind, WorkId},
+    },
 };
 
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
@@ -28,7 +31,7 @@ pub struct Client {
     /// The test invocation this client is responsible for.
     pub(crate) invocation_id: InvocationId,
     /// The stream to the queue server.
-    pub(crate) stream: tokio::net::TcpStream,
+    pub(crate) stream: net_async::ClientStream,
 }
 
 impl Client {
@@ -39,7 +42,8 @@ impl Client {
         invocation_id: InvocationId,
         runner: RunnerKind,
     ) -> Result<Self, io::Error> {
-        let mut stream = tokio::net::TcpStream::connect(abq_server_addr).await?;
+        let client = net_async::ConfiguredClient::new()?;
+        let mut stream = client.connect(abq_server_addr).await?;
 
         tracing::debug!(?entity, ?invocation_id, "invoking new work");
 
@@ -63,7 +67,8 @@ impl Client {
 
     /// Attempts to reconnect the client to the abq server.
     pub(crate) async fn reconnect(&mut self) -> Result<(), io::Error> {
-        let mut new_stream = tokio::net::TcpStream::connect(self.abq_server_addr).await?;
+        let client = net_async::ConfiguredClient::new()?;
+        let mut new_stream = client.connect(self.abq_server_addr).await?;
 
         net_protocol::async_write(
             &mut new_stream,

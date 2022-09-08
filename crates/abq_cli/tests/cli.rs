@@ -4,7 +4,6 @@ use std::process::{ExitStatus, Output};
 use std::{
     ffi::OsStr,
     io::{BufRead, BufReader},
-    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
@@ -80,6 +79,7 @@ where
 }
 
 fn find_free_port() -> u16 {
+    use std::net::TcpListener;
     // TERRIBLE HACK to find a free port: bind and take that port number, assuming the OS
     // will increment later binds past the attached port, and there won't be a TOCTOU race.
     // Should be fine for testing.
@@ -91,6 +91,7 @@ fn find_free_port() -> u16 {
 }
 
 fn port_active(port: u16) -> bool {
+    use std::net::TcpStream;
     TcpStream::connect(("0.0.0.0", port)).is_ok()
 }
 

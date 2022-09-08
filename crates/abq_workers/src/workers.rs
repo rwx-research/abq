@@ -523,7 +523,6 @@ fn resolve_context<'a>(
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, VecDeque};
-    use std::net::{TcpListener, TcpStream};
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -533,7 +532,7 @@ mod test {
         Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::workers::{NextWork, TestLikeRunner};
-    use abq_utils::{flatten_manifest, net_protocol};
+    use abq_utils::{flatten_manifest, net, net_protocol};
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
@@ -961,7 +960,7 @@ mod test {
     #[test]
     #[traced_test]
     fn bad_message_doesnt_take_down_queue_negotiator_server() {
-        let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let listener = net::ServerListener::bind("0.0.0.0:0").unwrap();
         let listener_addr = listener.local_addr().unwrap();
         let mut negotiator = QueueNegotiator::new(
             listener_addr.ip(),
@@ -972,7 +971,8 @@ mod test {
         )
         .unwrap();
 
-        let mut conn = TcpStream::connect(listener_addr).unwrap();
+        let client = net::ConfiguredClient::new().unwrap();
+        let mut conn = client.connect(listener_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
         negotiator.shutdown();
