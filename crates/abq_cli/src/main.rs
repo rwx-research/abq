@@ -24,6 +24,7 @@ use args::{default_num_workers, Cli, Command};
 
 use instance::AbqInstance;
 use reporting::{ExitCode, ReporterKind, SuiteReporters};
+use tracing::metadata::LevelFilter;
 use tracing_subscriber::{fmt, layer, prelude::*, EnvFilter, Registry};
 
 use crate::health::HealthCheckKind;
@@ -39,11 +40,17 @@ struct TracingGuards {
 
 #[must_use]
 fn setup_tracing() -> TracingGuards {
-    // Trace to standard error with ABQ_LOG set
+    // Trace to standard error with ABQ_LOG set. If unset, trace and log nothing.
+    let env_filter = EnvFilter::builder()
+        .with_env_var("ABQ_LOG")
+        .with_default_directive(LevelFilter::OFF.into())
+        .from_env()
+        .unwrap();
+
     let stderr_layer = fmt::Layer::default()
         .with_writer(std::io::stderr)
         .with_span_events(fmt::format::FmtSpan::ACTIVE)
-        .with_filter(EnvFilter::from_env("ABQ_LOG"));
+        .with_filter(env_filter);
 
     // Trace to a rotating log file under ABQ_FILE_LOG_DIR, if it's set.
     let (file_log_layer, file_appender_guard) = if let Ok(dir) = std::env::var("ABQ_FILE_LOG_DIR") {

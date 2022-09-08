@@ -14,10 +14,13 @@ pub(crate) fn default_num_workers() -> NonZeroUsize {
     NonZeroUsize::new(cpus).expect("No CPUs detected on this machine")
 }
 
+const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/abq_version.txt"));
+
 /// Always be queueing
 ///
 /// The abq cli
 #[derive(Parser)]
+#[clap(version = VERSION)]
 pub struct Cli {
     #[clap(subcommand)]
     pub command: Command,

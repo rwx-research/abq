@@ -245,7 +245,7 @@ fn yarn_jest_auto_workers_with_failing_tests() {
     let mut stdout_lines = stdout.lines();
     assert_eq!(stdout_lines.next().unwrap(), "F");
 
-    assert!(stderr.is_empty());
+    assert!(stderr.is_empty(), "{:?}", stderr);
 }
 
 #[test]
