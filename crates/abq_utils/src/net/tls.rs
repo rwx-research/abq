@@ -7,6 +7,8 @@ use std::{fs, io, thread};
 
 use rustls as tls;
 
+use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
+
 #[derive(Debug)]
 pub struct ServerStream(tls::StreamOwned<tls::ServerConnection, std::net::TcpStream>);
 
@@ -35,16 +37,18 @@ impl Write for ServerStream {
 pub struct ServerListener {
     pub(crate) listener: TcpListener,
     pub(crate) tls_config: Arc<tls::ServerConfig>,
+    pub(crate) auth_strategy: ServerAuthStrategy,
 }
 
 impl ServerListener {
-    pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    pub fn bind(auth_strategy: ServerAuthStrategy, addr: impl ToSocketAddrs) -> io::Result<Self> {
         let tls_config = crate::tls::get_server_config()?;
         let listener = TcpListener::bind(addr)?;
 
         Ok(Self {
             listener,
             tls_config,
+            auth_strategy,
         })
     }
 
@@ -62,9 +66,14 @@ impl ServerListener {
 
         let (sock, addr) = self.listener.accept()?;
 
+        // Wrap the socket around the connection, moving us into speaking TLS
         let stream = tls::StreamOwned::new(conn, sock);
+        let mut stream = ServerStream(stream);
 
-        Ok((ServerStream(stream), addr))
+        // Before we give back the TLS stream, we must validate auth
+        self.auth_strategy.verify_header(&mut stream)?;
+
+        Ok((stream, addr))
     }
 }
 
@@ -89,13 +98,17 @@ impl Write for ClientStream {
 #[derive(Clone)]
 pub struct ConfiguredClient {
     tls_config: Arc<tls::ClientConfig>,
+    auth_strategy: ClientAuthStrategy,
 }
 
 impl ConfiguredClient {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(auth_strategy: ClientAuthStrategy) -> io::Result<Self> {
         let tls_config = crate::tls::get_client_config()?;
 
-        Ok(Self { tls_config })
+        Ok(Self {
+            tls_config,
+            auth_strategy,
+        })
     }
 
     pub fn connect(&self, addr: SocketAddr) -> io::Result<ClientStream> {
@@ -105,8 +118,13 @@ impl ConfiguredClient {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         let sock = std::net::TcpStream::connect(addr)?;
 
+        // Wrap the socket around the connection, moving us into speaking TLS
         let stream = tls::StreamOwned::new(conn, sock);
+        let mut stream = ClientStream(stream);
 
-        Ok(ClientStream(stream))
+        // Before handing back the the stream, send over auth
+        self.auth_strategy.send(&mut stream)?;
+
+        Ok(stream)
     }
 }

@@ -528,6 +528,7 @@ mod test {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
     };
@@ -960,7 +961,7 @@ mod test {
     #[test]
     #[traced_test]
     fn bad_message_doesnt_take_down_queue_negotiator_server() {
-        let listener = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let listener = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let listener_addr = listener.local_addr().unwrap();
         let mut negotiator = QueueNegotiator::new(
             listener_addr.ip(),
@@ -971,7 +972,7 @@ mod test {
         )
         .unwrap();
 
-        let client = net::ConfiguredClient::new().unwrap();
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(listener_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 

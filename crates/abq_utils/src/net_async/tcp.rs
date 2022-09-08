@@ -7,6 +7,8 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::ToSocketAddrs;
 
+use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
+
 #[derive(Debug)]
 pub struct Stream(tokio::net::TcpStream);
 
@@ -63,19 +65,32 @@ impl AsyncWrite for Stream {
 
 pub struct ServerListener {
     listener: tokio::net::TcpListener,
+    auth_strategy: ServerAuthStrategy,
 }
 
 impl ServerListener {
-    pub async fn bind(addr: impl ToSocketAddrs) -> io::Result<Self> {
+    pub async fn bind(
+        auth_strategy: ServerAuthStrategy,
+        addr: impl ToSocketAddrs,
+    ) -> io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            auth_strategy,
+        })
     }
 
     pub fn from_sync(listener: crate::net::tcp::ServerListener) -> io::Result<Self> {
-        let crate::net::tcp::ServerListener { listener } = listener;
+        let crate::net::tcp::ServerListener {
+            listener,
+            auth_strategy,
+        } = listener;
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            auth_strategy,
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -84,18 +99,30 @@ impl ServerListener {
 
     pub async fn accept(&self) -> io::Result<(Stream, SocketAddr)> {
         let (stream, addr) = self.listener.accept().await?;
-        Ok((Stream(stream), addr))
+        let mut stream = Stream(stream);
+
+        // We need to validate any auth header before handing the connection over.
+        self.auth_strategy.async_verify_header(&mut stream).await?;
+
+        Ok((stream, addr))
     }
 }
 
-pub struct ConfiguredClient;
+pub struct ConfiguredClient {
+    auth_strategy: ClientAuthStrategy,
+}
 
 impl ConfiguredClient {
-    pub fn new() -> io::Result<Self> {
-        Ok(ConfiguredClient)
+    pub fn new(auth_strategy: ClientAuthStrategy) -> io::Result<Self> {
+        Ok(ConfiguredClient { auth_strategy })
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> io::Result<Stream> {
-        Stream::connect(addr).await
+        let mut stream = Stream::connect(addr).await?;
+
+        // Make our auth header, if any, known to the server.
+        self.auth_strategy.async_send(&mut stream).await?;
+
+        Ok(stream)
     }
 }

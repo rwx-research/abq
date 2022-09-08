@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use abq_utils::auth::ClientAuthStrategy;
 use abq_utils::net_protocol::workers::InvocationId;
 use abq_workers::negotiate::{QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator};
 use abq_workers::workers::{WorkerContext, WorkerPool};
@@ -13,6 +14,7 @@ pub fn start_workers(
     num_workers: NonZeroUsize,
     working_dir: PathBuf,
     queue_negotiator: QueueNegotiatorHandle,
+    client_auth: ClientAuthStrategy,
     invocation_id: InvocationId,
 ) -> anyhow::Result<WorkerPool> {
     abq_workers::workers::init();
@@ -35,6 +37,7 @@ pub fn start_workers(
     let worker_pool = WorkersNegotiator::negotiate_and_start_pool(
         workers_config,
         queue_negotiator,
+        client_auth,
         invocation_id,
     )?;
 
@@ -47,10 +50,17 @@ pub fn start_workers_forever(
     num_workers: NonZeroUsize,
     working_dir: PathBuf,
     queue_negotiator: QueueNegotiatorHandle,
+    client_auth: ClientAuthStrategy,
     invocation_id: InvocationId,
 ) -> ! {
-    let mut worker_pool =
-        start_workers(num_workers, working_dir, queue_negotiator, invocation_id).unwrap();
+    let mut worker_pool = start_workers(
+        num_workers,
+        working_dir,
+        queue_negotiator,
+        client_auth,
+        invocation_id,
+    )
+    .unwrap();
 
     const POLL_WAIT_TIME: Duration = Duration::from_millis(10);
     let mut term_signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();

@@ -17,6 +17,7 @@ use crate::workers::{
     GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
 };
 use abq_utils::{
+    auth::ClientAuthStrategy,
     net, net_async,
     net_protocol::{
         self,
@@ -104,17 +105,18 @@ pub struct WorkersNegotiator(net::ClientStream, WorkerContext);
 impl WorkersNegotiator {
     /// Runs the workers-side of the negotiation, returning the configured worker pool once
     /// negotiation is complete.
-    #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle), fields(
+    #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, auth_strategy), fields(
         num_workers = workers_config.num_workers
     ))]
     pub fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
+        auth_strategy: ClientAuthStrategy,
         wanted_invocation_id: InvocationId,
     ) -> Result<WorkerPool, WorkersNegotiateError> {
         use WorkersNegotiateError::*;
 
-        let client = net::ConfiguredClient::new()?;
+        let client = net::ConfiguredClient::new(auth_strategy)?;
         let mut conn = client
             .connect(queue_negotiator_handle.0)
             .map_err(|_| CouldNotConnect)?;
@@ -271,10 +273,11 @@ impl QueueNegotiatorHandle {
     pub fn ask_queue(
         entity: EntityId,
         queue_addr: SocketAddr,
+        auth_strategy: ClientAuthStrategy,
     ) -> Result<Self, QueueNegotiatorHandleError> {
         use QueueNegotiatorHandleError::*;
 
-        let client = net::ConfiguredClient::new()?;
+        let client = net::ConfiguredClient::new(auth_strategy)?;
         let mut conn = client.connect(queue_addr).map_err(|_| CouldNotConnect)?;
 
         let request = net_protocol::queue::Request {
@@ -501,6 +504,7 @@ mod test {
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
+    use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
@@ -517,7 +521,7 @@ mod test {
     type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
 
     fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
-        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -577,7 +581,7 @@ mod test {
         let msgs = Arc::new(Mutex::new(Vec::new()));
         let msgs2 = Arc::clone(&msgs);
 
-        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -680,7 +684,7 @@ mod test {
 
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
-            net::ServerListener::bind("0.0.0.0:0").unwrap(),
+            net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap(),
             next_work_addr,
             results_addr,
             get_assigned_run,
@@ -695,6 +699,7 @@ mod test {
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue_negotiator.get_handle(),
+            ClientAuthStrategy::NoAuth,
             invocation_id,
         )
         .unwrap();
@@ -722,7 +727,7 @@ mod test {
 
     #[test]
     fn queue_negotiator_healthcheck() {
-        let server = net::ServerListener::bind("0.0.0.0:0").unwrap();
+        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let mut queue_negotiator = QueueNegotiator::new(
@@ -744,7 +749,7 @@ mod test {
         )
         .unwrap();
 
-        let client = net::ConfiguredClient::new().unwrap();
+        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
         let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();

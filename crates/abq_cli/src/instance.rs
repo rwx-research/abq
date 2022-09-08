@@ -1,3 +1,4 @@
+use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
 use abq_workers::negotiate::{QueueNegotiatorHandle, QueueNegotiatorHandleError};
@@ -16,6 +17,7 @@ pub fn start_abq_forever(
     server_port: u16,
     work_port: u16,
     negotiator_port: u16,
+    auth_strategy: ServerAuthStrategy,
 ) -> ! {
     abq_queue::queue::init();
 
@@ -28,6 +30,7 @@ pub fn start_abq_forever(
         server_port,
         work_port,
         negotiator_port,
+        auth_strategy,
     };
     let mut abq = Abq::start(queue_config);
 
@@ -58,13 +61,16 @@ pub fn start_abq_forever(
     std::process::exit(101);
 }
 
-pub(crate) enum AbqInstance {
+pub(crate) struct AbqInstance {
+    locator: AbqLocator,
+    client_auth: ClientAuthStrategy,
+}
+
+enum AbqLocator {
     Remote {
         server_addr: SocketAddr,
         queue_negotiator: QueueNegotiatorHandle,
     },
-    #[allow(unused)]
-    Global(SocketAddr),
     Local(Abq),
 }
 
@@ -76,39 +82,60 @@ pub(crate) enum AbqInstanceError {
 
 impl AbqInstance {
     pub fn server_addr(&self) -> SocketAddr {
-        match self {
-            AbqInstance::Remote { server_addr, .. } => *server_addr,
-            AbqInstance::Global(addr) => *addr,
-            AbqInstance::Local(abq) => abq.server_addr(),
+        match &self.locator {
+            AbqLocator::Remote { server_addr, .. } => *server_addr,
+            AbqLocator::Local(abq) => abq.server_addr(),
         }
     }
 
     pub fn negotiator_handle(&self) -> QueueNegotiatorHandle {
-        match self {
-            AbqInstance::Remote {
+        match &self.locator {
+            AbqLocator::Remote {
                 queue_negotiator, ..
             } => *queue_negotiator,
-            AbqInstance::Global(_addr) => todo!(),
-            AbqInstance::Local(abq) => abq.get_negotiator_handle(),
+            AbqLocator::Local(abq) => abq.get_negotiator_handle(),
         }
     }
 
-    pub fn new_ephemeral() -> Self {
+    pub fn new_ephemeral(server_auth: ServerAuthStrategy, client_auth: ClientAuthStrategy) -> Self {
         tracing::debug!("Creating an ephemeral queue");
 
         abq_queue::queue::init();
 
-        let queue = Abq::start(Default::default());
-        AbqInstance::Local(queue)
+        let queue = Abq::start(QueueConfig {
+            auth_strategy: server_auth,
+            ..Default::default()
+        });
+
+        AbqInstance {
+            locator: AbqLocator::Local(queue),
+            client_auth,
+        }
     }
 
-    pub fn from_remote(entity: EntityId, queue_addr: SocketAddr) -> Result<Self, AbqInstanceError> {
+    pub fn from_remote(
+        entity: EntityId,
+        queue_addr: SocketAddr,
+        auth: ClientAuthStrategy,
+    ) -> Result<Self, AbqInstanceError> {
         tracing::debug!("Creating instance from remote {}", queue_addr);
 
-        let queue_negotiator = QueueNegotiatorHandle::ask_queue(entity, queue_addr)?;
-        Ok(AbqInstance::Remote {
+        // TODO: if we get an error here, there is a reasonable chance it's because the provided
+        // client auth is invalid; we should provide a nice error message in such cases.
+        let queue_negotiator = QueueNegotiatorHandle::ask_queue(entity, queue_addr, auth)?;
+
+        let abq = AbqLocator::Remote {
             server_addr: queue_addr,
             queue_negotiator,
+        };
+
+        Ok(AbqInstance {
+            locator: abq,
+            client_auth: auth,
         })
+    }
+
+    pub fn client_auth(&self) -> ClientAuthStrategy {
+        self.client_auth
     }
 }
