@@ -1196,8 +1196,10 @@ mod test {
 
         {
             // Register the initial connection
-            let client_conn = client.connect(fake_server_addr).await.unwrap();
-            let (server_conn, _) = fake_server.accept().await.unwrap();
+            let (client_res, server_res) =
+                futures::join!(client.connect(fake_server_addr), fake_server.accept());
+            let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
+
             let mut active_invocations = active_invocations.lock().await;
             active_invocations
                 .entry(invocation_id)
@@ -1207,13 +1209,15 @@ mod test {
         };
 
         // Attempt to reconnect
-        let new_conn = client.connect(fake_server_addr).await.unwrap();
-        let new_conn_addr = new_conn.local_addr().unwrap();
+        let (client_res, server_res) =
+            futures::join!(client.connect(fake_server_addr), fake_server.accept());
+        let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
+        let new_conn_addr = client_conn.local_addr().unwrap();
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
             Arc::clone(&active_invocations),
             EntityId::new(),
-            new_conn,
+            server_conn,
             invocation_id,
         )
         .await;
@@ -1223,7 +1227,7 @@ mod test {
         let active_conn_addr = {
             let active_invocations = active_invocations.lock().await;
             match active_invocations.get(&invocation_id).unwrap() {
-                ClientResponder::DirectStream(conn) => conn.local_addr().unwrap(),
+                ClientResponder::DirectStream(conn) => conn.peer_addr().unwrap(),
                 ClientResponder::Disconnected { .. } => unreachable!(),
             }
         };
@@ -1242,12 +1246,14 @@ mod test {
 
         let client = ConfiguredClient::new().unwrap();
 
-        let conn = client.connect(fake_server_addr).await.unwrap();
+        let (client_res, server_res) =
+            futures::join!(client.connect(fake_server_addr), fake_server.accept());
+        let (_client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
             Arc::clone(&active_invocations),
             EntityId::new(),
-            conn,
+            server_conn,
             invocation_id,
         )
         .await;
@@ -1279,8 +1285,10 @@ mod test {
 
         {
             // Register the initial connection
-            let client_conn = client.connect(fake_server_addr).await.unwrap();
-            let (server_conn, _) = fake_server.accept().await.unwrap();
+            let (client_res, server_res) =
+                futures::join!(client.connect(fake_server_addr), fake_server.accept());
+            let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
+
             let mut active_invocations = active_invocations.lock().await;
             let _responder = active_invocations
                 .entry(invocation_id)
@@ -1322,7 +1330,9 @@ mod test {
         }
 
         // Reconnect back to the queue
-        let client_conn = client.connect(fake_server_addr).await.unwrap();
+        let (client_res, server_res) =
+            futures::join!(client.connect(fake_server_addr), fake_server.accept());
+        let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
         let mut client = Client {
             entity: client_entity,
             abq_server_addr: fake_server_addr,
@@ -1330,7 +1340,6 @@ mod test {
             stream: client_conn,
         };
         {
-            let (server_conn, _) = fake_server.accept().await.unwrap();
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
                 Arc::clone(&active_invocations),
                 EntityId::new(),

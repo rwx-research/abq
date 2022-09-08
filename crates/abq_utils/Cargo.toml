@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+rustls = { version = "0.20.6", optional = true }
+rustls-pemfile = { version = "1.0.1", optional = true }
+tokio-rustls = { version = "0.23.4", optional = true }
 serde = "1.0.144"
 serde_derive = "1.0.144"
 serde_json = "1.0.85"
@@ -22,3 +25,4 @@ features = [
 [features]
 default = []
 test-actions = []
+tls = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]

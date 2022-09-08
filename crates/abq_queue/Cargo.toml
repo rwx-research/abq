@@ -36,3 +36,6 @@ procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile = "3.3.0"
 tracing-test = "0.2.3"
 futures = "0.3.24"
+
+[features]
+tls = ["abq_utils/tls", "abq_workers/tls"]

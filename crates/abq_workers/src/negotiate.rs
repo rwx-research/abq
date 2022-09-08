@@ -147,7 +147,10 @@ impl WorkersNegotiator {
             work_retries,
         } = workers_config;
 
-        let notify_result: NotifyResult = Arc::new(
+        let notify_result: NotifyResult = Arc::new({
+            #[allow(clippy::clone_on_copy)] // not all clients implement copy.
+            let client = client.clone();
+
             move |entity, invocation_id, work_id, result| {
                 let span = tracing::trace_span!("notify_result", invocation_id=?invocation_id, work_id=?work_id, queue_server=?queue_results_addr);
                 let _notify_result = span.enter();
@@ -168,30 +171,35 @@ impl WorkersNegotiator {
 
                 // TODO: error handling
                 net_protocol::write(&mut stream, request).unwrap();
-            },
-        );
+            }
+        });
 
-        let get_next_work: GetNextWork = Arc::new(move || {
-            let span = tracing::trace_span!("get_next_work", invocation_id=?invocation_id, new_work_server=?queue_new_work_addr);
-            let _get_next_work = span.enter();
+        let get_next_work: GetNextWork = Arc::new({
+            #[allow(clippy::clone_on_copy)] // not all clients implement copy.
+            let client = client.clone();
 
-            // TODO: error handling
-            // In particular, the work server may have shut down and we can't connect. In that
-            // case the worker should shutdown too.
-            let mut stream = client
-                .connect(queue_new_work_addr)
-                .expect("work server not available");
+            move || {
+                let span = tracing::trace_span!("get_next_work", invocation_id=?invocation_id, new_work_server=?queue_new_work_addr);
+                let _get_next_work = span.enter();
 
-            // Write the invocation ID we want work for
-            // TODO: error handling
-            net_protocol::write(
-                &mut stream,
-                net_protocol::work_server::WorkServerRequest::NextTest { invocation_id },
-            )
-            .unwrap();
+                // TODO: error handling
+                // In particular, the work server may have shut down and we can't connect. In that
+                // case the worker should shutdown too.
+                let mut stream = client
+                    .connect(queue_new_work_addr)
+                    .expect("work server not available");
 
-            // TODO: error handling
-            net_protocol::read(&mut stream).unwrap()
+                // Write the invocation ID we want work for
+                // TODO: error handling
+                net_protocol::write(
+                    &mut stream,
+                    net_protocol::work_server::WorkServerRequest::NextTest { invocation_id },
+                )
+                .unwrap();
+
+                // TODO: error handling
+                net_protocol::read(&mut stream).unwrap()
+            }
         });
 
         let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
@@ -590,6 +598,7 @@ mod test {
                 Err(_) => unreachable!(),
             };
 
+            client.set_nonblocking(false).unwrap();
             let request: net_protocol::queue::Request = net_protocol::read(&mut client).unwrap();
             match request.message {
                 net_protocol::queue::Message::WorkerResult(_, _, result) => {

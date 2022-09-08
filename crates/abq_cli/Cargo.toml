@@ -31,3 +31,4 @@ insta = "1.19.1"
 
 [features]
 test-abq-jest = []
+tls = ["abq_utils/tls", "abq_queue/tls", "abq_workers/tls"]
