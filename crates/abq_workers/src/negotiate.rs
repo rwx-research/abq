@@ -382,7 +382,15 @@ impl QueueNegotiator {
 
                 loop {
                     let (client, _) = tokio::select! {
-                        conn = listener.accept() => conn?,
+                        conn = listener.accept() => {
+                            match conn {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    tracing::error!("error accepting connection: {:?}", e);
+                                    continue;
+                                }
+                            }
+                        }
                         _ = server_shutdown_rx.recv() => {
                             break;
                         }

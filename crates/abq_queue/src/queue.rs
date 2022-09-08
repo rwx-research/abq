@@ -559,7 +559,15 @@ impl QueueServer {
 
             loop {
                 let (client, _) = tokio::select! {
-                    conn = server_listener.accept() => conn?,
+                    conn = server_listener.accept() => {
+                        match conn {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                tracing::error!("error accepting connection: {:?}", e);
+                                continue;
+                            }
+                        }
+                    }
                     _ = server_shutdown.recv() => {
                         break;
                     }
@@ -888,7 +896,15 @@ impl WorkScheduler {
 
             loop {
                 let (client, _) = tokio::select! {
-                    conn = listener.accept() => conn?,
+                    conn = listener.accept() => {
+                        match conn {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                tracing::error!("error accepting connection: {:?}", e);
+                                continue;
+                            }
+                        }
+                    }
                     _ = shutdown.recv() => {
                         break;
                     }

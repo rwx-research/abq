@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+/app/abq start \
+  --bind "0.0.0.0" \
+  --public-ip "168.220.85.45" \
+  --port "8080" \
+  --work-port "8081" \
+  --negotiator-port "8082" \
+  --token "$(cat /app/abq_server_token)"
