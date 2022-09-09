@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use abq_utils::{auth::AuthToken, net_protocol::workers::InvocationId};
+use abq_utils::{auth::AuthToken, net_opt::Tls, net_protocol::workers::InvocationId};
 use clap::{Parser, Subcommand};
 
 use crate::reporting::ReporterKind;
@@ -70,6 +70,11 @@ pub enum Command {
         /// Need a token? Use `abq token new`!
         #[clap(long)]
         token: Option<AuthToken>,
+
+        /// Whether to accept messages only with TLS; unset by default.
+        /// When set, workers and test clients must also be set to send messages only with TLS.
+        #[clap(long, parse(from_flag), required = false)]
+        tls: Tls,
     },
     /// Starts a pool of abq workers in a working directory.
     ///
@@ -96,6 +101,11 @@ pub enum Command {
         /// Usually, this should be the same token that `abq start` initialized with.
         #[clap(long, required = false)]
         token: Option<AuthToken>,
+
+        /// Whether to send messages only with TLS; unset by default.
+        /// When set, must talk to a queue configured with TLS.
+        #[clap(long, parse(from_flag), required = false)]
+        tls: Tls,
     },
     /// Starts an instance of `abq test`. Examples:
     ///
@@ -122,6 +132,12 @@ pub enum Command {
         /// Usually, this should be the same token that `abq start` initialized with.
         #[clap(long, required = false)]
         token: Option<AuthToken>,
+
+        /// Whether to send messages only with TLS; unset by default.
+        /// When set, only queues configured with TLS as well should be provided via
+        /// `--queue-addr`.
+        #[clap(long, parse(from_flag), required = false)]
+        tls: Tls,
 
         /// Test result reporter to use for a test run.
         #[clap(long, default_value = "line")]
@@ -151,6 +167,10 @@ pub enum Command {
         /// Usually, this should be the same token that `abq start` initialized with.
         #[clap(long, required = false)]
         token: Option<AuthToken>,
+
+        /// Whether the services being checked are configured with TLS.
+        #[clap(long, parse(from_flag), required = false)]
+        tls: Tls,
     },
     /// Utilities related to auth tokens.
     #[clap(subcommand)]

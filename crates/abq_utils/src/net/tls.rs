@@ -1,22 +1,17 @@
 //! TLS connections.
 
+use std::io;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::Arc;
-use std::{fs, io, thread};
 
 use rustls as tls;
+use tokio_rustls as tokio_tls;
 
 use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
 
 #[derive(Debug)]
 pub struct ServerStream(tls::StreamOwned<tls::ServerConnection, std::net::TcpStream>);
-
-impl ServerStream {
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.0.sock.set_nonblocking(nonblocking)
-    }
-}
 
 impl Read for ServerStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -34,10 +29,16 @@ impl Write for ServerStream {
     }
 }
 
+impl super::ServerStream for ServerStream {
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.0.sock.set_nonblocking(nonblocking)
+    }
+}
+
 pub struct ServerListener {
-    pub(crate) listener: TcpListener,
-    pub(crate) tls_config: Arc<tls::ServerConfig>,
-    pub(crate) auth_strategy: ServerAuthStrategy,
+    listener: TcpListener,
+    tls_config: Arc<tls::ServerConfig>,
+    auth_strategy: ServerAuthStrategy,
 }
 
 impl ServerListener {
@@ -51,16 +52,18 @@ impl ServerListener {
             auth_strategy,
         })
     }
+}
 
-    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+impl super::ServerListener for ServerListener {
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.listener.set_nonblocking(nonblocking)
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    pub fn accept(&self) -> io::Result<(ServerStream, SocketAddr)> {
+    fn accept(&self) -> io::Result<(Box<dyn super::ServerStream>, SocketAddr)> {
         let conn = tls::ServerConnection::new(Arc::clone(&self.tls_config))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
@@ -73,7 +76,25 @@ impl ServerListener {
         // Before we give back the TLS stream, we must validate auth
         self.auth_strategy.verify_header(&mut stream)?;
 
-        Ok((stream, addr))
+        Ok((Box::new(stream), addr))
+    }
+
+    fn into_async(self: Box<Self>) -> io::Result<Box<dyn crate::net_async::ServerListener>> {
+        let Self {
+            listener,
+            tls_config,
+            auth_strategy,
+        } = *self;
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+
+        let acceptor = tokio_tls::TlsAcceptor::from(tls_config);
+
+        Ok(Box::new(crate::net_async::tls::ServerListener {
+            listener,
+            acceptor,
+            auth_strategy,
+        }))
     }
 }
 
@@ -95,6 +116,8 @@ impl Write for ClientStream {
     }
 }
 
+impl super::ClientStream for ClientStream {}
+
 #[derive(Clone)]
 pub struct ConfiguredClient {
     tls_config: Arc<tls::ClientConfig>,
@@ -110,8 +133,10 @@ impl ConfiguredClient {
             auth_strategy,
         })
     }
+}
 
-    pub fn connect(&self, addr: SocketAddr) -> io::Result<ClientStream> {
+impl super::ConfiguredClient for ConfiguredClient {
+    fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn super::ClientStream>> {
         let server_name = crate::tls::get_server_name();
 
         let conn = tls::ClientConnection::new(Arc::clone(&self.tls_config), server_name)
@@ -125,6 +150,10 @@ impl ConfiguredClient {
         // Before handing back the the stream, send over auth
         self.auth_strategy.send(&mut stream)?;
 
-        Ok(stream)
+        Ok(Box::new(stream))
+    }
+
+    fn boxed_clone(&self) -> Box<dyn super::ConfiguredClient> {
+        Box::new(self.clone())
     }
 }

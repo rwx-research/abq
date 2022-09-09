@@ -1,22 +1,27 @@
 //! Server/client interfaces for use among entities in the ABQ ecosystem.
 
-pub(crate) mod tcp;
-#[cfg(not(feature = "tls"))]
-pub type ServerListener = tcp::ServerListener;
-#[cfg(not(feature = "tls"))]
-pub type ServerStream = tcp::Stream;
-#[cfg(not(feature = "tls"))]
-pub type ConfiguredClient = tcp::ConfiguredClient;
-#[cfg(not(feature = "tls"))]
-pub type ClientStream = tcp::Stream;
+use std::{
+    io::{self, Read, Write},
+    net::SocketAddr,
+};
 
-#[cfg(feature = "tls")]
-pub(crate) mod tls;
-#[cfg(feature = "tls")]
-pub type ServerListener = tls::ServerListener;
-#[cfg(feature = "tls")]
-pub type ServerStream = tls::ServerStream;
-#[cfg(feature = "tls")]
-pub type ConfiguredClient = tls::ConfiguredClient;
-#[cfg(feature = "tls")]
-pub type ClientStream = tls::ClientStream;
+pub trait ServerListener: Send + Sync {
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    fn accept(&self) -> io::Result<(Box<dyn ServerStream>, SocketAddr)>;
+    fn into_async(self: Box<Self>) -> io::Result<Box<dyn crate::net_async::ServerListener>>;
+}
+
+pub trait ServerStream: Read + Write {
+    fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+}
+
+pub trait ConfiguredClient: Send + Sync {
+    fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn ClientStream>>;
+    fn boxed_clone(&self) -> Box<dyn ConfiguredClient>;
+}
+
+pub trait ClientStream: Read + Write {}
+
+pub mod tcp;
+pub mod tls;

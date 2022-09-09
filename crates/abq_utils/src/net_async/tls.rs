@@ -1,7 +1,7 @@
 //! TLS-based connections.
 //! Must be created in a Tokio runtime.
 
-use rustls as tls;
+use async_trait::async_trait;
 use tokio_rustls as tokio_tls;
 
 use std::io;
@@ -15,8 +15,8 @@ use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
 #[derive(Debug)]
 pub struct ServerStream(tokio_tls::server::TlsStream<tokio::net::TcpStream>);
 
-impl ServerStream {
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+impl super::ServerStream for ServerStream {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.0.get_ref().0.peer_addr()
     }
 }
@@ -58,9 +58,9 @@ impl AsyncWrite for ServerStream {
 }
 
 pub struct ServerListener {
-    listener: tokio::net::TcpListener,
-    acceptor: tokio_tls::TlsAcceptor,
-    auth_strategy: ServerAuthStrategy,
+    pub(crate) listener: tokio::net::TcpListener,
+    pub(crate) acceptor: tokio_tls::TlsAcceptor,
+    pub(crate) auth_strategy: ServerAuthStrategy,
 }
 
 impl ServerListener {
@@ -78,30 +78,15 @@ impl ServerListener {
             auth_strategy,
         })
     }
+}
 
-    pub fn from_sync(listener: crate::net::tls::ServerListener) -> io::Result<Self> {
-        let crate::net::tls::ServerListener {
-            listener,
-            tls_config,
-            auth_strategy,
-        } = listener;
-        listener.set_nonblocking(true)?;
-        let listener = tokio::net::TcpListener::from_std(listener)?;
-
-        let acceptor = tokio_tls::TlsAcceptor::from(tls_config);
-
-        Ok(Self {
-            listener,
-            acceptor,
-            auth_strategy,
-        })
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+#[async_trait]
+impl super::ServerListener for ServerListener {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    pub async fn accept(&self) -> io::Result<(ServerStream, SocketAddr)> {
+    async fn accept(&self) -> io::Result<(Box<dyn super::ServerStream>, SocketAddr)> {
         let (stream, addr) = self.listener.accept().await?;
         let stream = self.acceptor.accept(stream).await?;
         let mut stream = ServerStream(stream);
@@ -110,14 +95,14 @@ impl ServerListener {
         // before handing the connection over.
         self.auth_strategy.async_verify_header(&mut stream).await?;
 
-        Ok((stream, addr))
+        Ok((Box::new(stream), addr))
     }
 }
 
 pub struct ClientStream(tokio_tls::client::TlsStream<tokio::net::TcpStream>);
 
-impl ClientStream {
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+impl super::ClientStream for ClientStream {
+    fn local_addr(&self) -> io::Result<SocketAddr> {
         self.0.get_ref().0.local_addr()
     }
 }
@@ -173,8 +158,11 @@ impl ConfiguredClient {
             auth_strategy,
         })
     }
+}
 
-    pub async fn connect(&self, addr: SocketAddr) -> io::Result<ClientStream> {
+#[async_trait]
+impl super::ConfiguredClient for ConfiguredClient {
+    async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn super::ClientStream>> {
         let sock = tokio::net::TcpStream::connect(addr).await?;
 
         // NB: we are assuming we are only ever connecting to an ABQ server!
@@ -186,6 +174,6 @@ impl ConfiguredClient {
         // Send any auth header over immediately.
         self.auth_strategy.async_send(&mut stream).await?;
 
-        Ok(stream)
+        Ok(Box::new(stream))
     }
 }

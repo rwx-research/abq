@@ -102,6 +102,7 @@ const TEST_AUTH_KEY: &str = "abqs_ckoUjQN4ufq1MiUeaNllztfyqjCtuz";
 /// or not.
 struct CSConfigOptions {
     use_auth_token: bool,
+    tls: bool,
 }
 
 impl CSConfigOptions {
@@ -109,6 +110,9 @@ impl CSConfigOptions {
         let mut args = args.to_vec();
         if self.use_auth_token {
             args.extend(["--token", TEST_AUTH_KEY]);
+        }
+        if self.tls {
+            args.extend(["--tls"]);
         }
         args
     }
@@ -124,17 +128,37 @@ macro_rules! test_all_network_config_options {
     ) => { paste::paste! {
         #[test]
         $(#[$cfg])*
-        fn [<$test_name _no_auth>]() {
+        fn [<$test_name _no_auth_no_tls>]() {
             $run(CSConfigOptions {
-                use_auth_token: false
+                use_auth_token: false,
+                tls: false,
             })
         }
 
         #[test]
         $(#[$cfg])*
-        fn [<$test_name _with_auth>]() {
+        fn [<$test_name _no_auth_with_tls>]() {
             $run(CSConfigOptions {
-                use_auth_token: true
+                use_auth_token: false,
+                tls: true,
+            })
+        }
+
+        #[test]
+        $(#[$cfg])*
+        fn [<$test_name _with_auth_no_tls>]() {
+            $run(CSConfigOptions {
+                use_auth_token: true,
+                tls: false,
+            })
+        }
+
+        #[test]
+        $(#[$cfg])*
+        fn [<$test_name _with_auth_with_tls>]() {
+            $run(CSConfigOptions {
+                use_auth_token: true,
+                tls: true,
             })
         }
     }};

@@ -17,8 +17,8 @@ use crate::workers::{
     GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
 };
 use abq_utils::{
-    auth::ClientAuthStrategy,
     net, net_async,
+    net_opt::ClientOptions,
     net_protocol::{
         self,
         entity::EntityId,
@@ -100,23 +100,23 @@ pub enum WorkersNegotiateError {
 }
 
 /// The worker pool side of the negotiation.
-pub struct WorkersNegotiator(net::ClientStream, WorkerContext);
+pub struct WorkersNegotiator(Box<dyn net::ClientStream>, WorkerContext);
 
 impl WorkersNegotiator {
     /// Runs the workers-side of the negotiation, returning the configured worker pool once
     /// negotiation is complete.
-    #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, auth_strategy), fields(
+    #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, client_options), fields(
         num_workers = workers_config.num_workers
     ))]
     pub fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
-        auth_strategy: ClientAuthStrategy,
+        client_options: ClientOptions,
         wanted_invocation_id: InvocationId,
     ) -> Result<WorkerPool, WorkersNegotiateError> {
         use WorkersNegotiateError::*;
 
-        let client = net::ConfiguredClient::new(auth_strategy)?;
+        let client = client_options.build()?;
         let mut conn = client
             .connect(queue_negotiator_handle.0)
             .map_err(|_| CouldNotConnect)?;
@@ -150,8 +150,7 @@ impl WorkersNegotiator {
         } = workers_config;
 
         let notify_result: NotifyResult = Arc::new({
-            #[allow(clippy::clone_on_copy)] // not all clients implement copy.
-            let client = client.clone();
+            let client = client.boxed_clone();
 
             move |entity, invocation_id, work_id, result| {
                 let span = tracing::trace_span!("notify_result", invocation_id=?invocation_id, work_id=?work_id, queue_server=?queue_results_addr);
@@ -177,8 +176,7 @@ impl WorkersNegotiator {
         });
 
         let get_next_work: GetNextWork = Arc::new({
-            #[allow(clippy::clone_on_copy)] // not all clients implement copy.
-            let client = client.clone();
+            let client = client.boxed_clone();
 
             move || {
                 let span = tracing::trace_span!("get_next_work", invocation_id=?invocation_id, new_work_server=?queue_new_work_addr);
@@ -273,11 +271,11 @@ impl QueueNegotiatorHandle {
     pub fn ask_queue(
         entity: EntityId,
         queue_addr: SocketAddr,
-        auth_strategy: ClientAuthStrategy,
+        client_options: ClientOptions,
     ) -> Result<Self, QueueNegotiatorHandleError> {
         use QueueNegotiatorHandleError::*;
 
-        let client = net::ConfiguredClient::new(auth_strategy)?;
+        let client = client_options.build()?;
         let mut conn = client.connect(queue_addr).map_err(|_| CouldNotConnect)?;
 
         let request = net_protocol::queue::Request {
@@ -347,7 +345,7 @@ impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
     pub fn new<GetAssignedRun>(
         public_ip: IpAddr,
-        listener: net::ServerListener,
+        listener: Box<dyn net::ServerListener>,
         queue_work_scheduler_addr: SocketAddr,
         queue_results_addr: SocketAddr,
         get_assigned_run: GetAssignedRun,
@@ -378,7 +376,7 @@ impl QueueNegotiator {
 
             let server_result: Result<(), QueueNegotiatorServerError> = rt.block_on(async {
                 // Initialize the listener in the async context.
-                let listener = net_async::ServerListener::from_sync(listener)?;
+                let listener = listener.into_async()?;
 
                 loop {
                     let (client, _) = tokio::select! {
@@ -422,7 +420,7 @@ impl QueueNegotiator {
 
     async fn handle_conn<GetAssignedRun>(
         ctx: QueueNegotiatorCtx<GetAssignedRun>,
-        mut stream: net_async::ServerStream,
+        mut stream: Box<dyn net_async::ServerStream>,
     ) -> io::Result<()>
     where
         GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
@@ -513,6 +511,7 @@ mod test {
     use crate::negotiate::WorkersConfig;
     use crate::workers::WorkerContext;
     use abq_utils::auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy};
+    use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
@@ -531,7 +530,9 @@ mod test {
     type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
 
     fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
-        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
+        let server = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+            .bind("0.0.0.0:0")
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -591,7 +592,9 @@ mod test {
         let msgs = Arc::new(Mutex::new(Vec::new()));
         let msgs2 = Arc::clone(&msgs);
 
-        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
+        let server = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+            .bind("0.0.0.0:0")
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
@@ -694,7 +697,9 @@ mod test {
 
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
-            net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap(),
+            ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+                .bind("0.0.0.0:0")
+                .unwrap(),
             next_work_addr,
             results_addr,
             get_assigned_run,
@@ -709,7 +714,7 @@ mod test {
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue_negotiator.get_handle(),
-            ClientAuthStrategy::NoAuth,
+            ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO),
             invocation_id,
         )
         .unwrap();
@@ -735,7 +740,7 @@ mod test {
         );
     }
 
-    fn test_negotiator(server: net::ServerListener) -> QueueNegotiator {
+    fn test_negotiator(server: Box<dyn net::ServerListener>) -> QueueNegotiator {
         QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
             server,
@@ -758,12 +763,16 @@ mod test {
 
     #[test]
     fn queue_negotiator_healthcheck() {
-        let server = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
+        let server = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+            .bind("0.0.0.0:0")
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let mut queue_negotiator = test_negotiator(server);
 
-        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
+        let client = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO)
+            .build()
+            .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
         let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
@@ -778,12 +787,14 @@ mod test {
     fn queue_negotiator_with_auth_okay() {
         let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
 
-        let server = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server = ServerOptions::new(server_auth, Tls::NO)
+            .bind("0.0.0.0:0")
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let mut queue_negotiator = test_negotiator(server);
 
-        let client = net::ConfiguredClient::new(client_auth).unwrap();
+        let client = ClientOptions::new(client_auth, Tls::NO).build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
         let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
@@ -800,12 +811,16 @@ mod test {
     fn queue_negotiator_connect_with_no_auth_fails() {
         let (server_auth, _) = AuthToken::new_random().build_strategies();
 
-        let server = net::ServerListener::bind(server_auth, "0.0.0.0:0").unwrap();
+        let server = ServerOptions::new(server_auth, Tls::NO)
+            .bind("0.0.0.0:0")
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let mut queue_negotiator = test_negotiator(server);
 
-        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
+        let client = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO)
+            .build()
+            .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
 

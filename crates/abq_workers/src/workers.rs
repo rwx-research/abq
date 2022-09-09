@@ -529,11 +529,12 @@ mod test {
     use std::time::{Duration, Instant};
 
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
+    use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::workers::{NextWork, TestLikeRunner};
-    use abq_utils::{flatten_manifest, net, net_protocol};
+    use abq_utils::{flatten_manifest, net_protocol};
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
@@ -961,7 +962,9 @@ mod test {
     #[test]
     #[traced_test]
     fn bad_message_doesnt_take_down_queue_negotiator_server() {
-        let listener = net::ServerListener::bind(ServerAuthStrategy::NoAuth, "0.0.0.0:0").unwrap();
+        let listener = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+            .bind("0.0.0.0:0")
+            .unwrap();
         let listener_addr = listener.local_addr().unwrap();
         let mut negotiator = QueueNegotiator::new(
             listener_addr.ip(),
@@ -972,7 +975,9 @@ mod test {
         )
         .unwrap();
 
-        let client = net::ConfiguredClient::new(ClientAuthStrategy::NoAuth).unwrap();
+        let client = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO)
+            .build()
+            .unwrap();
         let mut conn = client.connect(listener_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
