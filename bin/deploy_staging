@@ -2,7 +2,7 @@
 
 /app/abq start \
   --bind "0.0.0.0" \
-  --public-ip "168.220.85.45" \
+  --public-ip "213.188.214.85" \
   --port "8080" \
   --work-port "8081" \
   --negotiator-port "8082" \

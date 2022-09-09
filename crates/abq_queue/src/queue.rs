@@ -578,7 +578,7 @@ impl QueueServer {
                     async move {
                         let result = this.handle(client).await;
                         if let Err(err) = result {
-                            tracing::error!("error handling connection: {:?}", err);
+                            tracing::error!("error handling connection to queue: {:?}", err);
                         }
                     }
                 });
@@ -627,13 +627,17 @@ impl QueueServer {
                 // Upcast the reconnection error into a generic error
                 .map_err(|e| Box::new(e) as _)
             }
-            Message::Manifest(invocation_id, manifest) => Self::handle_manifest(
-                self.queues,
-                self.work_left_for_invocations,
-                entity,
-                invocation_id,
-                manifest,
-            ),
+            Message::Manifest(invocation_id, manifest) => {
+                Self::handle_manifest(
+                    self.queues,
+                    self.work_left_for_invocations,
+                    entity,
+                    invocation_id,
+                    manifest,
+                    stream,
+                )
+                .await
+            }
             Message::WorkerResult(invocation_id, work_id, result) => {
                 // Recording and sending the test result back to the abq test client may
                 // be expensive, with multiple IO transactions. There is no reason to block the
@@ -748,12 +752,13 @@ impl QueueServer {
     }
 
     #[instrument(level = "trace", skip(queues, work_left_for_invocations))]
-    fn handle_manifest(
+    async fn handle_manifest(
         queues: SharedInvocationQueues,
         work_left_for_invocations: WorkLeftForInvocations,
         entity: EntityId,
         invocation_id: InvocationId,
         manifest: ManifestMessage,
+        mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Record the manifest for this invocation in its appropriate queue.
         // TODO: actually record the manifest metadata
@@ -767,6 +772,8 @@ impl QueueServer {
             .lock()
             .unwrap()
             .add_manifest(invocation_id, flat_manifest);
+
+        net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
 
         Ok(())
     }

@@ -219,6 +219,7 @@ impl WorkersNegotiator {
 
                 // TODO: error handling
                 net_protocol::write(&mut stream, request).unwrap();
+                let net_protocol::workers::AckManifest = net_protocol::read(&mut stream).unwrap();
             }))
         } else {
             None
@@ -627,6 +628,7 @@ mod test {
                         old_manifest.is_none(),
                         "replacing existing manifest! This is a bug in our tests."
                     );
+                    net_protocol::write(&mut client, net_protocol::workers::AckManifest).unwrap();
                 }
                 _ => unreachable!(),
             }
