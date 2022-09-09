@@ -14,6 +14,7 @@ use std::{
 use abq_queue::invoke::Client;
 use abq_utils::{
     auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
+    net_opt::{ClientOptions, ServerOptions, Tls},
     net_protocol::{
         entity::EntityId,
         runners::TestResult,
@@ -99,13 +100,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             work_port,
             negotiator_port,
             token,
+            tls,
         } => instance::start_abq_forever(
             public_ip,
             bind_ip,
             server_port,
             work_port,
             negotiator_port,
-            ServerAuthStrategy::from(token),
+            ServerOptions::new(token.into(), tls),
         ),
         Command::Work {
             working_dir,
@@ -113,15 +115,16 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             test_run,
             num,
             token,
+            tls,
         } => {
-            let client_auth = ClientAuthStrategy::from(token);
+            let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), tls);
             let queue_negotiator =
-                QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_auth)?;
+                QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts)?;
             workers::start_workers_forever(
                 num,
                 working_dir,
                 queue_negotiator,
-                client_auth,
+                client_opts,
                 test_run,
             )
         }
@@ -131,11 +134,12 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             queue_addr,
             reporter: reporters,
             token,
+            tls,
         } => {
             let (server_auth, client_auth) = (token.into(), token.into());
 
             let runner_params = validate_abq_test_args(args)?;
-            let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth)?;
+            let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth, tls)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
             run_tests(entity, runner, abq, test_id, reporters)
         }
@@ -144,6 +148,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             work_scheduler,
             negotiator,
             token,
+            tls,
         } => {
             let mut to_check = (queue.into_iter().map(HealthCheckKind::Queue))
                 .chain(
@@ -162,9 +167,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             }
 
             let client_auth = token.into();
+            let client_options = ClientOptions::new(client_auth, tls);
+
             let mut all_healthy = true;
             for service in to_check {
-                if !service.is_healthy(client_auth) {
+                if !service.is_healthy(client_options) {
                     all_healthy = false;
                     println!("{service}: unhealthy");
                 }
@@ -208,13 +215,14 @@ fn find_or_create_abq(
     opt_queue_addr: Option<SocketAddr>,
     server_auth: ServerAuthStrategy,
     client_auth: ClientAuthStrategy,
+    tls: Tls,
 ) -> anyhow::Result<AbqInstance> {
     match opt_queue_addr {
         Some(queue_addr) => {
-            let instance = AbqInstance::from_remote(entity, queue_addr, client_auth)?;
+            let instance = AbqInstance::from_remote(entity, queue_addr, client_auth, tls)?;
             Ok(instance)
         }
-        None => Ok(AbqInstance::new_ephemeral(server_auth, client_auth)),
+        None => Ok(AbqInstance::new_ephemeral(server_auth, client_auth, tls)),
     }
 }
 
@@ -246,7 +254,7 @@ fn run_tests(
     let work_results_thread = start_test_result_reporter(
         entity,
         abq.server_addr(),
-        abq.client_auth(),
+        abq.client_options(),
         test_id,
         runner,
         on_result,
@@ -258,7 +266,7 @@ fn run_tests(
             default_num_workers(),
             working_dir,
             abq.negotiator_handle(),
-            abq.client_auth(),
+            abq.client_options(),
             test_id,
         )?;
         Some(workers)
@@ -282,7 +290,7 @@ fn run_tests(
 fn start_test_result_reporter(
     entity: EntityId,
     abq_server_addr: SocketAddr,
-    auth: ClientAuthStrategy,
+    client_opts: ClientOptions,
     test_id: InvocationId,
     runner: RunnerKind,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
@@ -293,7 +301,7 @@ fn start_test_result_reporter(
             .build()?;
         runtime.block_on(async move {
             let abq_test_client =
-                Client::invoke_work(entity, abq_server_addr, auth, test_id, runner).await?;
+                Client::invoke_work(entity, abq_server_addr, client_opts, test_id, runner).await?;
             abq_test_client.stream_results(on_result).await
         })
     })

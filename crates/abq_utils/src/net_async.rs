@@ -1,23 +1,29 @@
 //! Async-runtime-compatible server/client interfaces for use among entities in the ABQ ecosystem.
 //! Rely on the [tokio] runtime.
 
-mod tcp;
-#[cfg(not(feature = "tls"))]
-pub type ServerListener = tcp::ServerListener;
-#[cfg(not(feature = "tls"))]
-pub type ServerStream = tcp::Stream;
-#[cfg(not(feature = "tls"))]
-pub type ConfiguredClient = tcp::ConfiguredClient;
-#[cfg(not(feature = "tls"))]
-pub type ClientStream = tcp::Stream;
+use std::{io, net::SocketAddr};
 
-#[cfg(feature = "tls")]
-mod tls;
-#[cfg(feature = "tls")]
-pub type ServerListener = tls::ServerListener;
-#[cfg(feature = "tls")]
-pub type ServerStream = tls::ServerStream;
-#[cfg(feature = "tls")]
-pub type ConfiguredClient = tls::ConfiguredClient;
-#[cfg(feature = "tls")]
-pub type ClientStream = tls::ClientStream;
+use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+#[async_trait]
+pub trait ServerListener {
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+    async fn accept(&self) -> io::Result<(Box<dyn ServerStream>, SocketAddr)>;
+}
+
+pub trait ServerStream: std::fmt::Debug + AsyncRead + AsyncWrite + Send + Sync + Unpin {
+    fn peer_addr(&self) -> io::Result<SocketAddr>;
+}
+
+#[async_trait]
+pub trait ConfiguredClient {
+    async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn ClientStream>>;
+}
+
+pub trait ClientStream: AsyncRead + AsyncWrite + Unpin {
+    fn local_addr(&self) -> io::Result<SocketAddr>;
+}
+
+pub mod tcp;
+pub mod tls;

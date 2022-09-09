@@ -1,8 +1,7 @@
 use std::net::SocketAddr;
 
 use abq_utils::{
-    auth::ClientAuthStrategy,
-    net,
+    net_opt::ClientOptions,
     net_protocol::{self, entity::EntityId, queue},
 };
 
@@ -37,7 +36,7 @@ impl HealthCheckKind {
         }
     }
 
-    pub fn is_healthy(&self, auth: ClientAuthStrategy) -> bool {
+    pub fn is_healthy(&self, client_opts: ClientOptions) -> bool {
         macro_rules! bail {
             ($e:expr) => {
                 match $e {
@@ -51,7 +50,7 @@ impl HealthCheckKind {
 
         tracing::debug!(?entity, "starting healthchecks");
 
-        let client = net::ConfiguredClient::new(auth).unwrap();
+        let client = client_opts.build().unwrap();
         let mut conn = bail!(client.connect(self.addr()));
         match self {
             HealthCheckKind::Queue(_) => {

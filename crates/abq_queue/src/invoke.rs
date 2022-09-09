@@ -14,8 +14,8 @@
 use std::{io, net::SocketAddr};
 
 use abq_utils::{
-    auth::ClientAuthStrategy,
     net_async,
+    net_opt::ClientOptions,
     net_protocol::{
         self,
         entity::EntityId,
@@ -29,11 +29,11 @@ use abq_utils::{
 pub struct Client {
     pub(crate) entity: EntityId,
     pub(crate) abq_server_addr: SocketAddr,
-    pub(crate) auth_strategy: ClientAuthStrategy,
+    pub(crate) client: Box<dyn net_async::ConfiguredClient>,
     /// The test invocation this client is responsible for.
     pub(crate) invocation_id: InvocationId,
     /// The stream to the queue server.
-    pub(crate) stream: net_async::ClientStream,
+    pub(crate) stream: Box<dyn net_async::ClientStream>,
 }
 
 impl Client {
@@ -41,11 +41,11 @@ impl Client {
     pub async fn invoke_work(
         entity: EntityId,
         abq_server_addr: SocketAddr,
-        auth_strategy: ClientAuthStrategy,
+        client_options: ClientOptions,
         invocation_id: InvocationId,
         runner: RunnerKind,
     ) -> Result<Self, io::Error> {
-        let client = net_async::ConfiguredClient::new(auth_strategy)?;
+        let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
 
         tracing::debug!(?entity, ?invocation_id, "invoking new work");
@@ -63,7 +63,7 @@ impl Client {
         Ok(Client {
             entity,
             abq_server_addr,
-            auth_strategy,
+            client,
             invocation_id,
             stream,
         })
@@ -71,8 +71,7 @@ impl Client {
 
     /// Attempts to reconnect the client to the abq server.
     pub(crate) async fn reconnect(&mut self) -> Result<(), io::Error> {
-        let client = net_async::ConfiguredClient::new(self.auth_strategy)?;
-        let mut new_stream = client.connect(self.abq_server_addr).await?;
+        let mut new_stream = self.client.connect(self.abq_server_addr).await?;
 
         net_protocol::async_write(
             &mut new_stream,
