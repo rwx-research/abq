@@ -1,4 +1,4 @@
-app = "abq"
+app = "abq-staging"
 
 kill_signal = "SIGINT"
 kill_timeout = 5
@@ -9,7 +9,7 @@ ABQ_LOG = "abq=debug"
 
 [experimental]
 cmd = [
-  "/app/deploy_prod",
+  "/app/deploy_staging",
 ]
 
 [[services]]
@@ -49,8 +49,9 @@ tcp_checks = []
     soft_limit = 20
 
 [[services.script_checks]]
-command = "/app/health"
+command = "/app/health_staging"
 grace_period  = "5s"
 interval      = "15s"
 restart_limit = 0
 timeout       = "1s"
+

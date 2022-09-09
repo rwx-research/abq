@@ -246,6 +246,10 @@ pub mod workers {
         },
         EndOfWork,
     }
+
+    /// An acknowledgement from the queue that it received a manifest message.
+    #[derive(Serialize, Deserialize)]
+    pub struct AckManifest;
 }
 
 pub mod queue {
