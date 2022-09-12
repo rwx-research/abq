@@ -2,6 +2,7 @@ use std::{fmt::Display, io, path::PathBuf, str::FromStr};
 
 use abq_output::{format_result_dot, format_result_line, format_result_summary};
 use abq_utils::net_protocol::runners::{Status, TestResult};
+use termcolor::{ColorChoice, StandardStream};
 use thiserror::Error;
 
 static DEFAULT_JUNIT_XML_PATH: &str = "abq-test-results.xml";
@@ -51,12 +52,36 @@ impl FromStr for ReporterKind {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum ColorPreference {
+    Auto,
+    Never,
+}
+
+impl FromStr for ColorPreference {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "never" => Ok(Self::Never),
+            other => Err(format!("Unknown color option {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ReportingError {
     #[error("failed to format a test result in the reporting format")]
     FailedToFormat,
     #[error("failed to write a report to an output buffer")]
     FailedToWrite,
+}
+
+impl From<io::Error> for ReportingError {
+    fn from(_: io::Error) -> Self {
+        Self::FailedToWrite
+    }
 }
 
 pub(crate) struct ExitCode(i32);
@@ -111,12 +136,12 @@ fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> 
 }
 
 fn write_summary_results(
-    writer: &mut impl io::Write,
+    writer: &mut impl termcolor::WriteColor,
     results: Vec<TestResult>,
 ) -> Result<(), ReportingError> {
     for test_result in results {
         write(writer, &[b'\n'])?;
-        write(writer, format_result_summary(&test_result).as_bytes())?;
+        format_result_summary(writer, &test_result)?;
     }
     Ok(())
 }
@@ -125,7 +150,7 @@ fn write_summary_results(
 /// erroring tests at the end.
 struct LineReporter {
     /// The output buffer.
-    buffer: Box<dyn io::Write + Send>,
+    buffer: Box<dyn termcolor::WriteColor + Send>,
 
     /// Failures and errors for which a longer summary should be printed at the end.
     delayed_failure_reports: Vec<TestResult>,
@@ -133,7 +158,7 @@ struct LineReporter {
 
 impl Reporter for LineReporter {
     fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
-        write(&mut self.buffer, format_result_line(test_result).as_bytes())?;
+        format_result_line(&mut self.buffer, test_result)?;
 
         if matches!(test_result.status, Status::Failure | Status::Error) {
             self.delayed_failure_reports.push(test_result.clone());
@@ -159,7 +184,7 @@ const DOT_REPORTER_LINE_LIMIT: u64 = 40;
 /// Streams test results as dots to an output buffer, and prints a summary for failing and erroring
 /// tests at the end.
 struct DotReporter {
-    buffer: Box<dyn io::Write + Send>,
+    buffer: Box<dyn termcolor::WriteColor + Send>,
 
     num_results: u64,
 
@@ -170,7 +195,7 @@ impl Reporter for DotReporter {
     fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
         self.num_results += 1;
 
-        write(&mut self.buffer, format_result_dot(test_result).as_bytes())?;
+        format_result_dot(&mut self.buffer, test_result)?;
 
         if self.num_results % DOT_REPORTER_LINE_LIMIT == 0 {
             // Print a newline
@@ -233,14 +258,30 @@ impl Reporter for JUnitXmlReporter {
     }
 }
 
-fn reporter_from_kind(kind: ReporterKind, test_suite_name: &str) -> Box<dyn Reporter> {
+fn reporter_from_kind(
+    kind: ReporterKind,
+    color_preference: ColorPreference,
+    test_suite_name: &str,
+) -> Box<dyn Reporter> {
+    let color = match color_preference {
+        ColorPreference::Auto => {
+            if atty::is(atty::Stream::Stdout) {
+                ColorChoice::Auto
+            } else {
+                ColorChoice::Never
+            }
+        }
+        ColorPreference::Never => ColorChoice::Never,
+    };
+    let stdout = StandardStream::stdout(color);
+
     match kind {
         ReporterKind::Line => Box::new(LineReporter {
-            buffer: Box::new(std::io::stdout()),
+            buffer: Box::new(stdout),
             delayed_failure_reports: Default::default(),
         }),
         ReporterKind::Dot => Box::new(DotReporter {
-            buffer: Box::new(std::io::stdout()),
+            buffer: Box::new(stdout),
             num_results: 0,
             delayed_failure_reports: Default::default(),
         }),
@@ -259,12 +300,13 @@ pub(crate) struct SuiteReporters {
 impl SuiteReporters {
     pub fn new(
         reporter_kinds: impl IntoIterator<Item = ReporterKind>,
+        color_preference: ColorPreference,
         test_suite_name: &str,
     ) -> Self {
         Self {
             reporters: reporter_kinds
                 .into_iter()
-                .map(|kind| reporter_from_kind(kind, test_suite_name))
+                .map(|kind| reporter_from_kind(kind, color_preference, test_suite_name))
                 .collect(),
             overall_result: SuiteResult {
                 success: true,
@@ -383,6 +425,21 @@ struct MockWriter {
 }
 
 #[cfg(test)]
+impl termcolor::WriteColor for &mut MockWriter {
+    fn supports_color(&self) -> bool {
+        false
+    }
+
+    fn set_color(&mut self, _spec: &termcolor::ColorSpec) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 impl io::Write for &mut MockWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.buffer.extend(buf);
@@ -463,7 +520,7 @@ mod test_line_reporter {
         });
 
         assert!(!buffer.is_empty());
-        assert_eq!(num_writes, 2);
+        assert!(num_writes > 1);
         assert_eq!(num_flushes, 0);
     }
 

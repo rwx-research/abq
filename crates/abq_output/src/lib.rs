@@ -1,31 +1,29 @@
-use std::fmt::Write;
+use std::io;
 
 use abq_utils::net_protocol::runners::{Milliseconds, Status, TestResult};
+use termcolor::{Color, ColorSpec, WriteColor};
 
 /// Formats a test result on a single line.
-pub fn format_result_line(result: &TestResult) -> String {
-    let mut buf = String::new();
-    buf.push_str(&result.display_name);
-    buf.push_str(": ");
-    buf.push_str(format_status(result.status));
-    buf.push('\n');
-    buf
+pub fn format_result_line(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
+    write!(writer, "{}: ", &result.display_name)?;
+    format_status(writer, result.status)?;
+    writeln!(writer)
 }
 
 /// Formats a test result as a single dot.
-pub fn format_result_dot(result: &TestResult) -> String {
-    match result.status {
+pub fn format_result_dot(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
+    let dot = match result.status {
         Status::Failure => "F",
         Status::Success => ".",
         Status::Error => "E",
         Status::Pending => "P",
         Status::Skipped => "S",
-    }
-    .to_string()
+    };
+    with_color(writer, status_color(result.status), |w| write!(w, "{dot}"))
 }
 
 /// Formats a test result as a summary, possibly across multiple lines.
-pub fn format_result_summary(result: &TestResult) -> String {
+pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
     // --- test/name: {status} ---
     // {output}
     // (completed in {runtime})
@@ -41,30 +39,52 @@ pub fn format_result_summary(result: &TestResult) -> String {
 
     let output = output.as_deref().unwrap_or("<no output>");
 
-    let mut buf = String::new();
-    buf.push_str("--- ");
-    buf.push_str(display_name);
-    buf.push_str(": ");
-    buf.push_str(format_status(*status));
-    buf.push_str(" ---\n");
-    buf.push_str(output);
-    buf.push_str("\n(completed in ");
-    buf.push_str(&format_duration(*runtime));
-    buf.push_str(")\n");
-    buf
+    write!(writer, "--- {display_name}: ")?;
+    format_status(writer, *status)?;
+    writeln!(writer, " ---")?;
+    writeln!(writer, "{output}")?;
+    write!(writer, "(completed in ")?;
+    format_duration(writer, *runtime)?;
+    writeln!(writer, ")")
 }
 
-fn format_status(status: Status) -> &'static str {
+fn status_color(status: Status) -> Color {
     match status {
+        Status::Success => Color::Green,
+        Status::Failure => Color::Red,
+        Status::Error => Color::Red,
+        Status::Pending => Color::Yellow,
+        Status::Skipped => Color::Yellow,
+    }
+}
+
+fn with_color<W>(
+    writer: &mut W,
+    color: Color,
+    f: impl FnOnce(&mut W) -> io::Result<()>,
+) -> io::Result<()>
+where
+    W: WriteColor,
+{
+    writer.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    f(writer)?;
+    writer.reset()
+}
+
+fn format_status(writer: &mut impl WriteColor, status: Status) -> io::Result<()> {
+    let color = status_color(status);
+    let status = match status {
         Status::Failure => "FAILED",
         Status::Success => "ok",
         Status::Error => "ERRORED",
         Status::Pending => "pending",
         Status::Skipped => "skipped",
-    }
+    };
+
+    with_color(writer, color, |w| write!(w, "{status}"))
 }
 
-fn format_duration(millis: Milliseconds) -> String {
+fn format_duration(writer: &mut impl WriteColor, millis: Milliseconds) -> io::Result<()> {
     const MILLIS_IN_SECOND: u64 = 1000;
     const MILLIS_IN_MINUTE: u64 = 60 * MILLIS_IN_SECOND;
 
@@ -72,32 +92,36 @@ fn format_duration(millis: Milliseconds) -> String {
     let (minutes, millis) = (millis / MILLIS_IN_MINUTE, millis % MILLIS_IN_MINUTE);
     let (seconds, millis) = (millis / MILLIS_IN_SECOND, millis % MILLIS_IN_SECOND);
 
-    let mut buf = String::new();
+    let mut written = false;
     if minutes > 0 {
-        write!(&mut buf, "{} m", minutes).unwrap();
+        write!(writer, "{} m", minutes)?;
+        written = true;
     }
     if seconds > 0 {
-        if !buf.is_empty() {
-            buf.push_str(", ");
+        if written {
+            write!(writer, ", ")?;
         }
-        write!(&mut buf, "{} s", seconds).unwrap();
+        write!(writer, "{} s", seconds)?;
+        written = true;
     }
     if millis > 0 {
-        if !buf.is_empty() {
-            buf.push_str(", ");
+        if written {
+            write!(writer, ", ")?;
         }
-        write!(&mut buf, "{} ms", millis).unwrap();
+        write!(writer, "{} ms", millis)?;
     }
 
-    buf
+    Ok(())
 }
 
 #[cfg(test)]
 mod test {
     use abq_utils::net_protocol::runners::{Status, TestResult};
 
+    use crate::format_result_dot;
+
     use super::{format_duration, format_result_line, format_result_summary};
-    use std::time::Duration;
+    use std::{io, time::Duration};
 
     #[allow(clippy::identity_op)]
     fn default_result() -> TestResult {
@@ -111,12 +135,71 @@ mod test {
         }
     }
 
+    struct TestColorWriter<W: io::Write>(W);
+
+    impl<W: io::Write> io::Write for TestColorWriter<W> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl<W: io::Write> termcolor::WriteColor for TestColorWriter<W> {
+        fn supports_color(&self) -> bool {
+            true
+        }
+
+        fn set_color(&mut self, spec: &termcolor::ColorSpec) -> io::Result<()> {
+            assert!(spec.bg().is_none());
+            assert!(!spec.bold());
+            assert!(!spec.intense());
+            assert!(!spec.underline());
+            assert!(!spec.dimmed());
+            assert!(!spec.italic());
+            assert!(spec.reset());
+
+            use termcolor::Color::*;
+            let color = match spec.fg().unwrap() {
+                Black => "black",
+                Blue => "blue",
+                Green => "green",
+                Red => "red",
+                Cyan => "cyan",
+                Magenta => "magenta",
+                Yellow => "yellow",
+                White => "white",
+                _ => unreachable!(),
+            };
+
+            write!(&mut self.0, "<{color}>")
+        }
+
+        fn reset(&mut self) -> io::Result<()> {
+            write!(&mut self.0, "<reset>")
+        }
+    }
+
     macro_rules! test_format {
-        ($name:ident, $fn:ident, $item:expr, @$expect:literal) => {
+        ($name:ident, $fn:ident, $item:expr, @$expect_no_color:literal @$expect_colored:literal) => {
             #[test]
             fn $name() {
-                let formatted = $fn($item);
-                insta::assert_snapshot!(formatted, @$expect);
+                {
+                    // Test uncolored output
+                    let mut buf = termcolor::NoColor::new(vec![]);
+                    $fn(&mut buf, $item).unwrap();
+                    let formatted = String::from_utf8(buf.into_inner()).unwrap();
+                    insta::assert_snapshot!(formatted, @$expect_no_color);
+                }
+                {
+                    // Test colored output
+                    let mut buf = TestColorWriter(vec![]);
+                    $fn(&mut buf, $item).unwrap();
+                    let formatted = String::from_utf8(buf.0).unwrap();
+                    insta::assert_snapshot!(formatted, @$expect_colored);
+                }
             }
         };
     }
@@ -125,35 +208,86 @@ mod test {
         format_line_success, format_result_line,
         &TestResult {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() },
         @"abq/test: ok"
+        @r###"
+    abq/test: <green>ok<reset>
+    "###
     );
 
     test_format!(
         format_line_failure, format_result_line,
         &TestResult {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() },
         @"abq/test: FAILED"
+        @r###"
+    abq/test: <red>FAILED<reset>
+    "###
     );
 
     test_format!(
         format_line_error, format_result_line,
         &TestResult {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() },
         @"abq/test: ERRORED"
+        @r###"
+    abq/test: <red>ERRORED<reset>
+    "###
     );
 
     test_format!(
         format_line_pending, format_result_line,
         &TestResult {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() },
         @"abq/test: pending"
+        @r###"
+    abq/test: <yellow>pending<reset>
+    "###
     );
 
     test_format!(
         format_line_skipped, format_result_line,
         &TestResult {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() },
         @"abq/test: skipped"
+        @r###"
+    abq/test: <yellow>skipped<reset>
+    "###
+    );
+
+    test_format!(
+        format_dot_success, format_result_dot,
+        &TestResult {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() },
+        @"."
+        @"<green>.<reset>"
+    );
+
+    test_format!(
+        format_dot_failure, format_result_dot,
+        &TestResult {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() },
+        @"F"
+        @"<red>F<reset>"
+    );
+
+    test_format!(
+        format_dot_error, format_result_dot,
+        &TestResult {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() },
+        @"E"
+        @"<red>E<reset>"
+    );
+
+    test_format!(
+        format_dot_pending, format_result_dot,
+        &TestResult {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() },
+        @"P"
+        @"<yellow>P<reset>"
+    );
+
+    test_format!(
+        format_dot_skipped, format_result_dot,
+        &TestResult {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() },
+        @"S"
+        @"<yellow>S<reset>"
     );
 
     test_format!(
         format_exact_minutes, format_duration,
         Duration::from_secs(360).as_millis() as _,
+        @"6 m"
         @"6 m"
     );
 
@@ -161,11 +295,13 @@ mod test {
         format_exact_minutes_leftover_seconds_and_millis, format_duration,
         Duration::from_millis(6 * 60 * 1000 + 52 * 1000 + 35).as_millis() as _,
         @"6 m, 52 s, 35 ms"
+        @"6 m, 52 s, 35 ms"
     );
 
     test_format!(
         format_exact_seconds, format_duration,
         Duration::from_secs(15).as_millis() as _,
+        @"15 s"
         @"15 s"
     );
 
@@ -173,11 +309,13 @@ mod test {
         format_exact_seconds_leftover_millis, format_duration,
         Duration::from_millis(15 * 1000 + 35).as_millis() as _,
         @"15 s, 35 ms"
+        @"15 s, 35 ms"
     );
 
     test_format!(
         format_exact_millis, format_duration,
         Duration::from_millis(35).as_millis() as _,
+        @"35 ms"
         @"35 ms"
     );
 
@@ -186,6 +324,11 @@ mod test {
         &TestResult {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() },
         @r###"
     --- abq/test: ok ---
+    Test passed!
+    (completed in 1 m, 15 s, 3 ms)
+    "###
+        @r###"
+    --- abq/test: <green>ok<reset> ---
     Test passed!
     (completed in 1 m, 15 s, 3 ms)
     "###
@@ -199,6 +342,11 @@ mod test {
     Assertion failed: 1 != 2
     (completed in 1 m, 15 s, 3 ms)
     "###
+        @r###"
+    --- abq/test: <red>FAILED<reset> ---
+    Assertion failed: 1 != 2
+    (completed in 1 m, 15 s, 3 ms)
+    "###
     );
 
     test_format!(
@@ -206,6 +354,11 @@ mod test {
         &TestResult {status: Status::Error, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() },
         @r###"
     --- abq/test: ERRORED ---
+    Process at pid 72818 exited early with SIGTERM
+    (completed in 1 m, 15 s, 3 ms)
+    "###
+        @r###"
+    --- abq/test: <red>ERRORED<reset> ---
     Process at pid 72818 exited early with SIGTERM
     (completed in 1 m, 15 s, 3 ms)
     "###
@@ -219,6 +372,11 @@ mod test {
     Test not implemented yet for reason: "need to implement feature A"
     (completed in 1 m, 15 s, 3 ms)
     "###
+        @r###"
+    --- abq/test: <yellow>pending<reset> ---
+    Test not implemented yet for reason: "need to implement feature A"
+    (completed in 1 m, 15 s, 3 ms)
+    "###
     );
 
     test_format!(
@@ -226,6 +384,11 @@ mod test {
         &TestResult {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() },
         @r###"
     --- abq/test: skipped ---
+    Test skipped for reason: "only enabled on summer Fridays"
+    (completed in 1 m, 15 s, 3 ms)
+    "###
+        @r###"
+    --- abq/test: <yellow>skipped<reset> ---
     Test skipped for reason: "only enabled on summer Fridays"
     (completed in 1 m, 15 s, 3 ms)
     "###
@@ -242,6 +405,14 @@ mod test {
 
     (completed in 1 m, 15 s, 3 ms)
     "###
+        @r###"
+    --- abq/test: <green>ok<reset> ---
+    Test passed!
+    To see rendered webpage, see:
+    	https://example.com
+
+    (completed in 1 m, 15 s, 3 ms)
+    "###
     );
 
     test_format!(
@@ -249,6 +420,11 @@ mod test {
         &TestResult {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() },
         @r###"
     --- abq/test: ok ---
+    <no output>
+    (completed in 1 m, 15 s, 3 ms)
+    "###
+        @r###"
+    --- abq/test: <green>ok<reset> ---
     <no output>
     (completed in 1 m, 15 s, 3 ms)
     "###

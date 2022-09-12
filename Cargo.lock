@@ -13,6 +13,7 @@ dependencies = [
  "abq_utils",
  "abq_workers",
  "anyhow",
+ "atty",
  "clap",
  "indicatif",
  "insta",
@@ -21,6 +22,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "tempfile",
+ "termcolor",
  "thiserror",
  "tokio",
  "tracing",
@@ -91,6 +93,7 @@ dependencies = [
  "abq_utils",
  "abq_workers",
  "insta",
+ "termcolor",
 ]
 
 [[package]]
