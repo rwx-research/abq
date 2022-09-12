@@ -27,7 +27,7 @@ use clap::Parser;
 use args::{default_num_workers, Cli, Command};
 
 use instance::AbqInstance;
-use reporting::{ExitCode, ReporterKind, SuiteReporters};
+use reporting::{ColorPreference, ExitCode, ReporterKind, SuiteReporters};
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::{fmt, layer, prelude::*, EnvFilter, Registry};
 
@@ -135,13 +135,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             reporter: reporters,
             token,
             tls,
+            color,
         } => {
             let (server_auth, client_auth) = (token.into(), token.into());
 
             let runner_params = validate_abq_test_args(args)?;
             let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth, tls)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
-            run_tests(entity, runner, abq, test_id, reporters)
+            run_tests(entity, runner, abq, test_id, reporters, color)
         }
         Command::Health {
             queue,
@@ -232,9 +233,10 @@ fn run_tests(
     abq: AbqInstance,
     opt_test_id: Option<InvocationId>,
     reporters: Vec<ReporterKind>,
+    color_choice: ColorPreference,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
-    let mut reporters = SuiteReporters::new(reporters, test_suite_name);
+    let mut reporters = SuiteReporters::new(reporters, color_choice, test_suite_name);
 
     let on_result = {
         // Safety: rustc wants the `collector` to be live for the lifetime of the program because

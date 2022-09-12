@@ -7,7 +7,7 @@ use std::{
 use abq_utils::{auth::AuthToken, net_opt::Tls, net_protocol::workers::InvocationId};
 use clap::{Parser, Subcommand};
 
-use crate::reporting::ReporterKind;
+use crate::reporting::{ColorPreference, ReporterKind};
 
 pub(crate) fn default_num_workers() -> NonZeroUsize {
     let cpus = num_cpus::get();
@@ -146,6 +146,14 @@ pub enum Command {
         /// Arguments to the test executable.
         #[clap(required = true, multiple_values = true, allow_hyphen_values = true)]
         args: Vec<String>,
+
+        /// Whether to report tests with colors.
+        ///
+        /// When set to `auto`, will try to emit colors unless the output channel is detected
+        /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
+        /// TERM is set to `dumb`, amongst other heuristics.
+        #[clap(long, default_value = "auto")]
+        color: ColorPreference,
     },
     /// Checks the health of an abq instance.
     ///
