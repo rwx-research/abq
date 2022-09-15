@@ -11,7 +11,7 @@ use abq_utils::net_protocol::runners::{
     ACTIVE_PROTOCOL_VERSION_MINOR,
 };
 use abq_utils::net_protocol::workers::{
-    InvocationId, NativeTestRunnerParams, NextWork, WorkContext, WorkId,
+    InvocationId, NativeTestRunnerParams, NextWork, NextWorkBundle, WorkContext, WorkId,
 };
 use abq_utils::{flatten_manifest, net_protocol};
 use thiserror::Error;
@@ -182,18 +182,18 @@ impl From<ProtocolVersionMessageError> for RunnerError {
 }
 
 impl GenericTestRunner {
-    pub fn run<ShouldShutdown, SendManifest, GetNextWork, SendTestResult>(
+    pub fn run<ShouldShutdown, SendManifest, GetNextWorkBundle, SendTestResult>(
         input: NativeTestRunnerParams,
         working_dir: &Path,
         _polling_should_shutdown: ShouldShutdown,
         send_manifest: Option<SendManifest>,
-        mut get_next_test: GetNextWork,
+        mut get_next_test_bundle: GetNextWorkBundle,
         mut send_test_result: SendTestResult,
     ) -> Result<(), RunnerError>
     where
         ShouldShutdown: Fn() -> bool,
         SendManifest: FnMut(ManifestMessage),
-        GetNextWork: FnMut() -> NextWork + std::marker::Send + 'static,
+        GetNextWorkBundle: FnMut() -> NextWorkBundle + std::marker::Send + 'static,
         SendTestResult: FnMut(WorkId, TestResult),
     {
         let NativeTestRunnerParams {
@@ -256,28 +256,31 @@ impl GenericTestRunner {
 
         // We establish one connection with the native runner and repeatedly send tests until we're
         // done.
-        loop {
-            match get_next_test() {
-                NextWork::EndOfWork => {
-                    drop(runner_conn);
-                    break;
-                }
-                NextWork::Work {
-                    test_case,
-                    context: _,
-                    invocation_id: _,
-                    work_id,
-                } => {
-                    let test_case_message = TestCaseMessage { test_case };
+        'test_all: loop {
+            let NextWorkBundle(test_bundle) = get_next_test_bundle();
+            for next_test in test_bundle {
+                match next_test {
+                    NextWork::EndOfWork => {
+                        drop(runner_conn);
+                        break 'test_all;
+                    }
+                    NextWork::Work {
+                        test_case,
+                        context: _,
+                        invocation_id: _,
+                        work_id,
+                    } => {
+                        let test_case_message = TestCaseMessage { test_case };
 
-                    // TODO: errors
-                    net_protocol::write(&mut runner_conn, test_case_message).unwrap();
-                    let test_result_message: TestResultMessage =
-                        net_protocol::read(&mut runner_conn).unwrap();
+                        // TODO: errors
+                        net_protocol::write(&mut runner_conn, test_case_message).unwrap();
+                        let test_result_message: TestResultMessage =
+                            net_protocol::read(&mut runner_conn).unwrap();
 
-                    send_test_result(work_id, test_result_message.test_result);
+                        send_test_result(work_id, test_result_message.test_result);
+                    }
                 }
-            };
+            }
         }
 
         drop(our_listener);
@@ -334,7 +337,7 @@ pub fn execute_wrapped_runner(
                         continue;
                     }
                 };
-                return match next_test {
+                let next = match next_test {
                     Some(test_case) => {
                         test_case_index += 1;
 
@@ -349,6 +352,7 @@ pub fn execute_wrapped_runner(
                     }
                     None => NextWork::EndOfWork,
                 };
+                return NextWorkBundle(vec![next]);
             }
         }
     };
@@ -506,7 +510,7 @@ mod test_validate_protocol_version_message {
 mod test_abq_jest {
     use crate::{execute_wrapped_runner, GenericTestRunner};
     use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestOrGroup};
-    use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork};
+    use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
 
     use std::path::PathBuf;
 
@@ -527,7 +531,7 @@ mod test_abq_jest {
         let mut test_results = vec![];
 
         let send_manifest = |real_manifest| manifest = Some(real_manifest);
-        let get_next_test = || NextWork::EndOfWork;
+        let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
         let send_test_result = |_, test_result| test_results.push(test_result);
 
         GenericTestRunner::run(

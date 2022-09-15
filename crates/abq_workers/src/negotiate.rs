@@ -14,7 +14,7 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::workers::{
-    GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
+    GetNextWorkBundle, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
 };
 use abq_utils::{
     net, net_async,
@@ -175,7 +175,7 @@ impl WorkersNegotiator {
             }
         });
 
-        let get_next_work: GetNextWork = Arc::new({
+        let get_next_work: GetNextWorkBundle = Arc::new({
             let client = client.boxed_clone();
 
             move || {
@@ -518,7 +518,7 @@ mod test {
     };
     use abq_utils::net_protocol::work_server::WorkServerRequest;
     use abq_utils::net_protocol::workers::{
-        InvocationId, NextWork, RunnerKind, TestLikeRunner, WorkContext, WorkId,
+        InvocationId, NextWork, NextWorkBundle, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
     use abq_utils::{flatten_manifest, net, net_protocol};
     use tracing_test::internal::logs_with_scope_contain;
@@ -567,9 +567,10 @@ mod test {
                     Ok((mut worker, _)) => {
                         worker.set_nonblocking(false).unwrap();
                         let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
+                        let work_bundle = NextWorkBundle(vec![work]);
 
                         let _msg: WorkServerRequest = net_protocol::read(&mut worker).unwrap();
-                        net_protocol::write(&mut worker, work).unwrap();
+                        net_protocol::write(&mut worker, work_bundle).unwrap();
                     }
 
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

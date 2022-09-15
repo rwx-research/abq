@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     io,
     net::SocketAddr,
+    num::NonZeroU64,
     thread::{self, JoinHandle},
 };
 
@@ -136,13 +137,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             token,
             tls,
             color,
+            batch_size,
         } => {
             let (server_auth, client_auth) = (token.into(), token.into());
 
             let runner_params = validate_abq_test_args(args)?;
             let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth, tls)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
-            run_tests(entity, runner, abq, test_id, reporters, color)
+            run_tests(entity, runner, abq, test_id, reporters, color, batch_size)
         }
         Command::Health {
             queue,
@@ -234,6 +236,7 @@ fn run_tests(
     opt_test_id: Option<InvocationId>,
     reporters: Vec<ReporterKind>,
     color_choice: ColorPreference,
+    batch_size: NonZeroU64,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let mut reporters = SuiteReporters::new(reporters, color_choice, test_suite_name);
@@ -259,6 +262,7 @@ fn run_tests(
         abq.client_options(),
         test_id,
         runner,
+        batch_size,
         on_result,
     );
 
@@ -295,6 +299,7 @@ fn start_test_result_reporter(
     client_opts: ClientOptions,
     test_id: InvocationId,
     runner: RunnerKind,
+    batch_size: NonZeroU64,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
 ) -> JoinHandle<Result<(), io::Error>> {
     thread::spawn(move || {
@@ -302,8 +307,15 @@ fn start_test_result_reporter(
             .enable_all()
             .build()?;
         runtime.block_on(async move {
-            let abq_test_client =
-                Client::invoke_work(entity, abq_server_addr, client_opts, test_id, runner).await?;
+            let abq_test_client = Client::invoke_work(
+                entity,
+                abq_server_addr,
+                client_opts,
+                test_id,
+                runner,
+                batch_size,
+            )
+            .await?;
             abq_test_client.stream_results(on_result).await
         })
     })
