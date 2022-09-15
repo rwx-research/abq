@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
 };
 
@@ -143,9 +143,9 @@ pub enum Command {
         #[clap(long, default_value = "line")]
         reporter: Vec<ReporterKind>,
 
-        /// Arguments to the test executable.
-        #[clap(required = true, multiple_values = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// How many tests to send to a worker a time.
+        #[clap(long, default_value = "1")]
+        batch_size: NonZeroU64,
 
         /// Whether to report tests with colors.
         ///
@@ -154,6 +154,10 @@ pub enum Command {
         /// TERM is set to `dumb`, amongst other heuristics.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
+
+        /// Arguments to the test executable.
+        #[clap(required = true, multiple_values = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Checks the health of an abq instance.
     ///

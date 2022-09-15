@@ -11,7 +11,9 @@ use abq_generic_test_runner::{GenericTestRunner, RunnerError};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestId, TestResult};
-use abq_utils::net_protocol::workers::{InvocationId, NextWork, RunnerKind, WorkContext, WorkId};
+use abq_utils::net_protocol::workers::{
+    InvocationId, NextWork, NextWorkBundle, RunnerKind, WorkContext, WorkId,
+};
 use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
 
 use procspawn as proc;
@@ -22,7 +24,7 @@ enum MessageFromPool {
 
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
-pub type GetNextWork = Arc<dyn Fn() -> NextWork + Send + Sync + 'static>;
+pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
 pub type NotifyManifest =
     Box<dyn Fn(EntityId, InvocationId, ManifestMessage) + Send + Sync + 'static>;
 pub type NotifyResult =
@@ -56,7 +58,7 @@ pub struct WorkerPoolConfig {
     /// way.
     pub notify_manifest: Option<NotifyManifest>,
     /// How should a worker get the next unit of work it needs to run?
-    pub get_next_work: GetNextWork,
+    pub get_next_work: GetNextWorkBundle,
     /// How should results be communicated back?
     pub notify_result: NotifyResult,
     /// Context under which workers should operate.
@@ -161,7 +163,7 @@ impl WorkerPool {
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
                 invocation_id,
-                get_next_work,
+                get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
                 work_timeout,
@@ -183,7 +185,7 @@ impl WorkerPool {
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
                 invocation_id,
-                get_next_work,
+                get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
                 work_timeout,
@@ -256,7 +258,7 @@ struct WorkerEnv {
     msg_from_pool_rx: MessageFromPoolRx,
     invocation_id: InvocationId,
     notify_manifest: Option<NotifyManifest>,
-    get_next_work: GetNextWork,
+    get_next_work_bundle: GetNextWorkBundle,
     notify_result: NotifyResult,
     context: WorkerContext,
     work_timeout: Duration,
@@ -287,7 +289,7 @@ fn start_generic_test_runner(
     native_runner_params: NativeTestRunnerParams,
 ) -> Result<(), RunnerError> {
     let WorkerEnv {
-        get_next_work,
+        get_next_work_bundle,
         invocation_id,
         notify_result,
         notify_manifest,
@@ -306,7 +308,7 @@ fn start_generic_test_runner(
     let notify_manifest = notify_manifest
         .map(|notify_manifest| move |manifest| notify_manifest(entity, invocation_id, manifest));
 
-    let get_next_work = move || get_next_work();
+    let get_next_work_bundle = move || get_next_work_bundle();
 
     let send_test_result = move |work_id, test_result: TestResult| {
         notify_result(entity, invocation_id, work_id, test_result)
@@ -329,7 +331,7 @@ fn start_generic_test_runner(
         &working_dir,
         polling_should_shutdown,
         notify_manifest,
-        get_next_work,
+        get_next_work_bundle,
         send_test_result,
     )?;
 
@@ -341,7 +343,7 @@ fn start_generic_test_runner(
 fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: ManifestMessage) {
     let WorkerEnv {
         msg_from_pool_rx,
-        get_next_work,
+        get_next_work_bundle: get_next_work,
         invocation_id,
         notify_result,
         context,
@@ -357,11 +359,11 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         notify_manifest(entity, invocation_id, manifest);
     }
 
-    loop {
+    'tests_done: loop {
         // First, check if we have a message from our owner.
         let parent_message = msg_from_pool_rx.lock().unwrap().try_recv();
 
-        let (test_case, work_context, invocation_id, work_id) = match parent_message {
+        let bundle = match parent_message {
             Ok(MessageFromPool::Shutdown) => {
                 break;
             }
@@ -371,55 +373,60 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                 //
                 // TODO: add a timeout here, in case we get a message from the parent while
                 // blocking on the next test_id from the queue.
-                match get_next_work() {
-                    NextWork::EndOfWork => {
-                        // Shut down the worker
-                        break;
-                    }
-                    NextWork::Work {
-                        test_case,
-                        context,
-                        invocation_id,
-                        work_id,
-                    } => (test_case, context, invocation_id, work_id),
-                }
+                let NextWorkBundle(bundle) = get_next_work();
+                bundle
             }
         };
 
-        // Try the test_id once + how ever many retries were requested.
-        let allowed_attempts = 1 + work_retries;
-        'attempts: for attempt_number in 1.. {
-            let start_time = Instant::now();
-            let attempt_result = attempt_test_id_for_test_like_runner(
-                &context,
-                runner,
-                test_case.id.clone(),
-                &work_context,
-                work_timeout,
-                attempt_number,
-                allowed_attempts,
-            );
-            let runtime = start_time.elapsed().as_millis() as f64;
-
-            let (status, output) = match attempt_result {
-                Ok(output) => (Status::Success, output),
-                Err(AttemptError::ShouldRetry) => continue 'attempts,
-                Err(AttemptError::Panic(msg)) => (Status::Error, msg),
-                Err(AttemptError::Timeout(time)) => {
-                    (Status::Error, format!("Timeout: {}ms", time.as_millis()))
+        for next_work in bundle {
+            match next_work {
+                NextWork::EndOfWork => {
+                    // Shut down the worker
+                    break 'tests_done;
                 }
-            };
-            let result = TestResult {
-                status,
-                id: test_case.id.clone(),
-                display_name: test_case.id.clone(),
-                output: Some(output),
-                runtime,
-                meta: Default::default(),
-            };
+                NextWork::Work {
+                    test_case,
+                    context: work_context,
+                    invocation_id,
+                    work_id,
+                } => {
+                    // Try the test_id once + how ever many retries were requested.
+                    let allowed_attempts = 1 + work_retries;
+                    'attempts: for attempt_number in 1.. {
+                        let start_time = Instant::now();
+                        let attempt_result = attempt_test_id_for_test_like_runner(
+                            &context,
+                            runner,
+                            test_case.id.clone(),
+                            &work_context,
+                            work_timeout,
+                            attempt_number,
+                            allowed_attempts,
+                        );
+                        let runtime = start_time.elapsed().as_millis() as f64;
 
-            notify_result(entity, invocation_id, work_id.clone(), result);
-            break 'attempts;
+                        let (status, output) = match attempt_result {
+                            Ok(output) => (Status::Success, output),
+                            Err(AttemptError::ShouldRetry) => continue 'attempts,
+                            Err(AttemptError::Panic(msg)) => (Status::Error, msg),
+                            Err(AttemptError::Timeout(time)) => {
+                                (Status::Error, format!("Timeout: {}ms", time.as_millis()))
+                            }
+                        };
+                        let result = TestResult {
+                            status,
+                            id: test_case.id.clone(),
+                            display_name: test_case.id.clone(),
+                            output: Some(output),
+                            runtime,
+                            meta: Default::default(),
+                        };
+
+                        notify_result(entity, invocation_id, work_id.clone(), result);
+                        break 'attempts;
+                    }
+                }
+            }
         }
     }
 
@@ -533,13 +540,13 @@ mod test {
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
     };
-    use abq_utils::net_protocol::workers::{NextWork, TestLikeRunner};
+    use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, TestLikeRunner};
     use abq_utils::{flatten_manifest, net_protocol};
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
-    use super::{GetNextWork, NotifyManifest, NotifyResult, WorkerContext, WorkerPool};
+    use super::{GetNextWorkBundle, NotifyManifest, NotifyResult, WorkerContext, WorkerPool};
     use crate::negotiate::QueueNegotiator;
     use crate::workers::WorkerPoolConfig;
     use abq_utils::net_protocol::workers::{InvocationId, RunnerKind, WorkContext, WorkId};
@@ -547,15 +554,15 @@ mod test {
     type ResultsCollector = Arc<Mutex<HashMap<String, TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
 
-    fn work_writer() -> (impl Fn(NextWork), GetNextWork) {
+    fn work_writer() -> (impl Fn(NextWork), GetNextWorkBundle) {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
         let reader = Arc::clone(&writer);
         let write_work = move |work| {
             writer.lock().unwrap().push_back(work);
         };
-        let get_next_work: GetNextWork = Arc::new(move || loop {
+        let get_next_work: GetNextWorkBundle = Arc::new(move || loop {
             if let Some(work) = reader.lock().unwrap().pop_front() {
-                return work;
+                return NextWorkBundle(vec![work]);
             }
         });
         (write_work, get_next_work)
@@ -585,7 +592,7 @@ mod test {
         runner: TestLikeRunner,
         invocation_id: InvocationId,
         manifest: ManifestMessage,
-        get_next_work: GetNextWork,
+        get_next_work: GetNextWorkBundle,
         notify_result: NotifyResult,
     ) -> (WorkerPoolConfig, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();

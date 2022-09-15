@@ -11,7 +11,7 @@
 //!    the stream is closed.
 //! 1. Once it's done reading, the invoker closes its side of the stream.
 
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, num::NonZeroU64};
 
 use abq_utils::{
     net_async,
@@ -44,6 +44,7 @@ impl Client {
         client_options: ClientOptions,
         invocation_id: InvocationId,
         runner: RunnerKind,
+        batch_size_hint: NonZeroU64,
     ) -> Result<Self, io::Error> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
@@ -55,6 +56,7 @@ impl Client {
             message: Message::InvokeWork(InvokeWork {
                 invocation_id,
                 runner,
+                batch_size_hint,
             }),
         };
 

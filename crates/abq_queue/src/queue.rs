@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -16,7 +17,7 @@ use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::queue::{InvokerResponse, Request};
 use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
-use abq_utils::net_protocol::workers::{RunnerKind, WorkContext};
+use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, Message},
@@ -35,25 +36,40 @@ struct JobQueue {
 }
 
 impl JobQueue {
-    pub fn add_batch_work(&mut self, work: impl Iterator<Item = NextWork>) {
+    fn add_batch_work(&mut self, work: impl Iterator<Item = NextWork>) {
         self.queue.extend(work);
     }
 
-    pub fn get_work(&mut self) -> Option<NextWork> {
-        let work = self.queue.pop_front()?;
-        Some(work)
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn get_work(&mut self, n: NonZeroU64) -> impl Iterator<Item = NextWork> + '_ {
+        // We'll give back the number of tests that were asked for, or everything if there aren't
+        // that many tests left.
+        let chop_off = std::cmp::min(self.queue.len(), n.get() as usize);
+        self.queue.drain(..chop_off)
     }
 }
 
 enum InvocationState {
     WaitingForFirstWorker,
     WaitingForManifest,
-    HasWork(JobQueue),
+    HasWork {
+        queue: JobQueue,
+
+        /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
+        // Co-locate this here so that we don't have to index `invocation_data` when grabbing a
+        // test.
+        batch_size_hint: NonZeroU64,
+    },
     Done,
 }
 
 struct InvocationData {
     runner: RunnerKind,
+    /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
+    batch_size_hint: NonZeroU64,
 }
 
 struct WaitingForManifestError;
@@ -66,15 +82,24 @@ struct InvocationQueues {
 }
 
 impl InvocationQueues {
-    pub fn create_queue(&mut self, invocation_id: InvocationId, runner: RunnerKind) {
+    pub fn create_queue(
+        &mut self,
+        invocation_id: InvocationId,
+        runner: RunnerKind,
+        batch_size_hint: NonZeroU64,
+    ) {
         let old_queue = self
             .queues
             .insert(invocation_id, InvocationState::WaitingForFirstWorker);
         debug_assert!(old_queue.is_none());
 
-        let old_invocation_data = self
-            .invocation_data
-            .insert(invocation_id, InvocationData { runner });
+        let old_invocation_data = self.invocation_data.insert(
+            invocation_id,
+            InvocationData {
+                runner,
+                batch_size_hint,
+            },
+        );
         debug_assert!(old_invocation_data.is_none());
     }
 
@@ -83,7 +108,10 @@ impl InvocationQueues {
     pub fn get_run_for_worker(&mut self, invocation_id: InvocationId) -> Option<AssignedRun> {
         let invocation_state = self.queues.get_mut(&invocation_id)?;
 
-        let InvocationData { runner } = self.invocation_data.get(&invocation_id).unwrap();
+        let InvocationData {
+            runner,
+            batch_size_hint: _,
+        } = self.invocation_data.get(&invocation_id).unwrap();
 
         let assigned_run = match invocation_state {
             InvocationState::WaitingForFirstWorker => {
@@ -131,13 +159,20 @@ impl InvocationQueues {
         let mut queue = JobQueue::default();
         queue.add_batch_work(work_from_manifest);
 
-        *state = InvocationState::HasWork(queue);
+        *state = InvocationState::HasWork {
+            queue,
+            batch_size_hint: self
+                .invocation_data
+                .get(&invocation_id)
+                .expect("no data for invocation")
+                .batch_size_hint,
+        }
     }
 
     pub fn next_work(
         &mut self,
         invocation_id: InvocationId,
-    ) -> Result<NextWork, WaitingForManifestError> {
+    ) -> Result<NextWorkBundle, WaitingForManifestError> {
         match self
             .queues
             .get_mut(&invocation_id)
@@ -145,8 +180,25 @@ impl InvocationQueues {
         {
             InvocationState::WaitingForFirstWorker => Err(WaitingForManifestError),
             InvocationState::WaitingForManifest => Err(WaitingForManifestError),
-            InvocationState::HasWork(queue) => Ok(queue.get_work().unwrap_or(NextWork::EndOfWork)),
-            InvocationState::Done => Ok(NextWork::EndOfWork),
+            InvocationState::HasWork {
+                queue,
+                batch_size_hint,
+            } => {
+                // NB: in the future, the batch size is likely to be determined intellegently, i.e.
+                // from off-line timing data. But for now, we use the hint the client provided.
+                let batch_size = *batch_size_hint;
+
+                let mut bundle = Vec::with_capacity(batch_size.get() as _);
+                bundle.extend(queue.get_work(batch_size));
+                if bundle.len() < batch_size.get() as _ {
+                    // We've hit the end of the manifest but have space for more tests to send in
+                    // this batch. Let the worker know this is the end, so they don't have to
+                    // round-trip.
+                    bundle.push(NextWork::EndOfWork);
+                }
+                Ok(NextWorkBundle(bundle))
+            }
+            InvocationState::Done => Ok(NextWorkBundle(vec![NextWork::EndOfWork])),
         }
     }
 
@@ -156,11 +208,11 @@ impl InvocationQueues {
             .get_mut(&invocation_id)
             .expect("no queue state for invocation");
         match state {
-            InvocationState::HasWork(queue) => {
-                assert!(
-                    queue.get_work().is_none(),
-                    "Invalid state - queue is not complete!"
-                );
+            InvocationState::HasWork {
+                queue,
+                batch_size_hint: _,
+            } => {
+                assert!(queue.is_empty(), "Invalid state - queue is not complete!");
             }
             InvocationState::WaitingForFirstWorker
             | InvocationState::WaitingForManifest
@@ -698,6 +750,7 @@ impl QueueServer {
         let InvokeWork {
             invocation_id,
             runner,
+            batch_size_hint,
         } = invoke_work;
 
         let results_responder = ClientResponder::new(stream);
@@ -712,7 +765,10 @@ impl QueueServer {
         );
 
         // Create a new work queue for this invocation.
-        queues.lock().unwrap().create_queue(invocation_id, runner);
+        queues
+            .lock()
+            .unwrap()
+            .create_queue(invocation_id, runner, batch_size_hint);
 
         Ok(())
     }
@@ -975,7 +1031,7 @@ impl WorkScheduler {
 
 #[cfg(test)]
 mod test {
-    use std::{sync::Arc, thread, time::Duration};
+    use std::{num::NonZeroU64, sync::Arc, thread, time::Duration};
 
     use super::Abq;
     use crate::{
@@ -1031,6 +1087,10 @@ mod test {
         }
     }
 
+    fn one_nonzero() -> NonZeroU64 {
+        1.try_into().unwrap()
+    }
+
     #[test]
     #[timeout(1000)] // 1 second
     fn multiple_jobs_complete() {
@@ -1073,6 +1133,7 @@ mod test {
                     client_opts,
                     invocation_id,
                     runner,
+                    one_nonzero(),
                 )
                 .await
                 .unwrap();
@@ -1161,6 +1222,7 @@ mod test {
                     client_opts,
                     invocation1,
                     runner1,
+                    one_nonzero(),
                 )
                 .await
                 .unwrap();
@@ -1170,6 +1232,7 @@ mod test {
                     client_opts,
                     invocation2,
                     runner2,
+                    one_nonzero(),
                 )
                 .await
                 .unwrap();
@@ -1216,6 +1279,88 @@ mod test {
 
         assert_eq!(results1, [("echo1"), ("echo2")]);
         assert_eq!(results2, [("echo3"), ("echo4"), "echo5"]);
+    }
+
+    // TODO write some tests that smoke over # of workers and batch sizes
+    #[test]
+    #[timeout(1000)] // 1 second
+    fn batch_two_requests_at_a_time() {
+        let batch_size = 2.try_into().unwrap();
+
+        let mut queue = Abq::start(Default::default());
+
+        let manifest1 = ManifestMessage {
+            manifest: Manifest {
+                members: vec![
+                    echo_test("echo1".to_string()),
+                    echo_test("echo2".to_string()),
+                    echo_test("echo3".to_string()),
+                    echo_test("echo4".to_string()),
+                ],
+            },
+        };
+
+        let runner1 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest1);
+
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+        };
+
+        let queue_server_addr = queue.server_addr();
+
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+
+        let invocation = InvocationId::new();
+        let results_handle = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            runtime.block_on(async {
+                let mut results = Vec::default();
+
+                let client = Client::invoke_work(
+                    EntityId::new(),
+                    queue_server_addr,
+                    client_opts,
+                    invocation,
+                    runner1,
+                    batch_size,
+                )
+                .await
+                .unwrap();
+
+                client
+                    .stream_results(|id, result| {
+                        results.push((id.0, result));
+                    })
+                    .await
+                    .unwrap();
+
+                results
+            })
+        });
+
+        let mut workers_for_run1 = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            invocation,
+        )
+        .unwrap();
+
+        let mut results = results_handle.join().unwrap();
+
+        workers_for_run1.shutdown();
+        queue.shutdown().unwrap();
+
+        let results = sort_results(&mut results);
+
+        assert_eq!(results, ["echo1", "echo2", "echo3", "echo4"]);
     }
 
     #[test]

@@ -247,12 +247,18 @@ pub mod workers {
         EndOfWork,
     }
 
+    /// A bundle of work sent to a worker to be run in sequence.
+    #[derive(Serialize, Deserialize)]
+    pub struct NextWorkBundle(pub Vec<NextWork>);
+
     /// An acknowledgement from the queue that it received a manifest message.
     #[derive(Serialize, Deserialize)]
     pub struct AckManifest;
 }
 
 pub mod queue {
+    use std::num::NonZeroU64;
+
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
@@ -266,6 +272,7 @@ pub mod queue {
     pub struct InvokeWork {
         pub invocation_id: InvocationId,
         pub runner: RunnerKind,
+        pub batch_size_hint: NonZeroU64,
     }
 
     /// An incremental response to an invoker.
