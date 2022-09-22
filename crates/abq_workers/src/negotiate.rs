@@ -327,6 +327,7 @@ where
     get_assigned_run: Arc<GetAssignedRun>,
     advertised_queue_work_scheduler_addr: SocketAddr,
     advertised_queue_results_addr: SocketAddr,
+    handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
@@ -338,6 +339,7 @@ where
             get_assigned_run: Arc::clone(&self.get_assigned_run),
             advertised_queue_work_scheduler_addr: self.advertised_queue_work_scheduler_addr,
             advertised_queue_results_addr: self.advertised_queue_results_addr,
+            handshake_ctx: Arc::clone(&self.handshake_ctx),
         }
     }
 }
@@ -364,12 +366,6 @@ impl QueueNegotiator {
 
         let (server_shutdown_tx, mut server_shutdown_rx) = tokio::sync::mpsc::channel(1);
 
-        let ctx = QueueNegotiatorCtx {
-            get_assigned_run: Arc::new(get_assigned_run),
-            advertised_queue_work_scheduler_addr,
-            advertised_queue_results_addr,
-        };
-
         let listener_handle = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -378,6 +374,14 @@ impl QueueNegotiator {
             let server_result: Result<(), QueueNegotiatorServerError> = rt.block_on(async {
                 // Initialize the listener in the async context.
                 let listener = listener.into_async()?;
+                let handshake_ctx = listener.handshake_ctx();
+
+                let ctx = QueueNegotiatorCtx {
+                    get_assigned_run: Arc::new(get_assigned_run),
+                    advertised_queue_work_scheduler_addr,
+                    advertised_queue_results_addr,
+                    handshake_ctx: Arc::new(handshake_ctx),
+                };
 
                 loop {
                     let (client, _) = tokio::select! {
@@ -421,11 +425,12 @@ impl QueueNegotiator {
 
     async fn handle_conn<GetAssignedRun>(
         ctx: QueueNegotiatorCtx<GetAssignedRun>,
-        mut stream: Box<dyn net_async::ServerStream>,
+        stream: net_async::UnverifiedServerStream,
     ) -> io::Result<()>
     where
         GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
     {
+        let mut stream = ctx.handshake_ctx.handshake(stream).await?;
         let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut stream).await?;
 
         use MessageToQueueNegotiator::*;

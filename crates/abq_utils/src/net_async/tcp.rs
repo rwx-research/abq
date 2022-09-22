@@ -8,7 +8,10 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::ToSocketAddrs;
 
+use super::UnverifiedServerStream;
 use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
+
+pub struct RawServerStream(tokio::net::TcpStream);
 
 #[derive(Debug)]
 pub struct Stream(tokio::net::TcpStream);
@@ -86,20 +89,41 @@ impl ServerListener {
     }
 }
 
+struct HandshakeCtx {
+    auth_strategy: ServerAuthStrategy,
+}
+
 #[async_trait]
 impl super::ServerListener for ServerListener {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    async fn accept(&self) -> io::Result<(Box<dyn super::ServerStream>, SocketAddr)> {
+    async fn accept(&self) -> io::Result<(UnverifiedServerStream, SocketAddr)> {
         let (stream, addr) = self.listener.accept().await?;
+        Ok((UnverifiedServerStream(stream), addr))
+    }
+
+    fn handshake_ctx(&self) -> Box<dyn super::ServerHandshakeCtx> {
+        Box::new(HandshakeCtx {
+            auth_strategy: self.auth_strategy,
+        })
+    }
+}
+
+#[async_trait]
+impl super::ServerHandshakeCtx for HandshakeCtx {
+    async fn handshake(
+        &self,
+        unverified: UnverifiedServerStream,
+    ) -> io::Result<Box<dyn super::ServerStream>> {
+        let UnverifiedServerStream(stream) = unverified;
         let mut stream = Stream(stream);
 
         // We need to validate any auth header before handing the connection over.
         self.auth_strategy.async_verify_header(&mut stream).await?;
 
-        Ok((Box::new(stream), addr))
+        Ok(Box::new(stream))
     }
 }
 

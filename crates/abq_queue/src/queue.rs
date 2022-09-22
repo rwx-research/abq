@@ -541,11 +541,6 @@ type WorkLeftForInvocations = Arc<Mutex<HashMap<InvocationId, usize>>>;
 /// Central server listening for new test run invocations and results.
 struct QueueServer {
     queues: SharedInvocationQueues,
-    /// When all results for a particular invocation are communicated, we want to make sure that the
-    /// responder thread is closed and that the entry here is dropped.
-    active_invocations: ActiveInvocations,
-    work_left_for_invocations: WorkLeftForInvocations,
-
     public_negotiator_addr: SocketAddr,
 }
 
@@ -572,22 +567,22 @@ enum ClientReconnectionError {
     NeverInvoked(InvocationId),
 }
 
+#[derive(Clone)]
+struct QueueServerCtx {
+    queues: SharedInvocationQueues,
+    /// When all results for a particular invocation are communicated, we want to make sure that the
+    /// responder thread is closed and that the entry here is dropped.
+    active_invocations: ActiveInvocations,
+    work_left_for_invocations: WorkLeftForInvocations,
+    public_negotiator_addr: SocketAddr,
+    handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
+}
+
 impl QueueServer {
     fn new(queues: SharedInvocationQueues, public_negotiator_addr: SocketAddr) -> Self {
         Self {
             queues,
-            active_invocations: Default::default(),
-            work_left_for_invocations: Default::default(),
             public_negotiator_addr,
-        }
-    }
-
-    fn clone(&self) -> Self {
-        Self {
-            queues: Arc::clone(&self.queues),
-            active_invocations: Arc::clone(&self.active_invocations),
-            work_left_for_invocations: Arc::clone(&self.work_left_for_invocations),
-            public_negotiator_addr: self.public_negotiator_addr,
         }
     }
 
@@ -609,6 +604,19 @@ impl QueueServer {
             // Initialize the async server listener.
             let server_listener = server_listener.into_async()?;
 
+            let Self {
+                queues,
+                public_negotiator_addr,
+            } = self;
+
+            let ctx = QueueServerCtx {
+                queues,
+                active_invocations: Default::default(),
+                work_left_for_invocations: Default::default(),
+                public_negotiator_addr,
+                handshake_ctx: Arc::new(server_listener.handshake_ctx()),
+            };
+
             loop {
                 let (client, _) = tokio::select! {
                     conn = server_listener.accept() => {
@@ -626,9 +634,9 @@ impl QueueServer {
                 };
 
                 tokio::spawn({
-                    let this = self.clone();
+                    let ctx = ctx.clone();
                     async move {
-                        let result = this.handle(client).await;
+                        let result = Self::handle(ctx, client).await;
                         if let Err(err) = result {
                             tracing::error!("error handling connection to queue: {:?}", err);
                         }
@@ -644,9 +652,10 @@ impl QueueServer {
 
     #[inline(always)]
     async fn handle(
-        self,
-        mut stream: Box<dyn net_async::ServerStream>,
+        ctx: QueueServerCtx,
+        stream: net_async::UnverifiedServerStream,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut stream = ctx.handshake_ctx.handshake(stream).await?;
         let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
 
         let result: Result<(), Box<dyn Error + Send + Sync>> = match message {
@@ -656,12 +665,12 @@ impl QueueServer {
                 Self::handle_healthcheck(entity, stream).await
             }
             Message::NegotiatorAddr => {
-                Self::handle_negotiator_addr(entity, stream, self.public_negotiator_addr).await
+                Self::handle_negotiator_addr(entity, stream, ctx.public_negotiator_addr).await
             }
             Message::InvokeWork(invoke_work) => {
                 Self::handle_invoked_work(
-                    self.active_invocations,
-                    self.queues,
+                    ctx.active_invocations,
+                    ctx.queues,
                     entity,
                     stream,
                     invoke_work,
@@ -670,7 +679,7 @@ impl QueueServer {
             }
             Message::Reconnect(invocation_id) => {
                 Self::handle_invoker_reconnection(
-                    self.active_invocations,
+                    ctx.active_invocations,
                     entity,
                     stream,
                     invocation_id,
@@ -681,8 +690,8 @@ impl QueueServer {
             }
             Message::Manifest(invocation_id, manifest) => {
                 Self::handle_manifest(
-                    self.queues,
-                    self.work_left_for_invocations,
+                    ctx.queues,
+                    ctx.work_left_for_invocations,
                     entity,
                     invocation_id,
                     manifest,
@@ -702,9 +711,9 @@ impl QueueServer {
 
                 // Record the test result and notify the test client out-of-band.
                 Self::handle_worker_result(
-                    self.queues,
-                    self.active_invocations,
-                    self.work_left_for_invocations,
+                    ctx.queues,
+                    ctx.active_invocations,
+                    ctx.work_left_for_invocations,
                     entity,
                     invocation_id,
                     work_id,
@@ -938,13 +947,13 @@ pub enum WorkSchedulerError {
     Other(#[from] Box<dyn Error + Send + Sync>),
 }
 
-impl WorkScheduler {
-    fn clone(&self) -> Self {
-        Self {
-            queues: Arc::clone(&self.queues),
-        }
-    }
+#[derive(Clone)]
+struct SchedulerCtx {
+    queues: SharedInvocationQueues,
+    handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
+}
 
+impl WorkScheduler {
     fn start_on(
         self,
         listener: Box<dyn net::ServerListener>,
@@ -956,6 +965,12 @@ impl WorkScheduler {
 
         let server_result: Result<(), WorkSchedulerError> = rt.block_on(async {
             let listener = listener.into_async()?;
+
+            let Self { queues } = self;
+            let ctx = SchedulerCtx {
+                queues,
+                handshake_ctx: Arc::new(listener.handshake_ctx()),
+            };
 
             loop {
                 let (client, _) = tokio::select! {
@@ -974,9 +989,9 @@ impl WorkScheduler {
                 };
 
                 tokio::spawn({
-                    let mut this = self.clone();
+                    let ctx = ctx.clone();
                     async move {
-                        let result = this.handle_work_conn(client).await;
+                        let result = Self::handle_work_conn(ctx, client).await;
                         if let Err(err) = result {
                             tracing::error!("error handling connection: {:?}", err);
                         }
@@ -990,11 +1005,13 @@ impl WorkScheduler {
         server_result
     }
 
-    #[instrument(level = "trace", skip(self, stream))]
+    #[instrument(level = "trace", skip(ctx, stream))]
     async fn handle_work_conn(
-        &mut self,
-        mut stream: Box<dyn net_async::ServerStream>,
+        ctx: SchedulerCtx,
+        stream: net_async::UnverifiedServerStream,
     ) -> io::Result<()> {
+        let mut stream = ctx.handshake_ctx.handshake(stream).await?;
+
         // Get the invocation this worker wants work for.
         let request: WorkServerRequest = net_protocol::async_read(&mut stream).await?;
 
@@ -1009,7 +1026,7 @@ impl WorkScheduler {
             WorkServerRequest::NextTest { invocation_id } => {
                 // Pull the next work item.
                 let next_work = loop {
-                    let opt_work = { self.queues.lock().unwrap().next_work(invocation_id) };
+                    let opt_work = { ctx.queues.lock().unwrap().next_work(invocation_id) };
                     match opt_work {
                         Ok(work) => break work,
                         Err(WaitingForManifestError) => {
@@ -1031,7 +1048,7 @@ impl WorkScheduler {
 
 #[cfg(test)]
 mod test {
-    use std::{num::NonZeroU64, sync::Arc, thread, time::Duration};
+    use std::{io, net::SocketAddr, num::NonZeroU64, sync::Arc, thread, time::Duration};
 
     use super::Abq;
     use crate::{
@@ -1043,6 +1060,7 @@ mod test {
     };
     use abq_utils::{
         auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
+        net_async,
         net_opt::{ClientOptions, ServerOptions, Tls},
         net_protocol::{
             self,
@@ -1089,6 +1107,14 @@ mod test {
 
     fn one_nonzero() -> NonZeroU64 {
         1.try_into().unwrap()
+    }
+
+    async fn accept_handshake(
+        listener: &dyn net_async::ServerListener,
+    ) -> io::Result<(Box<dyn net_async::ServerStream>, SocketAddr)> {
+        let (unverified, addr) = listener.accept().await?;
+        let stream = listener.handshake_ctx().handshake(unverified).await?;
+        Ok((stream, addr))
     }
 
     #[test]
@@ -1404,8 +1430,10 @@ mod test {
 
         {
             // Register the initial connection
-            let (client_res, server_res) =
-                futures::join!(client.connect(fake_server_addr), fake_server.accept());
+            let (client_res, server_res) = futures::join!(
+                client.connect(fake_server_addr),
+                accept_handshake(&*fake_server)
+            );
             let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
             let mut active_invocations = active_invocations.lock().await;
@@ -1417,8 +1445,10 @@ mod test {
         };
 
         // Attempt to reconnect
-        let (client_res, server_res) =
-            futures::join!(client.connect(fake_server_addr), fake_server.accept());
+        let (client_res, server_res) = futures::join!(
+            client.connect(fake_server_addr),
+            accept_handshake(&*fake_server)
+        );
         let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
         let new_conn_addr = client_conn.local_addr().unwrap();
 
@@ -1455,8 +1485,10 @@ mod test {
 
         let client = client_opts.build_async().unwrap();
 
-        let (client_res, server_res) =
-            futures::join!(client.connect(fake_server_addr), fake_server.accept());
+        let (client_res, server_res) = futures::join!(
+            client.connect(fake_server_addr),
+            accept_handshake(&*fake_server)
+        );
         let (_client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
@@ -1495,8 +1527,10 @@ mod test {
 
         {
             // Register the initial connection
-            let (client_res, server_res) =
-                futures::join!(client.connect(fake_server_addr), fake_server.accept());
+            let (client_res, server_res) = futures::join!(
+                client.connect(fake_server_addr),
+                accept_handshake(&*fake_server)
+            );
             let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
             let mut active_invocations = active_invocations.lock().await;
@@ -1540,8 +1574,10 @@ mod test {
         }
 
         // Reconnect back to the queue
-        let (client_res, server_res) =
-            futures::join!(client.connect(fake_server_addr), fake_server.accept());
+        let (client_res, server_res) = futures::join!(
+            client.connect(fake_server_addr),
+            accept_handshake(&*fake_server)
+        );
         let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
@@ -1600,8 +1636,6 @@ mod test {
 
         let queue_server = QueueServer {
             queues: Default::default(),
-            active_invocations: Default::default(),
-            work_left_for_invocations: Default::default(),
             public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
         };
         let queue_handle = thread::spawn(|| {
