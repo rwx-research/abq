@@ -1,10 +1,10 @@
-//! Invocation of jobs on the queue, and waiting for their results.
+//! Run of jobs on the queue, and waiting for their results.
 //!
 //! Invoker <-> responder protocol:
 //!
-//! 1. [invoke_work] is called with a unique [invocation id][InvocationId] `IId`.
+//! 1. [invoke_work] is called with a unique [run id][RunId] `IId`.
 //! 1. The invoker keeps a stream open with the queue until it retrieves all work results.
-//! 1. When a result for a unit of work with invocation id `IId` is received by the
+//! 1. When a result for a unit of work with run id `IId` is received by the
 //!    [responder][respond], it is sent back to the invoker in a piecemeal fashion.
 //! 1. Once all results are communicated back by the responder, an
 //!    [end-of-results][InvokerResponse::EndOfResults] message is sent and the responder-side of
@@ -21,7 +21,7 @@ use abq_utils::{
         entity::EntityId,
         queue::{self, InvokeWork, InvokerResponse, Message},
         runners::TestResult,
-        workers::{InvocationId, RunnerKind, WorkId},
+        workers::{RunId, RunnerKind, WorkId},
     },
 };
 
@@ -30,8 +30,8 @@ pub struct Client {
     pub(crate) entity: EntityId,
     pub(crate) abq_server_addr: SocketAddr,
     pub(crate) client: Box<dyn net_async::ConfiguredClient>,
-    /// The test invocation this client is responsible for.
-    pub(crate) invocation_id: InvocationId,
+    /// The test run this client is responsible for.
+    pub(crate) run_id: RunId,
     /// The stream to the queue server.
     pub(crate) stream: Box<dyn net_async::ClientStream>,
 }
@@ -42,19 +42,19 @@ impl Client {
         entity: EntityId,
         abq_server_addr: SocketAddr,
         client_options: ClientOptions,
-        invocation_id: InvocationId,
+        run_id: RunId,
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
     ) -> Result<Self, io::Error> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
 
-        tracing::debug!(?entity, ?invocation_id, "invoking new work");
+        tracing::debug!(?entity, ?run_id, "invoking new work");
 
         let invoke_request = queue::Request {
             entity,
             message: Message::InvokeWork(InvokeWork {
-                invocation_id,
+                run_id,
                 runner,
                 batch_size_hint,
             }),
@@ -66,7 +66,7 @@ impl Client {
             entity,
             abq_server_addr,
             client,
-            invocation_id,
+            run_id,
             stream,
         })
     }
@@ -79,7 +79,7 @@ impl Client {
             &mut new_stream,
             &queue::Request {
                 entity: self.entity,
-                message: Message::Reconnect(self.invocation_id),
+                message: Message::Reconnect(self.run_id),
             },
         )
         .await?;

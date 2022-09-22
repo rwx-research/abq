@@ -11,10 +11,10 @@ use abq_generic_test_runner::{GenericTestRunner, RunnerError};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestId, TestResult};
-use abq_utils::net_protocol::workers::{
-    InvocationId, NextWork, NextWorkBundle, RunnerKind, WorkContext, WorkId,
-};
 use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
+use abq_utils::net_protocol::workers::{
+    NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext, WorkId,
+};
 
 use procspawn as proc;
 
@@ -25,10 +25,8 @@ enum MessageFromPool {
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
-pub type NotifyManifest =
-    Box<dyn Fn(EntityId, InvocationId, ManifestMessage) + Send + Sync + 'static>;
-pub type NotifyResult =
-    Arc<dyn Fn(EntityId, InvocationId, WorkId, TestResult) + Send + Sync + 'static>;
+pub type NotifyManifest = Box<dyn Fn(EntityId, RunId, ManifestMessage) + Send + Sync + 'static>;
+pub type NotifyResult = Arc<dyn Fn(EntityId, RunId, WorkId, TestResult) + Send + Sync + 'static>;
 
 type MarkWorkerComplete = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -52,8 +50,8 @@ pub struct WorkerPoolConfig {
     pub size: NonZeroUsize,
     /// The kind of runners the workers should start.
     pub runner_kind: RunnerKind,
-    /// The work invocation we're working for.
-    pub invocation_id: InvocationId,
+    /// The work run we're working for.
+    pub run_id: RunId,
     /// When [`Some`], one worker must be chosen to generate and return the manifest the following
     /// way.
     pub notify_manifest: Option<NotifyManifest>,
@@ -124,7 +122,7 @@ impl WorkerPool {
         let WorkerPoolConfig {
             size,
             runner_kind,
-            invocation_id,
+            run_id,
             get_next_work,
             notify_result,
             notify_manifest,
@@ -162,7 +160,7 @@ impl WorkerPool {
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
-                invocation_id,
+                run_id,
                 get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
@@ -184,7 +182,7 @@ impl WorkerPool {
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
-                invocation_id,
+                run_id,
                 get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
@@ -256,7 +254,7 @@ type AttemptResult = Result<String, AttemptError>;
 
 struct WorkerEnv {
     msg_from_pool_rx: MessageFromPoolRx,
-    invocation_id: InvocationId,
+    run_id: RunId,
     notify_manifest: Option<NotifyManifest>,
     get_next_work_bundle: GetNextWorkBundle,
     notify_result: NotifyResult,
@@ -290,7 +288,7 @@ fn start_generic_test_runner(
 ) -> Result<(), RunnerError> {
     let WorkerEnv {
         get_next_work_bundle,
-        invocation_id,
+        run_id,
         notify_result,
         notify_manifest,
         context,
@@ -306,13 +304,12 @@ fn start_generic_test_runner(
     tracing::debug!(?entity, "Starting new generic test runner");
 
     let notify_manifest = notify_manifest
-        .map(|notify_manifest| move |manifest| notify_manifest(entity, invocation_id, manifest));
+        .map(|notify_manifest| move |manifest| notify_manifest(entity, run_id, manifest));
 
     let get_next_work_bundle = move || get_next_work_bundle();
 
-    let send_test_result = move |work_id, test_result: TestResult| {
-        notify_result(entity, invocation_id, work_id, test_result)
-    };
+    let send_test_result =
+        move |work_id, test_result: TestResult| notify_result(entity, run_id, work_id, test_result);
 
     let polling_should_shutdown = || {
         matches!(
@@ -344,7 +341,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
     let WorkerEnv {
         msg_from_pool_rx,
         get_next_work_bundle: get_next_work,
-        invocation_id,
+        run_id,
         notify_result,
         context,
         work_timeout,
@@ -356,7 +353,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
     let entity = EntityId::new();
 
     if let Some(notify_manifest) = notify_manifest {
-        notify_manifest(entity, invocation_id, manifest);
+        notify_manifest(entity, run_id, manifest);
     }
 
     'tests_done: loop {
@@ -387,7 +384,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                 NextWork::Work {
                     test_case,
                     context: work_context,
-                    invocation_id,
+                    run_id,
                     work_id,
                 } => {
                     // Try the test_id once + how ever many retries were requested.
@@ -422,7 +419,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                             meta: Default::default(),
                         };
 
-                        notify_result(entity, invocation_id, work_id.clone(), result);
+                        notify_result(entity, run_id, work_id.clone(), result);
                         break 'attempts;
                     }
                 }
@@ -549,7 +546,7 @@ mod test {
     use super::{GetNextWorkBundle, NotifyManifest, NotifyResult, WorkerContext, WorkerPool};
     use crate::negotiate::QueueNegotiator;
     use crate::workers::WorkerPoolConfig;
-    use abq_utils::net_protocol::workers::{InvocationId, RunnerKind, WorkContext, WorkId};
+    use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkContext, WorkId};
 
     type ResultsCollector = Arc<Mutex<HashMap<String, TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
@@ -590,7 +587,7 @@ mod test {
 
     fn setup_pool(
         runner: TestLikeRunner,
-        invocation_id: InvocationId,
+        run_id: RunId,
         manifest: ManifestMessage,
         get_next_work: GetNextWorkBundle,
         notify_result: NotifyResult,
@@ -601,7 +598,7 @@ mod test {
             size: NonZeroUsize::new(1).unwrap(),
             get_next_work,
             runner_kind: RunnerKind::TestLikeRunner(runner, manifest),
-            invocation_id,
+            run_id,
             notify_manifest: Some(notify_manifest),
             notify_result,
             worker_context: WorkerContext::AssumeLocal,
@@ -612,13 +609,13 @@ mod test {
         (config, manifest_collector)
     }
 
-    fn local_work(test: TestCase, invocation_id: InvocationId, work_id: WorkId) -> NextWork {
+    fn local_work(test: TestCase, run_id: RunId, work_id: WorkId) -> NextWork {
         NextWork::Work {
             test_case: test,
             context: WorkContext {
                 working_dir: std::env::current_dir().unwrap(),
             },
-            invocation_id,
+            run_id,
             work_id,
         }
     }
@@ -674,7 +671,7 @@ mod test {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result) = results_collector();
 
-        let invocation_id = InvocationId::new();
+        let run_id = RunId::new();
         let mut expected_results = HashMap::new();
         let tests = (0..num_echos)
             .into_iter()
@@ -691,7 +688,7 @@ mod test {
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::Echo,
-            invocation_id,
+            run_id,
             manifest,
             get_next_work,
             notify_result,
@@ -708,7 +705,7 @@ mod test {
         let test_ids = await_manifest_test_cases(manifest_collector);
 
         for (i, test_id) in test_ids.into_iter().enumerate() {
-            write_work(local_work(test_id, invocation_id, WorkId(i.to_string())))
+            write_work(local_work(test_id, run_id, WorkId(i.to_string())))
         }
 
         for _ in 0..num_workers {
@@ -762,14 +759,14 @@ mod test {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result) = results_collector();
 
-        let invocation_id = InvocationId::new();
+        let run_id = RunId::new();
         let manifest = ManifestMessage {
             test_ids: vec![TestId::Echo("mona lisa".to_string())],
         };
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::InduceTimeout,
-            invocation_id,
+            run_id,
             manifest,
             get_next_work,
             notify_result,
@@ -784,11 +781,7 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         for test_id in await_manifest_test_cases(manifest_collector) {
-            write_work(local_work(
-                test_id,
-                invocation_id,
-                WorkId("id1".to_string()),
-            ));
+            write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
         }
 
         write_work(NextWork::EndOfWork);
@@ -811,14 +804,14 @@ mod test {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result) = results_collector();
 
-        let invocation_id = InvocationId::new();
+        let run_id = RunId::new();
         let manifest = ManifestMessage {
             test_ids: vec![TestId::Echo("".to_string())],
         };
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::EchoOnRetry(10),
-            invocation_id,
+            run_id,
             manifest,
             get_next_work,
             notify_result,
@@ -831,11 +824,7 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         for test_id in await_manifest_test_cases(manifest_collector) {
-            write_work(local_work(
-                test_id,
-                invocation_id,
-                WorkId("id1".to_string()),
-            ));
+            write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
         }
         write_work(NextWork::EndOfWork);
 
@@ -857,14 +846,14 @@ mod test {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result) = results_collector();
 
-        let invocation_id = InvocationId::new();
+        let run_id = RunId::new();
         let manifest = ManifestMessage {
             test_ids: vec![TestId::Echo("okay".to_string())],
         };
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::EchoOnRetry(2),
-            invocation_id,
+            run_id,
             manifest,
             get_next_work,
             notify_result,
@@ -877,11 +866,7 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         for test_id in await_manifest_test_cases(manifest_collector) {
-            write_work(local_work(
-                test_id,
-                invocation_id,
-                WorkId("id1".to_string()),
-            ));
+            write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
         }
         write_work(NextWork::EndOfWork);
 
@@ -913,7 +898,7 @@ mod test {
             working_dir: working_dir.path().to_owned(),
         };
 
-        let invocation_id = InvocationId::new();
+        let run_id = RunId::new();
         let manifest = ManifestMessage {
             manifest: Manifest {
                 members: vec![exec_test("cat", &["testfile"])],
@@ -922,7 +907,7 @@ mod test {
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::Exec,
-            invocation_id,
+            run_id,
             manifest,
             get_next_work,
             notify_result,
@@ -947,7 +932,7 @@ mod test {
             write_work(NextWork::Work {
                 test_case,
                 context: context.clone(),
-                invocation_id,
+                run_id,
                 work_id: WorkId("id1".to_string()),
             });
         }

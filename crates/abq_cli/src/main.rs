@@ -19,7 +19,7 @@ use abq_utils::{
     net_protocol::{
         entity::EntityId,
         runners::TestResult,
-        workers::{InvocationId, NativeTestRunnerParams, RunnerKind, WorkId},
+        workers::{NativeTestRunnerParams, RunId, RunnerKind, WorkId},
     },
 };
 use abq_workers::negotiate::QueueNegotiatorHandle;
@@ -113,7 +113,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         Command::Work {
             working_dir,
             queue_addr,
-            test_run,
+            run_id,
             num,
             token,
             tls,
@@ -121,17 +121,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), tls);
             let queue_negotiator =
                 QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts)?;
-            workers::start_workers_forever(
-                num,
-                working_dir,
-                queue_negotiator,
-                client_opts,
-                test_run,
-            )
+            workers::start_workers_forever(num, working_dir, queue_negotiator, client_opts, run_id)
         }
         Command::Test {
             args,
-            test_id,
+            run_id,
             queue_addr,
             reporter: reporters,
             token,
@@ -144,7 +138,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let runner_params = validate_abq_test_args(args)?;
             let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth, tls)?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
-            run_tests(entity, runner, abq, test_id, reporters, color, batch_size)
+            run_tests(entity, runner, abq, run_id, reporters, color, batch_size)
         }
         Command::Health {
             queue,
@@ -233,7 +227,7 @@ fn run_tests(
     entity: EntityId,
     runner: RunnerKind,
     abq: AbqInstance,
-    opt_test_id: Option<InvocationId>,
+    opt_test_id: Option<RunId>,
     reporters: Vec<ReporterKind>,
     color_choice: ColorPreference,
     batch_size: NonZeroU64,
@@ -254,7 +248,7 @@ fn run_tests(
     };
 
     let start_in_process_workers = opt_test_id.is_none();
-    let test_id = opt_test_id.unwrap_or_else(InvocationId::new);
+    let test_id = opt_test_id.unwrap_or_else(RunId::new);
 
     let work_results_thread = start_test_result_reporter(
         entity,
@@ -297,7 +291,7 @@ fn start_test_result_reporter(
     entity: EntityId,
     abq_server_addr: SocketAddr,
     client_opts: ClientOptions,
-    test_id: InvocationId,
+    test_id: RunId,
     runner: RunnerKind,
     batch_size: NonZeroU64,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,

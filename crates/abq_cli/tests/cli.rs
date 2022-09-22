@@ -9,7 +9,7 @@ use std::{
 };
 
 #[cfg(feature = "test-abq-jest")]
-use abq_utils::net_protocol::workers::InvocationId;
+use abq_utils::net_protocol::workers::RunId;
 
 const WORKSPACE: &str = std::env!("ABQ_WORKSPACE_DIR");
 
@@ -235,7 +235,7 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         let queue_addr = format!("0.0.0.0:{server_port}");
-        let test_id = InvocationId::new().to_string();
+        let test_id = RunId::new().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
@@ -276,14 +276,14 @@ test_all_network_config_options! {
         worker_args.extend([test_id.as_str()]);
         let mut worker_proc = spawn_abq(worker_args);
 
-        // abq test --reporter dot --queue-addr ... --test-id ... (--token ...)? -- yarn jest
+        // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
         let test_args = &[
             "test",
             "--reporter",
             "dot",
             "--queue-addr",
             &queue_addr,
-            "--test-id",
+            "--run-id",
             &test_id,
         ];
         let mut test_args = conf.extend_args(test_args);

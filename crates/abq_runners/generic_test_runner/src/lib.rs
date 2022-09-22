@@ -11,7 +11,7 @@ use abq_utils::net_protocol::runners::{
     ACTIVE_PROTOCOL_VERSION_MINOR,
 };
 use abq_utils::net_protocol::workers::{
-    InvocationId, NativeTestRunnerParams, NextWork, NextWorkBundle, WorkContext, WorkId,
+    NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
 };
 use abq_utils::{flatten_manifest, net_protocol};
 use thiserror::Error;
@@ -267,7 +267,7 @@ impl GenericTestRunner {
                     NextWork::Work {
                         test_case,
                         context: _,
-                        invocation_id: _,
+                        run_id: _,
                         work_id,
                     } => {
                         let test_case_message = TestCaseMessage { test_case };
@@ -346,7 +346,7 @@ pub fn execute_wrapped_runner(
                             context: WorkContext {
                                 working_dir: working_dir.clone(),
                             },
-                            invocation_id: InvocationId::new(),
+                            run_id: RunId::new(),
                             work_id: WorkId(Default::default()),
                         }
                     }
