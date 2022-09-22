@@ -5,7 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 abq_utils = { path = "../../abq_utils" }
-junit-report = "0.7.1"
+junit-report = "0.8.1"
 
 [dev-dependencies]
-insta = "1.19.1"
+insta = "1.20.0"
