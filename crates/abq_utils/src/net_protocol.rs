@@ -153,38 +153,37 @@ pub mod workers {
     };
 
     #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
-    /// ID for a particular invocation of the queue, which sends many units of work.
+    /// ID for a particular run of the queue, which sends many units of work.
     ///
     // TODO: consider supporting arbitrary strings, to ease the generation of in some contexts
     // (like a CI server that wants to use the build number to identify the test run). Note that we
     // need uniqueness checking either way, which we don't do yet.
-    pub struct InvocationId(pub [u8; 16]);
+    pub struct RunId(pub [u8; 16]);
 
-    impl InvocationId {
-        #[allow(clippy::new_without_default)] // Invocation IDs should be fresh, not defaulted
+    impl RunId {
+        #[allow(clippy::new_without_default)] // Run IDs should be fresh, not defaulted
         pub fn new() -> Self {
             Self(uuid::Uuid::new_v4().into_bytes())
         }
     }
 
-    impl FromStr for InvocationId {
+    impl FromStr for RunId {
         type Err = String;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let id = uuid::Uuid::from_str(s)
-                .map_err(|_| format!("{} is not a valid invocation ID", s))?;
+            let id = uuid::Uuid::from_str(s).map_err(|_| format!("{} is not a valid run ID", s))?;
 
             Ok(Self(id.into_bytes()))
         }
     }
 
-    impl Display for InvocationId {
+    impl Display for RunId {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
         }
     }
 
-    impl fmt::Debug for InvocationId {
+    impl fmt::Debug for RunId {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
         }
@@ -241,7 +240,7 @@ pub mod workers {
         Work {
             test_case: TestCase,
             context: WorkContext,
-            invocation_id: InvocationId,
+            run_id: RunId,
             work_id: WorkId,
         },
         EndOfWork,
@@ -264,13 +263,13 @@ pub mod queue {
     use super::{
         entity::EntityId,
         runners::{ManifestMessage, TestResult},
-        workers::{InvocationId, RunnerKind, WorkId},
+        workers::{RunId, RunnerKind, WorkId},
     };
 
     /// An ask to run some work by an invoker.
     #[derive(Serialize, Deserialize, Debug)]
     pub struct InvokeWork {
-        pub invocation_id: InvocationId,
+        pub run_id: RunId,
         pub runner: RunnerKind,
         pub batch_size_hint: NonZeroU64,
     }
@@ -300,25 +299,25 @@ pub mod queue {
         /// An ask to run some work by an invoker.
         InvokeWork(InvokeWork),
         /// An invoker of a test run would like to reconnect to the queue for results streaming.
-        Reconnect(InvocationId),
-        /// A work manifest for a given invocation.
-        Manifest(InvocationId, ManifestMessage),
+        Reconnect(RunId),
+        /// A work manifest for a given run.
+        Manifest(RunId, ManifestMessage),
         /// The result of some work from the queue.
-        WorkerResult(InvocationId, WorkId, TestResult),
+        WorkerResult(RunId, WorkId, TestResult),
     }
 }
 
 pub mod work_server {
     use serde_derive::{Deserialize, Serialize};
 
-    use super::workers::InvocationId;
+    use super::workers::RunId;
 
     #[derive(Serialize, Deserialize)]
     pub enum WorkServerRequest {
         HealthCheck,
-        /// An ask to get the next test for a particular invocation for the queue.
+        /// An ask to get the next test for a particular run for the queue.
         NextTest {
-            invocation_id: InvocationId,
+            run_id: RunId,
         },
     }
 }

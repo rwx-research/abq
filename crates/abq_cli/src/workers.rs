@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use abq_utils::net_opt::ClientOptions;
-use abq_utils::net_protocol::workers::InvocationId;
+use abq_utils::net_protocol::workers::RunId;
 use abq_workers::negotiate::{QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator};
 use abq_workers::workers::{WorkerContext, WorkerPool};
 use signal_hook::consts::{SIGINT, SIGTERM};
@@ -15,7 +15,7 @@ pub fn start_workers(
     working_dir: PathBuf,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
-    invocation_id: InvocationId,
+    run_id: RunId,
 ) -> anyhow::Result<WorkerPool> {
     abq_workers::workers::init();
 
@@ -38,7 +38,7 @@ pub fn start_workers(
         workers_config,
         queue_negotiator,
         client_opts,
-        invocation_id,
+        run_id,
     )?;
 
     tracing::debug!("Workers attached");
@@ -51,14 +51,14 @@ pub fn start_workers_forever(
     working_dir: PathBuf,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
-    invocation_id: InvocationId,
+    run_id: RunId,
 ) -> ! {
     let mut worker_pool = start_workers(
         num_workers,
         working_dir,
         queue_negotiator,
         client_opts,
-        invocation_id,
+        run_id,
     )
     .unwrap();
 

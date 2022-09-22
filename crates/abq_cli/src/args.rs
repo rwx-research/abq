@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use abq_utils::{auth::AuthToken, net_opt::Tls, net_protocol::workers::InvocationId};
+use abq_utils::{auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
 use clap::{Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
@@ -63,7 +63,7 @@ pub enum Command {
         public_ip: Option<IpAddr>,
 
         /// A token against which messages to the queue will be authorized.
-        /// When provided, the same token must be provided to invocations of the `work` and `test`
+        /// When provided, the same token must be provided to runs of the `work` and `test`
         /// commands.
         /// When not provided, the queue will start without assuming enforcing authorization.
         ///
@@ -90,7 +90,7 @@ pub enum Command {
         working_dir: PathBuf,
 
         /// The ID of the test run to pull work for.
-        test_run: InvocationId,
+        run_id: RunId,
 
         /// Number of workers to start. Must be >= 4. Defaults to the number of available (logical)
         /// CPUs - 1.
@@ -115,9 +115,9 @@ pub enum Command {
     /// The given executable must be available on abq workers fulfilling this test request,
     /// and must resolve to an executable that implements the ABQ protocol.
     Test {
-        /// Test ID for workers to connect to. If not specified, workers are started in-process.
+        /// Run ID for workers to connect to. If not specified, workers are started in-process.
         #[clap(long, required = false)]
-        test_id: Option<InvocationId>,
+        run_id: Option<RunId>,
 
         /// Address of the queue to send the test request to.
         ///

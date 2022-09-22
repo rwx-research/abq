@@ -21,7 +21,7 @@ use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, Message},
-    workers::{InvocationId, NextWork, WorkId},
+    workers::{NextWork, RunId, WorkId},
 };
 use abq_workers::negotiate::{AssignedRun, QueueNegotiator, QueueNegotiatorHandle};
 
@@ -52,21 +52,21 @@ impl JobQueue {
     }
 }
 
-enum InvocationState {
+enum RunState {
     WaitingForFirstWorker,
     WaitingForManifest,
     HasWork {
         queue: JobQueue,
 
         /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
-        // Co-locate this here so that we don't have to index `invocation_data` when grabbing a
+        // Co-locate this here so that we don't have to index `run_data` when grabbing a
         // test.
         batch_size_hint: NonZeroU64,
     },
     Done,
 }
 
-struct InvocationData {
+struct RunData {
     runner: RunnerKind,
     /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
     batch_size_hint: NonZeroU64,
@@ -75,50 +75,43 @@ struct InvocationData {
 struct WaitingForManifestError;
 
 #[derive(Default)]
-struct InvocationQueues {
-    /// One queue per `abq test ...` invocation, at least for now.
-    queues: HashMap<InvocationId, InvocationState>,
-    invocation_data: HashMap<InvocationId, InvocationData>,
+struct RunQueues {
+    /// One queue per `abq test ...` run, at least for now.
+    queues: HashMap<RunId, RunState>,
+    run_data: HashMap<RunId, RunData>,
 }
 
-impl InvocationQueues {
-    pub fn create_queue(
-        &mut self,
-        invocation_id: InvocationId,
-        runner: RunnerKind,
-        batch_size_hint: NonZeroU64,
-    ) {
-        let old_queue = self
-            .queues
-            .insert(invocation_id, InvocationState::WaitingForFirstWorker);
+impl RunQueues {
+    pub fn create_queue(&mut self, run_id: RunId, runner: RunnerKind, batch_size_hint: NonZeroU64) {
+        let old_queue = self.queues.insert(run_id, RunState::WaitingForFirstWorker);
         debug_assert!(old_queue.is_none());
 
-        let old_invocation_data = self.invocation_data.insert(
-            invocation_id,
-            InvocationData {
+        let old_run_data = self.run_data.insert(
+            run_id,
+            RunData {
                 runner,
                 batch_size_hint,
             },
         );
-        debug_assert!(old_invocation_data.is_none());
+        debug_assert!(old_run_data.is_none());
     }
 
     // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
     // found.
-    pub fn get_run_for_worker(&mut self, invocation_id: InvocationId) -> Option<AssignedRun> {
-        let invocation_state = self.queues.get_mut(&invocation_id)?;
+    pub fn get_run_for_worker(&mut self, run_id: RunId) -> Option<AssignedRun> {
+        let run_state = self.queues.get_mut(&run_id)?;
 
-        let InvocationData {
+        let RunData {
             runner,
             batch_size_hint: _,
-        } = self.invocation_data.get(&invocation_id).unwrap();
+        } = self.run_data.get(&run_id).unwrap();
 
-        let assigned_run = match invocation_state {
-            InvocationState::WaitingForFirstWorker => {
+        let assigned_run = match run_state {
+            RunState::WaitingForFirstWorker => {
                 // This is the first worker to attach; ask it to generate the manifest.
-                *invocation_state = InvocationState::WaitingForManifest;
+                *run_state = RunState::WaitingForManifest;
                 AssignedRun {
-                    invocation_id,
+                    run_id,
                     runner_kind: runner.clone(),
                     should_generate_manifest: true,
                 }
@@ -127,7 +120,7 @@ impl InvocationQueues {
                 // Otherwise we are already waiting for the manifest, or already have it; just tell
                 // the worker what runner it should set up.
                 AssignedRun {
-                    invocation_id,
+                    run_id,
                     runner_kind: runner.clone(),
                     should_generate_manifest: false,
                 }
@@ -137,16 +130,13 @@ impl InvocationQueues {
         Some(assigned_run)
     }
 
-    pub fn add_manifest(&mut self, invocation_id: InvocationId, flat_manifest: Vec<TestCase>) {
-        let state = self
-            .queues
-            .get_mut(&invocation_id)
-            .expect("no queue for invocation");
+    pub fn add_manifest(&mut self, run_id: RunId, flat_manifest: Vec<TestCase>) {
+        let state = self.queues.get_mut(&run_id).expect("no queue for run");
 
         let work_from_manifest = flat_manifest.into_iter().map(|test_case| {
             NextWork::Work {
                 test_case,
-                invocation_id,
+                run_id,
                 // TODO: populate correctly
                 work_id: WorkId("".to_string()),
                 // TODO: populate correctly
@@ -159,28 +149,25 @@ impl InvocationQueues {
         let mut queue = JobQueue::default();
         queue.add_batch_work(work_from_manifest);
 
-        *state = InvocationState::HasWork {
+        *state = RunState::HasWork {
             queue,
             batch_size_hint: self
-                .invocation_data
-                .get(&invocation_id)
-                .expect("no data for invocation")
+                .run_data
+                .get(&run_id)
+                .expect("no data for run")
                 .batch_size_hint,
         }
     }
 
-    pub fn next_work(
-        &mut self,
-        invocation_id: InvocationId,
-    ) -> Result<NextWorkBundle, WaitingForManifestError> {
+    pub fn next_work(&mut self, run_id: RunId) -> Result<NextWorkBundle, WaitingForManifestError> {
         match self
             .queues
-            .get_mut(&invocation_id)
-            .expect("no queue state for invocation")
+            .get_mut(&run_id)
+            .expect("no queue state for run")
         {
-            InvocationState::WaitingForFirstWorker => Err(WaitingForManifestError),
-            InvocationState::WaitingForManifest => Err(WaitingForManifestError),
-            InvocationState::HasWork {
+            RunState::WaitingForFirstWorker => Err(WaitingForManifestError),
+            RunState::WaitingForManifest => Err(WaitingForManifestError),
+            RunState::HasWork {
                 queue,
                 batch_size_hint,
             } => {
@@ -198,38 +185,36 @@ impl InvocationQueues {
                 }
                 Ok(NextWorkBundle(bundle))
             }
-            InvocationState::Done => Ok(NextWorkBundle(vec![NextWork::EndOfWork])),
+            RunState::Done => Ok(NextWorkBundle(vec![NextWork::EndOfWork])),
         }
     }
 
-    pub fn mark_complete(&mut self, invocation_id: InvocationId) {
+    pub fn mark_complete(&mut self, run_id: RunId) {
         let state = self
             .queues
-            .get_mut(&invocation_id)
-            .expect("no queue state for invocation");
+            .get_mut(&run_id)
+            .expect("no queue state for run");
         match state {
-            InvocationState::HasWork {
+            RunState::HasWork {
                 queue,
                 batch_size_hint: _,
             } => {
                 assert!(queue.is_empty(), "Invalid state - queue is not complete!");
             }
-            InvocationState::WaitingForFirstWorker
-            | InvocationState::WaitingForManifest
-            | InvocationState::Done => {
+            RunState::WaitingForFirstWorker | RunState::WaitingForManifest | RunState::Done => {
                 unreachable!("Invalid state");
             }
         }
 
         // TODO: right now, we are just marking something complete so that future workers asking
-        // for work about the invocation get an EndOfWork message. But this leaks memory, how can
+        // for work about the run get an EndOfWork message. But this leaks memory, how can
         // we avoid that?
-        *state = InvocationState::Done;
-        self.invocation_data.remove(&invocation_id);
+        *state = RunState::Done;
+        self.run_data.remove(&run_id);
     }
 }
 
-type SharedInvocationQueues = Arc<Mutex<InvocationQueues>>;
+type SharedRunQueues = Arc<Mutex<RunQueues>>;
 
 /// Executes an initialization sequence that must be performed before any queue can be created.
 /// [init] only needs to be run once in a process, even if multiple [Abq] instances are crated, but
@@ -368,7 +353,7 @@ fn start_queue(config: QueueConfig) -> Abq {
         server_options,
     } = config;
 
-    let queues: SharedInvocationQueues = Default::default();
+    let queues: SharedRunQueues = Default::default();
 
     let server_listener = server_options.bind((bind_ip, server_port)).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
@@ -397,17 +382,12 @@ fn start_queue(config: QueueConfig) -> Abq {
     });
 
     // Chooses a test run for a set of workers to attach to.
-    // This blocks until there is an invocation available for the particular worker.
+    // This blocks until there is an run available for the particular worker.
     // TODO: blocking is not good; workers that can connect fast may be blocked on workers waiting
     // for a test run to be established. Make this cede control to a runtime if the worker's run is
     // not yet available.
-    let choose_run_for_worker = move |wanted_invocation_id| loop {
-        let opt_assigned = {
-            queues
-                .lock()
-                .unwrap()
-                .get_run_for_worker(wanted_invocation_id)
-        };
+    let choose_run_for_worker = move |wanted_run_id| loop {
+        let opt_assigned = { queues.lock().unwrap().get_run_for_worker(wanted_run_id) };
         match opt_assigned {
             None => {
                 // Nothing yet; release control and sleep for a bit in case something comes.
@@ -527,20 +507,20 @@ impl ClientResponder {
     }
 }
 
-/// invocation -> (results sender, responder handle)
+/// run -> (results sender, responder handle)
 ///
 // TODO: certainly we can be smarter here, for example we have an invariant that a stream will only
-// ever be added and removed for an invocation ID once. Can we use that to get rid of the mutex?
-type ActiveInvocations = Arc<tokio::sync::Mutex<HashMap<InvocationId, ClientResponder>>>;
+// ever be added and removed for an run ID once. Can we use that to get rid of the mutex?
+type ActiveRuns = Arc<tokio::sync::Mutex<HashMap<RunId, ClientResponder>>>;
 
-/// Cache of how much is left in the queue for a particular invocation, so that we don't have to
+/// Cache of how much is left in the queue for a particular run, so that we don't have to
 /// lock the queue all the time.
 // TODO: consider using DashMap
-type WorkLeftForInvocations = Arc<Mutex<HashMap<InvocationId, usize>>>;
+type WorkLeftForRuns = Arc<Mutex<HashMap<RunId, usize>>>;
 
-/// Central server listening for new test run invocations and results.
+/// Central server listening for new test run runs and results.
 struct QueueServer {
-    queues: SharedInvocationQueues,
+    queues: SharedRunQueues,
     public_negotiator_addr: SocketAddr,
 }
 
@@ -562,24 +542,24 @@ pub enum QueueServerError {
 /// An error that occurs when an abq client attempts to re-connect to the queue.
 #[derive(Debug, Error, PartialEq)]
 enum ClientReconnectionError {
-    /// The client sent an initial test invocation request to the queue.
+    /// The client sent an initial test run request to the queue.
     #[error("{0} was never used to invoke work on the queue")]
-    NeverInvoked(InvocationId),
+    NeverInvoked(RunId),
 }
 
 #[derive(Clone)]
 struct QueueServerCtx {
-    queues: SharedInvocationQueues,
-    /// When all results for a particular invocation are communicated, we want to make sure that the
+    queues: SharedRunQueues,
+    /// When all results for a particular run are communicated, we want to make sure that the
     /// responder thread is closed and that the entry here is dropped.
-    active_invocations: ActiveInvocations,
-    work_left_for_invocations: WorkLeftForInvocations,
+    active_runs: ActiveRuns,
+    work_left_for_runs: WorkLeftForRuns,
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
 impl QueueServer {
-    fn new(queues: SharedInvocationQueues, public_negotiator_addr: SocketAddr) -> Self {
+    fn new(queues: SharedRunQueues, public_negotiator_addr: SocketAddr) -> Self {
         Self {
             queues,
             public_negotiator_addr,
@@ -611,8 +591,8 @@ impl QueueServer {
 
             let ctx = QueueServerCtx {
                 queues,
-                active_invocations: Default::default(),
-                work_left_for_invocations: Default::default(),
+                active_runs: Default::default(),
+                work_left_for_runs: Default::default(),
                 public_negotiator_addr,
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
             };
@@ -668,38 +648,27 @@ impl QueueServer {
                 Self::handle_negotiator_addr(entity, stream, ctx.public_negotiator_addr).await
             }
             Message::InvokeWork(invoke_work) => {
-                Self::handle_invoked_work(
-                    ctx.active_invocations,
-                    ctx.queues,
-                    entity,
-                    stream,
-                    invoke_work,
-                )
-                .await
+                Self::handle_invoked_work(ctx.active_runs, ctx.queues, entity, stream, invoke_work)
+                    .await
             }
-            Message::Reconnect(invocation_id) => {
-                Self::handle_invoker_reconnection(
-                    ctx.active_invocations,
-                    entity,
-                    stream,
-                    invocation_id,
-                )
-                .await
-                // Upcast the reconnection error into a generic error
-                .map_err(|e| Box::new(e) as _)
+            Message::Reconnect(run_id) => {
+                Self::handle_invoker_reconnection(ctx.active_runs, entity, stream, run_id)
+                    .await
+                    // Upcast the reconnection error into a generic error
+                    .map_err(|e| Box::new(e) as _)
             }
-            Message::Manifest(invocation_id, manifest) => {
+            Message::Manifest(run_id, manifest) => {
                 Self::handle_manifest(
                     ctx.queues,
-                    ctx.work_left_for_invocations,
+                    ctx.work_left_for_runs,
                     entity,
-                    invocation_id,
+                    run_id,
                     manifest,
                     stream,
                 )
                 .await
             }
-            Message::WorkerResult(invocation_id, work_id, result) => {
+            Message::WorkerResult(run_id, work_id, result) => {
                 // Recording and sending the test result back to the abq test client may
                 // be expensive, with multiple IO transactions. There is no reason to block the
                 // client connection on that; recall that the worker side of the connection will
@@ -712,10 +681,10 @@ impl QueueServer {
                 // Record the test result and notify the test client out-of-band.
                 Self::handle_worker_result(
                     ctx.queues,
-                    ctx.active_invocations,
-                    ctx.work_left_for_invocations,
+                    ctx.active_runs,
+                    ctx.work_left_for_runs,
                     entity,
-                    invocation_id,
+                    run_id,
                     work_id,
                     result,
                 )
@@ -748,53 +717,50 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(active_invocations, queues, stream))]
+    #[instrument(level = "trace", skip(active_runs, queues, stream))]
     async fn handle_invoked_work(
-        active_invocations: ActiveInvocations,
-        queues: SharedInvocationQueues,
+        active_runs: ActiveRuns,
+        queues: SharedRunQueues,
         entity: EntityId,
         stream: Box<dyn net_async::ServerStream>,
         invoke_work: InvokeWork,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let InvokeWork {
-            invocation_id,
+            run_id,
             runner,
             batch_size_hint,
         } = invoke_work;
 
         let results_responder = ClientResponder::new(stream);
-        let old_responder = active_invocations
-            .lock()
-            .await
-            .insert(invocation_id, results_responder);
+        let old_responder = active_runs.lock().await.insert(run_id, results_responder);
 
         debug_assert!(
             old_responder.is_none(),
-            "Existing stream for expected unique invocation id"
+            "Existing stream for expected unique run id"
         );
 
-        // Create a new work queue for this invocation.
+        // Create a new work queue for this run.
         queues
             .lock()
             .unwrap()
-            .create_queue(invocation_id, runner, batch_size_hint);
+            .create_queue(run_id, runner, batch_size_hint);
 
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(active_invocations, new_stream))]
+    #[instrument(level = "trace", skip(active_runs, new_stream))]
     async fn handle_invoker_reconnection(
-        active_invocations: ActiveInvocations,
+        active_runs: ActiveRuns,
         entity: EntityId,
         new_stream: Box<dyn net_async::ServerStream>,
-        invocation_id: InvocationId,
+        run_id: RunId,
     ) -> Result<(), ClientReconnectionError> {
         use std::collections::hash_map::Entry;
 
         // When an abq client loses connection with the queue, they may attempt to reconnect.
         // We'll need to update the connection from streaming results to the client to the new one.
-        let mut active_invocations = active_invocations.lock().await;
-        let active_conn_entry = active_invocations.entry(invocation_id);
+        let mut active_runs = active_runs.lock().await;
+        let active_conn_entry = active_runs.entry(run_id);
         match active_conn_entry {
             Entry::Occupied(mut occupied) => {
                 let new_stream_addr = new_stream.peer_addr();
@@ -803,67 +769,59 @@ impl QueueServer {
 
                 tracing::debug!(
                     "rerouted connection for {:?} to {:?}",
-                    invocation_id,
+                    run_id,
                     new_stream_addr
                 );
 
                 Ok(())
             }
             Entry::Vacant(_) => {
-                // There was never a connection for this invocation ID!
-                Err(ClientReconnectionError::NeverInvoked(invocation_id))
+                // There was never a connection for this run ID!
+                Err(ClientReconnectionError::NeverInvoked(run_id))
             }
         }
     }
 
-    #[instrument(level = "trace", skip(queues, work_left_for_invocations))]
+    #[instrument(level = "trace", skip(queues, work_left_for_runs))]
     async fn handle_manifest(
-        queues: SharedInvocationQueues,
-        work_left_for_invocations: WorkLeftForInvocations,
+        queues: SharedRunQueues,
+        work_left_for_runs: WorkLeftForRuns,
         entity: EntityId,
-        invocation_id: InvocationId,
+        run_id: RunId,
         manifest: ManifestMessage,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Record the manifest for this invocation in its appropriate queue.
+        // Record the manifest for this run in its appropriate queue.
         // TODO: actually record the manifest metadata
         let flat_manifest = flatten_manifest(manifest.manifest);
-        work_left_for_invocations
+        work_left_for_runs
             .lock()
             .unwrap()
-            .insert(invocation_id, flat_manifest.len());
+            .insert(run_id, flat_manifest.len());
 
-        queues
-            .lock()
-            .unwrap()
-            .add_manifest(invocation_id, flat_manifest);
+        queues.lock().unwrap().add_manifest(run_id, flat_manifest);
 
         net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
 
         Ok(())
     }
 
-    #[instrument(
-        level = "trace",
-        skip(queues, active_invocations, work_left_for_invocations)
-    )]
+    #[instrument(level = "trace", skip(queues, active_runs, work_left_for_runs))]
     async fn handle_worker_result(
-        queues: SharedInvocationQueues,
-        active_invocations: ActiveInvocations,
-        work_left_for_invocations: WorkLeftForInvocations,
+        queues: SharedRunQueues,
+        active_runs: ActiveRuns,
+        work_left_for_runs: WorkLeftForRuns,
         entity: EntityId,
-        invocation_id: InvocationId,
+        run_id: RunId,
         work_id: WorkId,
         result: TestResult,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         {
             // First up, chuck the test result back over to `abq test`. Make sure we don't steal
-            // the lock on active_invocations for any longer than it takes to send that request.
-            let mut active_invocations = active_invocations.lock().await;
+            // the lock on active_runs for any longer than it takes to send that request.
+            let mut active_runs = active_runs.lock().await;
 
-            let invoker_stream = active_invocations
-                .get_mut(&invocation_id)
-                .expect("invocation is not active");
+            let invoker_stream = active_runs.get_mut(&run_id).expect("run is not active");
 
             invoker_stream
                 .send_and_ack_one_test_result(InvokerResponse::Result(work_id, result))
@@ -873,29 +831,25 @@ impl QueueServer {
         let no_more_work = {
             // Update the amount of work we have left; again, steal the map of work for only as
             // long is it takes for us to do that.
-            let mut work_left_for_invocations = work_left_for_invocations.lock().unwrap();
-            let work_left = work_left_for_invocations
-                .get_mut(&invocation_id)
-                .expect("invocation id not recorded, but we got a result for it?");
+            let mut work_left_for_runs = work_left_for_runs.lock().unwrap();
+            let work_left = work_left_for_runs
+                .get_mut(&run_id)
+                .expect("run id not recorded, but we got a result for it?");
 
             *work_left -= 1;
             *work_left == 0
         };
 
         if no_more_work {
-            // Now, we have to take both the active invocations, and the map of work left, to mark
-            // the work for the current invocation as complete in both cases. It's okay for this to
+            // Now, we have to take both the active runs, and the map of work left, to mark
+            // the work for the current run as complete in both cases. It's okay for this to
             // be slow(er), since it happens only once per test run.
             //
             // Note however that this does block requests indexing into the maps for other `abq
-            // test` invocations.
+            // test` runs.
             // We may want to use concurrent hashmaps that index into partitioned buckets for that
             // use case (e.g. DashMap).
-            let responder = active_invocations
-                .lock()
-                .await
-                .remove(&invocation_id)
-                .unwrap();
+            let responder = active_runs.lock().await.remove(&run_id).unwrap();
 
             match responder {
                 ClientResponder::DirectStream(mut stream) => {
@@ -915,11 +869,8 @@ impl QueueServer {
                 }
             }
 
-            work_left_for_invocations
-                .lock()
-                .unwrap()
-                .remove(&invocation_id);
-            queues.lock().unwrap().mark_complete(invocation_id);
+            work_left_for_runs.lock().unwrap().remove(&run_id);
+            queues.lock().unwrap().mark_complete(run_id);
         }
 
         Ok(())
@@ -929,7 +880,7 @@ impl QueueServer {
 /// Sends work as workers request it.
 /// This does not schedule work in any interesting way today, but it may in the future.
 struct WorkScheduler {
-    queues: SharedInvocationQueues,
+    queues: SharedRunQueues,
 }
 
 /// An error that happens in the construction or execution of the work-scheduling server.
@@ -949,7 +900,7 @@ pub enum WorkSchedulerError {
 
 #[derive(Clone)]
 struct SchedulerCtx {
-    queues: SharedInvocationQueues,
+    queues: SharedRunQueues,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
@@ -1012,7 +963,7 @@ impl WorkScheduler {
     ) -> io::Result<()> {
         let mut stream = ctx.handshake_ctx.handshake(stream).await?;
 
-        // Get the invocation this worker wants work for.
+        // Get the run this worker wants work for.
         let request: WorkServerRequest = net_protocol::async_read(&mut stream).await?;
 
         match request {
@@ -1023,10 +974,10 @@ impl WorkScheduler {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
             }
-            WorkServerRequest::NextTest { invocation_id } => {
+            WorkServerRequest::NextTest { run_id } => {
                 // Pull the next work item.
                 let next_work = loop {
-                    let opt_work = { ctx.queues.lock().unwrap().next_work(invocation_id) };
+                    let opt_work = { ctx.queues.lock().unwrap().next_work(run_id) };
                     match opt_work {
                         Ok(work) => break work,
                         Err(WaitingForManifestError) => {
@@ -1054,8 +1005,8 @@ mod test {
     use crate::{
         invoke::Client,
         queue::{
-            ActiveInvocations, ClientReconnectionError, ClientResponder, QueueServer,
-            SharedInvocationQueues, WorkLeftForInvocations, WorkScheduler,
+            ActiveRuns, ClientReconnectionError, ClientResponder, QueueServer, SharedRunQueues,
+            WorkLeftForRuns, WorkScheduler,
         },
     };
     use abq_utils::{
@@ -1066,7 +1017,7 @@ mod test {
             self,
             entity::EntityId,
             runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
-            workers::{InvocationId, RunnerKind, TestLikeRunner, WorkId},
+            workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
         },
     };
     use abq_workers::{
@@ -1144,7 +1095,7 @@ mod test {
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
-        let invocation_id = InvocationId::new();
+        let run_id = RunId::new();
         let results_handle = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1157,7 +1108,7 @@ mod test {
                     EntityId::new(),
                     queue_server_addr,
                     client_opts,
-                    invocation_id,
+                    run_id,
                     runner,
                     one_nonzero(),
                 )
@@ -1177,7 +1128,7 @@ mod test {
             workers_config,
             queue.get_negotiator_handle(),
             client_opts,
-            invocation_id,
+            run_id,
         )
         .unwrap();
 
@@ -1230,8 +1181,8 @@ mod test {
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
-        let invocation1 = InvocationId::new();
-        let invocation2 = InvocationId::new();
+        let run1 = RunId::new();
+        let run2 = RunId::new();
         let results_handle = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1246,7 +1197,7 @@ mod test {
                     EntityId::new(),
                     queue_server_addr,
                     client_opts,
-                    invocation1,
+                    run1,
                     runner1,
                     one_nonzero(),
                 )
@@ -1256,7 +1207,7 @@ mod test {
                     EntityId::new(),
                     queue_server_addr,
                     client_opts,
-                    invocation2,
+                    run2,
                     runner2,
                     one_nonzero(),
                 )
@@ -1282,7 +1233,7 @@ mod test {
             workers_config.clone(),
             queue.get_negotiator_handle(),
             client_opts,
-            invocation1,
+            run1,
         )
         .unwrap();
 
@@ -1290,7 +1241,7 @@ mod test {
             workers_config,
             queue.get_negotiator_handle(),
             client_opts,
-            invocation2,
+            run2,
         )
         .unwrap();
 
@@ -1339,7 +1290,7 @@ mod test {
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
-        let invocation = InvocationId::new();
+        let run = RunId::new();
         let results_handle = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1353,7 +1304,7 @@ mod test {
                     EntityId::new(),
                     queue_server_addr,
                     client_opts,
-                    invocation,
+                    run,
                     runner1,
                     batch_size,
                 )
@@ -1375,7 +1326,7 @@ mod test {
             workers_config,
             queue.get_negotiator_handle(),
             client_opts,
-            invocation,
+            run,
         )
         .unwrap();
 
@@ -1416,13 +1367,13 @@ mod test {
 
     #[tokio::test]
     async fn invoker_reconnection_succeeds() {
-        let invocation_id = InvocationId::new();
-        let active_invocations = ActiveInvocations::default();
+        let run_id = RunId::new();
+        let active_runs = ActiveRuns::default();
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
-        // Set up an initial connection for streaming test results targetting the given invocation ID
+        // Set up an initial connection for streaming test results targetting the given run ID
         let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
 
@@ -1436,9 +1387,9 @@ mod test {
             );
             let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
-            let mut active_invocations = active_invocations.lock().await;
-            active_invocations
-                .entry(invocation_id)
+            let mut active_runs = active_runs.lock().await;
+            active_runs
+                .entry(run_id)
                 .or_insert(ClientResponder::DirectStream(server_conn));
             // Drop the connection
             drop(client_conn);
@@ -1453,18 +1404,18 @@ mod test {
         let new_conn_addr = client_conn.local_addr().unwrap();
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
-            Arc::clone(&active_invocations),
+            Arc::clone(&active_runs),
             EntityId::new(),
             server_conn,
-            invocation_id,
+            run_id,
         )
         .await;
 
         // Validate that the reconnection was granted
         assert!(reconnection_result.is_ok());
         let active_conn_addr = {
-            let active_invocations = active_invocations.lock().await;
-            match active_invocations.get(&invocation_id).unwrap() {
+            let active_runs = active_runs.lock().await;
+            match active_runs.get(&run_id).unwrap() {
                 ClientResponder::DirectStream(conn) => conn.peer_addr().unwrap(),
                 ClientResponder::Disconnected { .. } => unreachable!(),
             }
@@ -1474,8 +1425,8 @@ mod test {
 
     #[tokio::test]
     async fn invoker_reconnection_fails_never_invoked() {
-        let invocation_id = InvocationId::new();
-        let active_invocations = ActiveInvocations::default();
+        let run_id = RunId::new();
+        let active_runs = ActiveRuns::default();
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
@@ -1492,30 +1443,30 @@ mod test {
         let (_client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
-            Arc::clone(&active_invocations),
+            Arc::clone(&active_runs),
             EntityId::new(),
             server_conn,
-            invocation_id,
+            run_id,
         )
         .await;
 
         // Validate that the reconnection was granted
         assert!(reconnection_result.is_err());
         let err = reconnection_result.unwrap_err();
-        assert_eq!(err, ClientReconnectionError::NeverInvoked(invocation_id));
+        assert_eq!(err, ClientReconnectionError::NeverInvoked(run_id));
     }
 
     #[tokio::test]
     async fn client_disconnect_then_connect_gets_buffered_results() {
-        let invocation_id = InvocationId::new();
-        let active_invocations = ActiveInvocations::default();
-        let invocation_queues = SharedInvocationQueues::default();
-        let work_left = WorkLeftForInvocations::default();
+        let run_id = RunId::new();
+        let active_runs = ActiveRuns::default();
+        let run_queues = SharedRunQueues::default();
+        let work_left = WorkLeftForRuns::default();
 
         let client_entity = EntityId::new();
 
         // Pretend we have infinite work so the queue always streams back results to the client.
-        work_left.lock().unwrap().insert(invocation_id, usize::MAX);
+        work_left.lock().unwrap().insert(run_id, usize::MAX);
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
@@ -1533,9 +1484,9 @@ mod test {
             );
             let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
-            let mut active_invocations = active_invocations.lock().await;
-            let _responder = active_invocations
-                .entry(invocation_id)
+            let mut active_runs = active_runs.lock().await;
+            let _responder = active_runs
+                .entry(run_id)
                 .or_insert(ClientResponder::DirectStream(server_conn));
 
             // Drop the client connection
@@ -1546,11 +1497,11 @@ mod test {
         {
             // Send a test result, will force the responder to go into disconnected mode
             QueueServer::handle_worker_result(
-                Arc::clone(&invocation_queues),
-                Arc::clone(&active_invocations),
+                Arc::clone(&run_queues),
+                Arc::clone(&active_runs),
                 Arc::clone(&work_left),
                 EntityId::new(),
-                invocation_id,
+                run_id,
                 buffered_work_id.clone(),
                 fake_test_result(),
             )
@@ -1558,8 +1509,8 @@ mod test {
             .unwrap();
 
             // Check the internal state of the responder - it should be in disconnected mode.
-            let responders = active_invocations.lock().await;
-            let responder = responders.get(&invocation_id).unwrap();
+            let responders = active_runs.lock().await;
+            let responder = responders.get(&run_id).unwrap();
             assert!(
                 matches!(responder, ClientResponder::Disconnected { .. }),
                 "{:?}",
@@ -1586,15 +1537,15 @@ mod test {
             entity: client_entity,
             abq_server_addr: fake_server_addr,
             client: client_opts.build_async().unwrap(),
-            invocation_id,
+            run_id,
             stream: client_conn,
         };
         {
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
-                Arc::clone(&active_invocations),
+                Arc::clone(&active_runs),
                 EntityId::new(),
                 server_conn,
-                invocation_id,
+                run_id,
             ));
 
             let (work_id, _) = client.next().await.unwrap().unwrap();
@@ -1608,11 +1559,11 @@ mod test {
             // Make sure that new test results also get send to the new client connectiion.
             let second_work_id = WorkId("test2".to_string());
             let worker_result_future = tokio::spawn(QueueServer::handle_worker_result(
-                invocation_queues,
-                Arc::clone(&active_invocations),
+                run_queues,
+                Arc::clone(&active_runs),
                 work_left,
                 EntityId::new(),
-                invocation_id,
+                run_id,
                 second_work_id.clone(),
                 fake_test_result(),
             ));

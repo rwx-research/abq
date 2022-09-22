@@ -23,7 +23,7 @@ use abq_utils::{
         self,
         entity::EntityId,
         publicize_addr,
-        workers::{InvocationId, RunnerKind},
+        workers::{RunId, RunnerKind},
     },
 };
 
@@ -54,8 +54,8 @@ use abq_utils::{
 #[derive(Serialize, Deserialize)]
 enum MessageFromQueueNegotiator {
     ExecutionContext {
-        /// The work invocation we are connecting to.
-        invocation_id: InvocationId,
+        /// The work run we are connecting to.
+        run_id: RunId,
         /// Where workers should receive messages from.
         queue_new_work_addr: SocketAddr,
         /// Where workers should send results to.
@@ -73,9 +73,9 @@ enum MessageFromQueueNegotiator {
 pub enum MessageToQueueNegotiator {
     HealthCheck,
     WantsToAttach {
-        /// The invocation the worker wants to run tests for. The queue must respect assignment of
-        /// work related to this invocation, or return an error.
-        invocation: InvocationId,
+        /// The run the worker wants to run tests for. The queue must respect assignment of
+        /// work related to this run, or return an error.
+        run: RunId,
     },
 }
 
@@ -112,7 +112,7 @@ impl WorkersNegotiator {
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
         client_options: ClientOptions,
-        wanted_invocation_id: InvocationId,
+        wanted_run_id: RunId,
     ) -> Result<WorkerPool, WorkersNegotiateError> {
         use WorkersNegotiateError::*;
 
@@ -121,16 +121,14 @@ impl WorkersNegotiator {
             .connect(queue_negotiator_handle.0)
             .map_err(|_| CouldNotConnect)?;
 
-        let wants_to_attach = MessageToQueueNegotiator::WantsToAttach {
-            invocation: wanted_invocation_id,
-        };
+        let wants_to_attach = MessageToQueueNegotiator::WantsToAttach { run: wanted_run_id };
         tracing::debug!("Writing attach message");
         net_protocol::write(&mut conn, wants_to_attach).map_err(|_| CouldNotConnect)?;
         tracing::debug!("Wrote attach message");
 
         tracing::debug!("Awaiting execution message");
         let MessageFromQueueNegotiator::ExecutionContext {
-            invocation_id,
+            run_id,
             queue_new_work_addr,
             queue_results_addr,
             runner_kind,
@@ -152,8 +150,8 @@ impl WorkersNegotiator {
         let notify_result: NotifyResult = Arc::new({
             let client = client.boxed_clone();
 
-            move |entity, invocation_id, work_id, result| {
-                let span = tracing::trace_span!("notify_result", invocation_id=?invocation_id, work_id=?work_id, queue_server=?queue_results_addr);
+            move |entity, run_id, work_id, result| {
+                let span = tracing::trace_span!("notify_result", run_id=?run_id, work_id=?work_id, queue_server=?queue_results_addr);
                 let _notify_result = span.enter();
 
                 // TODO: error handling
@@ -163,11 +161,7 @@ impl WorkersNegotiator {
 
                 let request = net_protocol::queue::Request {
                     entity,
-                    message: net_protocol::queue::Message::WorkerResult(
-                        invocation_id,
-                        work_id,
-                        result,
-                    ),
+                    message: net_protocol::queue::Message::WorkerResult(run_id, work_id, result),
                 };
 
                 // TODO: error handling
@@ -179,7 +173,7 @@ impl WorkersNegotiator {
             let client = client.boxed_clone();
 
             move || {
-                let span = tracing::trace_span!("get_next_work", invocation_id=?invocation_id, new_work_server=?queue_new_work_addr);
+                let span = tracing::trace_span!("get_next_work", run_id=?run_id, new_work_server=?queue_new_work_addr);
                 let _get_next_work = span.enter();
 
                 // TODO: error handling
@@ -189,11 +183,11 @@ impl WorkersNegotiator {
                     .connect(queue_new_work_addr)
                     .expect("work server not available");
 
-                // Write the invocation ID we want work for
+                // Write the run ID we want work for
                 // TODO: error handling
                 net_protocol::write(
                     &mut stream,
-                    net_protocol::work_server::WorkServerRequest::NextTest { invocation_id },
+                    net_protocol::work_server::WorkServerRequest::NextTest { run_id },
                 )
                 .unwrap();
 
@@ -203,8 +197,8 @@ impl WorkersNegotiator {
         });
 
         let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
-            Some(Box::new(move |entity, invocation_id, manifest| {
-                let span = tracing::trace_span!("notify_manifest", ?entity, invocation_id=?invocation_id, queue_server=?queue_results_addr);
+            Some(Box::new(move |entity, run_id, manifest| {
+                let span = tracing::trace_span!("notify_manifest", ?entity, run_id=?run_id, queue_server=?queue_results_addr);
                 let _notify_manifest = span.enter();
 
                 // TODO: error handling
@@ -214,7 +208,7 @@ impl WorkersNegotiator {
 
                 let request = net_protocol::queue::Request {
                     entity,
-                    message: net_protocol::queue::Message::Manifest(invocation_id, manifest),
+                    message: net_protocol::queue::Message::Manifest(run_id, manifest),
                 };
 
                 // TODO: error handling
@@ -233,7 +227,7 @@ impl WorkersNegotiator {
             worker_context,
             work_timeout,
             work_retries,
-            invocation_id,
+            run_id,
             notify_manifest,
         };
 
@@ -300,7 +294,7 @@ pub enum QueueNegotiateError {
 
 /// The test run a worker should ask for work on.
 pub struct AssignedRun {
-    pub invocation_id: InvocationId,
+    pub run_id: RunId,
     pub runner_kind: RunnerKind,
     pub should_generate_manifest: bool,
 }
@@ -322,7 +316,7 @@ pub enum QueueNegotiatorServerError {
 
 struct QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
+    GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
 {
     get_assigned_run: Arc<GetAssignedRun>,
     advertised_queue_work_scheduler_addr: SocketAddr,
@@ -332,7 +326,7 @@ where
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
+    GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -354,7 +348,7 @@ impl QueueNegotiator {
         get_assigned_run: GetAssignedRun,
     ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
+        GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
     {
         let addr = listener.local_addr()?;
 
@@ -428,7 +422,7 @@ impl QueueNegotiator {
         stream: net_async::UnverifiedServerStream,
     ) -> io::Result<()>
     where
-        GetAssignedRun: Fn(InvocationId) -> AssignedRun + Send + Sync + 'static,
+        GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
     {
         let mut stream = ctx.handshake_ctx.handshake(stream).await?;
         let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut stream).await?;
@@ -442,33 +436,31 @@ impl QueueNegotiator {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
             }
-            WantsToAttach {
-                invocation: wanted_invocation_id,
-            } => {
+            WantsToAttach { run: wanted_run_id } => {
                 tracing::debug!("New worker set negotiating");
 
-                // Choose an `abq test ...` invocation the workers should perform work
+                // Choose an `abq test ...` run the workers should perform work
                 // for.
                 // TODO: this fully blocks the negotiator, so nothing else can connect
-                // while we wait for an invocation, and moreover we won't respect
+                // while we wait for an run, and moreover we won't respect
                 // shutdown messages.
                 tracing::debug!("Finding assigned run");
                 let AssignedRun {
-                    invocation_id,
+                    run_id,
                     runner_kind,
                     should_generate_manifest,
-                } = (ctx.get_assigned_run)(wanted_invocation_id);
+                } = (ctx.get_assigned_run)(wanted_run_id);
 
                 tracing::debug!("Found assigned run");
 
-                debug_assert_eq!(invocation_id, wanted_invocation_id);
+                debug_assert_eq!(run_id, wanted_run_id);
 
                 let execution_context = MessageFromQueueNegotiator::ExecutionContext {
                     queue_new_work_addr: ctx.advertised_queue_work_scheduler_addr,
                     queue_results_addr: ctx.advertised_queue_results_addr,
                     runner_kind,
                     worker_should_generate_manifest: should_generate_manifest,
-                    invocation_id,
+                    run_id,
                 };
 
                 tracing::debug!("Sending execution context");
@@ -523,7 +515,7 @@ mod test {
     };
     use abq_utils::net_protocol::work_server::WorkServerRequest;
     use abq_utils::net_protocol::workers::{
-        InvocationId, NextWork, NextWorkBundle, RunnerKind, TestLikeRunner, WorkContext, WorkId,
+        NextWork, NextWorkBundle, RunId, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
     use abq_utils::{flatten_manifest, net, net_protocol};
     use tracing_test::internal::logs_with_scope_contain;
@@ -555,7 +547,7 @@ mod test {
                                 context: WorkContext {
                                     working_dir: PathBuf::from("/"),
                                 },
-                                invocation_id: InvocationId::new(),
+                                run_id: RunId::new(),
                                 work_id: WorkId(i.to_string()),
                             })
                             .collect();
@@ -688,16 +680,16 @@ mod test {
         let (msgs, results_addr, shutdown_results_server, results_handle) =
             mock_queue_results_server(manifest_collector);
 
-        let invocation_id = InvocationId::new();
+        let run_id = RunId::new();
 
-        let get_assigned_run = |invocation_id| {
+        let get_assigned_run = |run_id| {
             let manifest = ManifestMessage {
                 manifest: Manifest {
                     members: vec![echo_test("hello".to_string())],
                 },
             };
             AssignedRun {
-                invocation_id,
+                run_id,
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
                 should_generate_manifest: true,
             }
@@ -723,7 +715,7 @@ mod test {
             workers_config,
             queue_negotiator.get_handle(),
             ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO),
-            invocation_id,
+            run_id,
         )
         .unwrap();
 
@@ -756,7 +748,7 @@ mod test {
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
             |_| AssignedRun {
-                invocation_id: InvocationId::new(),
+                run_id: RunId::new(),
                 runner_kind: RunnerKind::TestLikeRunner(
                     TestLikeRunner::Echo,
                     ManifestMessage {
