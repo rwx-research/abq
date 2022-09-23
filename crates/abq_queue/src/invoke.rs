@@ -54,7 +54,7 @@ impl Client {
         let invoke_request = queue::Request {
             entity,
             message: Message::InvokeWork(InvokeWork {
-                run_id,
+                run_id: run_id.clone(),
                 runner,
                 batch_size_hint,
             }),
@@ -79,7 +79,7 @@ impl Client {
             &mut new_stream,
             &queue::Request {
                 entity: self.entity,
-                message: Message::Reconnect(self.run_id),
+                message: Message::Reconnect(self.run_id.clone()),
             },
         )
         .await?;

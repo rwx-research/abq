@@ -107,11 +107,13 @@ jobs:
           captain-token: "${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}"
 
       - name: Run tests with cargo
+        timeout-minutes: 2
         if: github.run_attempt == 1
         run: |
           cargo test --all-features
 
       - name: Run retried tests with cargo, including debug output
+        timeout-minutes: 2
         if: github.run_attempt > 1
         run: |
            export ABQ_DEBUG_CLI_TESTS_FOR_CI=1

@@ -303,13 +303,13 @@ fn run_tests(
     };
 
     let start_in_process_workers = opt_test_id.is_none();
-    let test_id = opt_test_id.unwrap_or_else(RunId::new);
+    let run_id = opt_test_id.unwrap_or_else(RunId::unique);
 
     let work_results_thread = start_test_result_reporter(
         entity,
         abq.server_addr(),
         abq.client_options(),
-        test_id,
+        run_id.clone(),
         runner,
         batch_size,
         on_result,
@@ -322,11 +322,11 @@ fn run_tests(
             working_dir,
             abq.negotiator_handle(),
             abq.client_options(),
-            test_id,
+            run_id,
         )?;
         Some(workers)
     } else {
-        println!("Starting test run with ID {}", test_id);
+        println!("Starting test run with ID {}", run_id);
         None
     };
 

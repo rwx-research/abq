@@ -272,7 +272,7 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         let queue_addr = format!("0.0.0.0:{server_port}");
-        let test_id = RunId::new().to_string();
+        let test_id = RunId::unique().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
@@ -386,7 +386,7 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         let queue_addr = format!("0.0.0.0:{server_port}");
-        let test_id = RunId::new().to_string();
+        let test_id = RunId::unique().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
 
