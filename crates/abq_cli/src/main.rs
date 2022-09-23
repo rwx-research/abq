@@ -29,8 +29,8 @@ use args::{default_num_workers, Cli, Command};
 
 use instance::AbqInstance;
 use reporting::{ColorPreference, ExitCode, ReporterKind, SuiteReporters};
-use tracing::metadata::LevelFilter;
-use tracing_subscriber::{fmt, layer, prelude::*, EnvFilter, Registry};
+use tracing::{metadata::LevelFilter, Subscriber};
+use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
 use crate::{args::Token, health::HealthCheckKind};
 
@@ -43,6 +43,28 @@ struct TracingGuards {
     _file_appender_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
+struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
+    format: fmt::format::Format<fmt::format::Full, T>,
+    prefix: String,
+}
+
+impl<S, N, T> fmt::format::FormatEvent<S, N> for PrefixedCiEventFormat<T>
+where
+    S: Subscriber + for<'a> registry::LookupSpan<'a>,
+    N: for<'writer> fmt::FormatFields<'writer> + 'static,
+    T: fmt::time::FormatTime,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        writer.write_str(&self.prefix)?;
+        self.format.format_event(ctx, writer, event)
+    }
+}
+
 #[must_use]
 fn setup_tracing() -> TracingGuards {
     // Trace to standard error with ABQ_LOG set. If unset, trace and log nothing.
@@ -52,33 +74,66 @@ fn setup_tracing() -> TracingGuards {
         .from_env()
         .unwrap();
 
-    let stderr_layer = fmt::Layer::default()
-        .with_writer(std::io::stderr)
-        .with_span_events(fmt::format::FmtSpan::ACTIVE)
-        .with_filter(env_filter);
-
-    // Trace to a rotating log file under ABQ_FILE_LOG_DIR, if it's set.
-    let (file_log_layer, file_appender_guard) = if let Ok(dir) = std::env::var("ABQ_FILE_LOG_DIR") {
+    if let Ok(dir) = std::env::var("ABQ_LOGTO") {
+        // Trace to a rotating log file under ABQ_LOGTO, if it's set.
         let file_appender = tracing_appender::rolling::hourly(dir, "abq.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        (
-            fmt::Layer::default()
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .boxed(),
-            Some(guard),
-        )
+        let rolling_file_layer = fmt::Layer::default()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_filter(env_filter);
+
+        Registry::default().with(rolling_file_layer).init();
+
+        TracingGuards {
+            _file_appender_guard: Some(guard),
+        }
+    } else if let Ok(file) = std::env::var("ABQ_LOGFILE") {
+        // Trace to a static log file at ABQ_LOGFILE, if it's set
+        let _ = std::fs::remove_file(&file);
+        let file_appender = tracing_appender::rolling::never(".", file);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let file_layer = fmt::Layer::default()
+            .with_writer(non_blocking)
+            .with_ansi(false)
+            .with_filter(env_filter);
+
+        Registry::default().with(file_layer).init();
+
+        TracingGuards {
+            _file_appender_guard: Some(guard),
+        }
+    } else if let Ok(prefix) = std::env::var("ABQ_LOGCI_WITH_PREFIX") {
+        // Log to stderr, with all events having a given prefix. For use in CI where we just want
+        // to dump all logs to a single stderr stream and filter by prefix later.
+        let format = PrefixedCiEventFormat {
+            format: fmt::format::Format::default().with_ansi(false),
+            prefix,
+        };
+
+        let stderr_layer = fmt::Layer::default()
+            .with_span_events(fmt::format::FmtSpan::ACTIVE)
+            .event_format(format)
+            .with_writer(std::io::stderr)
+            .with_filter(env_filter);
+
+        Registry::default().with(stderr_layer).init();
+
+        TracingGuards {
+            _file_appender_guard: None,
+        }
     } else {
-        (layer::Identity::new().boxed(), None)
-    };
+        // Otherwise, log to stderr as appropriate.
+        let stderr_layer = fmt::Layer::default()
+            .with_writer(std::io::stderr)
+            .with_span_events(fmt::format::FmtSpan::ACTIVE)
+            .with_filter(env_filter);
 
-    Registry::default()
-        .with(stderr_layer)
-        .with(file_log_layer)
-        .init();
+        Registry::default().with(stderr_layer).init();
 
-    TracingGuards {
-        _file_appender_guard: file_appender_guard,
+        TracingGuards {
+            _file_appender_guard: None,
+        }
     }
 }
 
