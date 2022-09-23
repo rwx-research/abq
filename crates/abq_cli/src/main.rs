@@ -6,13 +6,12 @@ mod workers;
 
 use std::{
     collections::HashMap,
-    io,
     net::SocketAddr,
     num::NonZeroU64,
     thread::{self, JoinHandle},
 };
 
-use abq_queue::invoke::Client;
+use abq_queue::invoke::{Client, InvocationError};
 use abq_utils::{
     auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
     net_opt::{ClientOptions, ServerOptions, Tls},
@@ -351,7 +350,7 @@ fn start_test_result_reporter(
     runner: RunnerKind,
     batch_size: NonZeroU64,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
-) -> JoinHandle<Result<(), io::Error>> {
+) -> JoinHandle<Result<(), InvocationError>> {
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -366,7 +365,8 @@ fn start_test_result_reporter(
                 batch_size,
             )
             .await?;
-            abq_test_client.stream_results(on_result).await
+            abq_test_client.stream_results(on_result).await?;
+            Ok(())
         })
     })
 }

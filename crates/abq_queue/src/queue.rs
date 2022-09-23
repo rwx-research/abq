@@ -14,7 +14,7 @@ use abq_utils::net_async;
 use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
-use abq_utils::net_protocol::queue::{InvokerResponse, Request};
+use abq_utils::net_protocol::queue::{InvokerTestResult, Request};
 use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
@@ -83,8 +83,36 @@ struct RunQueues {
     run_data: HashMap<RunId, RunData>,
 }
 
+/// A reason a new queue for a run could not be created.
+#[derive(Debug)]
+enum NewQueueError {
+    /// The run ID has an active run.
+    RunIdAlreadyInProgress,
+    /// The run ID was previously completed.
+    RunIdPreviouslyCompleted,
+}
+
 impl RunQueues {
-    pub fn create_queue(&mut self, run_id: RunId, runner: RunnerKind, batch_size_hint: NonZeroU64) {
+    /// Attempts to create a new queue for a run.
+    /// If the given run ID already has an associated queue, an error is returned.
+    pub fn create_queue(
+        &mut self,
+        run_id: RunId,
+        runner: RunnerKind,
+        batch_size_hint: NonZeroU64,
+    ) -> Result<(), NewQueueError> {
+        if let Some(state) = self.queues.get(&run_id) {
+            let err = match state {
+                RunState::WaitingForFirstWorker
+                | RunState::WaitingForManifest
+                | RunState::HasWork { .. } => NewQueueError::RunIdAlreadyInProgress,
+                RunState::Done { .. } => NewQueueError::RunIdPreviouslyCompleted,
+            };
+
+            return Err(err);
+        }
+
+        // The run ID is fresh; create a new queue for it.
         let old_queue = self
             .queues
             .insert(run_id.clone(), RunState::WaitingForFirstWorker);
@@ -98,6 +126,8 @@ impl RunQueues {
             },
         );
         debug_assert!(old_run_data.is_none());
+
+        Ok(())
     }
 
     // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
@@ -441,7 +471,7 @@ enum ClientResponder {
     /// There is not yet an open connection we can stream the test results back on.
     /// This state may be reached during the time a client is disconnected.
     Disconnected {
-        buffered_results: Vec<InvokerResponse>,
+        buffered_results: Vec<InvokerTestResult>,
     },
 }
 
@@ -450,7 +480,7 @@ impl ClientResponder {
         Self::DirectStream(stream)
     }
 
-    async fn send_and_ack_one_test_result(&mut self, test_result: InvokerResponse) {
+    async fn send_and_ack_one_test_result(&mut self, test_result: InvokerTestResult) {
         use net_protocol::client::AckTestResult;
 
         match self {
@@ -742,7 +772,7 @@ impl QueueServer {
         active_runs: ActiveRunResponders,
         queues: SharedRunQueues,
         entity: EntityId,
-        stream: Box<dyn net_async::ServerStream>,
+        mut stream: Box<dyn net_async::ServerStream>,
         invoke_work: InvokeWork,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let InvokeWork {
@@ -751,24 +781,60 @@ impl QueueServer {
             batch_size_hint,
         } = invoke_work;
 
-        let results_responder = ClientResponder::new(stream);
-        let old_responder = active_runs
-            .lock()
-            .await
-            .insert(run_id.clone(), results_responder);
+        let could_create_queue =
+            queues
+                .lock()
+                .unwrap()
+                .create_queue(run_id.clone(), runner, batch_size_hint);
 
-        debug_assert!(
-            old_responder.is_none(),
-            "Existing stream for expected unique run id"
-        );
+        match could_create_queue {
+            Ok(()) => {
+                // Let the invoker know that our enqueuing of the work was successful, and it can
+                // start polling for test results.
+                //
+                // TODO: if this write fails, we will be in an inconsistent state and have leaked a
+                // run ID - there will be an active queue, but no active responder for when test
+                // results start streaming back in.
+                // If this run fails, we should switch the queue state to a mode where we say
+                // "something has went wrong" and disallow workers to pull tests until either the
+                // invoker re-invokes the run, or the run gets deleted.
+                net_protocol::async_write(
+                    &mut stream,
+                    &net_protocol::queue::InvokeWorkResponse::Success,
+                )
+                .await?;
 
-        // Create a new work queue for this run.
-        queues
-            .lock()
-            .unwrap()
-            .create_queue(run_id, runner, batch_size_hint);
+                // NOTE: it's important that there are no explicit errors hereafter, so that the
+                // "success" message is, in fact, indicative of a true success.
+                let results_responder = ClientResponder::new(stream);
+                let old_responder = active_runs.lock().await.insert(run_id, results_responder);
+                debug_assert!(
+                    old_responder.is_none(),
+                    "Existing stream for expected unique run id"
+                );
 
-        Ok(())
+                Ok(())
+            }
+            Err(err) => {
+                let failure_reason = match err {
+                    NewQueueError::RunIdAlreadyInProgress => {
+                        net_protocol::queue::InvokeFailureReason::DuplicateRunId {
+                            recently_completed: false,
+                        }
+                    }
+                    NewQueueError::RunIdPreviouslyCompleted => {
+                        net_protocol::queue::InvokeFailureReason::DuplicateRunId {
+                            recently_completed: true,
+                        }
+                    }
+                };
+                let failure_msg = net_protocol::queue::InvokeWorkResponse::Failure(failure_reason);
+
+                net_protocol::async_write(&mut stream, &failure_msg).await?;
+
+                Ok(())
+            }
+        }
     }
 
     #[instrument(level = "trace", skip(active_runs, new_stream))]
@@ -855,7 +921,7 @@ impl QueueServer {
             let invoker_stream = active_runs.get_mut(&run_id).expect("run is not active");
 
             invoker_stream
-                .send_and_ack_one_test_result(InvokerResponse::Result(work_id, result))
+                .send_and_ack_one_test_result(InvokerTestResult::Result(work_id, result))
                 .await;
         }
 
@@ -886,7 +952,8 @@ impl QueueServer {
 
             match responder {
                 ClientResponder::DirectStream(mut stream) => {
-                    net_protocol::async_write(&mut stream, &InvokerResponse::EndOfResults).await?;
+                    net_protocol::async_write(&mut stream, &InvokerTestResult::EndOfResults)
+                        .await?;
                     drop(stream);
                 }
                 ClientResponder::Disconnected { buffered_results } => {
@@ -1065,7 +1132,7 @@ mod test {
 
     use super::{Abq, RunStateCache};
     use crate::{
-        invoke::Client,
+        invoke::{Client, InvocationError},
         queue::{
             ActiveRunResponders, ClientReconnectionError, ClientResponder, QueueServer,
             SharedRunQueues, WorkScheduler,
@@ -2046,6 +2113,148 @@ mod test {
         let exit2 = workers2.shutdown();
         assert!(matches!(exit2, WorkersExit::Failure));
 
+        queue.shutdown().unwrap();
+    }
+
+    #[test]
+    #[timeout(1000)] // 1 second
+    fn invoke_work_with_duplicate_id_is_an_error() {
+        let queue = Abq::start(Default::default());
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![
+                    echo_test("echo1".to_string()),
+                    echo_test("echo2".to_string()),
+                ],
+            },
+        };
+
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
+        let queue_server_addr = queue.server_addr();
+
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+
+        let run_id = RunId::unique();
+
+        let handle = thread::spawn({
+            let run_id = run_id.clone();
+            move || {
+                make_runtime().block_on(async {
+                    // Start one client with the run ID
+                    let _client1 = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id.clone(),
+                        runner.clone(),
+                        one_nonzero(),
+                    )
+                    .await
+                    .unwrap();
+
+                    // Start a second, with the same run ID
+                    let client2_result = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id.clone(),
+                        runner,
+                        one_nonzero(),
+                    )
+                    .await;
+
+                    match client2_result {
+                        Err(err) => err,
+                        Ok(_) => unreachable!(),
+                    }
+                })
+            }
+        });
+
+        match handle.join().unwrap() {
+            InvocationError::DuplicateRun(run) => assert_eq!(run, run_id),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    #[timeout(1000)] // 1 second
+    fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
+        let mut queue = Abq::start(Default::default());
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![echo_test("echo1".to_string())],
+            },
+        };
+
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
+        let workers_config = WorkersConfig {
+            num_workers: 1.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(0),
+        };
+
+        let queue_server_addr = queue.server_addr();
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+        let run_id = RunId::unique();
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
+
+            move || {
+                make_runtime().block_on(async {
+                    // Start one client, and have it drain its test queue
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id.clone(),
+                        runner.clone(),
+                        one_nonzero(),
+                    )
+                    .await
+                    .unwrap();
+
+                    client.stream_results(|_, _| {}).await.unwrap();
+
+                    // Start a second, with the same run ID
+                    let client2_result = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                    )
+                    .await;
+
+                    match client2_result {
+                        Err(err) => err,
+                        Ok(_) => unreachable!(),
+                    }
+                })
+            }
+        });
+
+        // Start the workers for the first run
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id.clone(),
+        )
+        .unwrap();
+
+        let invocation_error = results_handle.join().unwrap();
+
+        match invocation_error {
+            InvocationError::DuplicateCompletedRun(run) => assert_eq!(run, run_id),
+            _ => unreachable!(),
+        }
+
+        let _ = workers.shutdown();
         queue.shutdown().unwrap();
     }
 }
