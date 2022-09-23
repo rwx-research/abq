@@ -6,7 +6,7 @@ use std::time::Duration;
 use abq_utils::net_opt::ClientOptions;
 use abq_utils::net_protocol::workers::RunId;
 use abq_workers::negotiate::{QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator};
-use abq_workers::workers::{WorkerContext, WorkerPool};
+use abq_workers::workers::{WorkerContext, WorkerPool, WorkersExit};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
@@ -75,9 +75,19 @@ pub fn start_workers_forever(
             term_signals.pending().next().is_some() || !worker_pool.workers_alive();
 
         if should_shutdown {
-            worker_pool.shutdown();
+            let exit_status = worker_pool.shutdown();
             tracing::debug!("Workers shutdown");
-            std::process::exit(0);
+
+            // We want to exit with an appropriate code if the workers were determined to have run
+            // any test that failed. This way, in distributed contexts, failure of test runs induces
+            // failures of workers, and it is enough to restart all unsuccessful processes to
+            // re-initialize an ABQ run.
+            let exit_code = match exit_status {
+                WorkersExit::Success => 0,
+                WorkersExit::Failure => 1,
+                WorkersExit::Error => 101,
+            };
+            std::process::exit(exit_code);
         }
     }
 }

@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use serial_test::serial;
 use std::process::{ExitStatus, Output};
 use std::{
     ffi::OsStr,
@@ -127,7 +128,9 @@ macro_rules! test_all_network_config_options {
         $run:expr
     ) => { paste::paste! {
         #[test]
+        #[serial]
         $(#[$cfg])*
+        #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _no_auth_no_tls>]() {
             $run(CSConfigOptions {
                 use_auth_token: false,
@@ -136,7 +139,9 @@ macro_rules! test_all_network_config_options {
         }
 
         #[test]
+        #[serial]
         $(#[$cfg])*
+        #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _no_auth_with_tls>]() {
             $run(CSConfigOptions {
                 use_auth_token: false,
@@ -145,7 +150,9 @@ macro_rules! test_all_network_config_options {
         }
 
         #[test]
+        #[serial]
         $(#[$cfg])*
+        #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _with_auth_no_tls>]() {
             $run(CSConfigOptions {
                 use_auth_token: true,
@@ -154,7 +161,9 @@ macro_rules! test_all_network_config_options {
         }
 
         #[test]
+        #[serial]
         $(#[$cfg])*
+        #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _with_auth_with_tls>]() {
             $run(CSConfigOptions {
                 use_auth_token: true,
@@ -166,8 +175,7 @@ macro_rules! test_all_network_config_options {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_auto_workers_without_failure |conf: CSConfigOptions| {
-
+    yarn_jest_auto_workers_without_failure (|conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
         let args = &["test", "--reporter", "dot"];
         let mut args = conf.extend_args(args);
@@ -184,26 +192,26 @@ test_all_network_config_options! {
         assert!(exit_status.success());
         assert_eq!(stdout, "..");
         assert!(stderr.is_empty(), "{:?}", stderr);
-    }
+    })
 }
 
 test_all_network_config_options! {
-    queue_open_servers_on_specified_ports |conf: CSConfigOptions| {
+    queue_open_servers_on_specified_ports (|conf: CSConfigOptions| {
         let server_port = find_free_port();
         let worker_port = find_free_port();
         let negotiator_port = find_free_port();
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
         let mut queue_proc = spawn_abq(conf.extend_args(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+                "start",
+                "--bind",
+                "0.0.0.0",
+                "--port",
+                &server_port.to_string(),
+                "--work-port",
+                &worker_port.to_string(),
+                "--negotiator-port",
+                &negotiator_port.to_string(),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -224,12 +232,12 @@ test_all_network_config_options! {
 
         // Must kill the queue because it sits around forever, waiting for new requests.
         queue_proc.kill().expect("queue already dead");
-    }
+    })
 }
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_separate_queue_workers_test_without_failure |conf: CSConfigOptions| {
+    yarn_jest_separate_queue_workers_test_without_failure (|conf: CSConfigOptions| {
         let server_port = find_free_port();
         let worker_port = find_free_port();
         let negotiator_port = find_free_port();
@@ -241,15 +249,15 @@ test_all_network_config_options! {
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
         let mut queue_proc = spawn_abq(conf.extend_args(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+                "start",
+                "--bind",
+                "0.0.0.0",
+                "--port",
+                &server_port.to_string(),
+                "--work-port",
+                &worker_port.to_string(),
+                "--negotiator-port",
+                &negotiator_port.to_string(),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -307,12 +315,12 @@ test_all_network_config_options! {
 
         // Must kill the queue because it sits around forever, waiting for new requests.
         queue_proc.kill().expect("queue already dead");
-    }
+    })
 }
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_auto_workers_with_failing_tests |conf: CSConfigOptions| {
+    yarn_jest_auto_workers_with_failing_tests (|conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
         let test_args = &[
             "test",
@@ -337,11 +345,97 @@ test_all_network_config_options! {
         assert_eq!(stdout_lines.next().unwrap(), "F");
 
         assert!(stderr.is_empty(), "{:?}", stderr);
-    }
+    })
 }
 
 test_all_network_config_options! {
-    healthcheck_queue_success |conf: CSConfigOptions| {
+    #[cfg(feature = "test-abq-jest")]
+    yarn_jest_separate_queue_workers_with_failing_tests (|conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+        let test_id = RunId::new().to_string();
+
+        let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
+
+        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+        let mut queue_proc = spawn_abq(conf.extend_args(&[
+                "start",
+                "--bind",
+                "0.0.0.0",
+                "--port",
+                &server_port.to_string(),
+                "--work-port",
+                &worker_port.to_string(),
+                "--negotiator-port",
+                &negotiator_port.to_string(),
+        ]));
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start workers") {
+                    break;
+                }
+            }
+        }
+
+        // abq work --queue-addr ... --working-dir ... (--token ...)? <test_id>
+        let worker_args = &[
+            "work",
+            "--queue-addr",
+            &queue_addr,
+            "--working-dir",
+            &npm_jest_project_path.display().to_string(),
+        ];
+        let mut worker_args = conf.extend_args(worker_args);
+        worker_args.extend([test_id.as_str()]);
+        let mut worker_proc = spawn_abq(worker_args);
+
+        // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
+        let test_args = &[
+            "test",
+            "--reporter",
+            "dot",
+            "--queue-addr",
+            &queue_addr,
+            "--run-id",
+            &test_id,
+        ];
+        let mut test_args = conf.extend_args(test_args);
+        test_args.extend(["--", "yarn", "jest"]);
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = run_abq(test_args);
+
+        // The `abq test` process should exit with a failure
+        assert!(!exit_status.success(), "{:?}", (stdout, stderr));
+
+        let mut lines = stdout.lines();
+        assert!(lines.next().unwrap().contains("Starting test run"));
+        assert_eq!(lines.next().unwrap(), "F");
+
+        assert!(stderr.is_empty());
+
+        // The `abq work` process should also exit with a failure, corresponding to having
+        // witnessed a test failure in the run.
+        let worker_exit_status = worker_proc.wait().unwrap();
+        assert!(!worker_exit_status.success());
+
+        // Must kill the queue because it sits around forever, waiting for new requests.
+        queue_proc.kill().expect("queue already dead");
+    })
+}
+
+test_all_network_config_options! {
+    healthcheck_queue_success (|conf: CSConfigOptions| {
         let server_port = find_free_port();
         let work_port = find_free_port();
         let negotiator_port = find_free_port();
@@ -352,15 +446,15 @@ test_all_network_config_options! {
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
         let mut queue_proc = spawn_abq(conf.extend_args(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &work_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+                "start",
+                "--bind",
+                "0.0.0.0",
+                "--port",
+                &server_port.to_string(),
+                "--work-port",
+                &work_port.to_string(),
+                "--negotiator-port",
+                &negotiator_port.to_string(),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -382,13 +476,13 @@ test_all_network_config_options! {
             stderr,
             exit_status,
         } = run_abq(conf.extend_args(&[
-            "health",
-            "--queue",
-            &queue_addr,
-            "--work-scheduler",
-            &work_scheduler_addr,
-            "--negotiator",
-            &negotiator_addr,
+                "health",
+                "--queue",
+                &queue_addr,
+                "--work-scheduler",
+                &work_scheduler_addr,
+                "--negotiator",
+                &negotiator_addr,
         ]));
 
         assert!(exit_status.success(), "{}\n{}", stdout, stderr);
@@ -396,11 +490,11 @@ test_all_network_config_options! {
         assert!(stderr.is_empty());
 
         queue_proc.kill().expect("queue already dead");
-    }
+    })
 }
 
 test_all_network_config_options! {
-    healthcheck_queue_failure |conf: CSConfigOptions| {
+    healthcheck_queue_failure (|conf: CSConfigOptions| {
         let server_port = find_free_port();
         let work_port = find_free_port();
         let negotiator_port = find_free_port();
@@ -411,15 +505,15 @@ test_all_network_config_options! {
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
         let mut queue_proc = spawn_abq(conf.extend_args(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &work_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+                "start",
+                "--bind",
+                "0.0.0.0",
+                "--port",
+                &server_port.to_string(),
+                "--work-port",
+                &work_port.to_string(),
+                "--negotiator-port",
+                &negotiator_port.to_string(),
         ]));
 
         queue_proc.kill().expect("queue already dead");
@@ -431,13 +525,13 @@ test_all_network_config_options! {
             stderr,
             exit_status,
         } = run_abq(conf.extend_args(&[
-            "health",
-            "--queue",
-            &queue_addr,
-            "--work-scheduler",
-            &work_scheduler_addr,
-            "--negotiator",
-            &negotiator_addr,
+                "health",
+                "--queue",
+                &queue_addr,
+                "--work-scheduler",
+                &work_scheduler_addr,
+                "--negotiator",
+                &negotiator_addr,
         ]));
 
         assert_eq!(exit_status.code().unwrap(), 1);
@@ -451,5 +545,5 @@ Negotiator at {negotiator_addr}: unhealthy
             )
         );
         assert!(stderr.is_empty());
-    }
+    })
 }

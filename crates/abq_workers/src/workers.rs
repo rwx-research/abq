@@ -27,6 +27,8 @@ type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, RunId, ManifestMessage) + Send + Sync + 'static>;
 pub type NotifyResult = Arc<dyn Fn(EntityId, RunId, WorkId, TestResult) + Send + Sync + 'static>;
+/// Did a given run complete successfully? Returns true if so.
+pub type RunCompletedSuccessfully = Arc<dyn Fn(EntityId) -> bool + Send + Sync + 'static>;
 
 type MarkWorkerComplete = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -59,6 +61,9 @@ pub struct WorkerPoolConfig {
     pub get_next_work: GetNextWorkBundle,
     /// How should results be communicated back?
     pub notify_result: NotifyResult,
+    /// Query whether the assigned run completed successfully, without any failure.
+    /// Will block until the result is well-known.
+    pub run_completed_successfully: RunCompletedSuccessfully,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
     /// Timeout for a single unit of work in the pool.
@@ -94,6 +99,10 @@ pub struct WorkerPool {
     workers: Vec<ThreadWorker>,
     worker_msg_tx: mpsc::Sender<MessageFromPool>,
     live_count: LiveWorkers,
+    /// Query whether the run assigned for this pool completed successfully.
+    run_completed_successfully: RunCompletedSuccessfully,
+    /// The entity of the worker pool itself.
+    entity: EntityId,
 }
 
 struct LiveWorkers(Arc<AtomicUsize>);
@@ -117,6 +126,18 @@ impl LiveWorkers {
     }
 }
 
+pub enum WorkersExit {
+    /// This pool of workers was determined to complete successfully.
+    /// Corresponds to all workers for a given [run][RunId] having only work that was
+    /// successful.
+    Success,
+    /// This pool of workers was determined to fail.
+    /// Corresponds to any workers for a given [run][RunId] having any work that failed.
+    Failure,
+    /// Some worker in this pool errored in an unexpected way.
+    Error,
+}
+
 impl WorkerPool {
     pub fn new(config: WorkerPoolConfig) -> Self {
         let WorkerPoolConfig {
@@ -126,6 +147,7 @@ impl WorkerPool {
             get_next_work,
             notify_result,
             notify_manifest,
+            run_completed_successfully,
             worker_context,
             work_timeout,
             work_retries,
@@ -200,6 +222,8 @@ impl WorkerPool {
             workers,
             worker_msg_tx,
             live_count,
+            run_completed_successfully,
+            entity: EntityId::new(),
         }
     }
 
@@ -209,7 +233,9 @@ impl WorkerPool {
         self.live_count.read() > 0
     }
 
-    pub fn shutdown(&mut self) {
+    /// Shuts down the worker pool, returning the pool [exit status][WorkersExit].
+    #[must_use]
+    pub fn shutdown(&mut self) -> WorkersExit {
         debug_assert!(self.active);
 
         self.active = false;
@@ -229,13 +255,19 @@ impl WorkerPool {
                 .expect("runner thread panicked rather than erroring")
                 .expect("runner failed, but we didn't catch it");
         }
+
+        match (self.run_completed_successfully)(self.entity) {
+            true => WorkersExit::Success,
+            false => WorkersExit::Failure,
+        }
     }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
         if self.active {
-            self.shutdown()
+            // We can't do anything with the exit status at this point.
+            let _exit = self.shutdown();
         }
     }
 }
@@ -393,7 +425,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                         let start_time = Instant::now();
                         let attempt_result = attempt_test_id_for_test_like_runner(
                             &context,
-                            runner,
+                            runner.clone(),
                             test_case.id.clone(),
                             &work_context,
                             work_timeout,
@@ -458,10 +490,16 @@ fn attempt_test_id_for_test_like_runner(
                     let cmd = args.remove(0);
                     exec::ExecWorker::run(exec::Work { cmd, args })
                 }
-                #[cfg(feature = "test-test_ids")]
                 (R::InduceTimeout, _) => {
                     thread::sleep(Duration::MAX);
                     unreachable!()
+                }
+                (R::FailOnTestName(fail_name), test) => {
+                    if test == fail_name {
+                        panic!("INDUCED FAIL")
+                    } else {
+                        "PASS".to_string()
+                    }
                 }
                 #[cfg(feature = "test-test_ids")]
                 (R::EchoOnRetry(succeed_on), s) => {
@@ -543,7 +581,10 @@ mod test {
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
-    use super::{GetNextWorkBundle, NotifyManifest, NotifyResult, WorkerContext, WorkerPool};
+    use super::{
+        GetNextWorkBundle, NotifyManifest, NotifyResult, RunCompletedSuccessfully, WorkerContext,
+        WorkerPool, WorkersExit,
+    };
     use crate::negotiate::QueueNegotiator;
     use crate::workers::WorkerPoolConfig;
     use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkContext, WorkId};
@@ -575,14 +616,22 @@ mod test {
         (man, notify_result)
     }
 
-    fn results_collector() -> (ResultsCollector, NotifyResult) {
+    fn results_collector() -> (ResultsCollector, NotifyResult, RunCompletedSuccessfully) {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
         let notify_result: NotifyResult = Arc::new(move |_, _, work_id, result| {
             let old_result = results2.lock().unwrap().insert(work_id.0, result);
             debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
         });
-        (results, notify_result)
+        let results3 = Arc::clone(&results);
+        let get_completed_status: RunCompletedSuccessfully = Arc::new(move |_| {
+            results3
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, result)| !result.status.is_fail_like())
+        });
+        (results, notify_result, get_completed_status)
     }
 
     fn setup_pool(
@@ -591,6 +640,7 @@ mod test {
         manifest: ManifestMessage,
         get_next_work: GetNextWorkBundle,
         notify_result: NotifyResult,
+        run_completed_successfully: RunCompletedSuccessfully,
     ) -> (WorkerPoolConfig, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
 
@@ -601,6 +651,7 @@ mod test {
             run_id,
             notify_manifest: Some(notify_manifest),
             notify_result,
+            run_completed_successfully,
             worker_context: WorkerContext::AssumeLocal,
             work_timeout: Duration::from_secs(5),
             work_retries: 0,
@@ -669,7 +720,7 @@ mod test {
 
     fn test_echo_n(num_workers: usize, num_echos: usize) {
         let (write_work, get_next_work) = work_writer();
-        let (results, notify_result) = results_collector();
+        let (results, notify_result, run_completed_successfully) = results_collector();
 
         let run_id = RunId::new();
         let mut expected_results = HashMap::new();
@@ -692,6 +743,7 @@ mod test {
             manifest,
             get_next_work,
             notify_result,
+            run_completed_successfully,
         );
 
         let config = WorkerPoolConfig {
@@ -725,7 +777,8 @@ mod test {
             results == expected_results
         });
 
-        pool.shutdown();
+        let exit = pool.shutdown();
+        assert!(matches!(exit, WorkersExit::Success));
     }
 
     #[test]
@@ -889,7 +942,7 @@ mod test {
     #[test]
     fn work_in_constant_context() {
         let (write_work, get_next_work) = work_writer();
-        let (results, notify_result) = results_collector();
+        let (results, notify_result, run_completed_successfully) = results_collector();
 
         let working_dir = TempDir::new().unwrap();
         std::fs::write(working_dir.path().join("testfile"), "testcontent").unwrap();
@@ -911,6 +964,7 @@ mod test {
             manifest,
             get_next_work,
             notify_result,
+            run_completed_successfully,
         );
 
         let pool_config = WorkerPoolConfig {
@@ -948,7 +1002,8 @@ mod test {
             result.status == Status::Success && result.output.as_ref().unwrap() == "testcontent"
         });
 
-        pool.shutdown();
+        let exit = pool.shutdown();
+        assert!(matches!(exit, WorkersExit::Success));
     }
 
     #[test]
