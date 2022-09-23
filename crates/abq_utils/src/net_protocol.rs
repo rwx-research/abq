@@ -160,18 +160,23 @@ pub mod workers {
         str::FromStr,
     };
 
-    #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
     /// ID for a particular run of the queue, which sends many units of work.
-    ///
-    // TODO: consider supporting arbitrary strings, to ease the generation of in some contexts
-    // (like a CI server that wants to use the build number to identify the test run). Note that we
-    // need uniqueness checking either way, which we don't do yet.
-    pub struct RunId(pub [u8; 16]);
+    /// We allow run IDs to be arbitrary strings, so that users can choose an identifier that suits
+    /// their use case best.
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+    pub struct RunId(
+        // NOTE: we could be clever here, for example, most identifiers are likely to be
+        // 40 bytes or less. You could keep those on the stack and avoid clones everywhere, or have the
+        // protocol messages always take `RunId`s by reference.
+        //
+        // But let's not be clever right now!
+        pub String,
+    );
 
     impl RunId {
         #[allow(clippy::new_without_default)] // Run IDs should be fresh, not defaulted
-        pub fn new() -> Self {
-            Self(uuid::Uuid::new_v4().into_bytes())
+        pub fn unique() -> Self {
+            Self(uuid::Uuid::new_v4().to_string())
         }
     }
 
@@ -179,21 +184,19 @@ pub mod workers {
         type Err = String;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let id = uuid::Uuid::from_str(s).map_err(|_| format!("{} is not a valid run ID", s))?;
-
-            Ok(Self(id.into_bytes()))
+            Ok(Self(s.to_string()))
         }
     }
 
     impl Display for RunId {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+            write!(f, "{}", self.0)
         }
     }
 
     impl fmt::Debug for RunId {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+            write!(f, "{}", self.0)
         }
     }
 

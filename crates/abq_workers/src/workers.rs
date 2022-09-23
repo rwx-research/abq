@@ -25,8 +25,8 @@ enum MessageFromPool {
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
-pub type NotifyManifest = Box<dyn Fn(EntityId, RunId, ManifestMessage) + Send + Sync + 'static>;
-pub type NotifyResult = Arc<dyn Fn(EntityId, RunId, WorkId, TestResult) + Send + Sync + 'static>;
+pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestMessage) + Send + Sync + 'static>;
+pub type NotifyResult = Arc<dyn Fn(EntityId, &RunId, WorkId, TestResult) + Send + Sync + 'static>;
 /// Did a given run complete successfully? Returns true if so.
 pub type RunCompletedSuccessfully = Arc<dyn Fn(EntityId) -> bool + Send + Sync + 'static>;
 
@@ -182,7 +182,7 @@ impl WorkerPool {
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
-                run_id,
+                run_id: run_id.clone(),
                 get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
@@ -204,7 +204,7 @@ impl WorkerPool {
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
-                run_id,
+                run_id: run_id.clone(),
                 get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
@@ -335,13 +335,16 @@ fn start_generic_test_runner(
 
     tracing::debug!(?entity, "Starting new generic test runner");
 
-    let notify_manifest = notify_manifest
-        .map(|notify_manifest| move |manifest| notify_manifest(entity, run_id, manifest));
+    let notify_manifest = notify_manifest.map(|notify_manifest| {
+        let run_id = run_id.clone();
+        move |manifest| notify_manifest(entity, &run_id, manifest)
+    });
 
     let get_next_work_bundle = move || get_next_work_bundle();
 
-    let send_test_result =
-        move |work_id, test_result: TestResult| notify_result(entity, run_id, work_id, test_result);
+    let send_test_result = move |work_id, test_result: TestResult| {
+        notify_result(entity, &run_id, work_id, test_result)
+    };
 
     let polling_should_shutdown = || {
         matches!(
@@ -385,7 +388,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
     let entity = EntityId::new();
 
     if let Some(notify_manifest) = notify_manifest {
-        notify_manifest(entity, run_id, manifest);
+        notify_manifest(entity, &run_id, manifest);
     }
 
     'tests_done: loop {
@@ -451,7 +454,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                             meta: Default::default(),
                         };
 
-                        notify_result(entity, run_id, work_id.clone(), result);
+                        notify_result(entity, &run_id, work_id.clone(), result);
                         break 'attempts;
                     }
                 }
@@ -722,7 +725,7 @@ mod test {
         let (write_work, get_next_work) = work_writer();
         let (results, notify_result, run_completed_successfully) = results_collector();
 
-        let run_id = RunId::new();
+        let run_id = RunId::unique();
         let mut expected_results = HashMap::new();
         let tests = (0..num_echos)
             .into_iter()
@@ -739,7 +742,7 @@ mod test {
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::Echo,
-            run_id,
+            run_id.clone(),
             manifest,
             get_next_work,
             notify_result,
@@ -757,7 +760,7 @@ mod test {
         let test_ids = await_manifest_test_cases(manifest_collector);
 
         for (i, test_id) in test_ids.into_iter().enumerate() {
-            write_work(local_work(test_id, run_id, WorkId(i.to_string())))
+            write_work(local_work(test_id, run_id.clone(), WorkId(i.to_string())))
         }
 
         for _ in 0..num_workers {
@@ -951,7 +954,7 @@ mod test {
             working_dir: working_dir.path().to_owned(),
         };
 
-        let run_id = RunId::new();
+        let run_id = RunId::unique();
         let manifest = ManifestMessage {
             manifest: Manifest {
                 members: vec![exec_test("cat", &["testfile"])],
@@ -960,7 +963,7 @@ mod test {
 
         let (default_config, manifest_collector) = setup_pool(
             TestLikeRunner::Exec,
-            run_id,
+            run_id.clone(),
             manifest,
             get_next_work,
             notify_result,
@@ -986,7 +989,7 @@ mod test {
             write_work(NextWork::Work {
                 test_case,
                 context: context.clone(),
-                run_id,
+                run_id: run_id.clone(),
                 work_id: WorkId("id1".to_string()),
             });
         }

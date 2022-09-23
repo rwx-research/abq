@@ -162,7 +162,11 @@ impl WorkersNegotiator {
 
                 let request = net_protocol::queue::Request {
                     entity,
-                    message: net_protocol::queue::Message::WorkerResult(run_id, work_id, result),
+                    message: net_protocol::queue::Message::WorkerResult(
+                        run_id.clone(),
+                        work_id,
+                        result,
+                    ),
                 };
 
                 // TODO: error handling
@@ -172,6 +176,7 @@ impl WorkersNegotiator {
 
         let get_next_work: GetNextWorkBundle = Arc::new({
             let client = client.boxed_clone();
+            let run_id = run_id.clone();
 
             move || {
                 let span = tracing::trace_span!("get_next_work", run_id=?run_id, new_work_server=?queue_new_work_addr);
@@ -188,7 +193,9 @@ impl WorkersNegotiator {
                 // TODO: error handling
                 net_protocol::write(
                     &mut stream,
-                    net_protocol::work_server::WorkServerRequest::NextTest { run_id },
+                    net_protocol::work_server::WorkServerRequest::NextTest {
+                        run_id: run_id.clone(),
+                    },
                 )
                 .unwrap();
 
@@ -212,7 +219,7 @@ impl WorkersNegotiator {
 
                     let request = net_protocol::queue::Request {
                         entity,
-                        message: net_protocol::queue::Message::Manifest(run_id, manifest),
+                        message: net_protocol::queue::Message::Manifest(run_id.clone(), manifest),
                     };
 
                     // TODO: error handling
@@ -230,6 +237,7 @@ impl WorkersNegotiator {
             // there still may be active work. So for now, let's poll every second; we can make
             // the strategy here more sophisticated in the future, e.g. with exponential backoffs.
             const BACKOFF: Duration = Duration::from_secs(1);
+            let run_id = run_id.clone();
 
             move |entity| {
                 let span = tracing::trace_span!("run_completed_successfully", run_id=?run_id, queue_addr=?queue_results_addr);
@@ -246,7 +254,7 @@ impl WorkersNegotiator {
 
                     let request = Request {
                         entity,
-                        message: Message::RequestTotalRunResult(run_id),
+                        message: Message::RequestTotalRunResult(run_id.clone()),
                     };
                     net_protocol::write(&mut stream, request).unwrap();
                     let run_result = net_protocol::read(&mut stream).unwrap();
@@ -360,7 +368,7 @@ pub enum QueueNegotiatorServerError {
 
 struct QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
 {
     get_assigned_run: Arc<GetAssignedRun>,
     advertised_queue_work_scheduler_addr: SocketAddr,
@@ -370,7 +378,7 @@ where
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -392,7 +400,7 @@ impl QueueNegotiator {
         get_assigned_run: GetAssignedRun,
     ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
     {
         let addr = listener.local_addr()?;
 
@@ -466,7 +474,7 @@ impl QueueNegotiator {
         stream: net_async::UnverifiedServerStream,
     ) -> io::Result<()>
     where
-        GetAssignedRun: Fn(RunId) -> AssignedRun + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
     {
         let mut stream = ctx.handshake_ctx.handshake(stream).await?;
         let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut stream).await?;
@@ -493,7 +501,7 @@ impl QueueNegotiator {
                     run_id,
                     runner_kind,
                     should_generate_manifest,
-                } = (ctx.get_assigned_run)(wanted_run_id);
+                } = (ctx.get_assigned_run)(&wanted_run_id);
 
                 tracing::debug!("Found assigned run");
 
@@ -591,7 +599,7 @@ mod test {
                                 context: WorkContext {
                                     working_dir: PathBuf::from("/"),
                                 },
-                                run_id: RunId::new(),
+                                run_id: RunId::unique(),
                                 work_id: WorkId(i.to_string()),
                             })
                             .collect();
@@ -736,16 +744,16 @@ mod test {
         let (msgs, results_addr, shutdown_results_server, results_handle) =
             mock_queue_results_server(manifest_collector);
 
-        let run_id = RunId::new();
+        let run_id = RunId::unique();
 
-        let get_assigned_run = |run_id| {
+        let get_assigned_run = |run_id: &RunId| {
             let manifest = ManifestMessage {
                 manifest: Manifest {
                     members: vec![echo_test("hello".to_string())],
                 },
             };
             AssignedRun {
-                run_id,
+                run_id: run_id.clone(),
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
                 should_generate_manifest: true,
             }
@@ -806,7 +814,7 @@ mod test {
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
             |_| AssignedRun {
-                run_id: RunId::new(),
+                run_id: RunId::unique(),
                 runner_kind: RunnerKind::TestLikeRunner(
                     TestLikeRunner::Echo,
                     ManifestMessage {

@@ -346,7 +346,7 @@ pub fn execute_wrapped_runner(
                             context: WorkContext {
                                 working_dir: working_dir.clone(),
                             },
-                            run_id: RunId::new(),
+                            run_id: RunId::unique(),
                             work_id: WorkId(Default::default()),
                         }
                     }

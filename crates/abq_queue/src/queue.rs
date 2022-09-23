@@ -85,7 +85,9 @@ struct RunQueues {
 
 impl RunQueues {
     pub fn create_queue(&mut self, run_id: RunId, runner: RunnerKind, batch_size_hint: NonZeroU64) {
-        let old_queue = self.queues.insert(run_id, RunState::WaitingForFirstWorker);
+        let old_queue = self
+            .queues
+            .insert(run_id.clone(), RunState::WaitingForFirstWorker);
         debug_assert!(old_queue.is_none());
 
         let old_run_data = self.run_data.insert(
@@ -100,20 +102,20 @@ impl RunQueues {
 
     // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
     // found.
-    pub fn get_run_for_worker(&mut self, run_id: RunId) -> Option<AssignedRun> {
-        let run_state = self.queues.get_mut(&run_id)?;
+    pub fn get_run_for_worker(&mut self, run_id: &RunId) -> Option<AssignedRun> {
+        let run_state = self.queues.get_mut(run_id)?;
 
         let RunData {
             runner,
             batch_size_hint: _,
-        } = self.run_data.get(&run_id).unwrap();
+        } = self.run_data.get(run_id).unwrap();
 
         let assigned_run = match run_state {
             RunState::WaitingForFirstWorker => {
                 // This is the first worker to attach; ask it to generate the manifest.
                 *run_state = RunState::WaitingForManifest;
                 AssignedRun {
-                    run_id,
+                    run_id: run_id.clone(),
                     runner_kind: runner.clone(),
                     should_generate_manifest: true,
                 }
@@ -122,7 +124,7 @@ impl RunQueues {
                 // Otherwise we are already waiting for the manifest, or already have it; just tell
                 // the worker what runner it should set up.
                 AssignedRun {
-                    run_id,
+                    run_id: run_id.clone(),
                     runner_kind: runner.clone(),
                     should_generate_manifest: false,
                 }
@@ -138,7 +140,7 @@ impl RunQueues {
         let work_from_manifest = flat_manifest.into_iter().map(|test_case| {
             NextWork::Work {
                 test_case,
-                run_id,
+                run_id: run_id.clone(),
                 // TODO: populate correctly
                 work_id: WorkId("".to_string()),
                 // TODO: populate correctly
@@ -394,7 +396,7 @@ fn start_queue(config: QueueConfig) -> Abq {
     // TODO: blocking is not good; workers that can connect fast may be blocked on workers waiting
     // for a test run to be established. Make this cede control to a runtime if the worker's run is
     // not yet available.
-    let choose_run_for_worker = move |wanted_run_id| loop {
+    let choose_run_for_worker = move |wanted_run_id: &RunId| loop {
         let opt_assigned = { queues.lock().unwrap().get_run_for_worker(wanted_run_id) };
         match opt_assigned {
             None => {
@@ -750,7 +752,10 @@ impl QueueServer {
         } = invoke_work;
 
         let results_responder = ClientResponder::new(stream);
-        let old_responder = active_runs.lock().await.insert(run_id, results_responder);
+        let old_responder = active_runs
+            .lock()
+            .await
+            .insert(run_id.clone(), results_responder);
 
         debug_assert!(
             old_responder.is_none(),
@@ -778,7 +783,7 @@ impl QueueServer {
         // When an abq client loses connection with the queue, they may attempt to reconnect.
         // We'll need to update the connection from streaming results to the client to the new one.
         let mut active_runs = active_runs.lock().await;
-        let active_conn_entry = active_runs.entry(run_id);
+        let active_conn_entry = active_runs.entry(run_id.clone());
         match active_conn_entry {
             Entry::Occupied(mut occupied) => {
                 let new_stream_addr = new_stream.peer_addr();
@@ -818,7 +823,10 @@ impl QueueServer {
             is_successful: true,
         };
 
-        state_cache.lock().unwrap().insert(run_id, run_state);
+        state_cache
+            .lock()
+            .unwrap()
+            .insert(run_id.clone(), run_state);
 
         queues.lock().unwrap().add_manifest(run_id, flat_manifest);
 
@@ -1031,7 +1039,7 @@ impl WorkScheduler {
             WorkServerRequest::NextTest { run_id } => {
                 // Pull the next work item.
                 let next_work = loop {
-                    let opt_work = { ctx.queues.lock().unwrap().next_work(run_id) };
+                    let opt_work = { ctx.queues.lock().unwrap().next_work(run_id.clone()) };
                     match opt_work {
                         Ok(work) => break work,
                         Err(WaitingForManifestError) => {
@@ -1156,33 +1164,36 @@ mod test {
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
-        let run_id = RunId::new();
-        let results_handle = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        let run_id = RunId::unique();
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
 
-            runtime.block_on(async {
-                let mut results = Vec::default();
-                let client = Client::invoke_work(
-                    EntityId::new(),
-                    queue_server_addr,
-                    client_opts,
-                    run_id,
-                    runner,
-                    one_nonzero(),
-                )
-                .await
-                .unwrap();
-                client
-                    .stream_results(|id, result| {
-                        results.push((id.0, result));
-                    })
+                runtime.block_on(async {
+                    let mut results = Vec::default();
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                    )
                     .await
                     .unwrap();
-                results
-            })
+                    client
+                        .stream_results(|id, result| {
+                            results.push((id.0, result));
+                        })
+                        .await
+                        .unwrap();
+                    results
+                })
+            }
         });
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
@@ -1243,52 +1254,56 @@ mod test {
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
-        let run1 = RunId::new();
-        let run2 = RunId::new();
-        let results_handle = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        let run1 = RunId::unique();
+        let run2 = RunId::unique();
+        let results_handle = thread::spawn({
+            let (run1, run2) = (run1.clone(), run2.clone());
 
-            runtime.block_on(async {
-                let mut results1 = Vec::default();
-                let mut results2 = Vec::default();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
 
-                let client1 = Client::invoke_work(
-                    EntityId::new(),
-                    queue_server_addr,
-                    client_opts,
-                    run1,
-                    runner1,
-                    one_nonzero(),
-                )
-                .await
-                .unwrap();
-                let client2 = Client::invoke_work(
-                    EntityId::new(),
-                    queue_server_addr,
-                    client_opts,
-                    run2,
-                    runner2,
-                    one_nonzero(),
-                )
-                .await
-                .unwrap();
+                runtime.block_on(async {
+                    let mut results1 = Vec::default();
+                    let mut results2 = Vec::default();
 
-                let fut1 = client1.stream_results(|id, result| {
-                    results1.push((id.0, result));
-                });
-                let fut2 = client2.stream_results(|id, result| {
-                    results2.push((id.0, result));
-                });
+                    let client1 = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run1,
+                        runner1,
+                        one_nonzero(),
+                    )
+                    .await
+                    .unwrap();
+                    let client2 = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run2,
+                        runner2,
+                        one_nonzero(),
+                    )
+                    .await
+                    .unwrap();
 
-                let (res1, res2) = future::join(fut1, fut2).await;
-                res1.unwrap();
-                res2.unwrap();
+                    let fut1 = client1.stream_results(|id, result| {
+                        results1.push((id.0, result));
+                    });
+                    let fut2 = client2.stream_results(|id, result| {
+                        results2.push((id.0, result));
+                    });
 
-                (results1, results2)
-            })
+                    let (res1, res2) = future::join(fut1, fut2).await;
+                    res1.unwrap();
+                    res2.unwrap();
+
+                    (results1, results2)
+                })
+            }
         });
 
         let mut workers_for_run1 = WorkersNegotiator::negotiate_and_start_pool(
@@ -1355,36 +1370,40 @@ mod test {
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
-        let run = RunId::new();
-        let results_handle = thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
+        let run = RunId::unique();
+        let results_handle = thread::spawn({
+            let run = run.clone();
 
-            runtime.block_on(async {
-                let mut results = Vec::default();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
 
-                let client = Client::invoke_work(
-                    EntityId::new(),
-                    queue_server_addr,
-                    client_opts,
-                    run,
-                    runner1,
-                    batch_size,
-                )
-                .await
-                .unwrap();
+                runtime.block_on(async {
+                    let mut results = Vec::default();
 
-                client
-                    .stream_results(|id, result| {
-                        results.push((id.0, result));
-                    })
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run,
+                        runner1,
+                        batch_size,
+                    )
                     .await
                     .unwrap();
 
-                results
-            })
+                    client
+                        .stream_results(|id, result| {
+                            results.push((id.0, result));
+                        })
+                        .await
+                        .unwrap();
+
+                    results
+                })
+            }
         });
 
         let mut workers_for_run1 = WorkersNegotiator::negotiate_and_start_pool(
@@ -1434,7 +1453,7 @@ mod test {
 
     #[tokio::test]
     async fn invoker_reconnection_succeeds() {
-        let run_id = RunId::new();
+        let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
@@ -1456,7 +1475,7 @@ mod test {
 
             let mut active_runs = active_runs.lock().await;
             active_runs
-                .entry(run_id)
+                .entry(run_id.clone())
                 .or_insert(ClientResponder::DirectStream(server_conn));
             // Drop the connection
             drop(client_conn);
@@ -1474,7 +1493,7 @@ mod test {
             Arc::clone(&active_runs),
             EntityId::new(),
             server_conn,
-            run_id,
+            run_id.clone(),
         )
         .await;
 
@@ -1492,7 +1511,7 @@ mod test {
 
     #[tokio::test]
     async fn invoker_reconnection_fails_never_invoked() {
-        let run_id = RunId::new();
+        let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
@@ -1513,7 +1532,7 @@ mod test {
             Arc::clone(&active_runs),
             EntityId::new(),
             server_conn,
-            run_id,
+            run_id.clone(),
         )
         .await;
 
@@ -1525,7 +1544,7 @@ mod test {
 
     #[tokio::test]
     async fn client_disconnect_then_connect_gets_buffered_results() {
-        let run_id = RunId::new();
+        let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
         let run_queues = SharedRunQueues::default();
         let run_state = RunStateCache::default();
@@ -1534,7 +1553,7 @@ mod test {
 
         // Pretend we have infinite work so the queue always streams back results to the client.
         run_state.lock().unwrap().insert(
-            run_id,
+            run_id.clone(),
             super::ActiveRunState {
                 work_left: usize::MAX,
                 is_successful: true,
@@ -1559,7 +1578,7 @@ mod test {
 
             let mut active_runs = active_runs.lock().await;
             let _responder = active_runs
-                .entry(run_id)
+                .entry(run_id.clone())
                 .or_insert(ClientResponder::DirectStream(server_conn));
 
             // Drop the client connection
@@ -1574,7 +1593,7 @@ mod test {
                 Arc::clone(&active_runs),
                 Arc::clone(&run_state),
                 EntityId::new(),
-                run_id,
+                run_id.clone(),
                 buffered_work_id.clone(),
                 fake_test_result(),
             )
@@ -1610,7 +1629,7 @@ mod test {
             entity: client_entity,
             abq_server_addr: fake_server_addr,
             client: client_opts.build_async().unwrap(),
-            run_id,
+            run_id: run_id.clone(),
             stream: client_conn,
         };
         {
@@ -1618,7 +1637,7 @@ mod test {
                 Arc::clone(&active_runs),
                 EntityId::new(),
                 server_conn,
-                run_id,
+                run_id.clone(),
             ));
 
             let (work_id, _) = client.next().await.unwrap().unwrap();
@@ -1902,23 +1921,27 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
-        let run_id = RunId::new();
-        let results_handle = thread::spawn(move || {
-            let runtime = make_runtime();
+        let run_id = RunId::unique();
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
 
-            runtime.block_on(async {
-                let client = Client::invoke_work(
-                    EntityId::new(),
-                    queue_server_addr,
-                    client_opts,
-                    run_id,
-                    runner,
-                    one_nonzero(),
-                )
-                .await
-                .unwrap();
-                client.stream_results(|_, _| {}).await.unwrap();
-            })
+            move || {
+                let runtime = make_runtime();
+
+                runtime.block_on(async {
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                    )
+                    .await
+                    .unwrap();
+                    client.stream_results(|_, _| {}).await.unwrap();
+                })
+            }
         });
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
@@ -1971,23 +1994,27 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
-        let run_id = RunId::new();
-        let results_handle = thread::spawn(move || {
-            let runtime = make_runtime();
+        let run_id = RunId::unique();
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
 
-            runtime.block_on(async {
-                let client = Client::invoke_work(
-                    EntityId::new(),
-                    queue_server_addr,
-                    client_opts,
-                    run_id,
-                    runner,
-                    one_nonzero(),
-                )
-                .await
-                .unwrap();
-                client.stream_results(|_, _| {}).await.unwrap();
-            })
+            move || {
+                let runtime = make_runtime();
+
+                runtime.block_on(async {
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                    )
+                    .await
+                    .unwrap();
+                    client.stream_results(|_, _| {}).await.unwrap();
+                })
+            }
         });
 
         // NOTE: it is very possible that workers1 completes all the tests before workers2 gets to
@@ -2001,7 +2028,7 @@ mod test {
             workers_config.clone(),
             queue.get_negotiator_handle(),
             client_opts,
-            run_id,
+            run_id.clone(),
         )
         .unwrap();
         let mut workers2 = WorkersNegotiator::negotiate_and_start_pool(
