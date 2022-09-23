@@ -19,11 +19,13 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::EntityId,
-        queue::{self, InvokeWork, InvokerResponse, Message},
+        queue::{self, InvokeWork, InvokerTestResult, Message},
         runners::TestResult,
         workers::{RunId, RunnerKind, WorkId},
     },
 };
+
+use thiserror::Error;
 
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
 pub struct Client {
@@ -36,6 +38,18 @@ pub struct Client {
     pub(crate) stream: Box<dyn net_async::ClientStream>,
 }
 
+#[derive(Debug, Error)]
+pub enum InvocationError {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+
+    #[error("{0} corresponds to a test run already active on this queue; please provide a different test run ID.")]
+    DuplicateRun(RunId),
+
+    #[error("{0} corresponds to a test run already completed on this queue; please provide a different test run ID.")]
+    DuplicateCompletedRun(RunId),
+}
+
 impl Client {
     /// Invokes work on an instance of [Abq], returning a [Client].
     pub async fn invoke_work(
@@ -45,7 +59,7 @@ impl Client {
         run_id: RunId,
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
-    ) -> Result<Self, io::Error> {
+    ) -> Result<Self, InvocationError> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
 
@@ -61,6 +75,21 @@ impl Client {
         };
 
         net_protocol::async_write(&mut stream, &invoke_request).await?;
+        let response: queue::InvokeWorkResponse = net_protocol::async_read(&mut stream).await?;
+
+        if let queue::InvokeWorkResponse::Failure(err) = response {
+            match err {
+                queue::InvokeFailureReason::DuplicateRunId { recently_completed } => {
+                    let error_msg = if recently_completed {
+                        InvocationError::DuplicateCompletedRun(run_id)
+                    } else {
+                        InvocationError::DuplicateRun(run_id)
+                    };
+
+                    return Err(error_msg);
+                }
+            }
+        }
 
         Ok(Client {
             entity,
@@ -93,7 +122,7 @@ impl Client {
     pub async fn next(&mut self) -> Option<Result<(WorkId, TestResult), io::Error>> {
         loop {
             match net_protocol::async_read(&mut self.stream).await {
-                Ok(InvokerResponse::Result(work_id, test_result)) => {
+                Ok(InvokerTestResult::Result(work_id, test_result)) => {
                     // Send an acknowledgement of the result to the server. If it fails, attempt to reconnect once.
                     let ack_result = net_protocol::async_write(
                         &mut self.stream,
@@ -108,7 +137,7 @@ impl Client {
 
                     return Some(Ok((work_id, test_result)));
                 }
-                Ok(InvokerResponse::EndOfResults) => return None,
+                Ok(InvokerTestResult::EndOfResults) => return None,
                 Err(err) => {
                     // Attempt to reconnect once. If it's successful, just re-read the next message.
                     // If it's unsuccessful, return the original error.

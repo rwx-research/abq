@@ -286,9 +286,29 @@ pub mod queue {
         pub batch_size_hint: NonZeroU64,
     }
 
-    /// An incremental response to an invoker.
+    /// Why an invocation of some work did not succeed.
     #[derive(Serialize, Deserialize, Debug)]
-    pub enum InvokerResponse {
+    pub enum InvokeFailureReason {
+        /// There is a run of the same ID already in progress, or recently completed.
+        DuplicateRunId {
+            /// A hint as to whether the run was determined to have recently completed.
+            recently_completed: bool,
+        },
+    }
+
+    /// Response from the queue regarding an ask to [invoke work][InvokeWork].
+    #[derive(Serialize, Deserialize, Debug)]
+    pub enum InvokeWorkResponse {
+        /// The work invocation was acknowledged and is enqueued.
+        /// The invoker should move to reading [test result][InvokerTestResult]s.
+        Success,
+        /// The work invocation failed.
+        Failure(InvokeFailureReason),
+    }
+
+    /// An incremental test result sent back to an invoker.
+    #[derive(Serialize, Deserialize, Debug)]
+    pub enum InvokerTestResult {
         /// The result of a requested unit of work.
         Result(WorkId, TestResult),
         /// No more results are known.
