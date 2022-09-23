@@ -63,7 +63,9 @@ enum RunState {
         // test.
         batch_size_hint: NonZeroU64,
     },
-    Done,
+    Done {
+        succeeded: bool,
+    },
 }
 
 struct RunData {
@@ -185,11 +187,11 @@ impl RunQueues {
                 }
                 Ok(NextWorkBundle(bundle))
             }
-            RunState::Done => Ok(NextWorkBundle(vec![NextWork::EndOfWork])),
+            RunState::Done { .. } => Ok(NextWorkBundle(vec![NextWork::EndOfWork])),
         }
     }
 
-    pub fn mark_complete(&mut self, run_id: RunId) {
+    pub fn mark_complete(&mut self, run_id: RunId, succeeded: bool) {
         let state = self
             .queues
             .get_mut(&run_id)
@@ -201,7 +203,9 @@ impl RunQueues {
             } => {
                 assert!(queue.is_empty(), "Invalid state - queue is not complete!");
             }
-            RunState::WaitingForFirstWorker | RunState::WaitingForManifest | RunState::Done => {
+            RunState::WaitingForFirstWorker
+            | RunState::WaitingForManifest
+            | RunState::Done { .. } => {
                 unreachable!("Invalid state");
             }
         }
@@ -209,8 +213,12 @@ impl RunQueues {
         // TODO: right now, we are just marking something complete so that future workers asking
         // for work about the run get an EndOfWork message. But this leaks memory, how can
         // we avoid that?
-        *state = RunState::Done;
+        *state = RunState::Done { succeeded };
         self.run_data.remove(&run_id);
+    }
+
+    fn get_run_state(&self, run_id: &RunId) -> Option<&RunState> {
+        self.queues.get(run_id)
     }
 }
 
@@ -511,12 +519,18 @@ impl ClientResponder {
 ///
 // TODO: certainly we can be smarter here, for example we have an invariant that a stream will only
 // ever be added and removed for an run ID once. Can we use that to get rid of the mutex?
-type ActiveRuns = Arc<tokio::sync::Mutex<HashMap<RunId, ClientResponder>>>;
+type ActiveRunResponders = Arc<tokio::sync::Mutex<HashMap<RunId, ClientResponder>>>;
 
-/// Cache of how much is left in the queue for a particular run, so that we don't have to
-/// lock the queue all the time.
+struct ActiveRunState {
+    /// Amount of work items left for the run.
+    work_left: usize,
+    /// So far, has the run been entirely successful?
+    is_successful: bool,
+}
+
+/// Cache of the current state of active runs, so that we don't have to lock the queue all the time.
 // TODO: consider using DashMap
-type WorkLeftForRuns = Arc<Mutex<HashMap<RunId, usize>>>;
+type RunStateCache = Arc<Mutex<HashMap<RunId, ActiveRunState>>>;
 
 /// Central server listening for new test run runs and results.
 struct QueueServer {
@@ -552,8 +566,8 @@ struct QueueServerCtx {
     queues: SharedRunQueues,
     /// When all results for a particular run are communicated, we want to make sure that the
     /// responder thread is closed and that the entry here is dropped.
-    active_runs: ActiveRuns,
-    work_left_for_runs: WorkLeftForRuns,
+    active_runs: ActiveRunResponders,
+    state_cache: RunStateCache,
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
@@ -592,7 +606,7 @@ impl QueueServer {
             let ctx = QueueServerCtx {
                 queues,
                 active_runs: Default::default(),
-                work_left_for_runs: Default::default(),
+                state_cache: Default::default(),
                 public_negotiator_addr,
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
             };
@@ -660,7 +674,7 @@ impl QueueServer {
             Message::Manifest(run_id, manifest) => {
                 Self::handle_manifest(
                     ctx.queues,
-                    ctx.work_left_for_runs,
+                    ctx.state_cache,
                     entity,
                     run_id,
                     manifest,
@@ -682,13 +696,17 @@ impl QueueServer {
                 Self::handle_worker_result(
                     ctx.queues,
                     ctx.active_runs,
-                    ctx.work_left_for_runs,
+                    ctx.state_cache,
                     entity,
                     run_id,
                     work_id,
                     result,
                 )
                 .await
+            }
+
+            Message::RequestTotalRunResult(run_id) => {
+                Self::handle_total_run_result_request(ctx.queues, run_id, stream).await
             }
         };
 
@@ -719,7 +737,7 @@ impl QueueServer {
 
     #[instrument(level = "trace", skip(active_runs, queues, stream))]
     async fn handle_invoked_work(
-        active_runs: ActiveRuns,
+        active_runs: ActiveRunResponders,
         queues: SharedRunQueues,
         entity: EntityId,
         stream: Box<dyn net_async::ServerStream>,
@@ -750,7 +768,7 @@ impl QueueServer {
 
     #[instrument(level = "trace", skip(active_runs, new_stream))]
     async fn handle_invoker_reconnection(
-        active_runs: ActiveRuns,
+        active_runs: ActiveRunResponders,
         entity: EntityId,
         new_stream: Box<dyn net_async::ServerStream>,
         run_id: RunId,
@@ -782,10 +800,10 @@ impl QueueServer {
         }
     }
 
-    #[instrument(level = "trace", skip(queues, work_left_for_runs))]
+    #[instrument(level = "trace", skip(queues, state_cache))]
     async fn handle_manifest(
         queues: SharedRunQueues,
-        work_left_for_runs: WorkLeftForRuns,
+        state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
         manifest: ManifestMessage,
@@ -794,10 +812,13 @@ impl QueueServer {
         // Record the manifest for this run in its appropriate queue.
         // TODO: actually record the manifest metadata
         let flat_manifest = flatten_manifest(manifest.manifest);
-        work_left_for_runs
-            .lock()
-            .unwrap()
-            .insert(run_id, flat_manifest.len());
+
+        let run_state = ActiveRunState {
+            work_left: flat_manifest.len(),
+            is_successful: true,
+        };
+
+        state_cache.lock().unwrap().insert(run_id, run_state);
 
         queues.lock().unwrap().add_manifest(run_id, flat_manifest);
 
@@ -806,16 +827,18 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues, active_runs, work_left_for_runs))]
+    #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
     async fn handle_worker_result(
         queues: SharedRunQueues,
-        active_runs: ActiveRuns,
-        work_left_for_runs: WorkLeftForRuns,
+        active_runs: ActiveRunResponders,
+        state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
         work_id: WorkId,
         result: TestResult,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let test_status = result.status;
+
         {
             // First up, chuck the test result back over to `abq test`. Make sure we don't steal
             // the lock on active_runs for any longer than it takes to send that request.
@@ -828,16 +851,18 @@ impl QueueServer {
                 .await;
         }
 
-        let no_more_work = {
+        let (no_more_work, is_successful) = {
             // Update the amount of work we have left; again, steal the map of work for only as
             // long is it takes for us to do that.
-            let mut work_left_for_runs = work_left_for_runs.lock().unwrap();
-            let work_left = work_left_for_runs
+            let mut state_cache = state_cache.lock().unwrap();
+            let run_state = state_cache
                 .get_mut(&run_id)
                 .expect("run id not recorded, but we got a result for it?");
 
-            *work_left -= 1;
-            *work_left == 0
+            run_state.work_left -= 1;
+            run_state.is_successful = run_state.is_successful && !test_status.is_fail_like();
+
+            (run_state.work_left == 0, run_state.is_successful)
         };
 
         if no_more_work {
@@ -854,7 +879,7 @@ impl QueueServer {
             match responder {
                 ClientResponder::DirectStream(mut stream) => {
                     net_protocol::async_write(&mut stream, &InvokerResponse::EndOfResults).await?;
-                    tokio::io::AsyncWriteExt::shutdown(&mut stream).await?;
+                    drop(stream);
                 }
                 ClientResponder::Disconnected { buffered_results } => {
                     // Unfortunately, since we still don't have an active connection to the abq
@@ -869,9 +894,38 @@ impl QueueServer {
                 }
             }
 
-            work_left_for_runs.lock().unwrap().remove(&run_id);
-            queues.lock().unwrap().mark_complete(run_id);
+            state_cache.lock().unwrap().remove(&run_id);
+            queues.lock().unwrap().mark_complete(run_id, is_successful);
         }
+
+        Ok(())
+    }
+
+    #[instrument(level = "trace", skip(queues, stream))]
+    async fn handle_total_run_result_request(
+        queues: SharedRunQueues,
+        run_id: RunId,
+        mut stream: Box<dyn net_async::ServerStream>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let response = {
+            let queues = queues.lock().unwrap();
+            let run_state = queues
+                .get_run_state(&run_id)
+                .ok_or("Invalid state: worker is requesting run result for non-existent ID")?;
+
+            match run_state {
+                RunState::WaitingForFirstWorker | RunState::WaitingForManifest => return Err(
+                    "Invalid state: worker is requesting run result before any tests have been run"
+                        .into(),
+                ),
+                RunState::HasWork { .. } => net_protocol::queue::TotalRunResult::Pending,
+                RunState::Done { succeeded } => net_protocol::queue::TotalRunResult::Completed {
+                    succeeded: *succeeded,
+                },
+            }
+        };
+
+        net_protocol::async_write(&mut stream, &response).await?;
 
         Ok(())
     }
@@ -1001,12 +1055,12 @@ impl WorkScheduler {
 mod test {
     use std::{io, net::SocketAddr, num::NonZeroU64, sync::Arc, thread, time::Duration};
 
-    use super::Abq;
+    use super::{Abq, RunStateCache};
     use crate::{
         invoke::Client,
         queue::{
-            ActiveRuns, ClientReconnectionError, ClientResponder, QueueServer, SharedRunQueues,
-            WorkLeftForRuns, WorkScheduler,
+            ActiveRunResponders, ClientReconnectionError, ClientResponder, QueueServer,
+            SharedRunQueues, WorkScheduler,
         },
     };
     use abq_utils::{
@@ -1022,7 +1076,7 @@ mod test {
     };
     use abq_workers::{
         negotiate::{WorkersConfig, WorkersNegotiator},
-        workers::WorkerContext,
+        workers::{WorkerContext, WorkersExit},
     };
     use futures::future;
     use ntest::timeout;
@@ -1066,6 +1120,13 @@ mod test {
         let (unverified, addr) = listener.accept().await?;
         let stream = listener.handshake_ctx().handshake(unverified).await?;
         Ok((stream, addr))
+    }
+
+    fn make_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -1134,7 +1195,8 @@ mod test {
 
         let mut results = results_handle.join().unwrap();
 
-        workers.shutdown();
+        let exit = workers.shutdown();
+        assert!(matches!(exit, WorkersExit::Success));
         queue.shutdown().unwrap();
 
         let results = sort_results(&mut results);
@@ -1247,8 +1309,11 @@ mod test {
 
         let (mut results1, mut results2) = results_handle.join().unwrap();
 
-        workers_for_run1.shutdown();
-        workers_for_run2.shutdown();
+        let exit1 = workers_for_run1.shutdown();
+        assert!(matches!(exit1, WorkersExit::Success));
+        let exit2 = workers_for_run2.shutdown();
+        assert!(matches!(exit2, WorkersExit::Success));
+
         queue.shutdown().unwrap();
 
         let results1 = sort_results(&mut results1);
@@ -1332,7 +1397,9 @@ mod test {
 
         let mut results = results_handle.join().unwrap();
 
-        workers_for_run1.shutdown();
+        let exit1 = workers_for_run1.shutdown();
+        assert!(matches!(exit1, WorkersExit::Success));
+
         queue.shutdown().unwrap();
 
         let results = sort_results(&mut results);
@@ -1368,7 +1435,7 @@ mod test {
     #[tokio::test]
     async fn invoker_reconnection_succeeds() {
         let run_id = RunId::new();
-        let active_runs = ActiveRuns::default();
+        let active_runs = ActiveRunResponders::default();
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
@@ -1426,7 +1493,7 @@ mod test {
     #[tokio::test]
     async fn invoker_reconnection_fails_never_invoked() {
         let run_id = RunId::new();
-        let active_runs = ActiveRuns::default();
+        let active_runs = ActiveRunResponders::default();
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
@@ -1459,14 +1526,20 @@ mod test {
     #[tokio::test]
     async fn client_disconnect_then_connect_gets_buffered_results() {
         let run_id = RunId::new();
-        let active_runs = ActiveRuns::default();
+        let active_runs = ActiveRunResponders::default();
         let run_queues = SharedRunQueues::default();
-        let work_left = WorkLeftForRuns::default();
+        let run_state = RunStateCache::default();
 
         let client_entity = EntityId::new();
 
         // Pretend we have infinite work so the queue always streams back results to the client.
-        work_left.lock().unwrap().insert(run_id, usize::MAX);
+        run_state.lock().unwrap().insert(
+            run_id,
+            super::ActiveRunState {
+                work_left: usize::MAX,
+                is_successful: true,
+            },
+        );
 
         let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
@@ -1499,7 +1572,7 @@ mod test {
             QueueServer::handle_worker_result(
                 Arc::clone(&run_queues),
                 Arc::clone(&active_runs),
-                Arc::clone(&work_left),
+                Arc::clone(&run_state),
                 EntityId::new(),
                 run_id,
                 buffered_work_id.clone(),
@@ -1561,7 +1634,7 @@ mod test {
             let worker_result_future = tokio::spawn(QueueServer::handle_worker_result(
                 run_queues,
                 Arc::clone(&active_runs),
-                work_left,
+                run_state,
                 EntityId::new(),
                 run_id,
                 second_work_id.clone(),
@@ -1805,5 +1878,147 @@ mod test {
         server_thread.join().unwrap();
 
         logs_with_scope_contain("", "error handling connection");
+    }
+
+    #[test]
+    #[timeout(1000)] // 1 second
+    fn worker_exits_with_failure_if_test_fails() {
+        let mut queue = Abq::start(Default::default());
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![echo_test("echo1".to_string())],
+            },
+        };
+
+        // Set up the runner so that it times out, always issuing an error.
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::InduceTimeout, manifest);
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(0),
+        };
+
+        let queue_server_addr = queue.server_addr();
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+        let run_id = RunId::new();
+        let results_handle = thread::spawn(move || {
+            let runtime = make_runtime();
+
+            runtime.block_on(async {
+                let client = Client::invoke_work(
+                    EntityId::new(),
+                    queue_server_addr,
+                    client_opts,
+                    run_id,
+                    runner,
+                    one_nonzero(),
+                )
+                .await
+                .unwrap();
+                client.stream_results(|_, _| {}).await.unwrap();
+            })
+        });
+
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id,
+        )
+        .unwrap();
+
+        results_handle.join().unwrap();
+
+        let exit = workers.shutdown();
+        assert!(matches!(exit, WorkersExit::Failure));
+
+        queue.shutdown().unwrap();
+    }
+
+    #[test]
+    #[timeout(1000)] // 1 second
+    fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
+        let mut queue = Abq::start(Default::default());
+
+        // NOTE: we set up two workers and unleash them on the following manifest, setting both
+        // workers to fail only on the `echo_fail` case. That way, no matter which one picks it up,
+        // we should observe a failure for both workers sets.
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![
+                    echo_test("echo1".to_string()),
+                    echo_test("echo2".to_string()),
+                    echo_test("echo_fail".to_string()),
+                    echo_test("echo3".to_string()),
+                    echo_test("echo4".to_string()),
+                ],
+            },
+        };
+
+        let runner = RunnerKind::TestLikeRunner(
+            TestLikeRunner::FailOnTestName("echo_fail".to_string()),
+            manifest,
+        );
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(0),
+        };
+
+        let queue_server_addr = queue.server_addr();
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+        let run_id = RunId::new();
+        let results_handle = thread::spawn(move || {
+            let runtime = make_runtime();
+
+            runtime.block_on(async {
+                let client = Client::invoke_work(
+                    EntityId::new(),
+                    queue_server_addr,
+                    client_opts,
+                    run_id,
+                    runner,
+                    one_nonzero(),
+                )
+                .await
+                .unwrap();
+                client.stream_results(|_, _| {}).await.unwrap();
+            })
+        });
+
+        // NOTE: it is very possible that workers1 completes all the tests before workers2 gets to
+        // start, because we are not controlling the order tests are delivered across the network
+        // here. However, the result should be the same no matter what, so this test should never
+        // flake.
+        //
+        // In the future, we'll probably want to test different networking order conditions. See
+        // also https://github.com/rwx-research/abq/issues/29.
+        let mut workers1 = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config.clone(),
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id,
+        )
+        .unwrap();
+        let mut workers2 = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id,
+        )
+        .unwrap();
+
+        results_handle.join().unwrap();
+
+        let exit1 = workers1.shutdown();
+        assert!(matches!(exit1, WorkersExit::Failure));
+        let exit2 = workers2.shutdown();
+        assert!(matches!(exit2, WorkersExit::Failure));
+
+        queue.shutdown().unwrap();
     }
 }

@@ -74,6 +74,14 @@ pub mod runners {
         Skipped,
     }
 
+    impl Status {
+        /// If this status had to be classified as either a success or failure,
+        /// would it be a failure?
+        pub fn is_fail_like(&self) -> bool {
+            matches!(self, Status::Failure | Status::Error)
+        }
+    }
+
     #[derive(Serialize, Deserialize)]
     pub struct TestResultMessage {
         pub test_result: TestResult,
@@ -196,15 +204,16 @@ pub mod workers {
     pub struct WorkId(pub String);
 
     /// Runners mostly used for testing.
-    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum TestLikeRunner {
         /// A worker that echos strings given to it.
         Echo,
         /// A worker that executes commands given to it.
         Exec,
         /// A worker that always times out.
-        #[cfg(feature = "test-actions")]
         InduceTimeout,
+        /// A worker that fails with "INDUCED FAIL" if given a test with the given name.
+        FailOnTestName(String),
         /// A worker that echos a string given to it after a number of retries.
         #[cfg(feature = "test-actions")]
         EchoOnRetry(u8),
@@ -283,6 +292,17 @@ pub mod queue {
         EndOfResults,
     }
 
+    /// A response regarding the final result of a given test run, after all tests in the run are
+    /// completed.
+    #[derive(Serialize, Deserialize)]
+    pub enum TotalRunResult {
+        /// The run is still ongoing; the queue will need to be polled again to determine whether
+        /// the result was a success.
+        Pending,
+        /// The result of the run.
+        Completed { succeeded: bool },
+    }
+
     /// A request sent to the queue.
     #[derive(Serialize, Deserialize)]
     pub struct Request {
@@ -304,6 +324,10 @@ pub mod queue {
         Manifest(RunId, ManifestMessage),
         /// The result of some work from the queue.
         WorkerResult(RunId, WorkId, TestResult),
+        /// An ask to return information about whether a given test run failed or not.
+        /// A worker issues this request before exiting to determine whether they should exit
+        /// cleanly, or fail.
+        RequestTotalRunResult(RunId),
     }
 }
 

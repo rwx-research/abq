@@ -276,7 +276,8 @@ fn run_tests(
     };
 
     if let Some(mut workers) = opt_workers {
-        workers.shutdown();
+        // The exit code will be determined by the test result status.
+        let _exit_code = workers.shutdown();
     }
 
     work_results_thread.join().unwrap()?;

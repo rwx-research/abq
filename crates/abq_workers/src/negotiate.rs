@@ -14,7 +14,8 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::workers::{
-    GetNextWorkBundle, NotifyManifest, NotifyResult, WorkerContext, WorkerPool, WorkerPoolConfig,
+    GetNextWorkBundle, NotifyManifest, NotifyResult, RunCompletedSuccessfully, WorkerContext,
+    WorkerPool, WorkerPoolConfig,
 };
 use abq_utils::{
     net, net_async,
@@ -197,33 +198,76 @@ impl WorkersNegotiator {
         });
 
         let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
-            Some(Box::new(move |entity, run_id, manifest| {
-                let span = tracing::trace_span!("notify_manifest", ?entity, run_id=?run_id, queue_server=?queue_results_addr);
-                let _notify_manifest = span.enter();
+            Some(Box::new({
+                let client = client.boxed_clone();
 
-                // TODO: error handling
-                let mut stream = client
-                    .connect(queue_results_addr)
-                    .expect("results server not available");
+                move |entity, run_id, manifest| {
+                    let span = tracing::trace_span!("notify_manifest", ?entity, run_id=?run_id, queue_server=?queue_results_addr);
+                    let _notify_manifest = span.enter();
 
-                let request = net_protocol::queue::Request {
-                    entity,
-                    message: net_protocol::queue::Message::Manifest(run_id, manifest),
-                };
+                    // TODO: error handling
+                    let mut stream = client
+                        .connect(queue_results_addr)
+                        .expect("results server not available");
 
-                // TODO: error handling
-                net_protocol::write(&mut stream, request).unwrap();
-                let net_protocol::workers::AckManifest = net_protocol::read(&mut stream).unwrap();
+                    let request = net_protocol::queue::Request {
+                        entity,
+                        message: net_protocol::queue::Message::Manifest(run_id, manifest),
+                    };
+
+                    // TODO: error handling
+                    net_protocol::write(&mut stream, request).unwrap();
+                    let net_protocol::workers::AckManifest =
+                        net_protocol::read(&mut stream).unwrap();
+                }
             }))
         } else {
             None
         };
+
+        let run_completed_successfully: RunCompletedSuccessfully = Arc::new({
+            // When our worker finishes and polls the queue for the final status of the run,
+            // there still may be active work. So for now, let's poll every second; we can make
+            // the strategy here more sophisticated in the future, e.g. with exponential backoffs.
+            const BACKOFF: Duration = Duration::from_secs(1);
+
+            move |entity| {
+                let span = tracing::trace_span!("run_completed_successfully", run_id=?run_id, queue_addr=?queue_results_addr);
+                let _run_completed_successfully = span.enter();
+
+                use net_protocol::queue::{Message, Request, TotalRunResult};
+                loop {
+                    // TODO: error handling, here and below.
+                    // In particular, the work server may have shut down and we can't connect. In that
+                    // case the worker should shutdown too.
+                    let mut stream = client
+                        .connect(queue_results_addr)
+                        .expect("work server not available");
+
+                    let request = Request {
+                        entity,
+                        message: Message::RequestTotalRunResult(run_id),
+                    };
+                    net_protocol::write(&mut stream, request).unwrap();
+                    let run_result = net_protocol::read(&mut stream).unwrap();
+
+                    match run_result {
+                        TotalRunResult::Pending => {
+                            std::thread::sleep(BACKOFF);
+                            continue;
+                        }
+                        TotalRunResult::Completed { succeeded } => return succeeded,
+                    }
+                }
+            }
+        });
 
         let pool_config = WorkerPoolConfig {
             size: num_workers,
             runner_kind,
             get_next_work,
             notify_result,
+            run_completed_successfully,
             worker_context,
             work_timeout,
             work_retries,
@@ -507,7 +551,7 @@ mod test {
 
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
-    use crate::workers::WorkerContext;
+    use crate::workers::{WorkerContext, WorkersExit};
     use abq_utils::auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
     use abq_utils::net_protocol::runners::{
@@ -628,6 +672,18 @@ mod test {
                     );
                     net_protocol::write(&mut client, net_protocol::workers::AckManifest).unwrap();
                 }
+                net_protocol::queue::Message::RequestTotalRunResult(_) => {
+                    let succeeded = msgs2
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|result| !result.status.is_fail_like());
+                    net_protocol::write(
+                        &mut client,
+                        net_protocol::queue::TotalRunResult::Completed { succeeded },
+                    )
+                    .unwrap();
+                }
                 _ => unreachable!(),
             }
         });
@@ -729,7 +785,9 @@ mod test {
             result.status == Status::Success && result.output.as_ref().unwrap() == "hello"
         });
 
-        workers.shutdown();
+        let status = workers.shutdown();
+        assert!(matches!(status, WorkersExit::Success));
+
         queue_negotiator.shutdown();
 
         close_queue_servers(

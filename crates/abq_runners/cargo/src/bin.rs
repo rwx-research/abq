@@ -2,8 +2,9 @@
 //! Eventually this should call cargo as a library directly, or fork cargo.
 
 use std::{
+    io::{BufRead, BufReader},
     net::{SocketAddr, TcpStream},
-    process,
+    process::{self, Stdio},
     string::FromUtf8Error,
     time::Instant,
 };
@@ -89,20 +90,30 @@ fn main() -> anyhow::Result<()> {
                     cmd.arg("test");
                     cmd.args(args.iter());
                     cmd.arg(&id);
+                    cmd.stdout(Stdio::piped());
+                    cmd.stderr(Stdio::piped());
 
                     let start = Instant::now();
-                    let output_result = cmd.output();
+                    let mut child = cmd.spawn().unwrap();
+
+                    // Cargo writes both test output and error to stdout
+                    let mut output = String::new();
+                    let stdout = child.stdout.take().unwrap();
+                    for line in BufReader::new(stdout).lines() {
+                        output.push_str(&line.unwrap());
+                    }
+
+                    let result = child.wait();
                     let duration = start.elapsed();
 
-                    let (status, output) = match output_result {
-                        Ok(output) => {
-                            let (status, buffer) = if output.status.success() {
-                                (Status::Success, output.stdout)
+                    let (status, output) = match result {
+                        Ok(status) => {
+                            let status = if status.success() {
+                                Status::Success
                             } else {
                                 // cargo writes test failures to stdout
-                                (Status::Failure, output.stdout)
+                                Status::Failure
                             };
-                            let output = String::from_utf8_lossy(&buffer).to_string();
                             (status, output)
                         }
                         Err(err) => (Status::Error, err.to_string()),
