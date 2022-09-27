@@ -1,0 +1,11 @@
+---
+source: crates/abq_cli/tests/cli.rs
+expression: stderr
+---
+error: One of --api-token <API_TOKEN> or --queue-addr <QUEUE_ADDR> must be provided.
+
+USAGE:
+    work [OPTIONS] --working-dir <WORKING_DIR> <RUN_ID>
+
+For more information try --help
+

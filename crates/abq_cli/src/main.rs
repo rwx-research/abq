@@ -8,11 +8,13 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     num::NonZeroU64,
+    str::FromStr,
     thread::{self, JoinHandle},
 };
 
 use abq_queue::invoke::{Client, InvocationError};
 use abq_utils::{
+    api::ApiKey,
     auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
     net_opt::{ClientOptions, ServerOptions, Tls},
     net_protocol::{
@@ -22,6 +24,7 @@ use abq_utils::{
     },
 };
 use abq_workers::negotiate::QueueNegotiatorHandle;
+use anyhow::bail;
 use clap::Parser;
 
 use args::{default_num_workers, Cli, Command};
@@ -45,6 +48,12 @@ struct TracingGuards {
 struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
     format: fmt::format::Format<fmt::format::Full, T>,
     prefix: String,
+}
+
+struct ConfigFromApi {
+    queue_addr: SocketAddr,
+    token: AuthToken,
+    tls: Tls,
 }
 
 impl<S, N, T> fmt::format::FormatEvent<S, N> for PrefixedCiEventFormat<T>
@@ -166,12 +175,26 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         ),
         Command::Work {
             working_dir,
-            queue_addr,
             run_id,
+            api_key,
+            queue_addr,
             num,
             token,
             tls,
         } => {
+            let mut cmd = Cli::command();
+            let cmd = cmd.find_subcommand_mut("work").unwrap();
+
+            let (token, queue_addr, tls) = resolve_config(token, queue_addr, tls, api_key)?;
+
+            let queue_addr = queue_addr.unwrap_or_else(|| {
+                let error = cmd.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "One of --api-token <API_TOKEN> or --queue-addr <QUEUE_ADDR> must be provided.",
+                );
+                clap::Error::exit(&error);
+            });
+
             let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), tls);
             let queue_negotiator =
                 QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts)?;
@@ -180,6 +203,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         Command::Test {
             args,
             run_id,
+            api_key,
             queue_addr,
             reporter: reporters,
             token,
@@ -187,10 +211,19 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             color,
             batch_size,
         } => {
-            let (server_auth, client_auth) = (token.into(), token.into());
+            let (resolved_token, resolved_queue_addr, resolved_tls) =
+                resolve_config(token, queue_addr, tls, api_key)?;
+
+            let (server_auth, client_auth) = (resolved_token.into(), resolved_token.into());
 
             let runner_params = validate_abq_test_args(args)?;
-            let abq = find_or_create_abq(entity, queue_addr, server_auth, client_auth, tls)?;
+            let abq = find_or_create_abq(
+                entity,
+                resolved_queue_addr,
+                server_auth,
+                client_auth,
+                resolved_tls,
+            )?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
             run_tests(entity, runner, abq, run_id, reporters, color, batch_size)
         }
@@ -236,6 +269,53 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::new(0))
         }
     }
+}
+
+fn resolve_config(
+    token_from_cli: Option<AuthToken>,
+    queue_addr_from_cli: Option<SocketAddr>,
+    tls_from_cli: Tls,
+    api_key: Option<ApiKey>,
+) -> anyhow::Result<(Option<AuthToken>, Option<SocketAddr>, Tls)> {
+    let (queue_addr_from_api, token_from_api, tls_from_api) = match api_key {
+        Some(key) => {
+            let config = get_config_from_api(key)?;
+            (
+                Some(config.queue_addr),
+                Some(config.token),
+                Some(config.tls),
+            )
+        }
+        None => (None, None, None),
+    };
+
+    let token = token_from_api.or(token_from_cli);
+    let queue_addr = queue_addr_from_api.or(queue_addr_from_cli);
+    let tls = tls_from_api.unwrap_or(tls_from_cli);
+
+    Ok((token, queue_addr, tls))
+}
+
+fn get_config_from_api(api_key: ApiKey) -> anyhow::Result<ConfigFromApi> {
+    let expected_key = ApiKey::from_str(
+        include_str!(concat!(env!("ABQ_WORKSPACE_DIR"), "bin/abq_api_key"))
+            .strip_suffix('\n')
+            .unwrap(),
+    )?;
+    if api_key != expected_key {
+        bail!("invalid api key")
+    }
+
+    // TODO: Call a real API to get this info
+    Ok(ConfigFromApi {
+        queue_addr: SocketAddr::from_str("168.220.85.45:8080")?,
+        token: AuthToken::from_str(
+            include_str!(concat!(env!("ABQ_WORKSPACE_DIR"), "bin/abq_server_token"))
+                .strip_suffix('\n')
+                .unwrap(),
+        )?,
+        tls: Tls::YES,
+    })
 }
 
 fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParams, clap::Error> {
