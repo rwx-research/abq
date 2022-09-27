@@ -13,6 +13,9 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Build application
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY .cargo ./.cargo
+COPY bin/abq_api_key ./bin/abq_api_key
+COPY bin/abq_server_token ./bin/abq_server_token
 RUN cargo build --release --bin abq
 
 # Runtime image
