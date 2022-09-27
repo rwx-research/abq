@@ -94,6 +94,7 @@ where
     cmd.args(args);
     cmd.current_dir(working_dir);
     cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
     if debug_log_for_local_run() {
         cmd.env("ABQ_LOGFILE", format!("{name}.debug"));
@@ -576,4 +577,23 @@ Negotiator at {negotiator_addr}: unhealthy
         );
         assert!(stderr.is_empty());
     })
+}
+
+#[test]
+#[serial]
+fn work_no_queue_addr_or_api_key() {
+    // Spawn worker without a queue addr or api key
+    // abq work --working-dir . run-id
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq(
+        "work_no_queue_addr_or_api_key",
+        ["work", "--working-dir", ".", "run-id"],
+    );
+
+    assert_eq!(exit_status.code().unwrap(), 2);
+    assert!(stdout.is_empty());
+    insta::assert_snapshot!(stderr);
 }

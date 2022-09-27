@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use abq_utils::{auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
+use abq_utils::{api::ApiKey, auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
 use clap::{Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
@@ -71,7 +71,7 @@ pub enum Command {
         #[clap(long)]
         token: Option<AuthToken>,
 
-        /// Whether to accept messages only with TLS; unset by default.
+        /// Whether to accept messages only with TLS; false by default.
         /// When set, workers and test clients must also be set to send messages only with TLS.
         #[clap(long, parse(from_flag), required = false)]
         tls: Tls,
@@ -81,16 +81,22 @@ pub enum Command {
     /// You should use this to start workers on a remote machine that you'd like to connect to an
     /// instance of `abq start`.
     Work {
-        /// Address of the queue to connect to.
-        #[clap(long, required = true)]
-        queue_addr: SocketAddr,
-
         /// Working directory of the workers.
         #[clap(long, required = true)]
         working_dir: PathBuf,
 
         /// The ID of the test run to pull work for.
         run_id: RunId,
+
+        /// The API key to use when fetching queue config information from the ABQ API
+        #[clap(long, required = false)]
+        api_key: Option<ApiKey>,
+
+        /// Address of the queue to connect to.
+        ///
+        /// If --api-key is specified, the queue_addr will be ignored and the address fetched from the ABQ API will be used.
+        #[clap(long, required = false)]
+        queue_addr: Option<SocketAddr>,
 
         /// Number of workers to start. Must be >= 4. Defaults to the number of available (logical)
         /// CPUs - 1.
@@ -99,11 +105,16 @@ pub enum Command {
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
+        ///
+        /// If --api-key is specified, the token will be ignored and the token fetched from the ABQ API will be used.
         #[clap(long, required = false)]
         token: Option<AuthToken>,
 
-        /// Whether to send messages only with TLS; unset by default.
-        /// When set, must talk to a queue configured with TLS.
+        /// Whether to send messages only with TLS; false by default.
+        /// When set, only queues configured with TLS as well should be provided via
+        /// `--queue-addr`.
+        ///
+        /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
         #[clap(long, parse(from_flag), required = false)]
         tls: Tls,
     },
@@ -119,23 +130,33 @@ pub enum Command {
         #[clap(long, required = false)]
         run_id: Option<RunId>,
 
+        /// The API key to use when fetching queue config information from the ABQ API
+        #[clap(long, required = false)]
+        api_key: Option<ApiKey>,
+
         /// Address of the queue to send the test request to.
         ///
         /// If specified, assumes that abq workers will start as seperate processes connected to
         /// the same queue.
         ///
-        /// If not specified, uses an in-process queue and workers.
+        /// If not specified and --api-key is specified, the queue address will be fetched from the ABQ API.
+        ///
+        /// If --api-key is specified, the queue_addr will be ignored and the address fetched from the ABQ API will be used.
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
+        ///
+        /// If --api-key is specified, the token will be ignored and the token fetched from the ABQ API will be used.
         #[clap(long, required = false)]
         token: Option<AuthToken>,
 
-        /// Whether to send messages only with TLS; unset by default.
+        /// Whether to send messages only with TLS; false by default.
         /// When set, only queues configured with TLS as well should be provided via
         /// `--queue-addr`.
+        ///
+        /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
         #[clap(long, parse(from_flag), required = false)]
         tls: Tls,
 
