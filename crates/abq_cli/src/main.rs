@@ -190,7 +190,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let queue_addr = queue_addr.unwrap_or_else(|| {
                 let error = cmd.error(
                     ErrorKind::MissingRequiredArgument,
-                    "One of --api-token <API_TOKEN> or --queue-addr <QUEUE_ADDR> must be provided.",
+                    "One of --api-key <API_KEY> or --queue-addr <QUEUE_ADDR> must be provided.",
                 );
                 clap::Error::exit(&error);
             });
