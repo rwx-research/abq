@@ -7,8 +7,8 @@ edition = "2021"
 rustls = "0.20.6"
 rustls-pemfile = "1.0.1"
 tokio-rustls = "0.23.4"
-serde = "1.0.144"
-serde_derive = "1.0.144"
+serde = "1.0.145"
+serde_derive = "1.0.145"
 serde_json = "1.0.85"
 
 tokio = { version = "1.21.1", features = ["io-util", "net", "rt", "macros"] }
@@ -16,7 +16,7 @@ tracing = "0.1.36"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 
-thiserror = "1.0.35"
+thiserror = "1.0.36"
 async-trait = "0.1.57"
 
 [dependencies.uuid]
