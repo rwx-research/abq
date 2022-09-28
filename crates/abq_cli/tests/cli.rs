@@ -56,10 +56,23 @@ fn run_abq<S>(name: &str, args: impl IntoIterator<Item = S>) -> CmdOutput
 where
     S: AsRef<OsStr>,
 {
-    run_abq_in(name, args, &std::env::current_dir().unwrap())
+    run_abq_in(name, args, &std::env::current_dir().unwrap(), false)
 }
 
-fn run_abq_in<S>(name: &str, args: impl IntoIterator<Item = S>, working_dir: &Path) -> CmdOutput
+fn run_abq_forcing_capture<S>(name: &str, args: impl IntoIterator<Item = S>) -> CmdOutput
+where
+    S: AsRef<OsStr>,
+{
+    run_abq_in(name, args, &std::env::current_dir().unwrap(), true)
+}
+
+fn run_abq_in<S>(
+    name: &str,
+    args: impl IntoIterator<Item = S>,
+    working_dir: &Path,
+    // If set to `false`, won't capture stderr when ABQ_DEBUG_CLI_TESTS_FOR_CI is set.
+    always_capture_stderr: bool,
+) -> CmdOutput
 where
     S: AsRef<OsStr>,
 {
@@ -67,7 +80,7 @@ where
         status,
         stdout,
         stderr,
-    } = spawn_abq_in(name, args, working_dir)
+    } = spawn_abq_in(name, args, working_dir, always_capture_stderr)
         .wait_with_output()
         .expect("abq cli failed on waiting");
 
@@ -82,10 +95,16 @@ fn spawn_abq<S>(name: &str, args: impl IntoIterator<Item = S>) -> Child
 where
     S: AsRef<OsStr>,
 {
-    spawn_abq_in(name, args, &std::env::current_dir().unwrap())
+    spawn_abq_in(name, args, &std::env::current_dir().unwrap(), false)
 }
 
-fn spawn_abq_in<S>(name: &str, args: impl IntoIterator<Item = S>, working_dir: &Path) -> Child
+fn spawn_abq_in<S>(
+    name: &str,
+    args: impl IntoIterator<Item = S>,
+    working_dir: &Path,
+    // If set to `false`, won't capture stderr when ABQ_DEBUG_CLI_TESTS_FOR_CI is set.
+    always_capture_stderr: bool,
+) -> Child
 where
     S: AsRef<OsStr>,
 {
@@ -94,13 +113,17 @@ where
     cmd.args(args);
     cmd.current_dir(working_dir);
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    if debug_log_for_ci() && !always_capture_stderr {
+        cmd.stderr(Stdio::inherit());
+    } else {
+        cmd.stderr(Stdio::piped());
+    }
 
     if debug_log_for_local_run() {
         cmd.env("ABQ_LOGFILE", format!("{name}.debug"));
         cmd.env("ABQ_LOG", "abq=debug");
     }
-    if debug_log_for_ci() {
+    if debug_log_for_ci() && !always_capture_stderr {
         cmd.env("ABQ_LOGCI_WITH_PREFIX", name);
         cmd.env("ABQ_LOG", "abq=debug");
     }
@@ -217,6 +240,7 @@ test_all_network_config_options! {
             name,
             args,
             &testdata_project("jest/npm-jest-project"),
+            false,
         );
 
         assert!(exit_status.success());
@@ -368,6 +392,7 @@ test_all_network_config_options! {
             name,
             test_args,
             &testdata_project("jest/npm-jest-project-with-failures"),
+            false
         );
 
         let code = exit_status.code().expect("process killed");
@@ -590,7 +615,7 @@ fn work_no_queue_addr_or_api_key() {
         stdout,
         stderr,
         exit_status,
-    } = run_abq(
+    } = run_abq_forcing_capture(
         "work_no_queue_addr_or_api_key",
         ["work", "--run-id", "run-id"],
     );
