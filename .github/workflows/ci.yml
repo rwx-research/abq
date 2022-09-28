@@ -43,12 +43,14 @@ jobs:
           cache-name: ci
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            target
-          key: ${{ hashFiles('Cargo.lock') }}
-
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1.0.7
         with:
@@ -80,6 +82,19 @@ jobs:
 
           eval `ssh-agent -k`
 
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn config get cacheFolder)"
+        shell: bash
+        working-directory: native-runners/abq-jest
+      - name: Restore yarn cache
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: yarn-cache-folder-${{ hashFiles('native-runners/abq-jest/yarn.lock', '.yarnrc.yml') }}
+          restore-keys: |
+            yarn-cache-folder-
+
       - name: Load test dependencies
         run: |
           scripts/init_testdata
@@ -110,18 +125,10 @@ jobs:
 
       - name: Run tests with cargo
         timeout-minutes: 2
-        if: github.run_attempt == 1
         run: |
           cargo test --all-features
         env:
           CI: false
-
-      - name: Run retried tests with cargo, including debug output
-        timeout-minutes: 2
-        if: github.run_attempt > 1
-        run: |
-          export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --all-features -- --nocapture
 
   deploy-main:
     name: Deploy abq
@@ -152,12 +159,14 @@ jobs:
           cache-name: ci
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            target
-          key: ${{ hashFiles('Cargo.lock') }}
-
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1.0.7
         with:
