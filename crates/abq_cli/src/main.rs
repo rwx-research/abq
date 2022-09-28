@@ -56,6 +56,28 @@ struct ConfigFromApi {
     tls: Tls,
 }
 
+struct RunIdEnvironment {
+    abq_run_id: Result<String, std::env::VarError>,
+    ci: Result<String, std::env::VarError>,
+    buildkite_build_id: Result<String, std::env::VarError>,
+    circle_workflow_id: Result<String, std::env::VarError>,
+    github_run_id: Result<String, std::env::VarError>,
+    github_run_attempt: Result<String, std::env::VarError>,
+}
+
+impl RunIdEnvironment {
+    fn from_env() -> Self {
+        Self {
+            abq_run_id: std::env::var("ABQ_RUN_ID"),
+            ci: std::env::var("CI"),
+            buildkite_build_id: std::env::var("BUILDKITE_BUILD_ID"),
+            circle_workflow_id: std::env::var("CIRCLE_WORKFLOW_ID"),
+            github_run_id: std::env::var("GITHUB_RUN_ID"),
+            github_run_attempt: std::env::var("GITHUB_RUN_ATTEMPT"),
+        }
+    }
+}
+
 impl<S, N, T> fmt::format::FormatEvent<S, N> for PrefixedCiEventFormat<T>
 where
     S: Subscriber + for<'a> registry::LookupSpan<'a>,
@@ -145,10 +167,40 @@ fn setup_tracing() -> TracingGuards {
     }
 }
 
+fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
+    let RunIdEnvironment {
+        abq_run_id,
+        ci,
+        buildkite_build_id,
+        circle_workflow_id,
+        github_run_id,
+        github_run_attempt,
+    } = run_id_environment;
+
+    if abq_run_id.is_ok() || ci.unwrap_or_else(|_| String::from("false")) == *"false" {
+        return None;
+    }
+    let github_actions_run_id = github_run_id.map({
+        |run_id| {
+            format!(
+                "{}-{}",
+                run_id,
+                github_run_attempt.unwrap_or_else(|_| String::from("1"))
+            )
+        }
+    });
+    let run_id_result = buildkite_build_id
+        .or(circle_workflow_id)
+        .or(github_actions_run_id);
+    run_id_result.ok().map(RunId)
+}
+
 fn abq_main() -> anyhow::Result<ExitCode> {
     use clap::{CommandFactory, ErrorKind};
 
     let _tracing_guards = setup_tracing();
+
+    let inferred_run_id = get_inferred_run_id(RunIdEnvironment::from_env());
 
     let Cli { command } = Cli::parse();
 
@@ -186,6 +238,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let cmd = cmd.find_subcommand_mut("work").unwrap();
 
             let (token, queue_addr, tls) = resolve_config(token, queue_addr, tls, api_key)?;
+            let run_id = run_id.or(inferred_run_id).unwrap_or_else(|| {
+                let error = cmd.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "The following required arguments were not provided: --run-id <RUN_ID>",
+                );
+                clap::Error::exit(&error);
+            });
 
             let queue_addr = queue_addr.unwrap_or_else(|| {
                 let error = cmd.error(
@@ -213,6 +272,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         } => {
             let (resolved_token, resolved_queue_addr, resolved_tls) =
                 resolve_config(token, queue_addr, tls, api_key)?;
+            let run_id = run_id.or(inferred_run_id);
 
             let (server_auth, client_auth) = (resolved_token.into(), resolved_token.into());
 
@@ -453,10 +513,25 @@ fn start_test_result_reporter(
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::workers::NativeTestRunnerParams;
+    use std::{env::VarError, str::FromStr};
+
+    use abq_utils::net_protocol::workers::{NativeTestRunnerParams, RunId};
     use clap::ErrorKind;
 
-    use super::validate_abq_test_args;
+    use super::{get_inferred_run_id, validate_abq_test_args, RunIdEnvironment};
+
+    impl Default for RunIdEnvironment {
+        fn default() -> RunIdEnvironment {
+            RunIdEnvironment {
+                abq_run_id: Err(VarError::NotPresent),
+                ci: Err(VarError::NotPresent),
+                buildkite_build_id: Err(VarError::NotPresent),
+                circle_workflow_id: Err(VarError::NotPresent),
+                github_run_id: Err(VarError::NotPresent),
+                github_run_attempt: Err(VarError::NotPresent),
+            }
+        }
+    }
 
     #[test]
     fn validate_test_args_empty() {
@@ -497,5 +572,83 @@ mod test {
 
         assert_eq!(cmd, "abq-test");
         assert_eq!(args, vec!["--filter", "onboarding"]);
+    }
+
+    #[test]
+    fn get_inferred_run_id_github_actions() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            ci: Ok(String::from("true")),
+            github_run_id: Ok(String::from("github-id")),
+            github_run_attempt: Ok(String::from("2")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id.unwrap(), RunId::from_str("github-id-2").unwrap());
+    }
+
+    #[test]
+    fn get_inferred_run_id_github_actions_no_attempt_envvar() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            ci: Ok(String::from("true")),
+            github_run_id: Ok(String::from("github-id")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id.unwrap(), RunId::from_str("github-id-1").unwrap());
+    }
+
+    #[test]
+    fn get_inferred_run_id_circleci() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            ci: Ok(String::from("true")),
+            circle_workflow_id: Ok(String::from("circleci-id")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id.unwrap(), RunId::from_str("circleci-id").unwrap());
+    }
+
+    #[test]
+    fn get_inferred_run_id_buildkite() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            ci: Ok(String::from("true")),
+            buildkite_build_id: Ok(String::from("buildkite-id")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id.unwrap(), RunId::from_str("buildkite-id").unwrap());
+    }
+
+    #[test]
+    fn get_inferred_run_id_ci_false() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            ci: Ok(String::from("false")),
+            buildkite_build_id: Ok(String::from("buildkite-id")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id, None);
+    }
+
+    #[test]
+    fn get_inferred_run_id_ci_absent() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            buildkite_build_id: Ok(String::from("buildkite-id")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id, None);
+    }
+
+    #[test]
+    fn get_inferred_run_id_already_set() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            abq_run_id: Ok(String::from("abq-id")),
+            ci: Ok(String::from("true")),
+            buildkite_build_id: Ok(String::from("buildkite-id")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id, None);
     }
 }

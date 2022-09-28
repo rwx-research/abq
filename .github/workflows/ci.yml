@@ -89,6 +89,8 @@ jobs:
       - name: Dogfood abq
         run: |
           make dogfood
+        env:
+          CI: false
 
       - name: Upload artifacts to captain
         uses: rwx-research/upload-captain-artifact@main
@@ -111,13 +113,15 @@ jobs:
         if: github.run_attempt == 1
         run: |
           cargo test --all-features
+        env:
+          CI: false
 
       - name: Run retried tests with cargo, including debug output
         timeout-minutes: 2
         if: github.run_attempt > 1
         run: |
-           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-           cargo test --all-features -- --nocapture
+          export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
+          cargo test --all-features -- --nocapture
 
   deploy-main:
     name: Deploy abq

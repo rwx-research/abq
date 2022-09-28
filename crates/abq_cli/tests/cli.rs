@@ -273,7 +273,7 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         let queue_addr = format!("0.0.0.0:{server_port}");
-        let test_id = RunId::unique().to_string();
+        let run_id = RunId::unique().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
@@ -302,16 +302,17 @@ test_all_network_config_options! {
             }
         }
 
-        // abq work --queue-addr ... --working-dir ... (--token ...)? <test_id>
+        // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
         let worker_args = &[
             "work",
             "--queue-addr",
             &queue_addr,
             "--working-dir",
             &npm_jest_project_path.display().to_string(),
+            "--run-id",
+            &run_id
         ];
-        let mut worker_args = conf.extend_args(worker_args);
-        worker_args.extend([test_id.as_str()]);
+        let worker_args = conf.extend_args(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_worker"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
@@ -322,7 +323,7 @@ test_all_network_config_options! {
             "--queue-addr",
             &queue_addr,
             "--run-id",
-            &test_id,
+            &run_id,
         ];
         let mut test_args = conf.extend_args(test_args);
         test_args.extend(["--", "yarn", "jest"]);
@@ -387,7 +388,7 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         let queue_addr = format!("0.0.0.0:{server_port}");
-        let test_id = RunId::unique().to_string();
+        let run_id = RunId::unique().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
 
@@ -416,16 +417,17 @@ test_all_network_config_options! {
             }
         }
 
-        // abq work --queue-addr ... --working-dir ... (--token ...)? <test_id>
+        // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
         let worker_args = &[
             "work",
             "--queue-addr",
             &queue_addr,
             "--working-dir",
             &npm_jest_project_path.display().to_string(),
+            "--run-id",
+            &run_id
         ];
-        let mut worker_args = conf.extend_args(worker_args);
-        worker_args.extend([test_id.as_str()]);
+        let worker_args = conf.extend_args(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
@@ -436,7 +438,7 @@ test_all_network_config_options! {
             "--queue-addr",
             &queue_addr,
             "--run-id",
-            &test_id,
+            &run_id,
         ];
         let mut test_args = conf.extend_args(test_args);
         test_args.extend(["--", "yarn", "jest"]);
@@ -590,7 +592,7 @@ fn work_no_queue_addr_or_api_key() {
         exit_status,
     } = run_abq(
         "work_no_queue_addr_or_api_key",
-        ["work", "--working-dir", ".", "run-id"],
+        ["work", "--run-id", "run-id"],
     );
 
     assert_eq!(exit_status.code().unwrap(), 2);
