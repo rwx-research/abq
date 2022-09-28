@@ -81,15 +81,17 @@ pub enum Command {
     /// You should use this to start workers on a remote machine that you'd like to connect to an
     /// instance of `abq start`.
     Work {
-        /// Working directory of the workers.
-        #[clap(long, required = true)]
+        /// Working directory of the workers. Defaults to the current directory.
+        #[clap(long, required = true, env("PWD"))]
         working_dir: PathBuf,
 
         /// The ID of the test run to pull work for.
-        run_id: RunId,
+        /// In CI environments, this can be inferred from CI environment variables. Otherwise it is required.
+        #[clap(long, required = false, env("ABQ_RUN_ID"))]
+        run_id: Option<RunId>,
 
         /// The API key to use when fetching queue config information from the ABQ API
-        #[clap(long, required = false)]
+        #[clap(long, required = false, env("ABQ_API_KEY"))]
         api_key: Option<ApiKey>,
 
         /// Address of the queue to connect to.
@@ -127,11 +129,12 @@ pub enum Command {
     /// and must resolve to an executable that implements the ABQ protocol.
     Test {
         /// Run ID for workers to connect to. If not specified, workers are started in-process.
-        #[clap(long, required = false)]
+        /// In CI environments, this can be inferred from CI environment variables.
+        #[clap(long, required = false, env("ABQ_RUN_ID"))]
         run_id: Option<RunId>,
 
         /// The API key to use when fetching queue config information from the ABQ API
-        #[clap(long, required = false)]
+        #[clap(long, required = false, env("ABQ_API_KEY"))]
         api_key: Option<ApiKey>,
 
         /// Address of the queue to send the test request to.
