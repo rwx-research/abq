@@ -24,7 +24,7 @@ use abq_utils::{
         self,
         entity::EntityId,
         publicize_addr,
-        workers::{RunId, RunnerKind},
+        workers::{NextWorkBundle, RunId, RunnerKind},
     },
 };
 
@@ -183,24 +183,7 @@ impl WorkersNegotiator {
                 let _get_next_work = span.enter();
 
                 // TODO: error handling
-                // In particular, the work server may have shut down and we can't connect. In that
-                // case the worker should shutdown too.
-                let mut stream = client
-                    .connect(queue_new_work_addr)
-                    .expect("work server not available");
-
-                // Write the run ID we want work for
-                // TODO: error handling
-                net_protocol::write(
-                    &mut stream,
-                    net_protocol::work_server::WorkServerRequest::NextTest {
-                        run_id: run_id.clone(),
-                    },
-                )
-                .unwrap();
-
-                // TODO: error handling
-                net_protocol::read(&mut stream).unwrap()
+                wait_for_next_work_bundle(&*client, queue_new_work_addr, run_id.clone()).unwrap()
             }
         });
 
@@ -288,6 +271,40 @@ impl WorkersNegotiator {
         tracing::debug!("Started worker pool");
 
         Ok(pool)
+    }
+}
+
+/// Asks the work server for the next item of work to run.
+/// Blocks on the result, repeatedly pinging the server until work is available.
+fn wait_for_next_work_bundle(
+    client: &dyn net::ConfiguredClient,
+    work_server_addr: SocketAddr,
+    run_id: RunId,
+) -> Result<NextWorkBundle, io::Error> {
+    use net_protocol::work_server::NextTestResponse;
+
+    let next_test_request = net_protocol::work_server::WorkServerRequest::NextTest { run_id };
+
+    // The work server may be waiting for the manifest, in which case there won't be any work yet
+    // available; to avoid pinging the server too often, let's decay on the frequency of our
+    // requests.
+    let mut decay = Duration::from_millis(10);
+    let max_decay = Duration::from_secs(3);
+    loop {
+        let mut stream = client.connect(work_server_addr)?;
+        net_protocol::write(&mut stream, next_test_request.clone())?;
+        match net_protocol::read(&mut stream)? {
+            NextTestResponse::WaitingForManifest => {
+                thread::sleep(decay);
+                decay *= 2;
+                if decay >= max_decay {
+                    tracing::info!("hit max decay limit for requesting next test");
+                    decay = max_decay;
+                }
+                continue;
+            }
+            NextTestResponse::Bundle(bundle) => return Ok(bundle),
+        }
     }
 }
 
@@ -565,7 +582,7 @@ mod test {
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
-    use abq_utils::net_protocol::work_server::WorkServerRequest;
+    use abq_utils::net_protocol::work_server::{NextTestResponse, WorkServerRequest};
     use abq_utils::net_protocol::workers::{
         NextWork, NextWorkBundle, RunId, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
@@ -619,7 +636,8 @@ mod test {
                         let work_bundle = NextWorkBundle(vec![work]);
 
                         let _msg: WorkServerRequest = net_protocol::read(&mut worker).unwrap();
-                        net_protocol::write(&mut worker, work_bundle).unwrap();
+                        let response = NextTestResponse::Bundle(work_bundle);
+                        net_protocol::write(&mut worker, response).unwrap();
                     }
 
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

@@ -247,7 +247,7 @@ pub mod workers {
     }
 
     /// A unit of work sent to a worker to be run.
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug)]
     pub enum NextWork {
         Work {
             test_case: TestCase,
@@ -259,7 +259,7 @@ pub mod workers {
     }
 
     /// A bundle of work sent to a worker to be run in sequence.
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug)]
     pub struct NextWorkBundle(pub Vec<NextWork>);
 
     /// An acknowledgement from the queue that it received a manifest message.
@@ -357,15 +357,23 @@ pub mod queue {
 pub mod work_server {
     use serde_derive::{Deserialize, Serialize};
 
-    use super::workers::RunId;
+    use super::workers::{self, RunId};
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum WorkServerRequest {
         HealthCheck,
         /// An ask to get the next test for a particular run for the queue.
         NextTest {
             run_id: RunId,
         },
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub enum NextTestResponse {
+        /// The manifest is yet to be received; try again later
+        WaitingForManifest,
+        /// The set of tests to run next
+        Bundle(workers::NextWorkBundle),
     }
 }
 

@@ -461,8 +461,6 @@ fn start_queue(config: QueueConfig) -> Abq {
     }
 }
 
-static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
-
 /// Handler for sending test results back to the abq client that issued a test run.
 #[derive(Debug)]
 enum ClientResponder {
@@ -515,7 +513,7 @@ impl ClientResponder {
     /// Updates the responder with a new connection. If there are any pending test results that
     /// failed to be sent from a previous connections, they are streamed to the new connection
     /// before the future returned from this function completes.
-    async fn reconnect_with(&mut self, new_conn: Box<dyn net_async::ServerStream>) {
+    async fn update_connection_to(&mut self, new_conn: Box<dyn net_async::ServerStream>) {
         // There's no great way for us to check whether the existing client connection is,
         // in fact, closed. Instead we accept all faithful reconnection requests, and
         // assume that the client is well-behaved (it will not attempt to reconnect unless
@@ -789,29 +787,34 @@ impl QueueServer {
 
         match could_create_queue {
             Ok(()) => {
-                // Let the invoker know that our enqueuing of the work was successful, and it can
-                // start polling for test results.
-                //
-                // TODO: if this write fails, we will be in an inconsistent state and have leaked a
-                // run ID - there will be an active queue, but no active responder for when test
-                // results start streaming back in.
-                // If this run fails, we should switch the queue state to a mode where we say
-                // "something has went wrong" and disallow workers to pull tests until either the
-                // invoker re-invokes the run, or the run gets deleted.
-                net_protocol::async_write(
-                    &mut stream,
-                    &net_protocol::queue::InvokeWorkResponse::Success,
-                )
-                .await?;
+                {
+                    // Only after telling the client that we are ready for it to move into listing
+                    // for test results, associate the results responder.
+                    //
+                    // NB: an exclusive lock here is important! As unlikely as it may be, sharing the
+                    // responder before the response message is sent may result in test results being
+                    // sent *before* this response message is sent.
+                    let mut active_runs = active_runs.lock().await;
 
-                // NOTE: it's important that there are no explicit errors hereafter, so that the
-                // "success" message is, in fact, indicative of a true success.
-                let results_responder = ClientResponder::new(stream);
-                let old_responder = active_runs.lock().await.insert(run_id, results_responder);
-                debug_assert!(
-                    old_responder.is_none(),
-                    "Existing stream for expected unique run id"
-                );
+                    // TODO: if this write fails, we will be in an inconsistent state and have leaked a
+                    // run ID - there will be an active queue, but no active responder for when test
+                    // results start streaming back in.
+                    // If this run fails, we should switch the queue state to a mode where we say
+                    // "something has went wrong" and disallow workers to pull tests until either the
+                    // invoker re-invokes the run, or the run gets deleted.
+                    net_protocol::async_write(
+                        &mut stream,
+                        &net_protocol::queue::InvokeWorkResponse::Success,
+                    )
+                    .await?;
+
+                    let results_responder = ClientResponder::new(stream);
+                    let old_responder = active_runs.insert(run_id, results_responder);
+                    debug_assert!(
+                        old_responder.is_none(),
+                        "Existing stream for expected unique run id"
+                    );
+                }
 
                 Ok(())
             }
@@ -854,7 +857,7 @@ impl QueueServer {
             Entry::Occupied(mut occupied) => {
                 let new_stream_addr = new_stream.peer_addr();
 
-                occupied.get_mut().reconnect_with(new_stream).await;
+                occupied.get_mut().update_connection_to(new_stream).await;
 
                 tracing::debug!(
                     "rerouted connection for {:?} to {:?}",
@@ -1104,21 +1107,19 @@ impl WorkScheduler {
                 }
             }
             WorkServerRequest::NextTest { run_id } => {
-                // Pull the next work item.
-                let next_work = loop {
-                    let opt_work = { ctx.queues.lock().unwrap().next_work(run_id.clone()) };
-                    match opt_work {
-                        Ok(work) => break work,
-                        Err(WaitingForManifestError) => {
-                            // Nothing yet; release control and sleep for a bit in case the
-                            // manifest comes in.
-                            tokio::time::sleep(POLL_WAIT_TIME).await;
-                            continue;
-                        }
+                // Pull the next bundle of work.
+                let opt_work_bundle = { ctx.queues.lock().unwrap().next_work(run_id.clone()) };
+
+                use net_protocol::work_server::NextTestResponse;
+                let response = match opt_work_bundle {
+                    Ok(bundle) => NextTestResponse::Bundle(bundle),
+                    Err(WaitingForManifestError) => {
+                        // Nothing yet; have the worker ask again later.
+                        NextTestResponse::WaitingForManifest
                     }
                 };
 
-                net_protocol::async_write(&mut stream, &next_work).await?;
+                net_protocol::async_write(&mut stream, &response).await?;
             }
         }
 
@@ -1128,13 +1129,20 @@ impl WorkScheduler {
 
 #[cfg(test)]
 mod test {
-    use std::{io, net::SocketAddr, num::NonZeroU64, sync::Arc, thread, time::Duration};
+    use std::{
+        io,
+        net::SocketAddr,
+        num::NonZeroU64,
+        sync::{Arc, Mutex},
+        thread::{self, JoinHandle},
+        time::Duration,
+    };
 
     use super::{Abq, RunStateCache};
     use crate::{
         invoke::{Client, InvocationError},
         queue::{
-            ActiveRunResponders, ClientReconnectionError, ClientResponder, QueueServer,
+            ActiveRunResponders, ClientReconnectionError, ClientResponder, QueueServer, RunQueues,
             SharedRunQueues, WorkScheduler,
         },
     };
@@ -2256,5 +2264,111 @@ mod test {
 
         let _ = workers.shutdown();
         queue.shutdown().unwrap();
+    }
+
+    fn create_work_scheduler(
+        server_auth: ServerAuthStrategy,
+        queues: SharedRunQueues,
+    ) -> (JoinHandle<()>, tokio::sync::mpsc::Sender<()>, SocketAddr) {
+        let server = WorkScheduler { queues };
+        let server_opts = ServerOptions::new(server_auth, Tls::NO);
+
+        let listener = server_opts.bind("0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        (server_thread, shutdown_tx, server_addr)
+    }
+
+    #[test]
+    #[traced_test]
+    fn get_work_from_work_server_waiting_for_first_worker() {
+        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+
+        let run_id = RunId::unique();
+
+        // Set up the queue so that a run ID is invoked, but no worker has connected yet.
+        let mut queues = RunQueues::default();
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(
+                    TestLikeRunner::Echo,
+                    ManifestMessage {
+                        manifest: Manifest { members: vec![] },
+                    },
+                ),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        let (server_thread, server_shutdown, server_addr) =
+            create_work_scheduler(server_auth, Arc::new(Mutex::new(queues)));
+
+        let client_opts = ClientOptions::new(client_auth, Tls::NO);
+        let client = client_opts.build().unwrap();
+
+        let mut conn = client.connect(server_addr).unwrap();
+
+        use net_protocol::work_server::{NextTestResponse, WorkServerRequest};
+
+        // Ask the server for the next test; we should be told a manifest is still TBD.
+        net_protocol::write(&mut conn, WorkServerRequest::NextTest { run_id }).unwrap();
+
+        let response: NextTestResponse = net_protocol::read(&mut conn).unwrap();
+
+        assert!(matches!(response, NextTestResponse::WaitingForManifest));
+
+        server_shutdown.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    #[traced_test]
+    fn get_work_from_work_server_waiting_for_manifest() {
+        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+
+        let run_id = RunId::unique();
+
+        // Set up the queue so a run ID is invoked, but the manifest is still unknown.
+        let mut queues = RunQueues::default();
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(
+                    TestLikeRunner::Echo,
+                    ManifestMessage {
+                        manifest: Manifest { members: vec![] },
+                    },
+                ),
+                one_nonzero(),
+            )
+            .unwrap();
+        // Get the run for a worker; since this is the first one to ask, it will be told to grab
+        // the manifest.
+        let _ = queues.get_run_for_worker(&run_id);
+
+        let (server_thread, server_shutdown, server_addr) =
+            create_work_scheduler(server_auth, Arc::new(Mutex::new(queues)));
+
+        let client_opts = ClientOptions::new(client_auth, Tls::NO);
+        let client = client_opts.build().unwrap();
+
+        let mut conn = client.connect(server_addr).unwrap();
+
+        use net_protocol::work_server::{NextTestResponse, WorkServerRequest};
+
+        // Ask the server for the next test; we should be told a manifest is still TBD.
+        net_protocol::write(&mut conn, WorkServerRequest::NextTest { run_id }).unwrap();
+
+        let response: NextTestResponse = net_protocol::read(&mut conn).unwrap();
+
+        assert!(matches!(response, NextTestResponse::WaitingForManifest));
+
+        server_shutdown.blocking_send(()).unwrap();
+        server_thread.join().unwrap();
     }
 }
