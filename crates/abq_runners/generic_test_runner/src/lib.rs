@@ -62,6 +62,7 @@ pub fn open_native_runner_connection(
         runner_conn,
     ) = loop {
         if start.elapsed() >= timeout {
+            tracing::error!(?timeout, elapsed=?start.elapsed(), "timeout");
             return Err(ProtocolVersionError::Timeout.into());
         }
 
@@ -203,7 +204,7 @@ impl GenericTestRunner {
         } = input;
 
         // TODO: get from runner params
-        let protocol_version_timeout = Duration::from_secs(30);
+        let protocol_version_timeout = Duration::from_secs(60);
 
         // If we need to retrieve the manifest, do that first.
         if let Some(mut send_manifest) = send_manifest {
