@@ -306,11 +306,14 @@ pub mod queue {
         Failure(InvokeFailureReason),
     }
 
+    /// A test result associated with an individual unit of work.
+    pub type AssociatedTestResult = (WorkId, TestResult);
+
     /// An incremental test result sent back to an invoker.
     #[derive(Serialize, Deserialize, Debug)]
     pub enum InvokerTestResult {
-        /// The result of a requested unit of work.
-        Result(WorkId, TestResult),
+        /// A batch of test results.
+        Results(Vec<AssociatedTestResult>),
         /// No more results are known.
         EndOfResults,
     }
