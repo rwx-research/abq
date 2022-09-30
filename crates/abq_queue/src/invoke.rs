@@ -119,10 +119,10 @@ impl Client {
 
     /// Yields the next test result, as it streams in.
     /// Returns [None] when there are no more test results.
-    pub async fn next(&mut self) -> Option<Result<(WorkId, TestResult), io::Error>> {
+    pub async fn next(&mut self) -> Option<Result<Vec<(WorkId, TestResult)>, io::Error>> {
         loop {
             match net_protocol::async_read(&mut self.stream).await {
-                Ok(InvokerTestResult::Result(work_id, test_result)) => {
+                Ok(InvokerTestResult::Results(results)) => {
                     // Send an acknowledgement of the result to the server. If it fails, attempt to reconnect once.
                     let ack_result = net_protocol::async_write(
                         &mut self.stream,
@@ -135,7 +135,7 @@ impl Client {
                         }
                     }
 
-                    return Some(Ok((work_id, test_result)));
+                    return Some(Ok(results));
                 }
                 Ok(InvokerTestResult::EndOfResults) => return None,
                 Err(err) => {
@@ -157,9 +157,11 @@ impl Client {
         mut self,
         mut on_result: impl FnMut(WorkId, TestResult),
     ) -> Result<(), io::Error> {
-        while let Some(maybe_result) = self.next().await {
-            let (work_id, test_result) = maybe_result?;
-            on_result(work_id, test_result);
+        while let Some(maybe_results) = self.next().await {
+            let results = maybe_results?;
+            for (work_id, test_result) in results {
+                on_result(work_id, test_result);
+            }
         }
         Ok(())
     }

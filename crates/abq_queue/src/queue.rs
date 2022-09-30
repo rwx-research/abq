@@ -14,7 +14,7 @@ use abq_utils::net_async;
 use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
-use abq_utils::net_protocol::queue::{InvokerTestResult, Request};
+use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
 use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
@@ -461,51 +461,153 @@ fn start_queue(config: QueueConfig) -> Abq {
     }
 }
 
+#[derive(Debug)]
+struct BufferedResults {
+    buffer: Vec<AssociatedTestResult>,
+    max_size: usize,
+}
+
+impl BufferedResults {
+    /// Default suggested sizing of the buffer. In general you should try to use a more precise
+    /// size when possible.
+    const DEFAULT_SIZE: usize = 10;
+
+    fn new(max_size: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    /// Adds a new test result to the buffer. If the buffer capacity is exceeded, all test results
+    /// to be drained are returned.
+    fn push(&mut self, result: AssociatedTestResult) -> Option<Vec<AssociatedTestResult>> {
+        self.buffer.push(result);
+        if self.buffer.len() >= self.max_size {
+            return Some(self.buffer.drain(..).collect());
+        }
+        None
+    }
+
+    fn drain_all(&mut self) -> Vec<AssociatedTestResult> {
+        std::mem::take(&mut self.buffer)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+}
+
 /// Handler for sending test results back to the abq client that issued a test run.
 #[derive(Debug)]
 enum ClientResponder {
     /// We have an open stream upon which to send back the test results.
-    DirectStream(Box<dyn net_async::ServerStream>),
+    DirectStream {
+        stream: Box<dyn net_async::ServerStream>,
+        buffer: BufferedResults,
+    },
     /// There is not yet an open connection we can stream the test results back on.
     /// This state may be reached during the time a client is disconnected.
     Disconnected {
-        buffered_results: Vec<InvokerTestResult>,
+        results: Vec<AssociatedTestResult>,
+        /// Size of the [buffer][BufferedResults] we should create when moving back into connected
+        /// mode.
+        buffer_size: usize,
     },
 }
 
 impl ClientResponder {
-    fn new(stream: Box<dyn net_async::ServerStream>) -> Self {
-        Self::DirectStream(stream)
+    fn new(stream: Box<dyn net_async::ServerStream>, buffer_size: usize) -> Self {
+        Self::DirectStream {
+            stream,
+            buffer: BufferedResults::new(buffer_size),
+        }
     }
 
-    async fn send_and_ack_one_test_result(&mut self, test_result: InvokerTestResult) {
+    async fn send_test_result_batch_help(
+        stream: &mut Box<dyn net_async::ServerStream>,
+        buffer: &mut BufferedResults,
+        results: Vec<AssociatedTestResult>,
+    ) -> Result<(), Self> {
         use net_protocol::client::AckTestResult;
 
-        match self {
-            ClientResponder::DirectStream(conn) => {
-                // Send the test result and wait for an ack. If either fails, suppose the client is
-                // disconnected.
-                let write_result = net_protocol::async_write(conn, &test_result).await;
-                let client_disconnected = match write_result {
-                    Err(_) => true,
-                    Ok(()) => {
-                        let ack = net_protocol::async_read(conn).await;
-                        match ack {
-                            Err(_) => true,
-                            Ok(AckTestResult {}) => false,
-                        }
-                    }
-                };
+        let batch_msg = InvokerTestResult::Results(results);
 
-                if client_disconnected {
-                    // Demote ourselves to the disconnected state until reconnection happens.
-                    *self = Self::Disconnected {
-                        buffered_results: vec![test_result],
+        // Send the test results and wait for an ack. If either fails, suppose the client is
+        // disconnected.
+        let write_result = net_protocol::async_write(stream, &batch_msg).await;
+        let client_disconnected = match write_result {
+            Err(_) => true,
+            Ok(()) => {
+                let ack = net_protocol::async_read(stream).await;
+                match ack {
+                    Err(_) => true,
+                    Ok(AckTestResult {}) => false,
+                }
+            }
+        };
+
+        if client_disconnected {
+            // Demote ourselves to the disconnected state until reconnection happens.
+            let results = match batch_msg {
+                InvokerTestResult::Results(results) => results,
+                _ => unreachable!(),
+            };
+
+            // NOTE: we could store old, empty `buffer` here, so we moving back to
+            // `DirectStream` doesn't cost an allocation.
+            return Err(Self::Disconnected {
+                results,
+                buffer_size: buffer.max_size,
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn send_test_result(&mut self, test_result: AssociatedTestResult) {
+        match self {
+            ClientResponder::DirectStream { stream, buffer } => {
+                let opt_results_to_drain = buffer.push(test_result);
+
+                if let Some(results) = opt_results_to_drain {
+                    let opt_disconnected =
+                        Self::send_test_result_batch_help(stream, buffer, results).await;
+                    if let Err(disconnected) = opt_disconnected {
+                        *self = disconnected;
                     }
                 }
             }
-            ClientResponder::Disconnected { buffered_results } => {
-                buffered_results.push(test_result);
+            ClientResponder::Disconnected {
+                results,
+                buffer_size: _,
+            } => {
+                results.push(test_result);
+            }
+        }
+    }
+
+    async fn flush_results(&mut self) {
+        match self {
+            ClientResponder::DirectStream { stream, buffer } => {
+                let remaining_results = buffer.drain_all();
+
+                if !remaining_results.is_empty() {
+                    let opt_disconnected =
+                        Self::send_test_result_batch_help(stream, buffer, remaining_results).await;
+
+                    debug_assert!(
+                        buffer.is_empty(),
+                        "buffer should remain empty after drainage"
+                    );
+
+                    if let Err(disconnected) = opt_disconnected {
+                        *self = disconnected;
+                    }
+                }
+            }
+            ClientResponder::Disconnected { .. } => {
+                // nothing we can do
             }
         }
     }
@@ -523,33 +625,43 @@ impl ClientResponder {
         // it may be the case that a stream closes between the time that we check it is closed,
         // and when we issue an error for the reconnection attempt.
 
+        let buffer_size_hint = match self {
+            ClientResponder::DirectStream { buffer, .. } => buffer.max_size,
+            ClientResponder::Disconnected { buffer_size, .. } => *buffer_size,
+        };
+
         let old_conn = {
-            let mut new_stream = Self::DirectStream(new_conn);
+            let mut new_stream = Self::DirectStream {
+                stream: new_conn,
+                buffer: BufferedResults::new(buffer_size_hint),
+            };
             std::mem::swap(self, &mut new_stream);
             new_stream
         };
 
         match old_conn {
-            ClientResponder::Disconnected { buffered_results } => {
+            ClientResponder::Disconnected { results, .. } => {
                 // We need to send back all the buffered results to the new stream.
                 // Must send all test results in sequence, since each writes to the
                 // same stream back to the client.
-                for test_result in buffered_results {
-                    self.send_and_ack_one_test_result(test_result).await;
+                for test_result in results {
+                    self.send_test_result(test_result).await;
                 }
             }
-            ClientResponder::DirectStream(_) => {
+            ClientResponder::DirectStream { .. } => {
                 // nothing more to do
             }
         }
     }
 }
 
-/// run -> (results sender, responder handle)
-///
-// TODO: certainly we can be smarter here, for example we have an invariant that a stream will only
-// ever be added and removed for an run ID once. Can we use that to get rid of the mutex?
-type ActiveRunResponders = Arc<tokio::sync::Mutex<HashMap<RunId, ClientResponder>>>;
+/// run ID -> result responder
+type ActiveRunResponders = Arc<
+    tokio::sync::RwLock<
+        //
+        HashMap<RunId, tokio::sync::Mutex<ClientResponder>>,
+    >,
+>;
 
 struct ActiveRunState {
     /// Amount of work items left for the run.
@@ -794,7 +906,7 @@ impl QueueServer {
                     // NB: an exclusive lock here is important! As unlikely as it may be, sharing the
                     // responder before the response message is sent may result in test results being
                     // sent *before* this response message is sent.
-                    let mut active_runs = active_runs.lock().await;
+                    let mut active_runs = active_runs.write().await;
 
                     // TODO: if this write fails, we will be in an inconsistent state and have leaked a
                     // run ID - there will be an active queue, but no active responder for when test
@@ -808,8 +920,13 @@ impl QueueServer {
                     )
                     .await?;
 
-                    let results_responder = ClientResponder::new(stream);
-                    let old_responder = active_runs.insert(run_id, results_responder);
+                    // TODO: we could determine a more optimal sizing of the test results buffer by
+                    // e.g. considering the size of the test manifest.
+                    let results_buffering_size = BufferedResults::DEFAULT_SIZE;
+
+                    let results_responder = ClientResponder::new(stream, results_buffering_size);
+                    let old_responder =
+                        active_runs.insert(run_id, tokio::sync::Mutex::new(results_responder));
                     debug_assert!(
                         old_responder.is_none(),
                         "Existing stream for expected unique run id"
@@ -851,13 +968,18 @@ impl QueueServer {
 
         // When an abq client loses connection with the queue, they may attempt to reconnect.
         // We'll need to update the connection from streaming results to the client to the new one.
-        let mut active_runs = active_runs.lock().await;
+        let mut active_runs = active_runs.write().await;
         let active_conn_entry = active_runs.entry(run_id.clone());
         match active_conn_entry {
             Entry::Occupied(mut occupied) => {
                 let new_stream_addr = new_stream.peer_addr();
 
-                occupied.get_mut().update_connection_to(new_stream).await;
+                occupied
+                    .get_mut()
+                    .lock()
+                    .await
+                    .update_connection_to(new_stream)
+                    .await;
 
                 tracing::debug!(
                     "rerouted connection for {:?} to {:?}",
@@ -919,12 +1041,14 @@ impl QueueServer {
         {
             // First up, chuck the test result back over to `abq test`. Make sure we don't steal
             // the lock on active_runs for any longer than it takes to send that request.
-            let mut active_runs = active_runs.lock().await;
+            let active_runs = active_runs.read().await;
 
-            let invoker_stream = active_runs.get_mut(&run_id).expect("run is not active");
+            let invoker_stream = active_runs.get(&run_id).expect("run is not active");
 
             invoker_stream
-                .send_and_ack_one_test_result(InvokerTestResult::Result(work_id, result))
+                .lock()
+                .await
+                .send_test_result((work_id, result))
                 .await;
         }
 
@@ -951,15 +1075,26 @@ impl QueueServer {
             // test` runs.
             // We may want to use concurrent hashmaps that index into partitioned buckets for that
             // use case (e.g. DashMap).
-            let responder = active_runs.lock().await.remove(&run_id).unwrap();
+            let responder = active_runs.write().await.remove(&run_id).unwrap();
+            let mut responder = responder.into_inner();
+
+            responder.flush_results().await;
 
             match responder {
-                ClientResponder::DirectStream(mut stream) => {
+                ClientResponder::DirectStream { mut stream, buffer } => {
+                    assert!(
+                        buffer.is_empty(),
+                        "no results should be buffered after drainage"
+                    );
+
                     net_protocol::async_write(&mut stream, &InvokerTestResult::EndOfResults)
                         .await?;
                     drop(stream);
                 }
-                ClientResponder::Disconnected { buffered_results } => {
+                ClientResponder::Disconnected {
+                    results,
+                    buffer_size: _,
+                } => {
                     // Unfortunately, since we still don't have an active connection to the abq
                     // client, we can't send any buffered test results or end-of-tests anywhere.
                     // To avoid leaking memory we assume the client is dead and drop the results.
@@ -968,7 +1103,7 @@ impl QueueServer {
                     // pending results back to the queue. If the client re-connects, send them all
                     // back at that point. The queue can run a weep to cleanup any uncolleted
                     // results on some time interval.
-                    let _ = buffered_results;
+                    let _ = results;
                 }
             }
 
@@ -1133,7 +1268,7 @@ mod test {
         io,
         net::SocketAddr,
         num::NonZeroU64,
-        sync::{Arc, Mutex},
+        sync::Arc,
         thread::{self, JoinHandle},
         time::Duration,
     };
@@ -1142,8 +1277,8 @@ mod test {
     use crate::{
         invoke::{Client, InvocationError},
         queue::{
-            ActiveRunResponders, ClientReconnectionError, ClientResponder, QueueServer, RunQueues,
-            SharedRunQueues, WorkScheduler,
+            ActiveRunResponders, BufferedResults, ClientReconnectionError, ClientResponder,
+            QueueServer, RunQueues, SharedRunQueues, WorkScheduler,
         },
     };
     use abq_utils::{
@@ -1163,6 +1298,7 @@ mod test {
     };
     use futures::future;
     use ntest::timeout;
+    use tokio::sync::Mutex;
     use tracing_test::{internal::logs_with_scope_contain, traced_test};
 
     fn sort_results(results: &mut [(String, TestResult)]) -> Vec<&str> {
@@ -1548,10 +1684,14 @@ mod test {
             );
             let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
-            let mut active_runs = active_runs.lock().await;
-            active_runs
-                .entry(run_id.clone())
-                .or_insert(ClientResponder::DirectStream(server_conn));
+            let mut active_runs = active_runs.write().await;
+            active_runs.insert(
+                run_id.clone(),
+                Mutex::new(ClientResponder::DirectStream {
+                    stream: server_conn,
+                    buffer: BufferedResults::new(5),
+                }),
+            );
             // Drop the connection
             drop(client_conn);
         };
@@ -1575,9 +1715,10 @@ mod test {
         // Validate that the reconnection was granted
         assert!(reconnection_result.is_ok());
         let active_conn_addr = {
-            let active_runs = active_runs.lock().await;
-            match active_runs.get(&run_id).unwrap() {
-                ClientResponder::DirectStream(conn) => conn.peer_addr().unwrap(),
+            let mut active_runs = active_runs.write().await;
+            let responder = active_runs.remove(&run_id).unwrap().into_inner();
+            match responder {
+                ClientResponder::DirectStream { stream, .. } => stream.peer_addr().unwrap(),
                 ClientResponder::Disconnected { .. } => unreachable!(),
             }
         };
@@ -1651,10 +1792,14 @@ mod test {
             );
             let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
-            let mut active_runs = active_runs.lock().await;
-            let _responder = active_runs
-                .entry(run_id.clone())
-                .or_insert(ClientResponder::DirectStream(server_conn));
+            let mut active_runs = active_runs.write().await;
+            let _responder = active_runs.insert(
+                run_id.clone(),
+                Mutex::new(ClientResponder::DirectStream {
+                    stream: server_conn,
+                    buffer: BufferedResults::new(0),
+                }),
+            );
 
             // Drop the client connection
             drop(client_conn);
@@ -1676,16 +1821,11 @@ mod test {
             .unwrap();
 
             // Check the internal state of the responder - it should be in disconnected mode.
-            let responders = active_runs.lock().await;
-            let responder = responders.get(&run_id).unwrap();
-            assert!(
-                matches!(responder, ClientResponder::Disconnected { .. }),
-                "{:?}",
-                responder
-            );
-            match responder {
-                ClientResponder::Disconnected { buffered_results } => {
-                    assert_eq!(buffered_results.len(), 1)
+            let responders = active_runs.write().await;
+            let responder = responders.get(&run_id).unwrap().lock().await;
+            match &*responder {
+                ClientResponder::Disconnected { results, .. } => {
+                    assert_eq!(results.len(), 1)
                 }
                 _ => unreachable!(),
             }
@@ -1715,7 +1855,7 @@ mod test {
                 run_id.clone(),
             ));
 
-            let (work_id, _) = client.next().await.unwrap().unwrap();
+            let (work_id, _) = client.next().await.unwrap().unwrap().pop().unwrap();
             assert_eq!(work_id, buffered_work_id);
 
             let reconnection_result = reconnection_future.await.unwrap();
@@ -1735,7 +1875,7 @@ mod test {
                 fake_test_result(),
             ));
 
-            let (work_id, _) = client.next().await.unwrap().unwrap();
+            let (work_id, _) = client.next().await.unwrap().unwrap().pop().unwrap();
             assert_eq!(work_id, second_work_id);
 
             worker_result_future.await.unwrap().unwrap();
@@ -2306,7 +2446,7 @@ mod test {
             .unwrap();
 
         let (server_thread, server_shutdown, server_addr) =
-            create_work_scheduler(server_auth, Arc::new(Mutex::new(queues)));
+            create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
 
         let client_opts = ClientOptions::new(client_auth, Tls::NO);
         let client = client_opts.build().unwrap();
@@ -2352,7 +2492,7 @@ mod test {
         let _ = queues.get_run_for_worker(&run_id);
 
         let (server_thread, server_shutdown, server_addr) =
-            create_work_scheduler(server_auth, Arc::new(Mutex::new(queues)));
+            create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
 
         let client_opts = ClientOptions::new(client_auth, Tls::NO);
         let client = client_opts.build().unwrap();
