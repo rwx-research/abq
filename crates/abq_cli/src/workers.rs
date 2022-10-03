@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use abq_utils::net_opt::ClientOptions;
 use abq_utils::net_protocol::workers::RunId;
-use abq_workers::negotiate::{QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator};
-use abq_workers::workers::{WorkerContext, WorkerPool, WorkersExit};
+use abq_workers::negotiate::{
+    NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
+};
+use abq_workers::workers::{WorkerContext, WorkersExit};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
@@ -16,7 +18,7 @@ pub fn start_workers(
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
     run_id: RunId,
-) -> anyhow::Result<WorkerPool> {
+) -> anyhow::Result<NegotiatedWorkers> {
     abq_workers::workers::init();
 
     let context = WorkerContext::AlwaysWorkIn { working_dir };
