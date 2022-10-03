@@ -15,10 +15,10 @@ serde = "1.0.145"
 serde_derive = "1.0.145"
 serde_json = "1.0.85"
 
-thiserror = "1.0.36"
+thiserror = "1.0.37"
 tracing = "0.1.36"
 
-tokio = { version = "1.21.1", features = ["net", "rt", "rt-multi-thread", "sync", "macros", "time"] }
+tokio = { version = "1.21.2", features = ["net", "rt", "rt-multi-thread", "sync", "macros", "time"] }
 
 [dependencies.uuid]
 version = "1.1.2"
