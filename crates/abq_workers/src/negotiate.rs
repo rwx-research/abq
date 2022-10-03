@@ -15,7 +15,7 @@ use tracing::{error, instrument};
 
 use crate::workers::{
     GetNextWorkBundle, NotifyManifest, NotifyResult, RunCompletedSuccessfully, WorkerContext,
-    WorkerPool, WorkerPoolConfig,
+    WorkerPool, WorkerPoolConfig, WorkersExit,
 };
 use abq_utils::{
     net, net_async,
@@ -53,21 +53,28 @@ use abq_utils::{
 // When the queue shuts down or sends `EndOfTests`, the workers shutdown.
 
 #[derive(Serialize, Deserialize)]
+struct ExecutionContext {
+    /// The work run we are connecting to.
+    run_id: RunId,
+    /// Where workers should receive messages from.
+    queue_new_work_addr: SocketAddr,
+    /// Where workers should send results to.
+    queue_results_addr: SocketAddr,
+    /// The kind of native runner workers should start.
+    runner_kind: RunnerKind,
+    /// Whether the queue wants a worker to generate the work manifest.
+    worker_should_generate_manifest: bool,
+    // TODO: do we want the queue to be able to modify the # workers configured and their
+    // capabilities (timeout, retries, etc)?
+}
+
+#[derive(Serialize, Deserialize)]
 enum MessageFromQueueNegotiator {
-    ExecutionContext {
-        /// The work run we are connecting to.
-        run_id: RunId,
-        /// Where workers should receive messages from.
-        queue_new_work_addr: SocketAddr,
-        /// Where workers should send results to.
-        queue_results_addr: SocketAddr,
-        /// The kind of native runner workers should start.
-        runner_kind: RunnerKind,
-        /// Whether the queue wants a worker to generate the work manifest.
-        worker_should_generate_manifest: bool,
-        // TODO: do we want the queue to be able to modify the # workers configured and their
-        // capabilities (timeout, retries, etc)?
-    },
+    /// The run a worker set is negotiating for has already completed, and the set should
+    /// immediately exit.
+    RunAlreadyCompleted { success: bool },
+    /// The context a worker set should execute a run with.
+    ExecutionContext(ExecutionContext),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,6 +110,38 @@ pub enum WorkersNegotiateError {
 /// The worker pool side of the negotiation.
 pub struct WorkersNegotiator(Box<dyn net::ClientStream>, WorkerContext);
 
+pub enum NegotiatedWorkers {
+    /// No more workers were created, because there is no more work to be done.
+    Redundant {
+        /// Whether the run was successful when completed.
+        success: bool,
+    },
+    /// A pool of workers were created.
+    Pool(WorkerPool),
+}
+
+impl NegotiatedWorkers {
+    pub fn shutdown(&mut self) -> WorkersExit {
+        match self {
+            NegotiatedWorkers::Redundant { success } => {
+                if *success {
+                    WorkersExit::Success
+                } else {
+                    WorkersExit::Failure
+                }
+            }
+            NegotiatedWorkers::Pool(pool) => pool.shutdown(),
+        }
+    }
+
+    pub fn workers_alive(&self) -> bool {
+        match self {
+            NegotiatedWorkers::Redundant { .. } => false,
+            NegotiatedWorkers::Pool(pool) => pool.workers_alive(),
+        }
+    }
+}
+
 impl WorkersNegotiator {
     /// Runs the workers-side of the negotiation, returning the configured worker pool once
     /// negotiation is complete.
@@ -114,7 +153,7 @@ impl WorkersNegotiator {
         queue_negotiator_handle: QueueNegotiatorHandle,
         client_options: ClientOptions,
         wanted_run_id: RunId,
-    ) -> Result<WorkerPool, WorkersNegotiateError> {
+    ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         use WorkersNegotiateError::*;
 
         let client = client_options.build()?;
@@ -128,13 +167,20 @@ impl WorkersNegotiator {
         tracing::debug!("Wrote attach message");
 
         tracing::debug!("Awaiting execution message");
-        let MessageFromQueueNegotiator::ExecutionContext {
+
+        let ExecutionContext {
             run_id,
             queue_new_work_addr,
             queue_results_addr,
             runner_kind,
             worker_should_generate_manifest,
-        } = net_protocol::read(&mut conn).map_err(|_| BadQueueMessage)?;
+        } = match net_protocol::read(&mut conn).map_err(|_| BadQueueMessage)? {
+            MessageFromQueueNegotiator::RunAlreadyCompleted { success } => {
+                return Ok(NegotiatedWorkers::Redundant { success });
+            }
+            MessageFromQueueNegotiator::ExecutionContext(ctx) => ctx,
+        };
+
         tracing::debug!(
             "Recieved execution message. New work addr: {:?}, results addr: {:?}",
             queue_new_work_addr,
@@ -270,7 +316,7 @@ impl WorkersNegotiator {
         let pool = WorkerPool::new(pool_config);
         tracing::debug!("Started worker pool");
 
-        Ok(pool)
+        Ok(NegotiatedWorkers::Pool(pool))
     }
 }
 
@@ -368,6 +414,14 @@ pub struct AssignedRun {
     pub should_generate_manifest: bool,
 }
 
+/// A marker that a test run should work on has already completed by the time the worker started
+/// up, and so the worker can exit immediately.
+pub struct AssignedRunCompeleted {
+    pub success: bool,
+}
+
+pub type AssignedRunResult = Result<AssignedRun, AssignedRunCompeleted>;
+
 /// An error that happens in the construction or execution of the queue negotiation server.
 ///
 /// Does not include errors in the handling of requests to the server, but does include errors in
@@ -385,7 +439,7 @@ pub enum QueueNegotiatorServerError {
 
 struct QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
 {
     get_assigned_run: Arc<GetAssignedRun>,
     advertised_queue_work_scheduler_addr: SocketAddr,
@@ -395,7 +449,7 @@ where
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -417,7 +471,7 @@ impl QueueNegotiator {
         get_assigned_run: GetAssignedRun,
     ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
     {
         let addr = listener.local_addr()?;
 
@@ -491,7 +545,7 @@ impl QueueNegotiator {
         stream: net_async::UnverifiedServerStream,
     ) -> io::Result<()>
     where
-        GetAssignedRun: Fn(&RunId) -> AssignedRun + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
     {
         let mut stream = ctx.handshake_ctx.handshake(stream).await?;
         let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut stream).await?;
@@ -514,26 +568,34 @@ impl QueueNegotiator {
                 // while we wait for an run, and moreover we won't respect
                 // shutdown messages.
                 tracing::debug!("Finding assigned run");
-                let AssignedRun {
-                    run_id,
-                    runner_kind,
-                    should_generate_manifest,
-                } = (ctx.get_assigned_run)(&wanted_run_id);
+
+                let assigned_run_result = (ctx.get_assigned_run)(&wanted_run_id);
 
                 tracing::debug!("Found assigned run");
 
-                debug_assert_eq!(run_id, wanted_run_id);
+                let msg = match assigned_run_result {
+                    Ok(AssignedRun {
+                        run_id,
+                        runner_kind,
+                        should_generate_manifest,
+                    }) => {
+                        debug_assert_eq!(run_id, wanted_run_id);
 
-                let execution_context = MessageFromQueueNegotiator::ExecutionContext {
-                    queue_new_work_addr: ctx.advertised_queue_work_scheduler_addr,
-                    queue_results_addr: ctx.advertised_queue_results_addr,
-                    runner_kind,
-                    worker_should_generate_manifest: should_generate_manifest,
-                    run_id,
+                        MessageFromQueueNegotiator::ExecutionContext(ExecutionContext {
+                            queue_new_work_addr: ctx.advertised_queue_work_scheduler_addr,
+                            queue_results_addr: ctx.advertised_queue_results_addr,
+                            runner_kind,
+                            worker_should_generate_manifest: should_generate_manifest,
+                            run_id,
+                        })
+                    }
+                    Err(AssignedRunCompeleted { success }) => {
+                        MessageFromQueueNegotiator::RunAlreadyCompleted { success }
+                    }
                 };
 
                 tracing::debug!("Sending execution context");
-                net_protocol::async_write(&mut stream, &execution_context).await?;
+                net_protocol::async_write(&mut stream, &msg).await?;
                 tracing::debug!("Sent execution context");
             }
         }
@@ -770,11 +832,11 @@ mod test {
                     members: vec![echo_test("hello".to_string())],
                 },
             };
-            AssignedRun {
+            Ok(AssignedRun {
                 run_id: run_id.clone(),
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
                 should_generate_manifest: true,
-            }
+            })
         };
 
         let mut queue_negotiator = QueueNegotiator::new(
@@ -831,15 +893,17 @@ mod test {
             // Below parameters are faux because they are unnecessary for healthchecks.
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
-            |_| AssignedRun {
-                run_id: RunId::unique(),
-                runner_kind: RunnerKind::TestLikeRunner(
-                    TestLikeRunner::Echo,
-                    ManifestMessage {
-                        manifest: Manifest { members: vec![] },
-                    },
-                ),
-                should_generate_manifest: true,
+            |_| {
+                Ok(AssignedRun {
+                    run_id: RunId::unique(),
+                    runner_kind: RunnerKind::TestLikeRunner(
+                        TestLikeRunner::Echo,
+                        ManifestMessage {
+                            manifest: Manifest { members: vec![] },
+                        },
+                    ),
+                    should_generate_manifest: true,
+                })
             },
         )
         .unwrap()

@@ -23,14 +23,16 @@ use abq_utils::net_protocol::{
     queue::{InvokeWork, Message},
     workers::{NextWork, RunId, WorkId},
 };
-use abq_workers::negotiate::{AssignedRun, QueueNegotiator, QueueNegotiatorHandle};
+use abq_workers::negotiate::{
+    AssignedRun, AssignedRunCompeleted, QueueNegotiator, QueueNegotiatorHandle,
+};
 
 use thiserror::Error;
 use tracing::instrument;
 
 // TODO: we probably want something more sophisticated here, in particular a concurrent
 // work-stealing queue.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct JobQueue {
     queue: VecDeque<NextWork>,
 }
@@ -52,6 +54,7 @@ impl JobQueue {
     }
 }
 
+#[derive(Debug)]
 enum RunState {
     WaitingForFirstWorker,
     WaitingForManifest,
@@ -90,6 +93,16 @@ enum NewQueueError {
     RunIdAlreadyInProgress,
     /// The run ID was previously completed.
     RunIdPreviouslyCompleted,
+}
+
+enum AssignedRunLookup {
+    Some(AssignedRun),
+    /// There is no associated run yet known.
+    NotFound,
+    /// An associated run is known, but it has already completed; a worker should exit immediately.
+    AlreadyDone {
+        success: bool,
+    },
 }
 
 impl RunQueues {
@@ -132,13 +145,42 @@ impl RunQueues {
 
     // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
     // found.
-    pub fn get_run_for_worker(&mut self, run_id: &RunId) -> Option<AssignedRun> {
-        let run_state = self.queues.get_mut(run_id)?;
+    pub fn get_run_for_worker(&mut self, run_id: &RunId) -> AssignedRunLookup {
+        let run_state = match self.queues.get_mut(run_id) {
+            Some(st) => st,
+            None => return AssignedRunLookup::NotFound,
+        };
+
+        let run_data = match self.run_data.get(run_id) {
+            Some(data) => data,
+            None => {
+                // If there is an active run, then the run data exists iff the run state exists;
+                // however, if the run state is known to be complete, the run data will already
+                // have been pruned, and the worker should not be given a run.
+                match run_state {
+                    RunState::Done { succeeded } => {
+                        return AssignedRunLookup::AlreadyDone {
+                            success: *succeeded,
+                        }
+                    }
+                    st => {
+                        tracing::error!(
+                            run_state=?st,
+                            "run data is missing, but run state is present and not marked as Done"
+                        );
+                        unreachable!(
+                            "run state should only be `Done` if data is missing, but it was {:?}",
+                            st
+                        );
+                    }
+                }
+            }
+        };
 
         let RunData {
             runner,
             batch_size_hint: _,
-        } = self.run_data.get(run_id).unwrap();
+        } = run_data;
 
         let assigned_run = match run_state {
             RunState::WaitingForFirstWorker => {
@@ -161,7 +203,7 @@ impl RunQueues {
             }
         };
 
-        Some(assigned_run)
+        AssignedRunLookup::Some(assigned_run)
     }
 
     pub fn add_manifest(&mut self, run_id: RunId, flat_manifest: Vec<TestCase>) {
@@ -429,13 +471,16 @@ fn start_queue(config: QueueConfig) -> Abq {
     let choose_run_for_worker = move |wanted_run_id: &RunId| loop {
         let opt_assigned = { queues.lock().unwrap().get_run_for_worker(wanted_run_id) };
         match opt_assigned {
-            None => {
+            AssignedRunLookup::NotFound => {
                 // Nothing yet; release control and sleep for a bit in case something comes.
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            Some(assigned) => {
-                return assigned;
+            AssignedRunLookup::AlreadyDone { success } => {
+                return Err(AssignedRunCompeleted { success })
+            }
+            AssignedRunLookup::Some(assigned) => {
+                return Ok(assigned);
             }
         }
     };
@@ -1293,7 +1338,7 @@ mod test {
         },
     };
     use abq_workers::{
-        negotiate::{WorkersConfig, WorkersNegotiator},
+        negotiate::{NegotiatedWorkers, WorkersConfig, WorkersNegotiator},
         workers::{WorkerContext, WorkersExit},
     };
     use futures::future;
@@ -2510,5 +2555,107 @@ mod test {
 
         server_shutdown.blocking_send(()).unwrap();
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn getting_run_after_work_is_complete_returns_nothing() {
+        let mut queue = Abq::start(Default::default());
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![
+                    echo_test("echo1".to_string()),
+                    echo_test("echo2".to_string()),
+                ],
+            },
+        };
+
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
+
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+        };
+
+        let queue_server_addr = queue.server_addr();
+
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+
+        let run_id = RunId::unique();
+
+        // First off, run the test suite to completion. It should complete successfully.
+        {
+            let results_handle = thread::spawn({
+                let run_id = run_id.clone();
+                move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+
+                    runtime.block_on(async {
+                        let mut results = Vec::default();
+                        let client = Client::invoke_work(
+                            EntityId::new(),
+                            queue_server_addr,
+                            client_opts,
+                            run_id,
+                            runner,
+                            one_nonzero(),
+                        )
+                        .await
+                        .unwrap();
+                        client
+                            .stream_results(|id, result| {
+                                results.push((id.0, result));
+                            })
+                            .await
+                            .unwrap();
+                        results
+                    })
+                }
+            });
+
+            let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+                workers_config.clone(),
+                queue.get_negotiator_handle(),
+                client_opts,
+                run_id.clone(),
+            )
+            .unwrap();
+
+            let mut results = results_handle.join().unwrap();
+
+            let exit = workers.shutdown();
+            assert!(matches!(exit, WorkersExit::Success));
+
+            let results = sort_results(&mut results);
+
+            assert_eq!(results, [("echo1"), ("echo2")]);
+        }
+
+        // Now, simulate a new set of workers connecting again. Negotiation should succeed, but
+        // they should be marked as redundant.
+        {
+            let mut new_workers = WorkersNegotiator::negotiate_and_start_pool(
+                workers_config,
+                queue.get_negotiator_handle(),
+                client_opts,
+                run_id,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                new_workers,
+                NegotiatedWorkers::Redundant { success: true }
+            ));
+
+            let exit = new_workers.shutdown();
+            assert!(matches!(exit, WorkersExit::Success));
+        }
+
+        queue.shutdown().unwrap();
     }
 }
