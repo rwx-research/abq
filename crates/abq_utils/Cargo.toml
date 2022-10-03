@@ -11,12 +11,12 @@ serde = "1.0.145"
 serde_derive = "1.0.145"
 serde_json = "1.0.85"
 
-tokio = { version = "1.21.1", features = ["io-util", "net", "rt", "macros"] }
+tokio = { version = "1.21.2", features = ["io-util", "net", "rt", "macros"] }
 tracing = "0.1.36"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 
-thiserror = "1.0.36"
+thiserror = "1.0.37"
 async-trait = "0.1.57"
 
 [dependencies.uuid]
