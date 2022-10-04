@@ -5,7 +5,7 @@ use std::{
 };
 
 use abq_utils::{api::ApiKey, auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
 
@@ -73,7 +73,7 @@ pub enum Command {
 
         /// Whether to accept messages only with TLS; false by default.
         /// When set, workers and test clients must also be set to send messages only with TLS.
-        #[clap(long, parse(from_flag), required = false)]
+        #[clap(long, action = ArgAction::SetTrue, required = false)]
         tls: Tls,
     },
     /// Starts a pool of abq workers in a working directory.
@@ -117,7 +117,7 @@ pub enum Command {
         /// `--queue-addr`.
         ///
         /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
-        #[clap(long, parse(from_flag), required = false)]
+        #[clap(long, action = ArgAction::SetTrue, required = false)]
         tls: Tls,
     },
     /// Starts an instance of `abq test`. Examples:
@@ -160,7 +160,7 @@ pub enum Command {
         /// `--queue-addr`.
         ///
         /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
-        #[clap(long, parse(from_flag), required = false)]
+        #[clap(long, action = ArgAction::SetTrue, required = false)]
         tls: Tls,
 
         /// Test result reporter to use for a test run.
@@ -180,7 +180,7 @@ pub enum Command {
         color: ColorPreference,
 
         /// Arguments to the test executable.
-        #[clap(required = true, multiple_values = true, allow_hyphen_values = true)]
+        #[clap(required = true, num_args=1.., allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Checks the health of an abq instance.
@@ -205,7 +205,7 @@ pub enum Command {
         token: Option<AuthToken>,
 
         /// Whether the services being checked are configured with TLS.
-        #[clap(long, parse(from_flag), required = false)]
+        #[clap(long, action=ArgAction::SetTrue, required = false)]
         tls: Tls,
     },
     /// Utilities related to auth tokens.

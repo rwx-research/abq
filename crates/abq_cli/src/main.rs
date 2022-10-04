@@ -196,7 +196,7 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
 }
 
 fn abq_main() -> anyhow::Result<ExitCode> {
-    use clap::{CommandFactory, ErrorKind};
+    use clap::{error::ErrorKind, CommandFactory};
 
     let _tracing_guards = setup_tracing();
 
@@ -379,7 +379,7 @@ fn get_config_from_api(api_key: ApiKey) -> anyhow::Result<ConfigFromApi> {
 }
 
 fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParams, clap::Error> {
-    use clap::{CommandFactory, ErrorKind};
+    use clap::{error::ErrorKind, CommandFactory};
     if args.is_empty() {
         let mut cmd = Cli::command();
         return Err(cmd.error(
@@ -516,7 +516,7 @@ mod test {
     use std::{env::VarError, str::FromStr};
 
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, RunId};
-    use clap::ErrorKind;
+    use clap::error::ErrorKind;
 
     use super::{get_inferred_run_id, validate_abq_test_args, RunIdEnvironment};
 
@@ -538,7 +538,7 @@ mod test {
         let result = validate_abq_test_args(vec![]);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind, ErrorKind::InvalidValue);
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
         assert!(err.to_string().contains("missing an executable to run"));
     }
 
