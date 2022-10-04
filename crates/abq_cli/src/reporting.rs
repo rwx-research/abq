@@ -7,7 +7,7 @@ use thiserror::Error;
 
 static DEFAULT_JUNIT_XML_PATH: &str = "abq-test-results.xml";
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub enum ReporterKind {
     /// Writes results line-by-line to stdout
     Line,

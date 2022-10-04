@@ -19,6 +19,14 @@ impl From<bool> for Tls {
     }
 }
 
+impl std::str::FromStr for Tls {
+    type Err = std::str::ParseBoolError;
+
+    fn from_str(tls: &str) -> Result<Self, Self::Err> {
+        bool::from_str(tls).map(Self)
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ServerOptions {
     auth_strategy: ServerAuthStrategy,
