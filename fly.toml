@@ -21,8 +21,8 @@ tcp_checks = []
      port = "8080"
 
   [services.concurrency]
-    hard_limit = 25
-    soft_limit = 20
+    hard_limit = 100
+    soft_limit = 80
 
 [[services]]
 internal_port = 8081
@@ -33,8 +33,8 @@ tcp_checks = []
      port = "8081"
 
   [services.concurrency]
-    hard_limit = 25
-    soft_limit = 20
+    hard_limit = 100
+    soft_limit = 80
 
 [[services]]
 internal_port = 8082
@@ -45,8 +45,8 @@ tcp_checks = []
      port = "8082"
 
   [services.concurrency]
-    hard_limit = 25
-    soft_limit = 20
+    hard_limit = 100
+    soft_limit = 80
 
 [[services.script_checks]]
 command = "/app/health"
