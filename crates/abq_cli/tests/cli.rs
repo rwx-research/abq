@@ -9,7 +9,6 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-#[cfg(feature = "test-abq-jest")]
 use abq_utils::net_protocol::workers::RunId;
 
 const WORKSPACE: &str = std::env!("ABQ_WORKSPACE_DIR");
@@ -623,4 +622,95 @@ fn work_no_queue_addr_or_api_key() {
     assert_eq!(exit_status.code().unwrap(), 2);
     assert!(stdout.is_empty());
     insta::assert_snapshot!(stderr);
+}
+
+#[test]
+#[serial]
+fn test_with_invalid_command() {
+    let name = "test_with_invalid_command";
+    let conf = CSConfigOptions {
+        use_auth_token: false,
+        tls: false,
+    };
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+    let run_id = RunId::unique().to_string();
+
+    // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+    let mut queue_proc = spawn_abq(
+        name,
+        conf.extend_args(&[
+            "start",
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            &server_port.to_string(),
+            "--work-port",
+            &worker_port.to_string(),
+            "--negotiator-port",
+            &negotiator_port.to_string(),
+        ]),
+    );
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start workers") {
+                break;
+            }
+        }
+    }
+
+    // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
+    let worker_args = &[
+        "work",
+        "--queue-addr",
+        &queue_addr,
+        "--working-dir",
+        ".",
+        "--run-id",
+        &run_id,
+    ];
+    let worker_args = conf.extend_args(worker_args);
+    let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
+
+    // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? \
+    //   -- __zzz_not_a_command__
+    let test_args = &[
+        "test",
+        "--reporter",
+        "dot",
+        "--queue-addr",
+        &queue_addr,
+        "--run-id",
+        &run_id,
+    ];
+    let mut test_args = conf.extend_args(test_args);
+    test_args.extend(["--", "__zzz_not_a_command__"]);
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq(&(name.to_string() + "_test"), test_args);
+
+    // The `abq test` process should exit with a failure
+    assert!(!exit_status.success(), "{:?}", (stdout, stderr));
+
+    insta::assert_snapshot!(stderr);
+
+    // The `abq work` process should also exit with a failure, corresponding to having
+    // witnessed a test failure in the run.
+    let worker_exit_status = worker_proc.wait().unwrap();
+    assert!(!worker_exit_status.success());
+
+    // Must kill the queue because it sits around forever, waiting for new requests.
+    queue_proc.kill().expect("queue already dead");
 }

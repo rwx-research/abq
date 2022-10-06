@@ -15,7 +15,7 @@ use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
-use abq_utils::net_protocol::runners::{ManifestMessage, TestCase, TestResult};
+use abq_utils::net_protocol::runners::{ManifestMessage, ManifestResult, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
@@ -288,6 +288,24 @@ impl RunQueues {
         // for work about the run get an EndOfWork message. But this leaks memory, how can
         // we avoid that?
         *state = RunState::Done { succeeded };
+        self.run_data.remove(&run_id);
+    }
+
+    pub fn mark_failed_to_start(&mut self, run_id: RunId) {
+        let state = self
+            .queues
+            .get_mut(&run_id)
+            .expect("no queue state for run");
+        match state {
+            RunState::WaitingForManifest => {
+                // okay
+            }
+            RunState::WaitingForFirstWorker | RunState::HasWork { .. } | RunState::Done { .. } => {
+                unreachable!("Invalid state - can only fail to start while waiting for manifest");
+            }
+        }
+
+        *state = RunState::Done { succeeded: false };
         self.run_data.remove(&run_id);
     }
 
@@ -858,13 +876,14 @@ impl QueueServer {
                     // Upcast the reconnection error into a generic error
                     .map_err(|e| Box::new(e) as _)
             }
-            Message::Manifest(run_id, manifest) => {
-                Self::handle_manifest(
+            Message::ManifestResult(run_id, manifest_result) => {
+                Self::handle_manifest_result(
                     ctx.queues,
+                    ctx.active_runs,
                     ctx.state_cache,
                     entity,
                     run_id,
-                    manifest,
+                    manifest_result,
                     stream,
                 )
                 .await
@@ -1042,7 +1061,37 @@ impl QueueServer {
     }
 
     #[instrument(level = "trace", skip(queues, state_cache))]
-    async fn handle_manifest(
+    async fn handle_manifest_result(
+        queues: SharedRunQueues,
+        active_runs: ActiveRunResponders,
+        state_cache: RunStateCache,
+        entity: EntityId,
+        run_id: RunId,
+        manifest_result: ManifestResult,
+        stream: Box<dyn net_async::ServerStream>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        match manifest_result {
+            ManifestResult::Manifest(manifest) => {
+                Self::handle_manifest_success(queues, state_cache, entity, run_id, manifest, stream)
+                    .await
+            }
+            ManifestResult::TestRunnerError { error } => {
+                Self::handle_manifest_failure(
+                    queues,
+                    active_runs,
+                    state_cache,
+                    entity,
+                    run_id,
+                    error,
+                    stream,
+                )
+                .await
+            }
+        }
+    }
+
+    #[instrument(level = "trace", skip(queues, state_cache, manifest))]
+    async fn handle_manifest_success(
         queues: SharedRunQueues,
         state_cache: RunStateCache,
         entity: EntityId,
@@ -1067,6 +1116,77 @@ impl QueueServer {
         queues.lock().unwrap().add_manifest(run_id, flat_manifest);
 
         net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
+
+        Ok(())
+    }
+
+    #[instrument(
+        level = "trace",
+        skip(queues, state_cache, opaque_manifest_generation_error)
+    )]
+    async fn handle_manifest_failure(
+        queues: SharedRunQueues,
+        active_runs: ActiveRunResponders,
+        state_cache: RunStateCache,
+        entity: EntityId,
+        run_id: RunId,
+        opaque_manifest_generation_error: String,
+        mut stream: Box<dyn net_async::ServerStream>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        // If a worker failed to generate a manifest, we're going to immediately end the test run,
+        // as this indicates a failure in the underlying test runners.
+
+        {
+            // Immediately ACK to the worker responsible for the manifest, so they can relinquish
+            // blocking and exit.
+            net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
+            drop(stream);
+        }
+
+        {
+            // We should not have an entry for the run in the state cache, since we only ever know
+            // the initial state of a run after receiving the manifest.
+            debug_assert!(!state_cache.lock().unwrap().contains_key(&run_id));
+        }
+
+        let responder = {
+            // Remove and take over the responder; since the manifest is not known, we should be the
+            // only task that ever communicates with the client.
+            let responder = active_runs.write().await.remove(&run_id).unwrap();
+            responder.into_inner()
+        };
+
+        // Tell the client that the test has failed.
+        match responder {
+            ClientResponder::DirectStream { mut stream, buffer } => {
+                debug_assert!(buffer.is_empty(), "messages before manifest received");
+
+                net_protocol::async_write(
+                    &mut stream,
+                    &InvokerTestResult::TestCommandError {
+                        error: opaque_manifest_generation_error,
+                    },
+                )
+                .await?;
+
+                drop(stream);
+            }
+            ClientResponder::Disconnected {
+                results,
+                buffer_size: _,
+            } => {
+                // Unfortunately, since we still don't have an active connection to the abq
+                // client, we can't do anything here.
+                // To avoid leaking memory we assume the client is dead and drop the results.
+                //
+                // TODO: rather than dropping the failure message, consider attaching it back
+                // to the queue. If the client re-connects, we'll let them know that the test
+                // has failed to startup.
+                let _ = results;
+            }
+        }
+
+        queues.lock().unwrap().mark_failed_to_start(run_id);
 
         Ok(())
     }
@@ -1320,7 +1440,7 @@ mod test {
 
     use super::{Abq, RunStateCache};
     use crate::{
-        invoke::{Client, InvocationError, DEFAULT_CLIENT_POLL_TIMEOUT},
+        invoke::{Client, InvocationError, TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT},
         queue::{
             ActiveRunResponders, BufferedResults, ClientReconnectionError, ClientResponder,
             QueueServer, RunQueues, SharedRunQueues, WorkScheduler,
@@ -1334,7 +1454,7 @@ mod test {
             self,
             entity::EntityId,
             runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
-            workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
+            workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
         },
     };
     use abq_workers::{
@@ -2667,6 +2787,76 @@ mod test {
             let exit = new_workers.shutdown();
             assert!(matches!(exit, WorkersExit::Success));
         }
+
+        queue.shutdown().unwrap();
+    }
+
+    #[test]
+    fn failure_to_run_worker_command_exits_gracefully() {
+        let mut queue = Abq::start(Default::default());
+
+        let runner = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+            cmd: "__zzz_not_a_command__".to_string(),
+            args: Default::default(),
+            extra_env: Default::default(),
+        });
+
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+        };
+
+        let queue_server_addr = queue.server_addr();
+
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+
+        let run_id = RunId::unique();
+
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                runtime.block_on(async {
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
+                    )
+                    .await
+                    .unwrap();
+
+                    client.stream_results(|_, _| {}).await.unwrap_err()
+                })
+            }
+        });
+
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id,
+        )
+        .unwrap();
+
+        let results_error = results_handle.join().unwrap();
+
+        assert!(matches!(
+            results_error,
+            TestResultError::TestCommandError(..)
+        ));
+
+        let exit = workers.shutdown();
+        assert!(matches!(exit, WorkersExit::Failure));
 
         queue.shutdown().unwrap();
     }

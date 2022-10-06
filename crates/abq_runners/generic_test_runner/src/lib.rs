@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
 
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersionMessage, ManifestMessage, TestCaseMessage, TestResult, TestResultMessage,
-    ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
+    AbqProtocolVersionMessage, ManifestMessage, ManifestResult, TestCaseMessage, TestResult,
+    TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
     ACTIVE_PROTOCOL_VERSION_MINOR,
 };
 use abq_utils::net_protocol::workers::{
@@ -159,7 +159,7 @@ fn retrieve_manifest<'a>(
 #[derive(Debug, Error)]
 pub enum RunnerError {
     #[error("{0}")]
-    Io(io::Error),
+    Io(#[from] io::Error),
     #[error("{0}")]
     ProtocolVersion(ProtocolVersionError),
 }
@@ -193,7 +193,7 @@ impl GenericTestRunner {
     ) -> Result<(), RunnerError>
     where
         ShouldShutdown: Fn() -> bool,
-        SendManifest: FnMut(ManifestMessage),
+        SendManifest: FnMut(ManifestResult),
         GetNextWorkBundle: FnMut() -> NextWorkBundle + std::marker::Send + 'static,
         SendTestResult: FnMut(WorkId, TestResult),
     {
@@ -209,15 +209,25 @@ impl GenericTestRunner {
         // If we need to retrieve the manifest, do that first.
         if let Some(mut send_manifest) = send_manifest {
             // TODO: error handling
-            let manifest = retrieve_manifest(
+            let manifest_or_error = retrieve_manifest(
                 &cmd,
                 &args,
                 &additional_env,
                 working_dir,
                 protocol_version_timeout,
-            )?;
+            );
 
-            send_manifest(manifest);
+            match manifest_or_error {
+                Ok(manifest) => {
+                    send_manifest(ManifestResult::Manifest(manifest));
+                }
+                Err(err) => {
+                    send_manifest(ManifestResult::TestRunnerError {
+                        error: err.to_string(),
+                    });
+                    return Err(err.into());
+                }
+            }
         }
 
         // Now, start the test runner.
@@ -249,7 +259,13 @@ impl GenericTestRunner {
         native_runner.current_dir(working_dir);
         native_runner.stdout(process::Stdio::null());
         native_runner.stderr(process::Stdio::null());
-        let mut native_runner_handle = native_runner.spawn().unwrap();
+
+        // If launching the native runner fails here, it should have failed during manifest
+        // generation as well (unless this is a flakey error in the underlying test runner, which
+        // we do not attempt to handle gracefully). Since the failure during manifest generation
+        // will have notified the queue, at this point, failures should just result in the worker
+        // exiting silently itself.
+        let mut native_runner_handle = native_runner.spawn()?;
 
         // First, get and validate the protocol version message.
         let mut runner_conn =
@@ -285,7 +301,7 @@ impl GenericTestRunner {
         }
 
         drop(our_listener);
-        native_runner_handle.wait().unwrap();
+        native_runner_handle.wait()?;
 
         Ok(())
     }
@@ -307,21 +323,28 @@ pub fn execute_wrapped_runner(
     // and moreover, `send_manifest` will never be called again. But to avoid bugs, we don't do
     // that for now.
     let flat_manifest = Arc::new(Mutex::new(None));
+    let mut opt_error_cell = None;
 
     let mut test_results = vec![];
 
     let send_manifest = {
         let flat_manifest = Arc::clone(&flat_manifest);
         let manifest_message = &mut manifest_message;
-        move |real_manifest: ManifestMessage| {
-            let mut flat_manifest = flat_manifest.lock().unwrap();
+        let opt_error_cell = &mut opt_error_cell;
+        move |manifest_result: ManifestResult| match manifest_result {
+            ManifestResult::Manifest(real_manifest) => {
+                let mut flat_manifest = flat_manifest.lock().unwrap();
 
-            if manifest_message.is_some() || flat_manifest.is_some() {
-                panic!("Manifest has already been defined, but is being sent again");
+                if manifest_message.is_some() || flat_manifest.is_some() {
+                    panic!("Manifest has already been defined, but is being sent again");
+                }
+
+                *manifest_message = Some(real_manifest.clone());
+                *flat_manifest = Some(flatten_manifest(real_manifest.manifest));
             }
-
-            *manifest_message = Some(real_manifest.clone());
-            *flat_manifest = Some(flatten_manifest(real_manifest.manifest));
+            ManifestResult::TestRunnerError { error } => {
+                *opt_error_cell = Some(error);
+            }
         }
     };
 
@@ -367,6 +390,13 @@ pub fn execute_wrapped_runner(
         get_next_test,
         send_test_result,
     )?;
+
+    if let Some(error) = opt_error_cell {
+        return Err(RunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            error,
+        )));
+    }
 
     Ok((
         manifest_message.expect("manifest never received!"),
@@ -510,7 +540,7 @@ mod test_validate_protocol_version_message {
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
     use crate::{execute_wrapped_runner, GenericTestRunner};
-    use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestOrGroup};
+    use abq_utils::net_protocol::runners::{ManifestMessage, ManifestResult, Status, TestOrGroup};
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
 
     use std::path::PathBuf;
@@ -547,7 +577,10 @@ mod test_abq_jest {
 
         assert!(test_results.is_empty());
 
-        let ManifestMessage { mut manifest } = manifest.unwrap();
+        let ManifestMessage { mut manifest } = match manifest.unwrap() {
+            ManifestResult::Manifest(man) => man,
+            ManifestResult::TestRunnerError { .. } => unreachable!(),
+        };
 
         manifest.members.sort_by_key(|member| match member {
             TestOrGroup::Test(test) => test.id.clone(),
@@ -577,5 +610,44 @@ mod test_abq_jest {
 
         assert_eq!(test_results[1].status, Status::Success);
         assert!(test_results[1].id.ends_with("names.test.js"));
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{GenericTestRunner, RunnerError};
+    use abq_utils::net_protocol::runners::ManifestResult;
+    use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
+
+    #[test]
+    fn invalid_command_yields_error() {
+        let input = NativeTestRunnerParams {
+            cmd: "__zzz_not_a_command__".to_string(),
+            args: vec![],
+            extra_env: Default::default(),
+        };
+
+        let mut manifest_result = None;
+
+        let send_manifest = |result| manifest_result = Some(result);
+        let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
+        let send_test_result = |_, _| {};
+
+        let runner_result = GenericTestRunner::run(
+            input,
+            &std::env::current_dir().unwrap(),
+            || false,
+            Some(send_manifest),
+            get_next_test,
+            send_test_result,
+        );
+
+        let manifest_result = manifest_result.unwrap();
+
+        assert!(matches!(
+            manifest_result,
+            ManifestResult::TestRunnerError { .. }
+        ));
+        assert!(matches!(runner_result, Err(RunnerError::Io(..))));
     }
 }

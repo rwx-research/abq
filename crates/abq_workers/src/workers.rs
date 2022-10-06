@@ -10,7 +10,9 @@ use abq_exec_worker as exec;
 use abq_generic_test_runner::{GenericTestRunner, RunnerError};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
-use abq_utils::net_protocol::runners::{ManifestMessage, Status, TestId, TestResult};
+use abq_utils::net_protocol::runners::{
+    ManifestMessage, ManifestResult, Status, TestId, TestResult,
+};
 use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
 use abq_utils::net_protocol::workers::{
     NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext, WorkId,
@@ -25,7 +27,7 @@ enum MessageFromPool {
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
-pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestMessage) + Send + Sync + 'static>;
+pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResult = Arc<dyn Fn(EntityId, &RunId, WorkId, TestResult) + Send + Sync + 'static>;
 /// Did a given run complete successfully? Returns true if so.
 pub type RunCompletedSuccessfully = Arc<dyn Fn(EntityId) -> bool + Send + Sync + 'static>;
@@ -246,17 +248,23 @@ impl WorkerPool {
             let _ = self.worker_msg_tx.send(MessageFromPool::Shutdown);
         }
 
+        let mut worker_has_error = false;
         for worker_thead in self.workers.iter_mut() {
-            worker_thead
+            let opt_err = worker_thead
                 .handle
                 .take()
                 .expect("worker thread already stolen")
                 .join()
-                .expect("runner thread panicked rather than erroring")
-                .expect("runner failed, but we didn't catch it");
+                .expect("runner thread panicked rather than erroring");
+
+            if let Err(error) = opt_err {
+                tracing::error!(?error, "worker thread exited with error");
+                eprintln!("{}", error);
+                worker_has_error = true;
+            }
         }
 
-        match (self.run_completed_successfully)(self.entity) {
+        match !worker_has_error && (self.run_completed_successfully)(self.entity) {
             true => WorkersExit::Success,
             false => WorkersExit::Failure,
         }
@@ -337,7 +345,7 @@ fn start_generic_test_runner(
 
     let notify_manifest = notify_manifest.map(|notify_manifest| {
         let run_id = run_id.clone();
-        move |manifest| notify_manifest(entity, &run_id, manifest)
+        move |manifest_result| notify_manifest(entity, &run_id, manifest_result)
     });
 
     let get_next_work_bundle = move || get_next_work_bundle();
@@ -358,18 +366,18 @@ fn start_generic_test_runner(
         WorkerContext::AlwaysWorkIn { working_dir } => working_dir,
     };
 
-    GenericTestRunner::run(
+    let opt_runner_err = GenericTestRunner::run(
         native_runner_params,
         &working_dir,
         polling_should_shutdown,
         notify_manifest,
         get_next_work_bundle,
         send_test_result,
-    )?;
+    );
 
     mark_worker_complete();
 
-    Ok(())
+    opt_runner_err
 }
 
 fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: ManifestMessage) {
@@ -388,7 +396,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
     let entity = EntityId::new();
 
     if let Some(notify_manifest) = notify_manifest {
-        notify_manifest(entity, &run_id, manifest);
+        notify_manifest(entity, &run_id, ManifestResult::Manifest(manifest));
     }
 
     'tests_done: loop {
@@ -576,7 +584,7 @@ mod test {
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
     use abq_utils::net_protocol::runners::{
-        Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
+        Manifest, ManifestMessage, ManifestResult, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, TestLikeRunner};
     use abq_utils::{flatten_manifest, net_protocol};
@@ -593,7 +601,7 @@ mod test {
     use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkContext, WorkId};
 
     type ResultsCollector = Arc<Mutex<HashMap<String, TestResult>>>;
-    type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
+    type ManifestCollector = Arc<Mutex<Option<ManifestResult>>>;
 
     fn work_writer() -> (impl Fn(NextWork), GetNextWorkBundle) {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
@@ -698,7 +706,10 @@ mod test {
     fn await_manifest_test_cases(manifest: ManifestCollector) -> Vec<TestCase> {
         loop {
             match manifest.lock().unwrap().take() {
-                Some(manifest) => return flatten_manifest(manifest.manifest),
+                Some(ManifestResult::Manifest(manifest)) => {
+                    return flatten_manifest(manifest.manifest)
+                }
+                Some(ManifestResult::TestRunnerError { .. }) => unreachable!(),
                 None => continue,
             }
         }

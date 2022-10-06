@@ -1,0 +1,16 @@
+---
+source: crates/abq_cli/tests/cli.rs
+expression: stderr
+---
+Error: The command
+
+    __zzz_not_a_command__
+
+failed to be run by all ABQ workers associating to this test run.
+
+Here's a message we found concerning the failure:
+
+No such file or directory (os error 2)
+
+HELP: Test commands run by ABQ must have support for the ABQ protocol.
+
