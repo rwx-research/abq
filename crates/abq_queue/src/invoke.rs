@@ -11,7 +11,7 @@
 //!    the stream is closed.
 //! 1. Once it's done reading, the invoker closes its side of the stream.
 
-use std::{io, net::SocketAddr, num::NonZeroU64};
+use std::{io, net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use abq_utils::{
     net_async,
@@ -27,6 +27,11 @@ use abq_utils::{
 
 use thiserror::Error;
 
+/// The default maximum amount of a time a client will wait between consecutive
+/// test results streamed from the queue.
+/// The current default is unbounded.
+pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::MAX;
+
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
 pub struct Client {
     pub(crate) entity: EntityId,
@@ -36,6 +41,9 @@ pub struct Client {
     pub(crate) run_id: RunId,
     /// The stream to the queue server.
     pub(crate) stream: Box<dyn net_async::ClientStream>,
+    // The maximum amount of a time a client should wait between consecutive test results
+    // streamed from the queue.
+    pub(crate) poll_timeout: Duration,
 }
 
 #[derive(Debug, Error)]
@@ -59,6 +67,7 @@ impl Client {
         run_id: RunId,
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
+        poll_timeout: Duration,
     ) -> Result<Self, InvocationError> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
@@ -97,6 +106,7 @@ impl Client {
             client,
             run_id,
             stream,
+            poll_timeout,
         })
     }
 
@@ -121,7 +131,17 @@ impl Client {
     /// Returns [None] when there are no more test results.
     pub async fn next(&mut self) -> Option<Result<Vec<(WorkId, TestResult)>, io::Error>> {
         loop {
-            match net_protocol::async_read(&mut self.stream).await {
+            let read_result = tokio::select! {
+                read = net_protocol::async_read(&mut self.stream) => {
+                    read
+                }
+                _ = tokio::time::sleep(self.poll_timeout) => {
+                    tracing::error!(timeout=?self.poll_timeout, entity=?self.entity, run_id=?self.run_id, "timed out waiting for queue message");
+                    return Some(Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a message from the queue")));
+                }
+            };
+
+            match read_result {
                 Ok(InvokerTestResult::Results(results)) => {
                     // Send an acknowledgement of the result to the server. If it fails, attempt to reconnect once.
                     let ack_result = net_protocol::async_write(

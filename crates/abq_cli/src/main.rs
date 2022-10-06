@@ -10,6 +10,7 @@ use std::{
     num::NonZeroU64,
     str::FromStr,
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use abq_queue::invoke::{Client, InvocationError};
@@ -269,6 +270,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             tls,
             color,
             batch_size,
+            result_timeout_seconds,
         } => {
             let (resolved_token, resolved_queue_addr, resolved_tls) =
                 resolve_config(token, queue_addr, tls, api_key)?;
@@ -285,7 +287,17 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 resolved_tls,
             )?;
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
-            run_tests(entity, runner, abq, run_id, reporters, color, batch_size)
+            let results_timeout = Duration::from_secs(result_timeout_seconds.get());
+            run_tests(
+                entity,
+                runner,
+                abq,
+                run_id,
+                reporters,
+                color,
+                batch_size,
+                results_timeout,
+            )
         }
         Command::Health {
             queue,
@@ -425,6 +437,7 @@ fn run_tests(
     reporters: Vec<ReporterKind>,
     color_choice: ColorPreference,
     batch_size: NonZeroU64,
+    results_timeout: Duration,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let mut reporters = SuiteReporters::new(reporters, color_choice, test_suite_name);
@@ -451,6 +464,7 @@ fn run_tests(
         run_id.clone(),
         runner,
         batch_size,
+        results_timeout,
         on_result,
     );
 
@@ -489,6 +503,7 @@ fn start_test_result_reporter(
     test_id: RunId,
     runner: RunnerKind,
     batch_size: NonZeroU64,
+    results_timeout: Duration,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
 ) -> JoinHandle<Result<(), InvocationError>> {
     thread::spawn(move || {
@@ -503,6 +518,7 @@ fn start_test_result_reporter(
                 test_id,
                 runner,
                 batch_size,
+                results_timeout,
             )
             .await?;
             abq_test_client.stream_results(on_result).await?;

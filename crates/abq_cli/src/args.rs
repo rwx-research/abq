@@ -179,6 +179,18 @@ pub enum Command {
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
+        /// The maximum number of seconds to wait for a test result to be reported back.
+        ///
+        /// Note that this applies to both the first test result reported back, and all subsequent
+        /// test results. When setting a timeout, it is recommended to significantly over-estimate
+        /// based on historical runtimes you have observed for abq.
+        ///
+        /// Hitting a timeout is typically indicative of a failure in ABQ workers.
+        ///
+        /// By defualt, the timeout is unbound.
+        #[clap(long, default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs().try_into().unwrap())]
+        result_timeout_seconds: NonZeroU64,
+
         /// Arguments to the test executable.
         #[clap(required = true, num_args=1.., allow_hyphen_values = true)]
         args: Vec<String>,
