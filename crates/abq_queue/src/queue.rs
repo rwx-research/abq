@@ -1320,7 +1320,7 @@ mod test {
 
     use super::{Abq, RunStateCache};
     use crate::{
-        invoke::{Client, InvocationError},
+        invoke::{Client, InvocationError, DEFAULT_CLIENT_POLL_TIMEOUT},
         queue::{
             ActiveRunResponders, BufferedResults, ClientReconnectionError, ClientResponder,
             QueueServer, RunQueues, SharedRunQueues, WorkScheduler,
@@ -1438,6 +1438,7 @@ mod test {
                         run_id,
                         runner,
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -1532,6 +1533,7 @@ mod test {
                         run1,
                         runner1,
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -1542,6 +1544,7 @@ mod test {
                         run2,
                         runner2,
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -1646,6 +1649,7 @@ mod test {
                         run,
                         runner1,
                         batch_size,
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -1891,6 +1895,7 @@ mod test {
             client: client_opts.build_async().unwrap(),
             run_id: run_id.clone(),
             stream: client_conn,
+            poll_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
         };
         {
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
@@ -2196,6 +2201,7 @@ mod test {
                         run_id,
                         runner,
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -2269,6 +2275,7 @@ mod test {
                         run_id,
                         runner,
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -2342,6 +2349,7 @@ mod test {
                         run_id.clone(),
                         runner.clone(),
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -2354,6 +2362,7 @@ mod test {
                         run_id.clone(),
                         runner,
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await;
 
@@ -2406,6 +2415,7 @@ mod test {
                         run_id.clone(),
                         runner.clone(),
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await
                     .unwrap();
@@ -2420,6 +2430,7 @@ mod test {
                         run_id,
                         runner,
                         one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
                     )
                     .await;
 
@@ -2604,6 +2615,7 @@ mod test {
                             run_id,
                             runner,
                             one_nonzero(),
+                            DEFAULT_CLIENT_POLL_TIMEOUT,
                         )
                         .await
                         .unwrap();

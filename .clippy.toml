@@ -1,0 +1,2 @@
+# The default of 7 is too much noise.
+too-many-arguments-threshold = 16
