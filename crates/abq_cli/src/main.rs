@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use abq_queue::invoke::{Client, InvocationError};
+use abq_queue::invoke::{Client, InvocationError, TestResultError};
 use abq_utils::{
     api::ApiKey,
     auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
@@ -286,11 +286,10 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 client_auth,
                 resolved_tls,
             )?;
-            let runner = RunnerKind::GenericNativeTestRunner(runner_params);
             let results_timeout = Duration::from_secs(result_timeout_seconds.get());
             run_tests(
                 entity,
-                runner,
+                runner_params,
                 abq,
                 run_id,
                 reporters,
@@ -431,7 +430,7 @@ fn find_or_create_abq(
 
 fn run_tests(
     entity: EntityId,
-    runner: RunnerKind,
+    runner_params: NativeTestRunnerParams,
     abq: AbqInstance,
     opt_test_id: Option<RunId>,
     reporters: Vec<ReporterKind>,
@@ -456,6 +455,8 @@ fn run_tests(
 
     let start_in_process_workers = opt_test_id.is_none();
     let run_id = opt_test_id.unwrap_or_else(RunId::unique);
+
+    let runner = RunnerKind::GenericNativeTestRunner(runner_params.clone());
 
     let work_results_thread = start_test_result_reporter(
         entity,
@@ -488,12 +489,62 @@ fn run_tests(
         let _exit_code = workers.shutdown();
     }
 
-    work_results_thread.join().unwrap()?;
+    let opt_invoked_error = work_results_thread.join().unwrap();
+    if let Err(invoke_error) = opt_invoked_error {
+        return Err(elaborate_invocation_error(invoke_error, runner_params));
+    }
 
     // TODO: is there a reasonable way to surface the errors?
     let (suite_result, _errors) = reporters.finish();
 
     Ok(suite_result.suggested_exit_code)
+}
+
+fn elaborate_invocation_error(
+    error: InvocationError,
+    runner_params: NativeTestRunnerParams,
+) -> anyhow::Error {
+    match error {
+        InvocationError::Io(_)
+        | InvocationError::DuplicateRun(_)
+        | InvocationError::DuplicateCompletedRun(_) => {
+            // The default error message provided is good here.
+            error.into()
+        }
+        InvocationError::TestResultError(error) => match error {
+            TestResultError::Io(error) => error.into(),
+            TestResultError::TestCommandError(opaque_error) => {
+                let NativeTestRunnerParams {
+                    cmd,
+                    args,
+                    extra_env: _,
+                } = runner_params;
+
+                let mut cmd = vec![cmd];
+                cmd.extend(args);
+                let cmd = cmd.join(" ");
+
+                let msg = format!(
+                    indoc::indoc!(
+                        r#"
+                        The command
+
+                            {}
+
+                        failed to be run by all ABQ workers associating to this test run.
+
+                        Here's a message we found concerning the failure:
+
+                        {}
+
+                        HELP: Test commands run by ABQ must have support for the ABQ protocol."#
+                    ),
+                    cmd, opaque_error,
+                );
+                anyhow::Error::msg(msg)
+            }
+        },
+    }
 }
 
 fn start_test_result_reporter(

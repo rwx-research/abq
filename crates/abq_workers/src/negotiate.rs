@@ -237,7 +237,7 @@ impl WorkersNegotiator {
             Some(Box::new({
                 let client = client.boxed_clone();
 
-                move |entity, run_id, manifest| {
+                move |entity, run_id, manifest_result| {
                     let span = tracing::trace_span!("notify_manifest", ?entity, run_id=?run_id, queue_server=?queue_results_addr);
                     let _notify_manifest = span.enter();
 
@@ -246,13 +246,16 @@ impl WorkersNegotiator {
                         .connect(queue_results_addr)
                         .expect("results server not available");
 
-                    let request = net_protocol::queue::Request {
+                    let message = net_protocol::queue::Request {
                         entity,
-                        message: net_protocol::queue::Message::Manifest(run_id.clone(), manifest),
+                        message: net_protocol::queue::Message::ManifestResult(
+                            run_id.clone(),
+                            manifest_result,
+                        ),
                     };
 
                     // TODO: error handling
-                    net_protocol::write(&mut stream, request).unwrap();
+                    net_protocol::write(&mut stream, message).unwrap();
                     let net_protocol::workers::AckManifest =
                         net_protocol::read(&mut stream).unwrap();
                 }
@@ -642,7 +645,7 @@ mod test {
     use abq_utils::auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
     use abq_utils::net_protocol::runners::{
-        Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
+        Manifest, ManifestMessage, ManifestResult, Status, Test, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::{NextTestResponse, WorkServerRequest};
     use abq_utils::net_protocol::workers::{
@@ -752,7 +755,11 @@ mod test {
                 net_protocol::queue::Message::WorkerResult(_, _, result) => {
                     msgs2.lock().unwrap().push(result);
                 }
-                net_protocol::queue::Message::Manifest(_, manifest) => {
+                net_protocol::queue::Message::ManifestResult(_, manifest_result) => {
+                    let manifest = match manifest_result {
+                        ManifestResult::Manifest(man) => man,
+                        _ => unreachable!(),
+                    };
                     let old_manifest = manifest_collector.lock().unwrap().replace(manifest);
                     debug_assert!(
                         old_manifest.is_none(),

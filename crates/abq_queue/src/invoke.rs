@@ -56,6 +56,18 @@ pub enum InvocationError {
 
     #[error("{0} corresponds to a test run already completed on this queue; please provide a different test run ID.")]
     DuplicateCompletedRun(RunId),
+
+    #[error("{0}")]
+    TestResultError(#[from] TestResultError),
+}
+
+#[derive(Debug, Error)]
+pub enum TestResultError {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+
+    #[error("The given test command failed to be executed by all workers. The recorded error message is:\n{0}")]
+    TestCommandError(String),
 }
 
 impl Client {
@@ -129,7 +141,7 @@ impl Client {
 
     /// Yields the next test result, as it streams in.
     /// Returns [None] when there are no more test results.
-    pub async fn next(&mut self) -> Option<Result<Vec<(WorkId, TestResult)>, io::Error>> {
+    pub async fn next(&mut self) -> Option<Result<Vec<(WorkId, TestResult)>, TestResultError>> {
         loop {
             let read_result = tokio::select! {
                 read = net_protocol::async_read(&mut self.stream) => {
@@ -137,7 +149,7 @@ impl Client {
                 }
                 _ = tokio::time::sleep(self.poll_timeout) => {
                     tracing::error!(timeout=?self.poll_timeout, entity=?self.entity, run_id=?self.run_id, "timed out waiting for queue message");
-                    return Some(Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a message from the queue")));
+                    return Some(Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a message from the queue").into()));
                 }
             };
 
@@ -151,19 +163,22 @@ impl Client {
                     .await;
                     if ack_result.is_err() {
                         if let Err(err) = self.reconnect().await {
-                            return Some(Err(err));
+                            return Some(Err(err.into()));
                         }
                     }
 
                     return Some(Ok(results));
                 }
                 Ok(InvokerTestResult::EndOfResults) => return None,
+                Ok(InvokerTestResult::TestCommandError { error }) => {
+                    return Some(Err(TestResultError::TestCommandError(error)))
+                }
                 Err(err) => {
                     // Attempt to reconnect once. If it's successful, just re-read the next message.
                     // If it's unsuccessful, return the original error.
                     match self.reconnect().await {
                         Ok(()) => continue,
-                        Err(_) => return Some(Err(err)),
+                        Err(_) => return Some(Err(err.into())),
                     }
                 }
             }
@@ -176,7 +191,7 @@ impl Client {
     pub async fn stream_results(
         mut self,
         mut on_result: impl FnMut(WorkId, TestResult),
-    ) -> Result<(), io::Error> {
+    ) -> Result<(), TestResultError> {
         while let Some(maybe_results) = self.next().await {
             let results = maybe_results?;
             for (work_id, test_result) in results {

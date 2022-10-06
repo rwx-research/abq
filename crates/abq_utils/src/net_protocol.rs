@@ -104,6 +104,18 @@ pub mod runners {
         pub manifest: Manifest,
     }
 
+    /// The result of a worker attempting to retrieve a manifest for a test command.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum ManifestResult {
+        /// The manifest was successfully retrieved.
+        Manifest(ManifestMessage),
+        /// The worker failed to start the underlying test runner.
+        TestRunnerError {
+            /// Opaque error message from the failing test runner.
+            error: String,
+        },
+    }
+
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "type")]
     pub enum TestOrGroup {
@@ -274,7 +286,7 @@ pub mod queue {
 
     use super::{
         entity::EntityId,
-        runners::{ManifestMessage, TestResult},
+        runners::{ManifestResult, TestResult},
         workers::{RunId, RunnerKind, WorkId},
     };
 
@@ -316,6 +328,12 @@ pub mod queue {
         Results(Vec<AssociatedTestResult>),
         /// No more results are known.
         EndOfResults,
+        /// The given test command is determined to have failed for all workers associated with
+        /// this test run, and the test run will not continue.
+        TestCommandError {
+            /// Opaque error message related to the failure of the test command.
+            error: String,
+        },
     }
 
     /// A response regarding the final result of a given test run, after all tests in the run are
@@ -347,7 +365,7 @@ pub mod queue {
         /// An invoker of a test run would like to reconnect to the queue for results streaming.
         Reconnect(RunId),
         /// A work manifest for a given run.
-        Manifest(RunId, ManifestMessage),
+        ManifestResult(RunId, ManifestResult),
         /// The result of some work from the queue.
         WorkerResult(RunId, WorkId, TestResult),
         /// An ask to return information about whether a given test run failed or not.
