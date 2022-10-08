@@ -5,7 +5,7 @@ use std::{
 };
 
 use abq_utils::{api::ApiKey, auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, ArgGroup, Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
 
@@ -27,6 +27,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
+
 pub enum Command {
     /// Starts the "abq" ephemeral queue.
     Start {
@@ -80,6 +81,12 @@ pub enum Command {
     ///
     /// You should use this to start workers on a remote machine that you'd like to connect to an
     /// instance of `abq start`.
+    #[command(group(
+        ArgGroup::new("execution") // don't allow both queue_addr and num_workers params
+            .required(true)
+            .multiple(false)
+            .args(["api_key", "queue_addr"]),
+        ))]
     Work {
         /// Working directory of the workers. Defaults to the current directory.
         #[clap(long, required = true, env("PWD"))]
@@ -90,17 +97,19 @@ pub enum Command {
         #[clap(long, required = false, env("ABQ_RUN_ID"))]
         run_id: Option<RunId>,
 
-        /// The API key to use when fetching queue config information from the ABQ API
+        /// The API key to use when fetching queue config information from the ABQ API.
+        ///
+        /// Cannot be used with queue_addr (implies: not using the ABQ API).
         #[clap(long, required = false, env("ABQ_API_KEY"))]
         api_key: Option<ApiKey>,
 
-        /// Address of the queue to connect to.
+        /// Address of the queue to work from.
         ///
-        /// If --api-key is specified, the queue_addr will be ignored and the address fetched from the ABQ API will be used.
+        /// Cannot be used with api_key (will fetch address from ABQ API).
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
-        /// Number of workers to start. Must be >= 4. Defaults to the number of available (logical)
+        /// Number of workers to start. Must be >= 1. Defaults to the number of available (logical)
         /// CPUs - 1.
         #[clap(long, short = 'n', required = false, default_value_t = default_num_workers())]
         num: NonZeroUsize,
@@ -120,33 +129,47 @@ pub enum Command {
         #[clap(long, action = ArgAction::SetTrue, required = false)]
         tls: Tls,
     },
-    /// Starts an instance of `abq test`. Examples:
+    /// Starts an instance of `abq test`.
+    ///
+    /// Examples:
     ///
     ///   abq test -- yarn jest -t "onboard flow"
     ///   abq test -- cargo test
     ///
-    /// The given executable must be available on abq workers fulfilling this test request,
-    /// and must resolve to an executable that implements the ABQ protocol.
+    /// The given executable must be available on abq workers fulfilling this test request, and must resolve to an executable that implements the ABQ protocol.
+    ///
+    #[clap(verbatim_doc_comment)]
+    #[command(group(
+        ArgGroup::new("execution") // don't allow both queue_addr and num_workers params
+            .multiple(false)
+            .args(["api_key", "queue_addr", "num_workers"]),
+        ))]
     Test {
         /// Run ID for workers to connect to. If not specified, workers are started in-process.
         /// In CI environments, this can be inferred from CI environment variables.
         #[clap(long, required = false, env("ABQ_RUN_ID"))]
         run_id: Option<RunId>,
 
-        /// The API key to use when fetching queue config information from the ABQ API
+        /// The API key to use when fetching queue config information from the ABQ API.
+        ///
+        /// Cannot be used with queue_addr (implies: not using the ABQ API) or num_workers (implies: run locally).
         #[clap(long, required = false, env("ABQ_API_KEY"))]
         api_key: Option<ApiKey>,
 
-        /// Address of the queue to send the test request to.
+        /// Address of the queue where the test command will be sent.
         ///
-        /// If specified, assumes that abq workers will start as seperate processes connected to
-        /// the same queue.
+        /// Requires that abq workers be started as seperate processes connected to the queue.
         ///
-        /// If not specified and --api-key is specified, the queue address will be fetched from the ABQ API.
-        ///
-        /// If --api-key is specified, the queue_addr will be ignored and the address fetched from the ABQ API will be used.
+        /// Cannot be used with api_key (will fetch address from ABQ API) or num_workers (implies: run locally).
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
+
+        /// Specifices the number of workers to start when running in standalone. Must be >= 1. Defaults to the number of available (logical)
+        /// CPUs - 1.
+        ///
+        /// Cannot be used with api_key (will fetch address from ABQ API) or queue_addr (implies: not using the ABQ API)
+        #[clap(long, short = 'n', required = false, default_value_t = default_num_workers())]
+        num_workers: NonZeroUsize,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
