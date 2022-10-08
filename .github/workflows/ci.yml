@@ -16,12 +16,8 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1.0.7
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          # Keep up-to-date with rust-toolchain.toml until https://github.com/actions-rs/toolchain/pull/209 lands.
-          toolchain: 1.62.1
-          override: true
           components: rustfmt
 
       - name: Check formatting
@@ -52,12 +48,8 @@ jobs:
           restore-keys: |
             cargo-
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1.0.7
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          # Keep up-to-date with rust-toolchain.toml until https://github.com/actions-rs/toolchain/pull/209 lands.
-          toolchain: 1.62.1
-          override: true
           components: clippy
 
       - name: Run lints
@@ -178,12 +170,7 @@ jobs:
           restore-keys: |
             cargo-
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1.0.7
-        with:
-          profile: minimal
-          # Keep up-to-date with rust-toolchain.toml until https://github.com/actions-rs/toolchain/pull/209 lands.
-          toolchain: 1.62.1
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build release
         run: cargo build --release
