@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     num::NonZeroU64,
+    num::NonZeroUsize,
     str::FromStr,
     thread::{self, JoinHandle},
     time::Duration,
@@ -28,7 +29,7 @@ use abq_workers::negotiate::QueueNegotiatorHandle;
 use anyhow::bail;
 use clap::Parser;
 
-use args::{default_num_workers, Cli, Command};
+use args::{Cli, Command};
 
 use instance::AbqInstance;
 use reporting::{ColorPreference, ExitCode, ReporterKind, SuiteReporters};
@@ -271,6 +272,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             color,
             batch_size,
             result_timeout_seconds,
+            num_workers,
         } => {
             let (resolved_token, resolved_queue_addr, resolved_tls) =
                 resolve_config(token, queue_addr, tls, api_key)?;
@@ -296,6 +298,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 color,
                 batch_size,
                 results_timeout,
+                num_workers,
             )
         }
         Command::Health {
@@ -437,6 +440,7 @@ fn run_tests(
     color_choice: ColorPreference,
     batch_size: NonZeroU64,
     results_timeout: Duration,
+    num_workers: NonZeroUsize,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let mut reporters = SuiteReporters::new(reporters, color_choice, test_suite_name);
@@ -472,7 +476,7 @@ fn run_tests(
     let opt_workers = if start_in_process_workers {
         let working_dir = std::env::current_dir().expect("no working directory");
         let workers = workers::start_workers(
-            default_num_workers(),
+            num_workers,
             working_dir,
             abq.negotiator_handle(),
             abq.client_options(),

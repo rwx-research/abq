@@ -38,7 +38,7 @@ jobs:
         uses: actions/checkout@v3
 
       - name: Restore cargo cache
-        uses: actions/cache@v3.0.9
+        uses: actions/cache@v3
         env:
           cache-name: ci
         with:
@@ -69,9 +69,9 @@ jobs:
       # setup testdata
       - uses: actions/setup-node@v3
         with:
-          node-version: "14"
-          cache: "npm"
-          cache-dependency-path: "testdata/**/package-lock.json"
+          node-version: '14'
+          cache: 'npm'
+          cache-dependency-path: 'testdata/**/package-lock.json'
 
       - name: Pull native test runners
         run: |
@@ -119,9 +119,9 @@ jobs:
                 "parser": "junit_xml"
               }
             ]
-          job-name: "Lint, test"
-          job-matrix: "${{ toJSON(matrix) }}"
-          captain-token: "${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}"
+          job-name: 'Lint, test'
+          job-matrix: '${{ toJSON(matrix) }}'
+          captain-token: '${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}'
 
       - name: Run tests with cargo
         timeout-minutes: 2
@@ -194,7 +194,7 @@ jobs:
           name: ABQ Nightly
           tag_name: init
           prerelease: true
-          body: ""
+          body: ''
           fail_on_unmatched_files: true
           files: |
             target/release/abq

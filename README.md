@@ -5,6 +5,12 @@
 Install [rustup](https://rustup.rs); local versions of Rust will be populated
 when you run `cargo` in this project.
 
+Then install cargo-insta for testing
+
+```
+$ cargo install cargo-insta
+```
+
 For development in an editor, you'll likely want a version of
 [rust-analyzer](https://rust-analyzer.github.io/manual.html#installation).
 

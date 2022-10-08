@@ -2,9 +2,10 @@
 source: crates/abq_cli/tests/cli.rs
 expression: stderr
 ---
-error: One of --api-key <API_KEY> or --queue-addr <QUEUE_ADDR> must be provided.
+error: The following required arguments were not provided:
+  <--api-key <API_KEY>|--queue-addr <QUEUE_ADDR>>
 
-Usage: work [OPTIONS] --working-dir <WORKING_DIR>
+Usage: abq work --working-dir <WORKING_DIR> --run-id <RUN_ID> <--api-key <API_KEY>|--queue-addr <QUEUE_ADDR>>
 
 For more information try '--help'
 
