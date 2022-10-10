@@ -210,7 +210,7 @@ pub enum Command {
         ///
         /// Hitting a timeout is typically indicative of a failure in ABQ workers.
         ///
-        /// By defualt, the timeout is unbound.
+        /// By default, the timeout is unbound.
         #[clap(long, default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs().try_into().unwrap())]
         result_timeout_seconds: NonZeroU64,
 
