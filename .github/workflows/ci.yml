@@ -201,6 +201,8 @@ jobs:
 
       - name: Cut nightly to S3
         run: |
+          set -exou
+          
           RELEASE_NAME="abq_nightly_${{ matrix.platform }}"
           RELEASE_TARBALL="$RELEASE_NAME.tar.gz"
 
