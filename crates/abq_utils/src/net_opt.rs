@@ -5,7 +5,7 @@ use crate::{
     net, net_async,
 };
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub struct Tls(bool);
 
 impl Tls {

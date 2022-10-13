@@ -5,6 +5,7 @@ members = [
   "crates/abq_queue",
   "crates/abq_workers",
   "crates/abq_utils",
+  "crates/abq_hosted",
   "crates/abq_runners/protocol",
   "crates/abq_runners/echo",
   "crates/abq_runners/exec",
