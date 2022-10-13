@@ -248,6 +248,7 @@ impl Reporter for JUnitXmlReporter {
     fn finish(self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
         let fd = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(self.path)
             .map_err(|_| ReportingError::FailedToWrite)?;
