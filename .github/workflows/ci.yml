@@ -147,9 +147,15 @@ jobs:
       - name: Deploy abq
         run: flyctl deploy --remote-only
 
-  release:
-    name: Release
-    runs-on: ubuntu-latest
+  nightly-release:
+    name: Release nightlies
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux_x86-64
+    runs-on: ${{ matrix.os }}
     if: github.ref == 'refs/heads/main'
     needs: test
     steps:
@@ -175,7 +181,7 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Release
+      - name: Cut GitHub release
         uses: softprops/action-gh-release@v1
         with:
           name: ABQ Nightly
@@ -187,3 +193,26 @@ jobs:
             target/release/abq
             target/release/abq_cargo
             target/release/abq_worker_harness
+
+      - name: Set up aws production profile
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID }} --profile production
+          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY }} --profile production
+
+      - name: Cut nightly to S3
+        run: |
+          RELEASE_NAME="abq_nightly_${{ matrix.platform }}"
+          RELEASE_TARBALL="$RELEASE_NAME.tar.gz"
+
+          RELEASE_BUCKET="abq-releases"
+          RELEASE_OBJECT="abq/nightly/$RELEASE_TARBALL"
+
+          mkdir "$RELEASE_NAME"
+          cp target/release/abq "$RELEASE_NAME"
+          tar -czvf "$RELEASE_TARBALL" "$RELEASE_NAME"
+          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_OBJECT" --profile production
+          aws s3api put-object-tagging \
+            --bucket "$RELEASE_BUCKET" \
+            --key "$RELEASE_OBJECT" \
+            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
+            --profile production
