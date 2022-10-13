@@ -347,6 +347,12 @@ pub mod queue {
         Completed { succeeded: bool },
     }
 
+    /// Notification of how many active test runs are currently being processed by the queue.
+    #[derive(Serialize, Deserialize)]
+    pub struct ActiveTestRunsResponse {
+        pub active_runs: u64,
+    }
+
     /// A request sent to the queue.
     #[derive(Serialize, Deserialize)]
     pub struct Request {
@@ -358,6 +364,12 @@ pub mod queue {
     #[derive(Serialize, Deserialize)]
     pub enum Message {
         HealthCheck,
+        /// Asks the queue how many active test runs it has enqueued, returning an [ActiveTestRunsResponse].
+        /// This is only useful for entities that manage test runs fed to a queue. Otherwise, the
+        /// result provided here is only accurate for a moment in time during the request
+        /// lifecycle.
+        // TODO: should this be gated behind additional authz?
+        ActiveTestRuns,
         /// An ask to return the address of the queue negotiator.
         NegotiatorAddr,
         /// An ask to run some work by an invoker.

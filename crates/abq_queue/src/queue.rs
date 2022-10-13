@@ -312,6 +312,18 @@ impl RunQueues {
     fn get_run_state(&self, run_id: &RunId) -> Option<&RunState> {
         self.queues.get(run_id)
     }
+
+    fn num_active_runs(&self) -> usize {
+        self.queues
+            .values()
+            .filter(|state| match state {
+                RunState::WaitingForFirstWorker
+                | RunState::WaitingForManifest
+                | RunState::HasWork { .. } => true,
+                RunState::Done { .. } => false,
+            })
+            .count()
+    }
 }
 
 type SharedRunQueues = Arc<Mutex<RunQueues>>;
@@ -863,6 +875,9 @@ impl QueueServer {
                 // auth is configured. Should they?
                 Self::handle_healthcheck(entity, stream).await
             }
+            Message::ActiveTestRuns => {
+                Self::handle_active_test_runs(ctx.queues, entity, stream).await
+            }
             Message::NegotiatorAddr => {
                 Self::handle_negotiator_addr(entity, stream, ctx.public_negotiator_addr).await
             }
@@ -927,6 +942,19 @@ impl QueueServer {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // Right now nothing interesting is owned by the queue, so nothing extra to check.
         net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await?;
+        Ok(())
+    }
+
+    #[inline(always)]
+    #[instrument(level = "trace", skip(queues, stream))]
+    async fn handle_active_test_runs(
+        queues: SharedRunQueues,
+        entity: EntityId,
+        mut stream: Box<dyn net_async::ServerStream>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let active_runs = queues.lock().unwrap().num_active_runs().try_into()?;
+        let response = net_protocol::queue::ActiveTestRunsResponse { active_runs };
+        net_protocol::async_write(&mut stream, &response).await?;
         Ok(())
     }
 
@@ -1511,6 +1539,12 @@ mod test {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    fn empty_manifest() -> ManifestMessage {
+        ManifestMessage {
+            manifest: Manifest { members: vec![] },
+        }
     }
 
     #[test]
@@ -2859,5 +2893,120 @@ mod test {
         assert!(matches!(exit, WorkersExit::Failure));
 
         queue.shutdown().unwrap();
+    }
+
+    #[test]
+    fn no_active_runs_when_non_enqueued() {
+        let queues = RunQueues::default();
+
+        assert_eq!(queues.num_active_runs(), 0);
+    }
+
+    #[test]
+    fn active_runs_when_some_waiting_on_workers() {
+        let mut queues = RunQueues::default();
+
+        queues
+            .create_queue(
+                RunId::unique(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        assert_eq!(queues.num_active_runs(), 1);
+    }
+
+    #[test]
+    fn active_runs_when_some_waiting_on_manifest() {
+        let mut queues = RunQueues::default();
+
+        let run_id = RunId::unique();
+
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        queues.get_run_for_worker(&run_id);
+
+        assert_eq!(queues.num_active_runs(), 1);
+    }
+
+    #[test]
+    fn active_runs_when_running() {
+        let mut queues = RunQueues::default();
+
+        let run_id = RunId::unique();
+
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        queues.get_run_for_worker(&run_id);
+        queues.add_manifest(run_id, vec![]);
+
+        assert_eq!(queues.num_active_runs(), 1);
+    }
+
+    #[test]
+    fn active_runs_when_all_done() {
+        let mut queues = RunQueues::default();
+
+        let run_id = RunId::unique();
+
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        queues.get_run_for_worker(&run_id);
+        queues.add_manifest(run_id.clone(), vec![]);
+        queues.mark_complete(run_id, true);
+
+        assert_eq!(queues.num_active_runs(), 0);
+    }
+
+    #[test]
+    fn active_runs_multiple_in_various_states() {
+        let mut queues = RunQueues::default();
+
+        let run_id1 = RunId::unique(); // DONE
+        let run_id2 = RunId::unique(); // DONE
+        let run_id3 = RunId::unique(); // WAITING
+        let run_id4 = RunId::unique(); // RUNNING
+        let expected_active = 2;
+
+        for run_id in [&run_id1, &run_id2, &run_id3, &run_id4] {
+            queues
+                .create_queue(
+                    run_id.clone(),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                    one_nonzero(),
+                )
+                .unwrap();
+
+            queues.get_run_for_worker(run_id);
+        }
+
+        for run_id in [&run_id1, &run_id2, &run_id4] {
+            queues.add_manifest(run_id.clone(), vec![]);
+        }
+
+        for run_id in [run_id1, run_id2] {
+            queues.mark_complete(run_id, true);
+        }
+
+        assert_eq!(queues.num_active_runs(), expected_active);
     }
 }

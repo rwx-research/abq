@@ -699,7 +699,7 @@ fn test_with_invalid_command() {
         stdout,
         stderr,
         exit_status,
-    } = run_abq(&(name.to_string() + "_test"), test_args);
+    } = run_abq_forcing_capture(&(name.to_string() + "_test"), test_args);
 
     // The `abq test` process should exit with a failure
     assert!(!exit_status.success(), "{:?}", (stdout, stderr));
