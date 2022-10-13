@@ -22,7 +22,7 @@ const AUTH_TOKEN_LEN: usize = 30;
 /// That gives us log_2(62^30) ~= 178 bits of entropy, more than enough for our needs right now.
 ///
 /// Tokens are exposed to users, and parsed from user input, with an `abqs_` prefix.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AuthToken([u8; AUTH_TOKEN_LEN]);
 
 #[derive(Debug, Error)]

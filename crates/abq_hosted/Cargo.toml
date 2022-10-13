@@ -1,0 +1,15 @@
+[package]
+name = "abq_hosted"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+abq_utils = { path = "../abq_utils" }
+
+reqwest = { version = "0.11.12", features = ["blocking", "json"] }
+serde = "1.0.145"
+url = { version = "2.3.1", features = ["serde"] }
+thiserror = "1.0.37"
+
+[dev-dependencies]
+mockito = "0.31.0"

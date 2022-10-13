@@ -9,7 +9,6 @@ use std::{
     net::SocketAddr,
     num::NonZeroU64,
     num::NonZeroUsize,
-    str::FromStr,
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -26,7 +25,6 @@ use abq_utils::{
     },
 };
 use abq_workers::negotiate::QueueNegotiatorHandle;
-use anyhow::bail;
 use clap::Parser;
 
 use args::{Cli, Command};
@@ -239,7 +237,6 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let mut cmd = Cli::command();
             let cmd = cmd.find_subcommand_mut("work").unwrap();
 
-            let (token, queue_addr, tls) = resolve_config(token, queue_addr, tls, api_key)?;
             let run_id = run_id.or(inferred_run_id).unwrap_or_else(|| {
                 let error = cmd.error(
                     ErrorKind::MissingRequiredArgument,
@@ -247,6 +244,8 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 );
                 clap::Error::exit(&error);
             });
+            let (token, queue_addr, tls) =
+                resolve_config(token, queue_addr, tls, api_key, &run_id)?;
 
             let queue_addr = queue_addr.unwrap_or_else(|| {
                 let error = cmd.error(
@@ -274,9 +273,15 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             result_timeout_seconds,
             num_workers,
         } => {
+            let external_run_id = run_id.or(inferred_run_id);
+            // Workers are run in-band only if `abq test` is started without a run ID, regardless
+            // of the queue server location.
+            let start_in_process_workers = external_run_id.is_none();
+
+            let run_id = external_run_id.unwrap_or_else(RunId::unique);
+
             let (resolved_token, resolved_queue_addr, resolved_tls) =
-                resolve_config(token, queue_addr, tls, api_key)?;
-            let run_id = run_id.or(inferred_run_id);
+                resolve_config(token, queue_addr, tls, api_key, &run_id)?;
 
             let (server_auth, client_auth) = (resolved_token.into(), resolved_token.into());
 
@@ -299,6 +304,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 batch_size,
                 results_timeout,
                 num_workers,
+                start_in_process_workers,
             )
         }
         Command::Health {
@@ -350,10 +356,11 @@ fn resolve_config(
     queue_addr_from_cli: Option<SocketAddr>,
     tls_from_cli: Tls,
     api_key: Option<ApiKey>,
+    run_id: &RunId,
 ) -> anyhow::Result<(Option<AuthToken>, Option<SocketAddr>, Tls)> {
     let (queue_addr_from_api, token_from_api, tls_from_api) = match api_key {
         Some(key) => {
-            let config = get_config_from_api(key)?;
+            let config = get_config_from_api(key, run_id)?;
             (
                 Some(config.queue_addr),
                 Some(config.token),
@@ -370,25 +377,22 @@ fn resolve_config(
     Ok((token, queue_addr, tls))
 }
 
-fn get_config_from_api(api_key: ApiKey) -> anyhow::Result<ConfigFromApi> {
-    let expected_key = ApiKey::from_str(
-        include_str!(concat!(env!("ABQ_WORKSPACE_DIR"), "bin/abq_api_key"))
-            .strip_suffix('\n')
-            .unwrap(),
-    )?;
-    if api_key != expected_key {
-        bail!("invalid api key")
-    }
+fn get_config_from_api(api_key: ApiKey, run_id: &RunId) -> anyhow::Result<ConfigFromApi> {
+    use abq_hosted::{HostedQueueConfig, DEFAULT_RWX_ABQ_API_URL};
 
-    // TODO: Call a real API to get this info
+    let api_url = std::env::var("ABQ_API").unwrap_or_else(|_| DEFAULT_RWX_ABQ_API_URL.to_string());
+
+    let HostedQueueConfig {
+        addr,
+        run_id: _,
+        auth_token,
+        tls,
+    } = HostedQueueConfig::from_api(api_url, api_key, run_id)?;
+
     Ok(ConfigFromApi {
-        queue_addr: SocketAddr::from_str("168.220.85.45:8080")?,
-        token: AuthToken::from_str(
-            include_str!(concat!(env!("ABQ_WORKSPACE_DIR"), "bin/abq_server_token"))
-                .strip_suffix('\n')
-                .unwrap(),
-        )?,
-        tls: Tls::YES,
+        queue_addr: addr,
+        token: auth_token,
+        tls,
     })
 }
 
@@ -435,12 +439,13 @@ fn run_tests(
     entity: EntityId,
     runner_params: NativeTestRunnerParams,
     abq: AbqInstance,
-    opt_test_id: Option<RunId>,
+    run_id: RunId,
     reporters: Vec<ReporterKind>,
     color_choice: ColorPreference,
     batch_size: NonZeroU64,
     results_timeout: Duration,
     num_workers: NonZeroUsize,
+    start_in_process_workers: bool,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let mut reporters = SuiteReporters::new(reporters, color_choice, test_suite_name);
@@ -456,9 +461,6 @@ fn run_tests(
             let _opt_error = reporters.push_result(&test_result);
         }
     };
-
-    let start_in_process_workers = opt_test_id.is_none();
-    let run_id = opt_test_id.unwrap_or_else(RunId::unique);
 
     let runner = RunnerKind::GenericNativeTestRunner(runner_params.clone());
 
