@@ -992,6 +992,8 @@ impl QueueServer {
         match could_create_queue {
             Ok(()) => {
                 {
+                    tracing::info!(?run_id, ?entity, "created new queue");
+
                     // Only after telling the client that we are ready for it to move into listing
                     // for test results, associate the results responder.
                     //
@@ -1028,6 +1030,12 @@ impl QueueServer {
                 Ok(())
             }
             Err(err) => {
+                tracing::info!(
+                    ?run_id,
+                    ?entity,
+                    "failed to create new queue for invocation"
+                );
+
                 let failure_reason = match err {
                     NewQueueError::RunIdAlreadyInProgress => {
                         net_protocol::queue::InvokeFailureReason::DuplicateRunId {
@@ -1131,6 +1139,8 @@ impl QueueServer {
         // TODO: actually record the manifest metadata
         let flat_manifest = flatten_manifest(manifest.manifest);
 
+        tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
+
         let run_state = ActiveRunState {
             work_left: flat_manifest.len(),
             is_successful: true,
@@ -1163,6 +1173,8 @@ impl QueueServer {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         // If a worker failed to generate a manifest, we're going to immediately end the test run,
         // as this indicates a failure in the underlying test runners.
+
+        tracing::info!(?run_id, ?entity, "failure notification for manifest");
 
         {
             // Immediately ACK to the worker responsible for the manifest, so they can relinquish
@@ -1260,6 +1272,8 @@ impl QueueServer {
         };
 
         if no_more_work {
+            tracing::info!(?run_id, ?entity, "run completed");
+
             // Now, we have to take both the active runs, and the map of work left, to mark
             // the work for the current run as complete in both cases. It's okay for this to
             // be slow(er), since it happens only once per test run.
@@ -1283,11 +1297,15 @@ impl QueueServer {
                     net_protocol::async_write(&mut stream, &InvokerTestResult::EndOfResults)
                         .await?;
                     drop(stream);
+
+                    tracing::info!(?run_id, "closed connected results responder");
                 }
                 ClientResponder::Disconnected {
                     results,
                     buffer_size: _,
                 } => {
+                    tracing::warn!(?run_id, "dropping disconnected results responder");
+
                     // Unfortunately, since we still don't have an active connection to the abq
                     // client, we can't send any buffered test results or end-of-tests anywhere.
                     // To avoid leaking memory we assume the client is dead and drop the results.
