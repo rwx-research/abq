@@ -72,6 +72,9 @@ pub mod runners {
         /// A test that was explicitly skipped.
         #[serde(rename = "skipped")]
         Skipped,
+        /// The underlying native test runner failed unexpectedly.
+        /// This is a state caught only be abq workers, and should never be reported directly.
+        PrivateNativeRunnerError,
     }
 
     impl Status {

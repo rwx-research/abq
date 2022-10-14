@@ -50,7 +50,7 @@ impl Collector {
                 )
             }
             Status::Success => junit::TestCase::success(display_name, duration),
-            Status::Error => {
+            Status::Error | Status::PrivateNativeRunnerError => {
                 // TODO: expose optional error type on `TestResult`?
                 let error_type = "error";
 

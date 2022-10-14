@@ -106,7 +106,7 @@ pub(crate) struct SuiteResult {
 impl SuiteResult {
     fn account_result(&mut self, test_result: &TestResult) {
         match test_result.status {
-            Status::Failure | Status::Error => {
+            Status::Failure | Status::Error | Status::PrivateNativeRunnerError => {
                 self.success = false;
                 self.suggested_exit_code = ExitCode(1);
             }
@@ -160,6 +160,10 @@ impl Reporter for LineReporter {
     fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
         format_result_line(&mut self.buffer, test_result)?;
 
+        if matches!(test_result.status, Status::PrivateNativeRunnerError) {
+            format_result_summary(&mut self.buffer, test_result)?;
+        }
+
         if matches!(test_result.status, Status::Failure | Status::Error) {
             self.delayed_failure_reports.push(test_result.clone());
         }
@@ -206,6 +210,10 @@ impl Reporter for DotReporter {
         self.buffer
             .flush()
             .map_err(|_| ReportingError::FailedToWrite)?;
+
+        if matches!(test_result.status, Status::PrivateNativeRunnerError) {
+            format_result_summary(&mut self.buffer, test_result)?;
+        }
 
         if matches!(test_result.status, Status::Failure | Status::Error) {
             self.delayed_failure_reports.push(test_result.clone());

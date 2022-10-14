@@ -15,7 +15,7 @@ pub fn format_result_dot(writer: &mut impl WriteColor, result: &TestResult) -> i
     let dot = match result.status {
         Status::Failure => "F",
         Status::Success => ".",
-        Status::Error => "E",
+        Status::Error | Status::PrivateNativeRunnerError => "E",
         Status::Pending => "P",
         Status::Skipped => "S",
     };
@@ -52,7 +52,7 @@ fn status_color(status: Status) -> Color {
     match status {
         Status::Success => Color::Green,
         Status::Failure => Color::Red,
-        Status::Error => Color::Red,
+        Status::Error | Status::PrivateNativeRunnerError => Color::Red,
         Status::Pending => Color::Yellow,
         Status::Skipped => Color::Yellow,
     }
@@ -76,7 +76,7 @@ fn format_status(writer: &mut impl WriteColor, status: Status) -> io::Result<()>
     let status = match status {
         Status::Failure => "FAILED",
         Status::Success => "ok",
-        Status::Error => "ERRORED",
+        Status::Error | Status::PrivateNativeRunnerError => "ERRORED",
         Status::Pending => "pending",
         Status::Skipped => "skipped",
     };
