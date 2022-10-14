@@ -71,12 +71,14 @@ dependencies = [
  "abq_utils",
  "anyhow",
  "clap",
+ "indoc",
  "insta",
  "serde",
  "serde_derive",
  "serde_json",
  "thiserror",
  "tracing",
+ "uuid 1.2.1",
 ]
 
 [[package]]

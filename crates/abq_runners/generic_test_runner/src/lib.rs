@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -6,14 +6,15 @@ use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
 
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersionMessage, ManifestMessage, ManifestResult, TestCaseMessage, TestResult,
-    TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
-    ACTIVE_PROTOCOL_VERSION_MINOR,
+    AbqProtocolVersionMessage, ManifestMessage, ManifestResult, Status, TestCaseMessage,
+    TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    ACTIVE_PROTOCOL_VERSION_MAJOR, ACTIVE_PROTOCOL_VERSION_MINOR,
 };
 use abq_utils::net_protocol::workers::{
     NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
 };
 use abq_utils::{flatten_manifest, net_protocol};
+use indoc::indoc;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -141,7 +142,7 @@ fn retrieve_manifest<'a>(
         native_runner.stderr(process::Stdio::null());
         let mut native_runner_handle = native_runner.spawn()?;
 
-        // Wait for and validate the protocol version message, which must always come first.
+        // Wait for and validate the protocol version message, channel must always come first.
         let runner_conn =
             open_native_runner_connection(&mut our_listener, protocol_version_timeout)?;
 
@@ -257,11 +258,11 @@ impl GenericTestRunner {
         native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
-        native_runner.stdout(process::Stdio::null());
-        native_runner.stderr(process::Stdio::null());
+        native_runner.stdout(process::Stdio::piped());
+        native_runner.stderr(process::Stdio::piped());
 
         // If launching the native runner fails here, it should have failed during manifest
-        // generation as well (unless this is a flakey error in the underlying test runner, which
+        // generation as well (unless this is a flakey error in the underlying test runner, channel
         // we do not attempt to handle gracefully). Since the failure during manifest generation
         // will have notified the queue, at this point, failures should just result in the worker
         // exiting silently itself.
@@ -275,7 +276,8 @@ impl GenericTestRunner {
         // done.
         'test_all: loop {
             let NextWorkBundle(test_bundle) = get_next_test_bundle();
-            for next_test in test_bundle {
+            let mut test_iter = test_bundle.into_iter();
+            while let Some(next_test) = test_iter.next() {
                 match next_test {
                     NextWork::EndOfWork => {
                         drop(runner_conn);
@@ -289,12 +291,44 @@ impl GenericTestRunner {
                     } => {
                         let test_case_message = TestCaseMessage { test_case };
 
-                        // TODO: errors
-                        net_protocol::write(&mut runner_conn, test_case_message).unwrap();
-                        let test_result_message: TestResultMessage =
-                            net_protocol::read(&mut runner_conn).unwrap();
+                        let estimated_start = Instant::now();
 
-                        send_test_result(work_id, test_result_message.test_result);
+                        let opt_test_result_cycle: Result<TestResultMessage, _> =
+                            net_protocol::write(&mut runner_conn, test_case_message)
+                                .and_then(|_| net_protocol::read(&mut runner_conn));
+
+                        let estimated_runtime = estimated_start.elapsed();
+
+                        match opt_test_result_cycle {
+                            Ok(TestResultMessage { test_result }) => {
+                                send_test_result(work_id, test_result);
+                            }
+                            Err(err) => {
+                                // Our connection with the native test runner failed, for some
+                                // reason. Consider this a fatal error, and report internal errors
+                                // back to the queue for the remaining test in the batch.
+                                let cmd = std::iter::once(native_runner.get_program())
+                                    .chain(native_runner.get_args())
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .collect();
+
+                                tracing::error!(?cmd, "underlying native test runner failed");
+
+                                let remaining_work = test_iter.filter_map(|w| match w {
+                                    NextWork::Work { work_id, .. } => Some(work_id),
+                                    NextWork::EndOfWork => None,
+                                });
+
+                                handle_native_runner_failure(
+                                    send_test_result,
+                                    cmd,
+                                    native_runner_handle,
+                                    estimated_runtime,
+                                    std::iter::once(work_id).chain(remaining_work),
+                                );
+                                return Err(err.into());
+                            }
+                        }
                     }
                 }
             }
@@ -304,6 +338,116 @@ impl GenericTestRunner {
         native_runner_handle.wait()?;
 
         Ok(())
+    }
+}
+
+const INDENT: &str = "    ";
+
+#[allow(clippy::format_push_string)] // write! can fail, push can't
+fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
+    let read_result = fd.map(|mut fd| {
+        let mut out_buf = Vec::new();
+        fd.read_to_end(&mut out_buf)
+            .map(|_| String::from_utf8_lossy(&out_buf).to_string())
+    });
+
+    if let Some(Ok(out)) = read_result {
+        if !out.is_empty() {
+            writer.push_str(&format!(
+                "\n\nHere's the standard {channel} of the command:"
+            ));
+            for line in out.lines() {
+                writer.push_str(&format!("\n{INDENT}{line}"));
+            }
+        } else {
+            writer.push_str(&format!("\n\nThe command had no standard {channel}."));
+        }
+    } else {
+        writer.push_str(&format!(
+            "\n\nUnfortunately, we couldn't read the full standard {channel} of the command.",
+        ));
+    }
+}
+
+#[allow(clippy::format_push_string)] // write! can fail, push can't
+fn handle_native_runner_failure<SendTestResult, I>(
+    mut send_test_result: SendTestResult,
+    args: Vec<String>,
+    mut native_runner_handle: process::Child,
+    estimated_time_to_failure: Duration,
+    remaining_work: I,
+) where
+    SendTestResult: FnMut(WorkId, TestResult),
+    I: IntoIterator<Item = WorkId>,
+{
+    let formatted_cmd = args.join(" ");
+
+    // Let's try to figure out why the native test runner failed, and print a nice error message
+    // enumerating as much of the problem as we're aware of.
+    // Since this is an unexpected error with the native test runner, we want to provide the end
+    // user with as much information as possible for a report or reproduction.
+    let mut error_message = format!(
+        indoc!(
+            r#"
+            -- Unexpected Test Runner Failure --
+
+            The test command
+
+            {}{}
+            "#
+        ),
+        INDENT, formatted_cmd
+    );
+    error_message.push('\n');
+    match native_runner_handle.try_wait() {
+        Ok(Some(exit_status)) => {
+            tracing::warn!(?exit_status, "native test runner exited before completion");
+
+            match exit_status.code() {
+                Some(code) => {
+                    error_message.push_str(&format!(
+                        "exited unexpectedly with code `{}` before completing all abq test requests.",
+                        code,
+                    ));
+                }
+                None => {
+                    error_message.push_str("\
+                        exited unexpectedly without an exit code before completing all abq test requests.\n\
+                        It was likely terminated by a signal.");
+                }
+            }
+        }
+        Ok(None) | Err(_) => {
+            error_message.push_str(
+                "stopped communicating with its abq worker before completing all test requests.",
+            );
+        }
+    }
+
+    format_failed_fd(
+        native_runner_handle.stdout.take(),
+        &mut error_message,
+        "stdout",
+    );
+    format_failed_fd(
+        native_runner_handle.stderr.take(),
+        &mut error_message,
+        "stderr",
+    );
+
+    tracing::warn!(?error_message, "native test runner failure");
+
+    for work_id in remaining_work.into_iter() {
+        let error_result = TestResult {
+            status: Status::PrivateNativeRunnerError,
+            id: format!("internal-error-{}", uuid::Uuid::new_v4()),
+            display_name: "<internal test runner error>".to_string(),
+            output: Some(error_message.clone()),
+            runtime: estimated_time_to_failure.as_millis() as _,
+            meta: Default::default(),
+        };
+
+        send_test_result(work_id, error_result);
     }
 }
 
