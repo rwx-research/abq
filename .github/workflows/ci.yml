@@ -100,7 +100,7 @@ jobs:
           CI: false
 
       - name: Upload artifacts to captain
-        uses: rwx-research/upload-captain-artifact@main
+        uses: rwx-research/upload-captain-artifact@v1
         with:
           artifacts: |
             [
@@ -162,7 +162,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
       - name: Restore cargo cache
-        uses: actions/cache@v3.0.10
+        uses: actions/cache@v3.0.11
         env:
           cache-name: ci
         with:
