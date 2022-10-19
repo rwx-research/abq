@@ -89,7 +89,8 @@ fn main() -> anyhow::Result<()> {
         Command::Manifest { server_addr } => {
             let mut server = TcpListener::bind(server_addr)?;
 
-            let runner_conn = open_native_runner_connection(&mut server, Duration::from_secs(10))?;
+            let runner_conn =
+                open_native_runner_connection(&mut server, Duration::from_secs(10), || true)?;
             let manifest = wait_for_manifest(runner_conn)?;
 
             serde_json::to_writer(std::io::stdout(), &manifest)?;

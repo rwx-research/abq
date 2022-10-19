@@ -28,6 +28,8 @@ pub enum ProtocolVersionError {
     Timeout,
     #[error("Incompatible native runner protocol version")]
     NotCompatible,
+    #[error("Worker quit before sending protocol version")]
+    WorkerQuit,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +50,7 @@ type RunnerConnection = TcpStream;
 pub fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
+    mut is_native_runner_alive: impl FnMut() -> bool,
 ) -> Result<RunnerConnection, ProtocolVersionMessageError> {
     use ProtocolVersionMessageError::*;
 
@@ -65,6 +68,10 @@ pub fn open_native_runner_connection(
         if start.elapsed() >= timeout {
             tracing::error!(?timeout, elapsed=?start.elapsed(), "timeout");
             return Err(ProtocolVersionError::Timeout.into());
+        }
+
+        if !is_native_runner_alive() {
+            return Err(ProtocolVersionError::WorkerQuit.into());
         }
 
         match listener.accept() {
@@ -142,9 +149,14 @@ fn retrieve_manifest<'a>(
         native_runner.stderr(process::Stdio::null());
         let mut native_runner_handle = native_runner.spawn()?;
 
+        let is_native_runner_alive = || matches!(native_runner_handle.try_wait(), Ok(None));
+
         // Wait for and validate the protocol version message, channel must always come first.
-        let runner_conn =
-            open_native_runner_connection(&mut our_listener, protocol_version_timeout)?;
+        let runner_conn = open_native_runner_connection(
+            &mut our_listener,
+            protocol_version_timeout,
+            is_native_runner_alive,
+        )?;
 
         let manifest = wait_for_manifest(runner_conn)?;
 
@@ -267,10 +279,14 @@ impl GenericTestRunner {
         // will have notified the queue, at this point, failures should just result in the worker
         // exiting silently itself.
         let mut native_runner_handle = native_runner.spawn()?;
+        let is_native_runner_alive = || matches!(native_runner_handle.try_wait(), Ok(None));
 
         // First, get and validate the protocol version message.
-        let mut runner_conn =
-            open_native_runner_connection(&mut our_listener, protocol_version_timeout)?;
+        let mut runner_conn = open_native_runner_connection(
+            &mut our_listener,
+            protocol_version_timeout,
+            is_native_runner_alive,
+        )?;
 
         // We establish one connection with the native runner and repeatedly send tests until we're
         // done.
@@ -582,7 +598,7 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
 
         assert!(result.is_ok());
     }
@@ -603,7 +619,7 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -625,7 +641,7 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -643,7 +659,7 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1));
+        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -669,13 +685,42 @@ mod test_validate_protocol_version_message {
         .join()
         .unwrap();
 
-        let result = open_native_runner_connection(&mut listener, timeout);
+        let result = open_native_runner_connection(&mut listener, timeout, || true);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(
             err,
             ProtocolVersionMessageError::Version(ProtocolVersionError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn protocol_version_message_tunnel_connection_dies() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+
+        let timeout = Duration::from_millis(100);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let mut stream = TcpStream::connect(socket_addr).unwrap();
+            let version_message = AbqProtocolVersionMessage {
+                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+                major: ACTIVE_PROTOCOL_VERSION_MAJOR,
+                minor: ACTIVE_PROTOCOL_VERSION_MINOR,
+            };
+            net_protocol::write(&mut stream, version_message).unwrap();
+        })
+        .join()
+        .unwrap();
+
+        let result = open_native_runner_connection(&mut listener, timeout, || false);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            ProtocolVersionMessageError::Version(ProtocolVersionError::WorkerQuit)
         ));
     }
 }
