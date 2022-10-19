@@ -265,20 +265,20 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             run_id,
             api_key,
             queue_addr,
+            num_workers,
             reporter: reporters,
             token,
             tls,
             color,
             batch_size,
             result_timeout_seconds,
-            num_workers,
         } => {
             let external_run_id = run_id.or(inferred_run_id);
-            // Workers are run in-band only if `abq test` is started without a run ID, regardless
-            // of the queue server location.
-            let start_in_process_workers = external_run_id.is_none();
-
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
+
+            // Workers are run in-band only if a queue for `abq test` is not going to be
+            // provided from an external source.
+            let start_in_process_workers = api_key.is_none() && queue_addr.is_none();
 
             let (resolved_token, resolved_queue_addr, resolved_tls) =
                 resolve_config(token, queue_addr, tls, api_key, &run_id)?;
