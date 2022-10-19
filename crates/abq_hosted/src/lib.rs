@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::thread;
+use std::time::Duration;
 
 use abq_utils::auth::AuthToken;
 use abq_utils::net_protocol::workers::RunId;
 use abq_utils::{api::ApiKey, net_opt::Tls};
-use reqwest::StatusCode;
+use reqwest::{blocking::RequestBuilder, StatusCode};
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
@@ -73,11 +75,11 @@ impl HostedQueueConfig {
             })?;
 
         let client = reqwest::blocking::Client::new();
-        let resp: HostedQueueResponse = client
+        let request = client
             .get(queue_api)
             .bearer_auth(api_key)
-            .query(&[("run_id", run_id.to_string())])
-            .send()?
+            .query(&[("run_id", run_id.to_string())]);
+        let resp: HostedQueueResponse = send_request_with_decay(request)?
             .error_for_status()?
             .json()?;
 
@@ -129,11 +131,83 @@ impl HostedQueueConfig {
     }
 }
 
+// Decay with {5, 10, 20, 40, 80, 160}-second delays; eats ~ 5 minutes at most
+const DEFAULT_REQUEST_ATTEMPTS: usize = 6;
+const DEFAULT_REQUEST_DECAY: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_DECAY_MUL: u32 = 2;
+
+fn build_retrier(
+    max_attempts: usize,
+    mut decay: Duration,
+    decay_mul: u32,
+) -> impl FnMut(usize) -> bool {
+    move |last_attempt| {
+        if last_attempt == max_attempts {
+            return false;
+        }
+        thread::sleep(decay);
+        decay *= decay_mul;
+        true
+    }
+}
+
+/// Attempts a request a number of times, retrying with an exponential decay if the server was
+/// determined to have errored or notified a rate-limit.
+fn send_request_with_decay(
+    request: RequestBuilder,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    send_request_with_decay_help(
+        request,
+        build_retrier(
+            DEFAULT_REQUEST_ATTEMPTS,
+            DEFAULT_REQUEST_DECAY,
+            DEFAULT_REQUEST_DECAY_MUL,
+        ),
+    )
+}
+
+fn send_request_with_decay_help(
+    request: RequestBuilder,
+    mut wait_for_retry: impl FnMut(usize) -> bool,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    let mut last_attempt = 0;
+    loop {
+        last_attempt += 1;
+
+        let response = request
+            .try_clone()
+            .expect("bodies provided in the hosted API should never be streams")
+            .send()?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+            if wait_for_retry(last_attempt) {
+                tracing::debug!(?status, "server error, retrying after decay");
+                continue;
+            } else {
+                tracing::info!(?last_attempt, "not retrying hosted API");
+                return Ok(response);
+            }
+        } else {
+            // There may be other errors in the response, but they are not something that we should
+            // retry for.
+            return Ok(response);
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::str::FromStr;
 
     use abq_utils::{api::ApiKey, auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
+    use reqwest::StatusCode;
+
+    use crate::send_request_with_decay_help;
 
     use super::{Error, HostedQueueConfig};
 
@@ -283,5 +357,117 @@ mod test {
         .unwrap_err();
 
         assert!(matches!(err, Error::InvalidUrl(..)));
+    }
+
+    #[test]
+    fn retry_request_on_429() {
+        let mut m = mock("GET", "/")
+            .match_query(Matcher::Any)
+            .with_status(429)
+            .create();
+
+        let mut last_seen_attempt = 0;
+
+        let retrier = |last_attempt| {
+            last_seen_attempt = last_attempt;
+            if last_attempt == 1 {
+                m = mock("GET", "/")
+                    .match_query(Matcher::Any)
+                    .with_status(200)
+                    .create();
+                true
+            } else {
+                false
+            }
+        };
+
+        let client = reqwest::blocking::Client::new();
+        let resp =
+            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(last_seen_attempt, 1);
+    }
+
+    #[test]
+    fn retry_request_on_500() {
+        let mut m = mock("GET", "/")
+            .match_query(Matcher::Any)
+            .with_status(500)
+            .create();
+
+        let mut last_seen_attempt = 0;
+
+        let retrier = |last_attempt| {
+            last_seen_attempt = last_attempt;
+            if last_attempt == 1 {
+                m = mock("GET", "/")
+                    .match_query(Matcher::Any)
+                    .with_status(200)
+                    .create();
+                true
+            } else {
+                false
+            }
+        };
+
+        let client = reqwest::blocking::Client::new();
+        let resp =
+            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(last_seen_attempt, 1);
+    }
+
+    #[test]
+    fn do_not_retry_request_on_400_level() {
+        let mut m = mock("GET", "/")
+            .match_query(Matcher::Any)
+            .with_status(401)
+            .create();
+
+        let mut last_seen_attempt = 0;
+
+        let retrier = |last_attempt| {
+            last_seen_attempt = last_attempt;
+            if last_attempt == 1 {
+                m = mock("GET", "/")
+                    .match_query(Matcher::Any)
+                    .with_status(200)
+                    .create();
+                true
+            } else {
+                false
+            }
+        };
+
+        let client = reqwest::blocking::Client::new();
+        let resp =
+            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(last_seen_attempt, 0);
+    }
+
+    #[test]
+    fn do_not_retry_request_when_retrier_is_done() {
+        let _m = mock("GET", "/")
+            .match_query(Matcher::Any)
+            .with_status(500)
+            .create();
+
+        let mut last_seen_attempt = 0;
+
+        let retrier = |last_attempt| {
+            last_seen_attempt = last_attempt;
+            last_attempt < 3
+        };
+
+        let client = reqwest::blocking::Client::new();
+        let resp =
+            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+
+        assert_eq!(resp.status().as_u16(), 500);
+        assert_eq!(last_seen_attempt, 3);
     }
 }

@@ -90,6 +90,7 @@ dependencies = [
  "reqwest",
  "serde",
  "thiserror",
+ "tracing",
  "url",
 ]
 
