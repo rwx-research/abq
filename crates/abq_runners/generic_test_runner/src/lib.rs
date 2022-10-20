@@ -70,10 +70,6 @@ pub fn open_native_runner_connection(
             return Err(ProtocolVersionError::Timeout.into());
         }
 
-        if !is_native_runner_alive() {
-            return Err(ProtocolVersionError::WorkerQuit.into());
-        }
-
         match listener.accept() {
             Ok((mut conn, _)) => {
                 conn.set_nonblocking(false).map_err(Io)?;
@@ -86,6 +82,9 @@ pub fn open_native_runner_connection(
             }
             Err(err) => match err.kind() {
                 io::ErrorKind::WouldBlock => {
+                    if !is_native_runner_alive() {
+                        return Err(ProtocolVersionError::WorkerQuit.into());
+                    }
                     std::thread::sleep(POLL_WAIT_TIME);
                     continue;
                 }
@@ -701,8 +700,8 @@ mod test_validate_protocol_version_message {
         let socket_addr = listener.local_addr().unwrap();
 
         let timeout = Duration::from_millis(100);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(200));
+        let thread = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
             let mut stream = TcpStream::connect(socket_addr).unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
@@ -710,11 +709,12 @@ mod test_validate_protocol_version_message {
                 minor: ACTIVE_PROTOCOL_VERSION_MINOR,
             };
             net_protocol::write(&mut stream, version_message).unwrap();
-        })
-        .join()
-        .unwrap();
+        });
 
         let result = open_native_runner_connection(&mut listener, timeout, || false);
+
+        // join blocks so we have to call it after we get a result
+        thread.join().unwrap();
 
         assert!(result.is_err());
         let err = result.unwrap_err();
