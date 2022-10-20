@@ -44,6 +44,8 @@ pub struct Client {
     // The maximum amount of a time a client should wait between consecutive test results
     // streamed from the queue.
     pub(crate) poll_timeout: Duration,
+    /// Signal to cancel an active test run.
+    pub(crate) cancellation_rx: RunCancellationRx,
 }
 
 #[derive(Debug, Error)]
@@ -68,6 +70,31 @@ pub enum TestResultError {
 
     #[error("The given test command failed to be executed by all workers. The recorded error message is:\n{0}")]
     TestCommandError(String),
+
+    #[error("The test run was cancelled.")]
+    Cancelled,
+}
+
+pub struct RunCancellationTx(tokio::sync::mpsc::Sender<()>);
+pub struct RunCancellationRx(tokio::sync::mpsc::Receiver<()>);
+
+impl RunCancellationTx {
+    pub fn blocking_send(&self) -> io::Result<()> {
+        self.0
+            .blocking_send(())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "failed to send cancellation"))
+    }
+}
+
+impl RunCancellationRx {
+    pub async fn recv(&mut self) -> Option<()> {
+        self.0.recv().await
+    }
+}
+
+pub fn run_cancellation_pair() -> (RunCancellationTx, RunCancellationRx) {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    (RunCancellationTx(tx), RunCancellationRx(rx))
 }
 
 impl Client {
@@ -80,6 +107,7 @@ impl Client {
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
         poll_timeout: Duration,
+        cancellation_rx: RunCancellationRx,
     ) -> Result<Self, InvocationError> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
@@ -119,6 +147,7 @@ impl Client {
             run_id,
             stream,
             poll_timeout,
+            cancellation_rx,
         })
     }
 
@@ -139,9 +168,25 @@ impl Client {
         Ok(())
     }
 
+    /// Signals to the abq server that a test run should be cancelled prematurely.
+    async fn cancel_active_run(&mut self) -> io::Result<()> {
+        let mut conn = self.client.connect(self.abq_server_addr).await?;
+
+        net_protocol::async_write(
+            &mut conn,
+            &queue::Request {
+                entity: self.entity,
+                message: Message::CancelRun(self.run_id.clone()),
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// Yields the next test result, as it streams in.
     /// Returns [None] when there are no more test results.
-    pub async fn next(&mut self) -> Option<Result<Vec<(WorkId, TestResult)>, TestResultError>> {
+    pub async fn next(&mut self) -> Result<Option<Vec<(WorkId, TestResult)>>, TestResultError> {
         loop {
             let read_result = tokio::select! {
                 read = net_protocol::async_read(&mut self.stream) => {
@@ -149,7 +194,11 @@ impl Client {
                 }
                 _ = tokio::time::sleep(self.poll_timeout) => {
                     tracing::error!(timeout=?self.poll_timeout, entity=?self.entity, run_id=?self.run_id, "timed out waiting for queue message");
-                    return Some(Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a message from the queue").into()));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a message from the queue").into());
+                }
+                _ = self.cancellation_rx.recv() => {
+                    self.cancel_active_run().await?;
+                    return Err(TestResultError::Cancelled);
                 }
             };
 
@@ -162,23 +211,31 @@ impl Client {
                     )
                     .await;
                     if ack_result.is_err() {
-                        if let Err(err) = self.reconnect().await {
-                            return Some(Err(err.into()));
-                        }
+                        self.reconnect().await?;
                     }
 
-                    return Some(Ok(results));
+                    return Ok(Some(results));
                 }
-                Ok(InvokerTestResult::EndOfResults) => return None,
+                Ok(InvokerTestResult::EndOfResults) => {
+                    // Send a final ACK of the test results, so that cancellation signals do not
+                    // interfere with us here.
+                    net_protocol::async_write(
+                        &mut self.stream,
+                        &net_protocol::client::AckEndOfTests {},
+                    )
+                    .await?;
+
+                    return Ok(None);
+                }
                 Ok(InvokerTestResult::TestCommandError { error }) => {
-                    return Some(Err(TestResultError::TestCommandError(error)))
+                    return Err(TestResultError::TestCommandError(error))
                 }
                 Err(err) => {
                     // Attempt to reconnect once. If it's successful, just re-read the next message.
                     // If it's unsuccessful, return the original error.
                     match self.reconnect().await {
                         Ok(()) => continue,
-                        Err(_) => return Some(Err(err.into())),
+                        Err(_) => return Err(err.into()),
                     }
                 }
             }
@@ -192,8 +249,7 @@ impl Client {
         mut self,
         mut on_result: impl FnMut(WorkId, TestResult),
     ) -> Result<(), TestResultError> {
-        while let Some(maybe_results) = self.next().await {
-            let results = maybe_results?;
+        while let Some(results) = self.next().await? {
             for (work_id, test_result) in results {
                 on_result(work_id, test_result);
             }

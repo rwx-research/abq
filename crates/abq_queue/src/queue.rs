@@ -13,7 +13,6 @@ use abq_utils::net;
 use abq_utils::net_async;
 use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
-use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
 use abq_utils::net_protocol::runners::{ManifestMessage, ManifestResult, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
@@ -23,6 +22,7 @@ use abq_utils::net_protocol::{
     queue::{InvokeWork, Message},
     workers::{NextWork, RunId, WorkId},
 };
+use abq_utils::net_protocol::{client, publicize_addr};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunCompeleted, QueueNegotiator, QueueNegotiatorHandle,
 };
@@ -69,6 +69,7 @@ enum RunState {
     Done {
         succeeded: bool,
     },
+    Cancelled {},
 }
 
 struct RunData {
@@ -119,7 +120,9 @@ impl RunQueues {
                 RunState::WaitingForFirstWorker
                 | RunState::WaitingForManifest
                 | RunState::HasWork { .. } => NewQueueError::RunIdAlreadyInProgress,
-                RunState::Done { .. } => NewQueueError::RunIdPreviouslyCompleted,
+                RunState::Done { .. } | RunState::Cancelled {} => {
+                    NewQueueError::RunIdPreviouslyCompleted
+                }
             };
 
             return Err(err);
@@ -162,6 +165,9 @@ impl RunQueues {
                         return AssignedRunLookup::AlreadyDone {
                             success: *succeeded,
                         }
+                    }
+                    RunState::Cancelled {} => {
+                        return AssignedRunLookup::AlreadyDone { success: false }
                     }
                     st => {
                         tracing::error!(
@@ -208,6 +214,21 @@ impl RunQueues {
 
     pub fn add_manifest(&mut self, run_id: RunId, flat_manifest: Vec<TestCase>) {
         let state = self.queues.get_mut(&run_id).expect("no queue for run");
+
+        match state {
+            RunState::WaitingForManifest => {
+                // expected state, pass through
+            }
+            RunState::WaitingForFirstWorker | RunState::HasWork { .. } | RunState::Done { .. } => {
+                unreachable!(
+                    "Invalid state - can only provide manifest while waiting for manifest"
+                );
+            }
+            RunState::Cancelled {} => {
+                // If cancelled, do nothing.
+                return;
+            }
+        }
 
         let work_from_manifest = flat_manifest.into_iter().map(|test_case| {
             NextWork::Work {
@@ -261,7 +282,9 @@ impl RunQueues {
                 }
                 Ok(NextWorkBundle(bundle))
             }
-            RunState::Done { .. } => Ok(NextWorkBundle(vec![NextWork::EndOfWork])),
+            RunState::Done { .. } | RunState::Cancelled {} => {
+                Ok(NextWorkBundle(vec![NextWork::EndOfWork]))
+            }
         }
     }
 
@@ -276,6 +299,10 @@ impl RunQueues {
                 batch_size_hint: _,
             } => {
                 assert!(queue.is_empty(), "Invalid state - queue is not complete!");
+            }
+            RunState::Cancelled { .. } => {
+                // Cancellation always takes priority over completeness.
+                return;
             }
             RunState::WaitingForFirstWorker
             | RunState::WaitingForManifest
@@ -300,6 +327,10 @@ impl RunQueues {
             RunState::WaitingForManifest => {
                 // okay
             }
+            RunState::Cancelled {} => {
+                // No-op, since the run was already cancelled.
+                return;
+            }
             RunState::WaitingForFirstWorker | RunState::HasWork { .. } | RunState::Done { .. } => {
                 unreachable!("Invalid state - can only fail to start while waiting for manifest");
             }
@@ -307,6 +338,20 @@ impl RunQueues {
 
         *state = RunState::Done { succeeded: false };
         self.run_data.remove(&run_id);
+    }
+
+    pub fn mark_cancelled(&mut self, run_id: &RunId) {
+        let state = self.queues.get_mut(run_id).expect("no queue state for run");
+
+        // Cancellation can happen at any time, including after the test run is determined to have
+        // completed with a particular success status by one party, because that observation may
+        // not have been shared with a test supervisor prior to their cancellation of a test run.
+        //
+        // We prefer the observation of the test supervisor, so test cancellation is always marked
+        // as a failure.
+        *state = RunState::Cancelled {};
+
+        self.run_data.remove(run_id);
     }
 
     fn get_run_state(&self, run_id: &RunId) -> Option<&RunState> {
@@ -320,7 +365,7 @@ impl RunQueues {
                 RunState::WaitingForFirstWorker
                 | RunState::WaitingForManifest
                 | RunState::HasWork { .. } => true,
-                RunState::Done { .. } => false,
+                RunState::Done { .. } | RunState::Cancelled {} => false,
             })
             .count()
     }
@@ -885,6 +930,20 @@ impl QueueServer {
                 Self::handle_invoked_work(ctx.active_runs, ctx.queues, entity, stream, invoke_work)
                     .await
             }
+            Message::CancelRun(run_id) => {
+                // The test supervisor will not wait for an ACK, so drop the stream immediately to
+                // avoid leaks.
+                drop(stream);
+
+                Self::handle_run_cancellation(
+                    ctx.queues,
+                    ctx.active_runs,
+                    ctx.state_cache,
+                    entity,
+                    run_id,
+                )
+                .await
+            }
             Message::Reconnect(run_id) => {
                 Self::handle_invoker_reconnection(ctx.active_runs, entity, stream, run_id)
                     .await
@@ -1055,6 +1114,37 @@ impl QueueServer {
                 Ok(())
             }
         }
+    }
+
+    /// A supervisor cancels a test run.
+    #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
+    async fn handle_run_cancellation(
+        queues: SharedRunQueues,
+        active_runs: ActiveRunResponders,
+        state_cache: RunStateCache,
+        entity: EntityId,
+        run_id: RunId,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        tracing::info!(?run_id, ?entity, "test supervisor cancelled a test run");
+
+        {
+            // Mark the cancellation in the queue first, so that new queries from workers will be
+            // told to terminate.
+            queues.lock().unwrap().mark_cancelled(&run_id);
+        }
+
+        {
+            // Drop the entry from the state cache
+            state_cache.lock().unwrap().remove(&run_id);
+        }
+
+        {
+            // We can drop the responder as well, the supervisor does not need any extra
+            // information from us.
+            active_runs.write().await.remove(&run_id);
+        }
+
+        Ok(())
     }
 
     #[instrument(level = "trace", skip(active_runs, new_stream))]
@@ -1248,7 +1338,17 @@ impl QueueServer {
             // the lock on active_runs for any longer than it takes to send that request.
             let active_runs = active_runs.read().await;
 
-            let invoker_stream = active_runs.get(&run_id).expect("run is not active");
+            let invoker_stream = match active_runs.get(&run_id) {
+                Some(stream) => stream,
+                None => {
+                    tracing::info!(
+                        ?run_id,
+                        ?work_id,
+                        "got test result for no-longer active (cancelled) run"
+                    );
+                    return Err("run no longer active".into());
+                }
+            };
 
             invoker_stream
                 .lock()
@@ -1261,9 +1361,16 @@ impl QueueServer {
             // Update the amount of work we have left; again, steal the map of work for only as
             // long is it takes for us to do that.
             let mut state_cache = state_cache.lock().unwrap();
-            let run_state = state_cache
-                .get_mut(&run_id)
-                .expect("run id not recorded, but we got a result for it?");
+            let run_state = match state_cache.get_mut(&run_id) {
+                Some(state) => state,
+                None => {
+                    tracing::info!(
+                        ?run_id,
+                        "got test result for no-longer active (cancelled) run"
+                    );
+                    return Err("run no longer active".into());
+                }
+            };
 
             run_state.work_left -= 1;
             run_state.is_successful = run_state.is_successful && !test_status.is_fail_like();
@@ -1296,6 +1403,24 @@ impl QueueServer {
 
                     net_protocol::async_write(&mut stream, &InvokerTestResult::EndOfResults)
                         .await?;
+
+                    // To avoid a race between the total test result observed by a supervisor vs.
+                    // the total test result observed by a worker, require the supervisor to
+                    // provide an ACK of the test ending before marking the test result as complete
+                    // here.
+                    //
+                    // Consider the case where we are streaming this last test result back to the
+                    // supervisor, but during the send, the supervisor issues a cancellation.
+                    // Without checking for an ACK, we would now record the test run as `Done`,
+                    // before later receiving the cancellation from the client. This delta
+                    // exposes a temporal race in how workers observe the final test result.
+                    //
+                    // Since the supervisor always blocks, achieving an ACK here means that the
+                    // client will have seen a proper completion as well. Otherwise, in the
+                    // presence of a cancellation, the stream will break before the ACK, and this
+                    // request will be dropped while the cancellation will be fulfilled.
+                    let client::AckEndOfTests {} = net_protocol::async_read(&mut stream).await?;
+
                     drop(stream);
 
                     tracing::info!(?run_id, "closed connected results responder");
@@ -1346,6 +1471,9 @@ impl QueueServer {
                 RunState::Done { succeeded } => net_protocol::queue::TotalRunResult::Completed {
                     succeeded: *succeeded,
                 },
+                RunState::Cancelled {} => {
+                    net_protocol::queue::TotalRunResult::Completed { succeeded: false }
+                }
             }
         };
 
@@ -1476,6 +1604,7 @@ impl WorkScheduler {
 #[cfg(test)]
 mod test {
     use std::{
+        collections::HashMap,
         io,
         net::SocketAddr,
         num::NonZeroU64,
@@ -1484,12 +1613,15 @@ mod test {
         time::Duration,
     };
 
-    use super::{Abq, RunStateCache};
+    use super::{Abq, ActiveRunState, RunStateCache};
     use crate::{
-        invoke::{Client, InvocationError, TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT},
+        invoke::{
+            run_cancellation_pair, Client, InvocationError, TestResultError,
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+        },
         queue::{
             ActiveRunResponders, BufferedResults, ClientReconnectionError, ClientResponder,
-            QueueServer, RunQueues, SharedRunQueues, WorkScheduler,
+            QueueServer, RunQueues, RunState, SharedRunQueues, WorkScheduler,
         },
     };
     use abq_utils::{
@@ -1509,7 +1641,10 @@ mod test {
     };
     use futures::future;
     use ntest::timeout;
-    use tokio::sync::Mutex;
+    use tokio::{
+        io::AsyncWriteExt,
+        sync::{Mutex, RwLock},
+    };
     use tracing_test::{internal::logs_with_scope_contain, traced_test};
 
     fn sort_results(results: &mut [(String, TestResult)]) -> Vec<&str> {
@@ -1593,6 +1728,7 @@ mod test {
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
         let run_id = RunId::unique();
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
             move || {
@@ -1611,6 +1747,7 @@ mod test {
                         runner,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
                     )
                     .await
                     .unwrap();
@@ -1685,6 +1822,8 @@ mod test {
 
         let run1 = RunId::unique();
         let run2 = RunId::unique();
+        let (_cancellation_tx1, cancellation_rx1) = run_cancellation_pair();
+        let (_cancellation_tx2, cancellation_rx2) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let (run1, run2) = (run1.clone(), run2.clone());
 
@@ -1706,6 +1845,7 @@ mod test {
                         runner1,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx1,
                     )
                     .await
                     .unwrap();
@@ -1717,6 +1857,7 @@ mod test {
                         runner2,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx2,
                     )
                     .await
                     .unwrap();
@@ -1802,6 +1943,7 @@ mod test {
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
         let run = RunId::unique();
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run = run.clone();
 
@@ -1822,6 +1964,7 @@ mod test {
                         runner1,
                         batch_size,
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
                     )
                     .await
                     .unwrap();
@@ -2061,6 +2204,7 @@ mod test {
 
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let mut client = Client {
             entity: client_entity,
             abq_server_addr: fake_server_addr,
@@ -2068,6 +2212,7 @@ mod test {
             run_id: run_id.clone(),
             stream: client_conn,
             poll_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
+            cancellation_rx,
         };
         {
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
@@ -2359,6 +2504,7 @@ mod test {
         let queue_server_addr = queue.server_addr();
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
         let run_id = RunId::unique();
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
 
@@ -2374,6 +2520,7 @@ mod test {
                         runner,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
                     )
                     .await
                     .unwrap();
@@ -2433,6 +2580,7 @@ mod test {
         let queue_server_addr = queue.server_addr();
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
         let run_id = RunId::unique();
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
 
@@ -2448,6 +2596,7 @@ mod test {
                         runner,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
                     )
                     .await
                     .unwrap();
@@ -2509,6 +2658,8 @@ mod test {
 
         let run_id = RunId::unique();
 
+        let (_cancellation_tx1, cancellation_rx1) = run_cancellation_pair();
+        let (_cancellation_tx2, cancellation_rx2) = run_cancellation_pair();
         let handle = thread::spawn({
             let run_id = run_id.clone();
             move || {
@@ -2522,6 +2673,7 @@ mod test {
                         runner.clone(),
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx1,
                     )
                     .await
                     .unwrap();
@@ -2535,6 +2687,7 @@ mod test {
                         runner,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx2,
                     )
                     .await;
 
@@ -2574,6 +2727,8 @@ mod test {
         let queue_server_addr = queue.server_addr();
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
         let run_id = RunId::unique();
+        let (_cancellation_tx1, cancellation_rx1) = run_cancellation_pair();
+        let (_cancellation_tx2, cancellation_rx2) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
 
@@ -2588,6 +2743,7 @@ mod test {
                         runner.clone(),
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx1,
                     )
                     .await
                     .unwrap();
@@ -2603,6 +2759,7 @@ mod test {
                         runner,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx2,
                     )
                     .await;
 
@@ -2768,6 +2925,8 @@ mod test {
 
         let run_id = RunId::unique();
 
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
+
         // First off, run the test suite to completion. It should complete successfully.
         {
             let results_handle = thread::spawn({
@@ -2788,6 +2947,7 @@ mod test {
                             runner,
                             one_nonzero(),
                             DEFAULT_CLIENT_POLL_TIMEOUT,
+                            cancellation_rx,
                         )
                         .await
                         .unwrap();
@@ -2865,6 +3025,7 @@ mod test {
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
         let run_id = RunId::unique();
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
 
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
@@ -2883,6 +3044,7 @@ mod test {
                         runner,
                         one_nonzero(),
                         DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
                     )
                     .await
                     .unwrap();
@@ -3026,5 +3188,244 @@ mod test {
         }
 
         assert_eq!(queues.num_active_runs(), expected_active);
+    }
+
+    #[test]
+    fn mark_cancellation_when_waiting_on_workers() {
+        let mut queues = RunQueues::default();
+        let run_id = RunId::unique();
+
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        assert_eq!(queues.num_active_runs(), 1);
+
+        queues.mark_cancelled(&run_id);
+
+        assert_eq!(queues.num_active_runs(), 0);
+        assert!(matches!(
+            queues.get_run_state(&run_id).unwrap(),
+            RunState::Cancelled {}
+        ));
+    }
+
+    #[test]
+    fn mark_cancellation_when_some_waiting_on_manifest() {
+        let mut queues = RunQueues::default();
+
+        let run_id = RunId::unique();
+
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        queues.get_run_for_worker(&run_id);
+
+        assert_eq!(queues.num_active_runs(), 1);
+
+        queues.mark_cancelled(&run_id);
+
+        assert_eq!(queues.num_active_runs(), 0);
+        assert!(matches!(
+            queues.get_run_state(&run_id).unwrap(),
+            RunState::Cancelled {}
+        ));
+    }
+
+    #[test]
+    fn mark_cancellation_when_running() {
+        let mut queues = RunQueues::default();
+
+        let run_id = RunId::unique();
+
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                one_nonzero(),
+            )
+            .unwrap();
+
+        queues.get_run_for_worker(&run_id);
+        queues.add_manifest(run_id.clone(), vec![]);
+
+        assert_eq!(queues.num_active_runs(), 1);
+
+        queues.mark_cancelled(&run_id);
+
+        assert_eq!(queues.num_active_runs(), 0);
+        assert!(matches!(
+            queues.get_run_state(&run_id).unwrap(),
+            RunState::Cancelled {}
+        ));
+    }
+
+    #[test]
+    fn test_cancellation_drops_remaining_work_smoke() {
+        let mut queue = Abq::start(Default::default());
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![echo_test("echo1".to_string())],
+            },
+        };
+
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
+        let workers_config = WorkersConfig {
+            num_workers: 1.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(0),
+        };
+
+        let queue_server_addr = queue.server_addr();
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+        let run_id = RunId::unique();
+
+        let (cancel_tx, cancel_rx) = run_cancellation_pair();
+        let all_results = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
+            let all_results = Arc::clone(&all_results);
+
+            move || {
+                make_runtime().block_on(async {
+                    // Start one client, and have it drain its test queue
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id.clone(),
+                        runner.clone(),
+                        one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancel_rx,
+                    )
+                    .await
+                    .unwrap();
+
+                    client
+                        .stream_results(|_, result| all_results.lock().unwrap().push(result))
+                        .await
+                })
+            }
+        });
+
+        // Cancel the run after invocation
+        cancel_tx.blocking_send().unwrap();
+        let client_err = results_handle.join().unwrap().unwrap_err();
+
+        assert!(matches!(client_err, TestResultError::Cancelled));
+        assert!(all_results.lock().unwrap().is_empty());
+
+        // Start the workers for the run. They should exit quickly with a failure code.
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id,
+        )
+        .unwrap();
+
+        let workers_exit = workers.shutdown();
+        assert!(matches!(workers_exit, WorkersExit::Failure));
+
+        queue.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn receiving_cancellation_during_last_test_results_is_cancellation() {
+        let server_opts = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO);
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+
+        let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
+        let fake_server_addr = fake_server.local_addr().unwrap();
+
+        let client = client_opts.build_async().unwrap();
+
+        // Register the initial connection
+        let (client_res, server_res) = futures::join!(
+            client.connect(fake_server_addr),
+            accept_handshake(&*fake_server)
+        );
+        let (mut client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
+
+        let run_id = RunId::unique();
+        let queues = {
+            let mut queues = RunQueues::default();
+            queues
+                .create_queue(
+                    run_id.clone(),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                    one_nonzero(),
+                )
+                .unwrap();
+            queues.get_run_for_worker(&run_id);
+            queues.add_manifest(run_id.clone(), vec![]);
+            Arc::new(std::sync::Mutex::new(queues))
+        };
+        let active_runs: ActiveRunResponders = {
+            let mut map = HashMap::default();
+            map.insert(
+                run_id.clone(),
+                Mutex::new(ClientResponder::new(server_conn, 1)),
+            );
+            Arc::new(RwLock::new(map))
+        };
+        let state_cache: RunStateCache = {
+            let mut cache = HashMap::default();
+            cache.insert(
+                run_id.clone(),
+                ActiveRunState {
+                    work_left: 1,
+                    is_successful: true,
+                },
+            );
+            Arc::new(std::sync::Mutex::new(cache))
+        };
+
+        let entity = EntityId::new();
+
+        let send_last_result_fut = QueueServer::handle_worker_result(
+            Arc::clone(&queues),
+            Arc::clone(&active_runs),
+            Arc::clone(&state_cache),
+            entity,
+            run_id.clone(),
+            WorkId("work".into()),
+            fake_test_result(),
+        );
+        let cancellation_fut = QueueServer::handle_run_cancellation(
+            Arc::clone(&queues),
+            Arc::clone(&active_runs),
+            Arc::clone(&state_cache),
+            entity,
+            run_id.clone(),
+        );
+        let client_exit_fut = client_conn.shutdown();
+
+        let (send_last_result_end, cancellation_end, client_exit_end) =
+            futures::join!(send_last_result_fut, cancellation_fut, client_exit_fut);
+
+        assert!(send_last_result_end.is_err());
+        assert!(cancellation_end.is_ok());
+        assert!(client_exit_end.is_ok());
+
+        assert!(matches!(
+            queues.lock().unwrap().get_run_state(&run_id).unwrap(),
+            RunState::Cancelled {}
+        ));
+        assert!(!active_runs.read().await.contains_key(&run_id));
+        assert!(!state_cache.lock().unwrap().contains_key(&run_id));
     }
 }

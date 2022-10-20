@@ -9,7 +9,7 @@ use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
 };
 use abq_workers::workers::{WorkerContext, WorkersExit};
-use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
 
 pub fn start_workers(
@@ -65,7 +65,7 @@ pub fn start_workers_forever(
     .unwrap();
 
     const POLL_WAIT_TIME: Duration = Duration::from_millis(10);
-    let mut term_signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
+    let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
 
     // Shut down the pool when
     //   - all its workers are done

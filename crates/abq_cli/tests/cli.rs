@@ -374,6 +374,102 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
+    yarn_jest_cancel_run_before_workers (|name, conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+        let run_id = RunId::unique().to_string();
+
+        let npm_jest_project_path = testdata_project("jest/npm-jest-project");
+
+        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+        let mut queue_proc = spawn_abq(name, conf.extend_args(&[
+            "start",
+            "--bind",
+            "0.0.0.0",
+            "--port",
+            &server_port.to_string(),
+            "--work-port",
+            &worker_port.to_string(),
+            "--negotiator-port",
+            &negotiator_port.to_string(),
+        ]));
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start workers") {
+                    break;
+                }
+            }
+        }
+
+        // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
+        let test_args = &[
+            "test",
+            "--reporter",
+            "dot",
+            "--queue-addr",
+            &queue_addr,
+            "--run-id",
+            &run_id,
+        ];
+        let mut test_args = conf.extend_args(test_args);
+        test_args.extend(["--", "yarn", "jest"]);
+        let mut supervisor = spawn_abq(&(name.to_string() + "_test"), test_args);
+
+        let supervisor_stdout = supervisor.stdout.as_mut().unwrap();
+        let mut supervisor_reader = BufReader::new(supervisor_stdout).lines();
+        // Spin until we know the supervisor is UP
+        loop {
+            if let Some(line) = supervisor_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Starting test run") {
+                    break;
+                }
+            }
+        }
+
+        use nix::sys::signal;
+        use nix::unistd::Pid;
+
+        // SIGINT the supervisor.
+        signal::kill(Pid::from_raw(supervisor.id() as _), signal::Signal::SIGTERM).unwrap();
+
+        let supervisor_exit = supervisor.wait().unwrap();
+        assert!(!supervisor_exit.success());
+
+        // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
+        let worker_args = &[
+            "work",
+            "--queue-addr",
+            &queue_addr,
+            "--working-dir",
+            &npm_jest_project_path.display().to_string(),
+            "--run-id",
+            &run_id
+        ];
+        let worker_args = conf.extend_args(worker_args);
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = run_abq(&(name.to_string() + "_worker"), worker_args);
+
+        // The worker should exit with a failure as well.
+        assert!(!exit_status.success(), "{:?}", (stdout, stderr));
+
+        queue_proc.kill().expect("queue already dead");
+    })
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
     yarn_jest_auto_workers_with_failing_tests (|name, conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
         let test_args = &[
