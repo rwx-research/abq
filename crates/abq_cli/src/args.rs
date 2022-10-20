@@ -10,8 +10,14 @@ use clap::{ArgAction, ArgGroup, Parser, Subcommand};
 use crate::reporting::{ColorPreference, ReporterKind};
 
 pub(crate) fn default_num_workers() -> NonZeroUsize {
-    let cpus = num_cpus::get();
+    let cpus = num_cpus::get_physical();
     NonZeroUsize::new(cpus).expect("No CPUs detected on this machine")
+}
+
+pub(crate) fn default_num_workers_for_test() -> NonZeroUsize {
+    let cpus_without_one = num_cpus::get_physical() - 1;
+    NonZeroUsize::new(std::cmp::Ord::max(cpus_without_one, 1))
+        .expect("No CPUs detected on this machine")
 }
 
 const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/abq_version.txt"));
@@ -109,8 +115,8 @@ pub enum Command {
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
-        /// Number of workers to start. Must be >= 1. Defaults to the number of available (logical)
-        /// CPUs - 1.
+        /// Number of workers to start. Must be >= 1. Defaults to the number of available (physical)
+        /// CPUs
         #[clap(long, short = 'n', required = false, default_value_t = default_num_workers())]
         num: NonZeroUsize,
 
@@ -164,11 +170,11 @@ pub enum Command {
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
-        /// Specifices the number of workers to start when running in standalone. Must be >= 1. Defaults to the number of available (logical)
+        /// Specifices the number of workers to start when running in standalone. Must be >= 1. Defaults to the number of available (physical)
         /// CPUs - 1.
         ///
         /// Cannot be used with api_key (will fetch address from ABQ API) or queue_addr (implies: not using the ABQ API)
-        #[clap(long, short = 'n', required = false, default_value_t = default_num_workers())]
+        #[clap(long, short = 'n', required = false, default_value_t = default_num_workers_for_test())]
         num_workers: NonZeroUsize,
 
         /// Token to authorize messages sent to the queue with.
@@ -191,7 +197,7 @@ pub enum Command {
         reporter: Vec<ReporterKind>,
 
         /// How many tests to send to a worker a time.
-        #[clap(long, default_value = "1")]
+        #[clap(long, default_value = "7")]
         batch_size: NonZeroU64,
 
         /// Whether to report tests with colors.
