@@ -6,6 +6,7 @@ mod workers;
 
 use std::{
     collections::HashMap,
+    io,
     net::SocketAddr,
     num::NonZeroU64,
     num::NonZeroUsize,
@@ -13,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use abq_queue::invoke::{Client, InvocationError, TestResultError};
+use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
 use abq_utils::{
     api::ApiKey,
     auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
@@ -31,6 +32,7 @@ use args::{Cli, Command};
 
 use instance::AbqInstance;
 use reporting::{ColorPreference, ExitCode, ReporterKind, SuiteReporters};
+use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
@@ -473,7 +475,7 @@ fn run_tests(
         batch_size,
         results_timeout,
         on_result,
-    );
+    )?;
 
     let opt_workers = if start_in_process_workers {
         let working_dir = std::env::current_dir().expect("no working directory");
@@ -490,12 +492,13 @@ fn run_tests(
         None
     };
 
+    let opt_invoked_error = work_results_thread.join().unwrap();
+
     if let Some(mut workers) = opt_workers {
         // The exit code will be determined by the test result status.
         let _exit_code = workers.shutdown();
     }
 
-    let opt_invoked_error = work_results_thread.join().unwrap();
     if let Err(invoke_error) = opt_invoked_error {
         return Err(elaborate_invocation_error(invoke_error, runner_params));
     }
@@ -549,10 +552,16 @@ fn elaborate_invocation_error(
                 );
                 anyhow::Error::msg(msg)
             }
+            TestResultError::Cancelled => anyhow::Error::msg("Test run cancelled!"),
         },
     }
 }
 
+/// Starts a test result reporter on a new thread.
+/// This should not block the main thread, only return a handle to the reporter.
+///
+/// NOTE: this function takes control of the process's signal handlers! It may not be
+/// composed with other functions that expect control or access to signal handlers.
 fn start_test_result_reporter(
     entity: EntityId,
     abq_server_addr: SocketAddr,
@@ -562,12 +571,23 @@ fn start_test_result_reporter(
     batch_size: NonZeroU64,
     results_timeout: Duration,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
-) -> JoinHandle<Result<(), InvocationError>> {
-    thread::spawn(move || {
+) -> io::Result<JoinHandle<Result<(), InvocationError>>> {
+    let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
+
+    let mut term_signals = Signals::new(TERM_SIGNALS)?;
+    let term_signals_handle = term_signals.handle();
+    let kill_run_thread = thread::spawn(move || {
+        if term_signals.into_iter().next().is_some() {
+            // If this fails, we definitely want a panic.
+            run_cancellation_tx.blocking_send().unwrap();
+        }
+    });
+
+    let test_results_thread = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        runtime.block_on(async move {
+        let result = runtime.block_on(async move {
             let abq_test_client = Client::invoke_work(
                 entity,
                 abq_server_addr,
@@ -576,12 +596,22 @@ fn start_test_result_reporter(
                 runner,
                 batch_size,
                 results_timeout,
+                run_cancellation_rx,
             )
             .await?;
             abq_test_client.stream_results(on_result).await?;
             Ok(())
-        })
-    })
+        });
+
+        // No matter how we exited, now close the thread responsible for capturing termination
+        // signals.
+        term_signals_handle.close();
+        kill_run_thread.join().unwrap();
+
+        result
+    });
+
+    Ok(test_results_thread)
 }
 
 #[cfg(test)]

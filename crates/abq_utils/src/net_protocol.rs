@@ -377,6 +377,8 @@ pub mod queue {
         NegotiatorAddr,
         /// An ask to run some work by an invoker.
         InvokeWork(InvokeWork),
+        /// An ask to mark an active test run as cancelled.
+        CancelRun(RunId),
         /// An invoker of a test run would like to reconnect to the queue for results streaming.
         Reconnect(RunId),
         /// A work manifest for a given run.
@@ -419,6 +421,11 @@ pub mod client {
     /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
     #[derive(Serialize, Deserialize)]
     pub struct AckTestResult {}
+
+    /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub struct AckEndOfTests {}
 }
 
 pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketAddr {
