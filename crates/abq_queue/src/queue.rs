@@ -78,6 +78,8 @@ struct RunData {
     batch_size_hint: NonZeroU64,
 }
 
+const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
+
 struct WaitingForManifestError;
 
 #[derive(Default)]
@@ -1041,6 +1043,20 @@ impl QueueServer {
             runner,
             batch_size_hint,
         } = invoke_work;
+
+        tracing::debug!(?run_id, ?batch_size_hint, "new invoked work");
+
+        let batch_size_hint = if batch_size_hint > MAX_BATCH_SIZE {
+            tracing::warn!(
+                ?run_id,
+                ?batch_size_hint,
+                ?MAX_BATCH_SIZE,
+                "invocation parameters exceed max batch size"
+            );
+            MAX_BATCH_SIZE
+        } else {
+            batch_size_hint
+        };
 
         let could_create_queue =
             queues
