@@ -12,12 +12,12 @@ abq_utils = { path = "../abq_utils" }
 abq_hosted = { path = "../abq_hosted" }
 abq_junit_xml = { path = "../reporters/junit_xml" }
 
-anyhow = "1.0.65"
-clap = { version = "4.0.15", features = ["derive", "env"] }
+anyhow = "1.0.66"
+clap = { version = "4.0.18", features = ["derive", "env"] }
 tempfile = "3.3.0"
 signal-hook = "0.3.14"
 indicatif = "0.17.1"
-serde_json = "1.0.86"
+serde_json = "1.0.87"
 thiserror = "1.0.37"
 num_cpus = "1.13.1"
 termcolor = "1.1.3"
