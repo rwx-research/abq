@@ -76,6 +76,9 @@ pub struct WorkerPoolConfig {
     /// during startup or exit. Failure modes related to the result of a cleanly-exiting piece of
     /// work (e.g. a test fails, but the process exits cleanly) are not accounted for here.
     pub work_retries: u8,
+
+    // Whether to allow passthrough of stdout/stderr from the native runner process.
+    pub debug_native_runner: bool,
 }
 
 /// Executes an initialization sequence that must be performed before any worker pool can be created.
@@ -153,6 +156,7 @@ impl WorkerPool {
             worker_context,
             work_timeout,
             work_retries,
+            debug_native_runner,
         } = config;
 
         let num_workers = size.get();
@@ -192,6 +196,7 @@ impl WorkerPool {
                 work_retries,
                 notify_manifest,
                 mark_worker_complete,
+                debug_native_runner,
             };
 
             workers.push(ThreadWorker::new(runner_kind.clone(), worker_env));
@@ -214,6 +219,7 @@ impl WorkerPool {
                 work_retries,
                 notify_manifest: None,
                 mark_worker_complete,
+                debug_native_runner,
             };
 
             workers.push(ThreadWorker::new(runner_kind.clone(), worker_env));
@@ -302,6 +308,7 @@ struct WorkerEnv {
     work_timeout: Duration,
     work_retries: u8,
     mark_worker_complete: MarkWorkerComplete,
+    debug_native_runner: bool,
 }
 
 impl ThreadWorker {
@@ -337,6 +344,7 @@ fn start_generic_test_runner(
         work_timeout: _,
         work_retries: _,
         mark_worker_complete,
+        debug_native_runner,
     } = env;
 
     let entity = EntityId::new();
@@ -373,6 +381,7 @@ fn start_generic_test_runner(
         notify_manifest,
         get_next_work_bundle,
         send_test_result,
+        debug_native_runner,
     );
 
     mark_worker_complete();
@@ -391,6 +400,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         work_retries,
         notify_manifest,
         mark_worker_complete,
+        debug_native_runner: _,
     } = env;
 
     let entity = EntityId::new();
@@ -666,6 +676,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_timeout: Duration::from_secs(5),
             work_retries: 0,
+            debug_native_runner: false,
         };
 
         (config, manifest_collector)
