@@ -131,6 +131,7 @@ fn retrieve_manifest<'a>(
     additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
     working_dir: &Path,
     protocol_version_timeout: Duration,
+    debug_native_runner: bool,
 ) -> Result<ManifestMessage, RetrieveManifestError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
@@ -144,8 +145,14 @@ fn retrieve_manifest<'a>(
         native_runner.env(ABQ_GENERATE_MANIFEST, "1");
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
-        native_runner.stdout(process::Stdio::null());
-        native_runner.stderr(process::Stdio::null());
+        if debug_native_runner {
+            native_runner.stdout(process::Stdio::inherit());
+            native_runner.stderr(process::Stdio::inherit());
+        } else {
+            native_runner.stdout(process::Stdio::piped());
+            native_runner.stderr(process::Stdio::piped());
+        }
+
         let mut native_runner_handle = native_runner.spawn()?;
 
         let is_native_runner_alive = || matches!(native_runner_handle.try_wait(), Ok(None));
@@ -202,6 +209,7 @@ impl GenericTestRunner {
         send_manifest: Option<SendManifest>,
         mut get_next_test_bundle: GetNextWorkBundle,
         mut send_test_result: SendTestResult,
+        debug_native_runner: bool,
     ) -> Result<(), RunnerError>
     where
         ShouldShutdown: Fn() -> bool,
@@ -227,6 +235,7 @@ impl GenericTestRunner {
                 &additional_env,
                 working_dir,
                 protocol_version_timeout,
+                debug_native_runner,
             );
 
             match manifest_or_error {
@@ -269,8 +278,13 @@ impl GenericTestRunner {
         native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
-        native_runner.stdout(process::Stdio::piped());
-        native_runner.stderr(process::Stdio::piped());
+        if debug_native_runner {
+            native_runner.stdout(process::Stdio::inherit());
+            native_runner.stderr(process::Stdio::inherit());
+        } else {
+            native_runner.stdout(process::Stdio::null());
+            native_runner.stderr(process::Stdio::null());
+        }
 
         // If launching the native runner fails here, it should have failed during manifest
         // generation as well (unless this is a flakey error in the underlying test runner, channel
@@ -548,6 +562,7 @@ pub fn execute_wrapped_runner(
         Some(send_manifest),
         get_next_test,
         send_test_result,
+        false,
     )?;
 
     if let Some(error) = opt_error_cell {
@@ -761,6 +776,7 @@ mod test_abq_jest {
             Some(send_manifest),
             get_next_test,
             send_test_result,
+            false,
         )
         .unwrap();
 
@@ -829,6 +845,7 @@ mod test {
             Some(send_manifest),
             get_next_test,
             send_test_result,
+            false,
         );
 
         let manifest_result = manifest_result.unwrap();

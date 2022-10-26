@@ -1737,6 +1737,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -1830,6 +1831,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -1952,6 +1954,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -2515,6 +2518,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(0),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -2591,6 +2595,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(0),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -2738,6 +2743,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(0),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -2933,6 +2939,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -3034,6 +3041,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();
@@ -3301,6 +3309,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(0),
+            debug_native_runner: false,
         };
 
         let queue_server_addr = queue.server_addr();

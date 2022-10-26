@@ -95,6 +95,7 @@ pub struct WorkersConfig {
     pub worker_context: WorkerContext,
     pub work_timeout: Duration,
     pub work_retries: u8,
+    pub debug_native_runner: bool,
 }
 
 #[derive(Debug, Error)]
@@ -192,6 +193,7 @@ impl WorkersNegotiator {
             worker_context,
             work_timeout,
             work_retries,
+            debug_native_runner,
         } = workers_config;
 
         let notify_result: NotifyResult = Arc::new({
@@ -313,6 +315,7 @@ impl WorkersNegotiator {
             work_retries,
             run_id,
             notify_manifest,
+            debug_native_runner,
         };
 
         tracing::debug!("Starting worker pool");
@@ -861,6 +864,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             work_timeout: Duration::from_secs(1),
             work_retries: 0,
+            debug_native_runner: false,
         };
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,

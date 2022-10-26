@@ -29,6 +29,7 @@ pub fn start_workers(
         worker_context: context,
         work_timeout: Duration::from_secs(30),
         work_retries: 2,
+        debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE") != None,
     };
 
     tracing::debug!(
