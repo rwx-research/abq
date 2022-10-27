@@ -3,13 +3,15 @@ use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
 use abq_workers::negotiate::{QueueNegotiatorHandle, QueueNegotiatorHandleError};
-use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
 use std::net::{IpAddr, SocketAddr};
+use std::thread;
 
 use abq_queue::queue::{Abq, QueueConfig};
 
 use thiserror::Error;
+use tokio::{runtime::Builder, select};
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 type ClientAuthStrategy = abq_utils::auth::ClientAuthStrategy<abq_utils::auth::User>;
@@ -51,18 +53,51 @@ pub fn start_abq_forever(
         publicize_addr(abq.server_addr(), public_ip),
     );
 
-    // Make sure the queue shuts down and the socket is unliked when the process dies.
-    let mut term_signals = Signals::new(&[SIGINT, SIGTERM]).unwrap();
-    for _ in term_signals.forever() {
-        #[allow(unused_must_use)]
-        {
-            abq.shutdown();
-            tracing::debug!("Queue shutdown");
-            std::process::exit(0);
+    // Register signal handlers, so we know to shutdown (or kill) the queue if
+    // we get a termination signal.
+    let (stop_queue_tx, mut stop_queue_rx) = tokio::sync::mpsc::channel(2);
+    let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
+    let term_signals_handle = term_signals.handle();
+    let listen_for_signals_thread = thread::spawn(move || {
+        if term_signals.into_iter().next().is_some() {
+            // If this fails, we definitely want a panic.
+            stop_queue_tx.blocking_send(()).unwrap();
         }
-    }
+    });
 
-    std::process::exit(101);
+    // Make sure the queue retires on one term signal, and dies on two term signals.
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let mut received_shutdown = false;
+
+        loop {
+            select! {
+                _ = stop_queue_rx.recv() => {
+                    if received_shutdown {
+                        assert!(abq.is_retired());
+                        tracing::debug!("second shutdown signal; killing queue");
+                        // If we already received a shutdown signal, immediately
+                        // exit and kill the queue.
+                        return;
+                    }
+                    // Otherwise, move the queue into retirement and wake only
+                    // to check if it's fully been drained.
+                    received_shutdown = true;
+                    abq.retire();
+                    tracing::debug!("first shutdown signal; retiring queue");
+                }
+            }
+        }
+    });
+
+    tracing::debug!("shutting down queue");
+    term_signals_handle.close();
+    listen_for_signals_thread.join().unwrap();
+
+    tracing::debug!("shutting down queue");
+    abq.shutdown().unwrap();
+
+    std::process::exit(0);
 }
 
 pub(crate) struct AbqInstance {

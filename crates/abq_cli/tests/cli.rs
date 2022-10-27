@@ -238,6 +238,10 @@ macro_rules! test_all_network_config_options {
     }};
 }
 
+fn term_queue(mut queue_proc: Child) {
+    queue_proc.kill().unwrap();
+}
+
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_auto_workers_without_failure (|name, conf: CSConfigOptions| {
@@ -297,8 +301,7 @@ test_all_network_config_options! {
         assert!(port_active(worker_port));
         assert!(port_active(negotiator_port));
 
-        // Must kill the queue because it sits around forever, waiting for new requests.
-        queue_proc.kill().expect("queue already dead");
+        term_queue(queue_proc)
     })
 }
 
@@ -381,8 +384,7 @@ test_all_network_config_options! {
         let worker_exit_status = worker_proc.wait().unwrap();
         assert!(worker_exit_status.success());
 
-        // Must kill the queue because it sits around forever, waiting for new requests.
-        queue_proc.kill().expect("queue already dead");
+        term_queue(queue_proc);
     })
 }
 
@@ -452,7 +454,7 @@ test_all_network_config_options! {
         use nix::sys::signal;
         use nix::unistd::Pid;
 
-        // SIGINT the supervisor.
+        // SIGTERM the supervisor.
         signal::kill(Pid::from_raw(supervisor.id() as _), signal::Signal::SIGTERM).unwrap();
 
         let supervisor_exit = supervisor.wait().unwrap();
@@ -478,7 +480,7 @@ test_all_network_config_options! {
         // The worker should exit with a failure as well.
         assert!(!exit_status.success(), "{:?}", (stdout, stderr));
 
-        queue_proc.kill().expect("queue already dead");
+        term_queue(queue_proc);
     })
 }
 
@@ -596,8 +598,7 @@ test_all_network_config_options! {
         let worker_exit_status = worker_proc.wait().unwrap();
         assert!(!worker_exit_status.success());
 
-        // Must kill the queue because it sits around forever, waiting for new requests.
-        queue_proc.kill().expect("queue already dead");
+        term_queue(queue_proc);
     })
 }
 
@@ -656,7 +657,7 @@ test_all_network_config_options! {
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
 
-        queue_proc.kill().expect("queue already dead");
+        term_queue(queue_proc);
     })
 }
 
@@ -861,6 +862,5 @@ fn test_with_invalid_command() {
     let worker_exit_status = worker_proc.wait().unwrap();
     assert!(!worker_exit_status.success());
 
-    // Must kill the queue because it sits around forever, waiting for new requests.
-    queue_proc.kill().expect("queue already dead");
+    term_queue(queue_proc);
 }
