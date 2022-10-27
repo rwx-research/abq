@@ -3453,4 +3453,80 @@ mod test {
         assert!(!active_runs.read().await.contains_key(&run_id));
         assert!(!state_cache.lock().unwrap().contains_key(&run_id));
     }
+
+    #[test]
+    fn cancel_test_run_in_supervisor_on_test_timeout() {
+        let mut queue = Abq::start(Default::default());
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![echo_test("echo1".to_string())],
+            },
+        };
+
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
+
+        let queue_server_addr = queue.server_addr();
+        let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
+        let run_id = RunId::unique();
+
+        let (_cancel_tx, cancel_rx) = run_cancellation_pair();
+        let supervisor_poll_timeout = Duration::from_secs(0);
+
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
+
+            move || {
+                make_runtime().block_on(async {
+                    // Start one client, and have it drain its test queue
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id.clone(),
+                        runner.clone(),
+                        one_nonzero(),
+                        supervisor_poll_timeout,
+                        cancel_rx,
+                    )
+                    .await
+                    .unwrap();
+
+                    client.stream_results(|_, _| {}).await
+                })
+            }
+        });
+
+        // The client should immediately hit the timeout and cancel.
+        let client_err = results_handle.join().unwrap().unwrap_err();
+
+        assert!(
+            matches!(client_err, TestResultError::Io(io) if io.kind() == io::ErrorKind::TimedOut)
+        );
+
+        // The test run should be observed as cancelled and failed.
+        let mut sock = client_opts
+            .build()
+            .unwrap()
+            .connect(queue.server_addr)
+            .unwrap();
+
+        use net_protocol::queue;
+        net_protocol::write(
+            &mut sock,
+            queue::Request {
+                entity: EntityId::new(),
+                message: queue::Message::RequestTotalRunResult(run_id),
+            },
+        )
+        .unwrap();
+        let run_result: queue::TotalRunResult = net_protocol::read(&mut sock).unwrap();
+
+        assert!(matches!(
+            run_result,
+            queue::TotalRunResult::Completed { succeeded: false }
+        ));
+
+        queue.shutdown().unwrap();
+    }
 }

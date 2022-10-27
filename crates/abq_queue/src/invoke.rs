@@ -194,6 +194,7 @@ impl Client {
                 }
                 _ = tokio::time::sleep(self.poll_timeout) => {
                     tracing::error!(timeout=?self.poll_timeout, entity=?self.entity, run_id=?self.run_id, "timed out waiting for queue message");
+                    self.cancel_active_run().await?;
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a message from the queue").into());
                 }
                 _ = self.cancellation_rx.recv() => {
