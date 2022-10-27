@@ -645,7 +645,7 @@ mod test {
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::{WorkerContext, WorkersExit};
-    use abq_utils::auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy};
+    use abq_utils::auth::{build_strategies, ClientAuthStrategy, ClientToken, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestOrGroup, TestResult,
@@ -944,7 +944,7 @@ mod test {
     #[test]
     #[traced_test]
     fn queue_negotiator_with_auth_okay() {
-        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+        let (server_auth, client_auth) = build_strategies(ClientToken::new_random());
 
         let server = ServerOptions::new(server_auth, Tls::NO)
             .bind("0.0.0.0:0")
@@ -968,7 +968,7 @@ mod test {
     #[test]
     #[traced_test]
     fn queue_negotiator_connect_with_no_auth_fails() {
-        let (server_auth, _) = AuthToken::new_random().build_strategies();
+        let (server_auth, _) = build_strategies(ClientToken::new_random());
 
         let server = ServerOptions::new(server_auth, Tls::NO)
             .bind("0.0.0.0:0")

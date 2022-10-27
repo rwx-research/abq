@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use abq_utils::{api::ApiKey, auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
+use abq_utils::{api::ApiKey, auth::ClientToken, net_opt::Tls, net_protocol::workers::RunId};
 use clap::{ArgAction, ArgGroup, Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
@@ -76,7 +76,7 @@ pub enum Command {
         ///
         /// Need a token? Use `abq token new`!
         #[clap(long)]
-        token: Option<AuthToken>,
+        token: Option<ClientToken>,
 
         /// Whether to accept messages only with TLS; false by default.
         /// When set, workers and test clients must also be set to send messages only with TLS.
@@ -125,7 +125,7 @@ pub enum Command {
         ///
         /// If --api-key is specified, the token will be ignored and the token fetched from the ABQ API will be used.
         #[clap(long, required = false)]
-        token: Option<AuthToken>,
+        token: Option<ClientToken>,
 
         /// Whether to send messages only with TLS; false by default.
         /// When set, only queues configured with TLS as well should be provided via
@@ -182,7 +182,7 @@ pub enum Command {
         ///
         /// If --api-key is specified, the token will be ignored and the token fetched from the ABQ API will be used.
         #[clap(long, required = false)]
-        token: Option<AuthToken>,
+        token: Option<ClientToken>,
 
         /// Whether to send messages only with TLS; false by default.
         /// When set, only queues configured with TLS as well should be provided via
@@ -243,7 +243,7 @@ pub enum Command {
         /// Token to authorize messages sent to the services.
         /// Usually, this should be the same token that `abq start` initialized with.
         #[clap(long, required = false)]
-        token: Option<AuthToken>,
+        token: Option<ClientToken>,
 
         /// Whether the services being checked are configured with TLS.
         #[clap(long, action=ArgAction::SetTrue, required = false)]
