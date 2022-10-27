@@ -17,7 +17,7 @@ use std::{
 use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
 use abq_utils::{
     api::ApiKey,
-    auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
+    auth::{ClientAuthStrategy, ClientToken, ServerAuthStrategy},
     net_opt::{ClientOptions, ServerOptions, Tls},
     net_protocol::{
         entity::EntityId,
@@ -54,7 +54,7 @@ struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
 
 struct ConfigFromApi {
     queue_addr: SocketAddr,
-    token: AuthToken,
+    token: ClientToken,
     tls: Tls,
 }
 
@@ -346,7 +346,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             Ok(reporting::ExitCode::new(exit))
         }
         Command::Token(Token::New) => {
-            let token = AuthToken::new_random();
+            let token = ClientToken::new_random();
             println!("{token}");
             Ok(ExitCode::new(0))
         }
@@ -354,12 +354,12 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 }
 
 fn resolve_config(
-    token_from_cli: Option<AuthToken>,
+    token_from_cli: Option<ClientToken>,
     queue_addr_from_cli: Option<SocketAddr>,
     tls_from_cli: Tls,
     api_key: Option<ApiKey>,
     run_id: &RunId,
-) -> anyhow::Result<(Option<AuthToken>, Option<SocketAddr>, Tls)> {
+) -> anyhow::Result<(Option<ClientToken>, Option<SocketAddr>, Tls)> {
     let (queue_addr_from_api, token_from_api, tls_from_api) = match api_key {
         Some(key) => {
             let config = get_config_from_api(key, run_id)?;

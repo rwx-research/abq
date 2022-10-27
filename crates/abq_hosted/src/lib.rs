@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
-use abq_utils::auth::AuthToken;
+use abq_utils::auth::ClientToken;
 use abq_utils::net_protocol::workers::RunId;
 use abq_utils::{api::ApiKey, net_opt::Tls};
 use reqwest::{blocking::RequestBuilder, StatusCode};
@@ -18,7 +18,7 @@ pub const DEFAULT_RWX_ABQ_API_URL: &str = "https://captain.build/abq/api/";
 pub struct HostedQueueConfig {
     pub addr: SocketAddr,
     pub run_id: RunId,
-    pub auth_token: AuthToken,
+    pub auth_token: ClientToken,
     pub tls: Tls,
 }
 
@@ -107,7 +107,7 @@ impl HostedQueueConfig {
             .get("token")
             .ok_or_else(|| Error::SchemaError("missing token".to_owned()))
             .and_then(|token_str| {
-                AuthToken::from_str(token_str)
+                ClientToken::from_str(token_str)
                     .map_err(|e| Error::SchemaError(format!("invalid token: {e}")))
             })?;
 
@@ -204,7 +204,7 @@ fn send_request_with_decay_help(
 mod test {
     use std::str::FromStr;
 
-    use abq_utils::{api::ApiKey, auth::AuthToken, net_opt::Tls, net_protocol::workers::RunId};
+    use abq_utils::{api::ApiKey, auth::ClientToken, net_opt::Tls, net_protocol::workers::RunId};
     use reqwest::StatusCode;
 
     use crate::send_request_with_decay_help;
@@ -217,8 +217,8 @@ mod test {
         ApiKey::from_str("abqapi_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
     }
 
-    fn test_auth_token() -> AuthToken {
-        AuthToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
+    fn test_auth_token() -> ClientToken {
+        ClientToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
     }
 
     #[test]

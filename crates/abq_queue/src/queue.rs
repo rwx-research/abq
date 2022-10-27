@@ -1641,7 +1641,7 @@ mod test {
         },
     };
     use abq_utils::{
-        auth::{AuthToken, ClientAuthStrategy, ServerAuthStrategy},
+        auth::{build_strategies, ClientAuthStrategy, ClientToken, ServerAuthStrategy},
         net_async,
         net_opt::{ClientOptions, ServerOptions, Tls},
         net_protocol::{
@@ -2370,7 +2370,7 @@ mod test {
         let negotiator_addr = "0.0.0.0:0".parse().unwrap();
         let server = QueueServer::new(Default::default(), negotiator_addr);
 
-        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+        let (server_auth, client_auth) = build_strategies(ClientToken::new_random());
         let server_opts = ServerOptions::new(server_auth, Tls::NO);
         let client_opts = ClientOptions::new(client_auth, Tls::NO);
 
@@ -2405,7 +2405,7 @@ mod test {
         let negotiator_addr = "0.0.0.0:0".parse().unwrap();
         let server = QueueServer::new(Default::default(), negotiator_addr);
 
-        let (server_auth, _) = AuthToken::new_random().build_strategies();
+        let (server_auth, _) = build_strategies(ClientToken::new_random());
 
         let server_opts = ServerOptions::new(server_auth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
@@ -2441,7 +2441,7 @@ mod test {
             queues: Default::default(),
         };
 
-        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+        let (server_auth, client_auth) = build_strategies(ClientToken::new_random());
         let server_opts = ServerOptions::new(server_auth, Tls::NO);
         let client_opts = ClientOptions::new(client_auth, Tls::NO);
 
@@ -2475,7 +2475,7 @@ mod test {
             queues: Default::default(),
         };
 
-        let (server_auth, _) = AuthToken::new_random().build_strategies();
+        let (server_auth, _) = build_strategies(ClientToken::new_random());
         let server_opts = ServerOptions::new(server_auth, Tls::NO);
         let client_opts = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO);
 
@@ -2833,7 +2833,7 @@ mod test {
     #[test]
     #[traced_test]
     fn get_work_from_work_server_waiting_for_first_worker() {
-        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+        let (server_auth, client_auth) = build_strategies(ClientToken::new_random());
 
         let run_id = RunId::unique();
 
@@ -2876,7 +2876,7 @@ mod test {
     #[test]
     #[traced_test]
     fn get_work_from_work_server_waiting_for_manifest() {
-        let (server_auth, client_auth) = AuthToken::new_random().build_strategies();
+        let (server_auth, client_auth) = build_strategies(ClientToken::new_random());
 
         let run_id = RunId::unique();
 
