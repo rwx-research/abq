@@ -14,6 +14,7 @@
 use std::{io, net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use abq_utils::{
+    auth::User,
     net_async,
     net_opt::ClientOptions,
     net_protocol::{
@@ -102,7 +103,7 @@ impl Client {
     pub async fn invoke_work(
         entity: EntityId,
         abq_server_addr: SocketAddr,
-        client_options: ClientOptions,
+        client_options: ClientOptions<User>,
         run_id: RunId,
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,

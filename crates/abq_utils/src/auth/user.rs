@@ -6,12 +6,12 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-use super::token::{Token, TokenError};
+use super::token::{RawToken, TokenError};
 
-const CLIENT_DISPLAY_PREFIX: &str = "abqs_";
+const USER_DISPLAY_PREFIX: &str = "abqs_";
 
-/// A token representing a "client" role for authz against a server.
-/// A client is an ABQ worker or supervisor, which can communicate freely with an ABQ queue server
+/// A token representing a "user" role for authz against a server.
+/// A user is an ABQ worker or supervisor, which can communicate freely with an ABQ queue server
 /// in all regards except admin requests.
 ///
 /// The token is GitHub's model - we take 30 bits from the ASCII alphanumeric alphabet [a, z] U [A, Z] U [0, 9].
@@ -19,15 +19,15 @@ const CLIENT_DISPLAY_PREFIX: &str = "abqs_";
 ///
 /// Tokens are exposed to users, and parsed from user input, with an `abqs_` prefix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ClientToken(pub(crate) Token);
+pub struct UserToken(pub(crate) RawToken);
 
 #[derive(Debug, Error)]
-pub enum ClientTokenError {
+pub enum UserTokenError {
     #[error("invalid auth token")]
     InvalidToken,
 }
 
-impl From<TokenError> for ClientTokenError {
+impl From<TokenError> for UserTokenError {
     fn from(te: TokenError) -> Self {
         match te {
             TokenError::InvalidToken => Self::InvalidToken,
@@ -35,34 +35,38 @@ impl From<TokenError> for ClientTokenError {
     }
 }
 
-impl ClientToken {
+impl UserToken {
     /// Creates a new, randomly generated token.
     pub fn new_random() -> Self {
-        Self(Token::new_random())
+        Self(RawToken::new_random())
     }
 
+    #[cfg(test)]
     pub(crate) fn raw_bytes(&self) -> &[u8] {
         &self.0 .0
     }
 }
 
-impl fmt::Display for ClientToken {
+impl fmt::Display for UserToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.display_human_readable(f, CLIENT_DISPLAY_PREFIX)
+        self.0.display_human_readable(f, USER_DISPLAY_PREFIX)
     }
 }
 
-impl FromStr for ClientToken {
-    type Err = ClientTokenError;
+impl FromStr for UserToken {
+    type Err = UserTokenError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Token::parse_human_readable(s, CLIENT_DISPLAY_PREFIX)?))
+        Ok(Self(RawToken::parse_human_readable(
+            s,
+            USER_DISPLAY_PREFIX,
+        )?))
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::ClientToken;
+    use super::UserToken;
 
     use std::str::FromStr;
 
@@ -75,7 +79,7 @@ mod test {
         // For their string representation, check the above, and that
         //   - they start with `abqs_`
         for _ in 0..1_000 {
-            let token = ClientToken::new_random();
+            let token = UserToken::new_random();
             assert_eq!(token.raw_bytes().len(), 30);
             assert!(token.raw_bytes().iter().all(|c| c.is_ascii_alphanumeric()));
 
@@ -94,7 +98,7 @@ mod test {
 
     #[test]
     fn parse_valid_token() {
-        let token = ClientToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap();
+        let token = UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap();
         assert_eq!(
             token.raw_bytes(),
             [
@@ -108,43 +112,43 @@ mod test {
 
     #[test]
     fn reject_string_token_too_short() {
-        let result = ClientToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwz");
+        let result = UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwz");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_string_token_too_long() {
-        let result = ClientToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzzzzzz");
+        let result = UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzzzzzz");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_string_token_not_alphanumeric() {
-        let result = ClientToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwz_xF");
+        let result = UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwz_xF");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_string_token_not_ascii_alphanumeric() {
-        let result = ClientToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNx京");
+        let result = UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNx京");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_string_token_no_abqs_prefix() {
-        let result = ClientToken::from_str("MD2QPKH2VZU2krvOa2mN54Q4qwzNxF");
+        let result = UserToken::from_str("MD2QPKH2VZU2krvOa2mN54Q4qwzNxF");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_string_token_malformed_abqs_prefix() {
-        let result = ClientToken::from_str("abqsMD2QPKH2VZU2krvOa2mN54Q4qwzNxF");
+        let result = UserToken::from_str("abqsMD2QPKH2VZU2krvOa2mN54Q4qwzNxF");
         assert!(result.is_err());
     }
 
     #[test]
     fn reject_string_token_abqs_prefix_in_middle_of_token() {
-        let result = ClientToken::from_str("MD2QPKH2V_abqs_ZU2krvOa2mN54Q4qwzNxF");
+        let result = UserToken::from_str("MD2QPKH2V_abqs_ZU2krvOa2mN54Q4qwzNxF");
         assert!(result.is_err());
     }
 }

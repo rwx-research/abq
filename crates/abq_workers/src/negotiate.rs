@@ -18,6 +18,7 @@ use crate::workers::{
     WorkerPool, WorkerPoolConfig, WorkersExit,
 };
 use abq_utils::{
+    auth::User,
     net, net_async,
     net_opt::ClientOptions,
     net_protocol::{
@@ -152,7 +153,7 @@ impl WorkersNegotiator {
     pub fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
-        client_options: ClientOptions,
+        client_options: ClientOptions<User>,
         wanted_run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         use WorkersNegotiateError::*;
@@ -387,7 +388,7 @@ impl QueueNegotiatorHandle {
     pub fn ask_queue(
         entity: EntityId,
         queue_addr: SocketAddr,
-        client_options: ClientOptions,
+        client_options: ClientOptions<User>,
     ) -> Result<Self, QueueNegotiatorHandleError> {
         use QueueNegotiatorHandleError::*;
 
@@ -645,7 +646,10 @@ mod test {
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::WorkersConfig;
     use crate::workers::{WorkerContext, WorkersExit};
-    use abq_utils::auth::{build_strategies, ClientAuthStrategy, ClientToken, ServerAuthStrategy};
+    use abq_utils::auth::{
+        build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
+        UserToken,
+    };
     use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestOrGroup, TestResult,
@@ -658,6 +662,14 @@ mod test {
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
+    pub fn build_random_strategies() -> (
+        ServerAuthStrategy,
+        ClientAuthStrategy<User>,
+        ClientAuthStrategy<Admin>,
+    ) {
+        build_strategies(UserToken::new_random(), AdminToken::new_random())
+    }
+
     type Messages = Arc<Mutex<Vec<TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
 
@@ -665,7 +677,7 @@ mod test {
     type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
 
     fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
-        let server = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -729,7 +741,7 @@ mod test {
         let msgs = Arc::new(Mutex::new(Vec::new()));
         let msgs2 = Arc::clone(&msgs);
 
-        let server = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -851,7 +863,7 @@ mod test {
 
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
-            ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+            ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
                 .bind("0.0.0.0:0")
                 .unwrap(),
             next_work_addr,
@@ -869,7 +881,7 @@ mod test {
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue_negotiator.get_handle(),
-            ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO),
+            ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO),
             run_id,
         )
         .unwrap();
@@ -922,14 +934,14 @@ mod test {
 
     #[test]
     fn queue_negotiator_healthcheck() {
-        let server = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let mut queue_negotiator = test_negotiator(server);
 
-        let client = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO)
+        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
             .build()
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
@@ -944,7 +956,7 @@ mod test {
     #[test]
     #[traced_test]
     fn queue_negotiator_with_auth_okay() {
-        let (server_auth, client_auth) = build_strategies(ClientToken::new_random());
+        let (server_auth, client_auth, _) = build_random_strategies();
 
         let server = ServerOptions::new(server_auth, Tls::NO)
             .bind("0.0.0.0:0")
@@ -968,7 +980,7 @@ mod test {
     #[test]
     #[traced_test]
     fn queue_negotiator_connect_with_no_auth_fails() {
-        let (server_auth, _) = build_strategies(ClientToken::new_random());
+        let (server_auth, _, _) = build_random_strategies();
 
         let server = ServerOptions::new(server_auth, Tls::NO)
             .bind("0.0.0.0:0")
@@ -977,7 +989,7 @@ mod test {
 
         let mut queue_negotiator = test_negotiator(server);
 
-        let client = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO)
+        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
             .build()
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();

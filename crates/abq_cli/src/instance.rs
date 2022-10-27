@@ -1,5 +1,5 @@
-use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
-use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
+use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
+use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
 use abq_workers::negotiate::{QueueNegotiatorHandle, QueueNegotiatorHandleError};
@@ -10,6 +10,9 @@ use std::net::{IpAddr, SocketAddr};
 use abq_queue::queue::{Abq, QueueConfig};
 
 use thiserror::Error;
+
+type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
+type ClientAuthStrategy = abq_utils::auth::ClientAuthStrategy<abq_utils::auth::User>;
 
 /// Starts an [Abq] instance in the current process forever.
 pub fn start_abq_forever(
@@ -99,13 +102,22 @@ impl AbqInstance {
     }
 
     pub fn new_ephemeral(
-        server_auth: ServerAuthStrategy,
+        opt_user_token: Option<UserToken>,
         client_auth: ClientAuthStrategy,
         tls: Tls,
     ) -> Self {
         tracing::debug!("Creating an ephemeral queue");
 
         abq_queue::queue::init();
+
+        let server_auth = match opt_user_token {
+            Some(user_token) => {
+                // Ephemeral instances are managed in-process, so there will be no external admin
+                // communicating - as such we can create a fresh admin token.
+                ServerAuthStrategy::from_set(user_token, AdminToken::new_random())
+            }
+            None => ServerAuthStrategy::no_auth(),
+        };
 
         let queue = Abq::start(QueueConfig {
             server_options: ServerOptions::new(server_auth, tls),

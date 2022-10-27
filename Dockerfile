@@ -28,7 +28,8 @@ WORKDIR /app
 
 # Get compiled binaries from the builder
 COPY --from=builder /app/target/release/abq /app/abq
-COPY bin/abq_server_token /app/abq_server_token
+COPY bin/abq_user_token /app/abq_user_token
+COPY bin/abq_admin_token /app/abq_admin_token
 COPY bin/deploy_prod /app/deploy_prod
 COPY bin/health /app/health
 COPY bin/deploy_staging /app/deploy_staging

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use abq_utils::net_opt::ClientOptions;
 use abq_utils::net_protocol::workers::RunId;
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
@@ -11,6 +10,8 @@ use abq_workers::negotiate::{
 use abq_workers::workers::{WorkerContext, WorkersExit};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
+
+type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
 pub fn start_workers(
     num_workers: NonZeroUsize,

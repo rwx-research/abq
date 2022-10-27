@@ -9,33 +9,27 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::ToSocketAddrs;
 
 use super::UnverifiedServerStream;
-use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
+use crate::auth::{ClientAuthStrategy, Role, ServerAuthStrategy};
 
 pub struct RawServerStream(tokio::net::TcpStream);
 
 #[derive(Debug)]
-pub struct Stream(tokio::net::TcpStream);
+pub struct ClientStream(tokio::net::TcpStream);
 
-impl Stream {
+impl ClientStream {
     pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
         let stream = tokio::net::TcpStream::connect(addr).await?;
         Ok(Self(stream))
     }
 }
 
-impl super::ClientStream for Stream {
+impl super::ClientStream for ClientStream {
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.0.local_addr()
     }
 }
 
-impl super::ServerStream for Stream {
-    fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.0.peer_addr()
-    }
-}
-
-impl AsyncRead for Stream {
+impl AsyncRead for ClientStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -47,7 +41,56 @@ impl AsyncRead for Stream {
     }
 }
 
-impl AsyncWrite for Stream {
+impl AsyncWrite for ClientStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, io::Error>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+#[derive(Debug)]
+pub struct ServerStream(tokio::net::TcpStream, Role);
+
+impl super::ServerStream for ServerStream {
+    fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.0.peer_addr()
+    }
+
+    fn role(&self) -> Role {
+        self.1
+    }
+}
+
+impl AsyncRead for ServerStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        // TODO(ayaz): i think we can get rid of these pins we mark `Stream` as transparent, since
+        // it should be compiled that way anyway.
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ServerStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -117,30 +160,32 @@ impl super::ServerHandshakeCtx for HandshakeCtx {
         &self,
         unverified: UnverifiedServerStream,
     ) -> io::Result<Box<dyn super::ServerStream>> {
-        let UnverifiedServerStream(stream) = unverified;
-        let mut stream = Stream(stream);
+        let UnverifiedServerStream(mut stream) = unverified;
 
         // We need to validate any auth header before handing the connection over.
-        self.auth_strategy.async_verify_header(&mut stream).await?;
+        let role = self.auth_strategy.async_verify_header(&mut stream).await?;
 
-        Ok(Box::new(stream))
+        Ok(Box::new(ServerStream(stream, role)))
     }
 }
 
-pub struct ConfiguredClient {
-    auth_strategy: ClientAuthStrategy,
+pub struct ConfiguredClient<Role> {
+    auth_strategy: ClientAuthStrategy<Role>,
 }
 
-impl ConfiguredClient {
-    pub fn new(auth_strategy: ClientAuthStrategy) -> io::Result<Self> {
+impl<Role> ConfiguredClient<Role> {
+    pub fn new(auth_strategy: ClientAuthStrategy<Role>) -> io::Result<Self> {
         Ok(ConfiguredClient { auth_strategy })
     }
 }
 
 #[async_trait]
-impl super::ConfiguredClient for ConfiguredClient {
+impl<Role> super::ConfiguredClient for ConfiguredClient<Role>
+where
+    Role: Send + Sync,
+{
     async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn super::ClientStream>> {
-        let mut stream = Stream::connect(addr).await?;
+        let mut stream = ClientStream::connect(addr).await?;
 
         // Make our auth header, if any, known to the server.
         self.auth_strategy.async_send(&mut stream).await?;

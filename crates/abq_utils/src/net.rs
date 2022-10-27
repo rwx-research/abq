@@ -5,6 +5,8 @@ use std::{
     net::SocketAddr,
 };
 
+use crate::auth::Role;
+
 pub trait ServerListener: Send + Sync {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
     fn local_addr(&self) -> io::Result<SocketAddr>;
@@ -14,6 +16,9 @@ pub trait ServerListener: Send + Sync {
 
 pub trait ServerStream: Read + Write {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()>;
+
+    /// The [Role] of the connected client this stream represents.
+    fn role(&self) -> Role;
 }
 
 pub trait ConfiguredClient: Send + Sync {

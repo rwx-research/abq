@@ -9,7 +9,7 @@ use thiserror::Error;
 pub(crate) const TOKEN_LEN: usize = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct Token(pub(crate) [u8; TOKEN_LEN]);
+pub(crate) struct RawToken(pub(crate) [u8; TOKEN_LEN]);
 
 #[derive(Debug, Error)]
 pub(crate) enum TokenError {
@@ -17,7 +17,7 @@ pub(crate) enum TokenError {
     InvalidToken,
 }
 
-impl Token {
+impl RawToken {
     /// Creates a new, randomly generated token.
     pub(crate) fn new_random() -> Self {
         // Use an RNG backed by 20-round ChaCha cipher. That should be more than enough security

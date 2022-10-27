@@ -11,16 +11,20 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::ToSocketAddrs;
 
 use super::UnverifiedServerStream;
-use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
+use crate::auth::{ClientAuthStrategy, Role, ServerAuthStrategy};
 
 pub struct RawServerStream(tokio::net::TcpStream);
 
 #[derive(Debug)]
-pub struct ServerStream(tokio_tls::server::TlsStream<tokio::net::TcpStream>);
+pub struct ServerStream(tokio_tls::server::TlsStream<tokio::net::TcpStream>, Role);
 
 impl super::ServerStream for ServerStream {
     fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.0.get_ref().0.peer_addr()
+    }
+
+    fn role(&self) -> Role {
+        self.1
     }
 }
 
@@ -115,14 +119,13 @@ impl super::ServerHandshakeCtx for HandshakeCtx {
     ) -> io::Result<Box<dyn super::ServerStream>> {
         let UnverifiedServerStream(stream) = unverified;
 
-        let stream = self.acceptor.accept(stream).await?;
-        let mut stream = ServerStream(stream);
+        let mut stream = self.acceptor.accept(stream).await?;
 
         // We now have a stream talking TLS, and we need to validate any auth header
         // before handing the connection over.
-        self.auth_strategy.async_verify_header(&mut stream).await?;
+        let role = self.auth_strategy.async_verify_header(&mut stream).await?;
 
-        Ok(Box::new(stream))
+        Ok(Box::new(ServerStream(stream, role)))
     }
 }
 
@@ -170,13 +173,13 @@ impl AsyncWrite for ClientStream {
     }
 }
 
-pub struct ConfiguredClient {
+pub struct ConfiguredClient<Role> {
     connector: tokio_tls::TlsConnector,
-    auth_strategy: ClientAuthStrategy,
+    auth_strategy: ClientAuthStrategy<Role>,
 }
 
-impl ConfiguredClient {
-    pub fn new(auth_strategy: ClientAuthStrategy) -> io::Result<Self> {
+impl<Role> ConfiguredClient<Role> {
+    pub fn new(auth_strategy: ClientAuthStrategy<Role>) -> io::Result<Self> {
         let tls_config = crate::tls::get_client_config()?;
         let connector = tokio_tls::TlsConnector::from(tls_config);
 
@@ -188,7 +191,10 @@ impl ConfiguredClient {
 }
 
 #[async_trait]
-impl super::ConfiguredClient for ConfiguredClient {
+impl<Role> super::ConfiguredClient for ConfiguredClient<Role>
+where
+    Role: Send + Sync,
+{
     async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn super::ClientStream>> {
         let sock = tokio::net::TcpStream::connect(addr).await?;
 

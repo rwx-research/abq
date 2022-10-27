@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
 
-use abq_utils::{
-    net_opt::ClientOptions,
-    net_protocol::{self, entity::EntityId, queue},
-};
+use abq_utils::net_protocol::{self, entity::EntityId, queue};
+
+type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
 pub(crate) enum HealthCheckKind {
     Queue(SocketAddr),
