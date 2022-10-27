@@ -1,3 +1,7 @@
+mod api_key;
+
+pub use api_key::ApiKey;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -5,8 +9,8 @@ use std::thread;
 use std::time::Duration;
 
 use abq_utils::auth::UserToken;
+use abq_utils::net_opt::Tls;
 use abq_utils::net_protocol::workers::RunId;
-use abq_utils::{api::ApiKey, net_opt::Tls};
 use reqwest::{blocking::RequestBuilder, StatusCode};
 use serde::Deserialize;
 use thiserror::Error;
@@ -204,10 +208,10 @@ fn send_request_with_decay_help(
 mod test {
     use std::str::FromStr;
 
-    use abq_utils::{api::ApiKey, auth::UserToken, net_opt::Tls, net_protocol::workers::RunId};
+    use abq_utils::{auth::UserToken, net_opt::Tls, net_protocol::workers::RunId};
     use reqwest::StatusCode;
 
-    use crate::send_request_with_decay_help;
+    use crate::{send_request_with_decay_help, ApiKey};
 
     use super::{Error, HostedQueueConfig};
 

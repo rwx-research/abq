@@ -4,12 +4,13 @@ use std::{
     path::PathBuf,
 };
 
+use abq_hosted::ApiKey;
 use abq_utils::{
-    api::ApiKey,
     auth::{AdminToken, UserToken},
     net_opt::Tls,
     net_protocol::workers::RunId,
 };
+
 use clap::{ArgAction, ArgGroup, Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};

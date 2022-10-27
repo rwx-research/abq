@@ -14,9 +14,9 @@ use std::{
     time::Duration,
 };
 
+use abq_hosted::ApiKey;
 use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
 use abq_utils::{
-    api::ApiKey,
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     net_opt::{ClientOptions, ServerOptions, Tls},
     net_protocol::{
@@ -26,9 +26,9 @@ use abq_utils::{
     },
 };
 use abq_workers::negotiate::QueueNegotiatorHandle;
-use clap::Parser;
 
 use args::{Cli, Command};
+use clap::Parser;
 
 use instance::AbqInstance;
 use reporting::{ColorPreference, ExitCode, ReporterKind, SuiteReporters};
