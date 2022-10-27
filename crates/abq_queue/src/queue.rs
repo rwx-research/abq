@@ -412,6 +412,8 @@ pub fn init() {
 pub struct Abq {
     shutdown_manager: ShutdownManager,
 
+    queues: SharedRunQueues,
+
     server_addr: SocketAddr,
     server_handle: Option<JoinHandle<Result<(), QueueServerError>>>,
 
@@ -445,6 +447,24 @@ impl Abq {
     pub fn wait_forever(&mut self) {
         self.server_handle.take().map(JoinHandle::join);
         self.work_scheduler_handle.take().map(JoinHandle::join);
+    }
+
+    /// Moves the queue into retirement.
+    #[instrument(level = "trace", skip(self))]
+    pub fn retire(&mut self) {
+        self.shutdown_manager.retire()
+    }
+
+    /// Moves the queue into retirement.
+    #[instrument(level = "trace", skip(self))]
+    pub fn is_retired(&self) -> bool {
+        self.shutdown_manager.is_retired()
+    }
+
+    /// Checks whether the queue has no more active runs.
+    /// Guaranteed to be eventually consistent if the queue is [retiring][Self::retire].
+    pub fn is_drained(&self) -> bool {
+        self.queues.lock().unwrap().num_active_runs() == 0
     }
 
     /// Sends a signal to shutdown immediately.
@@ -566,19 +586,22 @@ fn start_queue(config: QueueConfig) -> Abq {
     // TODO: blocking is not good; workers that can connect fast may be blocked on workers waiting
     // for a test run to be established. Make this cede control to a runtime if the worker's run is
     // not yet available.
-    let choose_run_for_worker = move |wanted_run_id: &RunId| loop {
-        let opt_assigned = { queues.lock().unwrap().get_run_for_worker(wanted_run_id) };
-        match opt_assigned {
-            AssignedRunLookup::NotFound => {
-                // Nothing yet; release control and sleep for a bit in case something comes.
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            AssignedRunLookup::AlreadyDone { success } => {
-                return Err(AssignedRunCompeleted { success })
-            }
-            AssignedRunLookup::Some(assigned) => {
-                return Ok(assigned);
+    let choose_run_for_worker = {
+        let queues = Arc::clone(&queues);
+        move |wanted_run_id: &RunId| loop {
+            let opt_assigned = { queues.lock().unwrap().get_run_for_worker(wanted_run_id) };
+            match opt_assigned {
+                AssignedRunLookup::NotFound => {
+                    // Nothing yet; release control and sleep for a bit in case something comes.
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                AssignedRunLookup::AlreadyDone { success } => {
+                    return Err(AssignedRunCompeleted { success })
+                }
+                AssignedRunLookup::Some(assigned) => {
+                    return Ok(assigned);
+                }
             }
         }
     };
@@ -596,6 +619,7 @@ fn start_queue(config: QueueConfig) -> Abq {
 
     Abq {
         shutdown_manager,
+        queues,
 
         server_addr,
         server_handle: Some(server_handle),
