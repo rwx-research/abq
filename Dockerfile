@@ -1,4 +1,6 @@
-FROM lukemathwalker/cargo-chef:latest-rust-latest AS chef
+# https://hub.docker.com/layers/rustlang/rust/nightly-bullseye-slim/images/sha256-bcfd21c359b6f64f40cb40a0284b2ed573695dc5910dd9db0367630fa285af4c
+FROM rustlang/rust:nightly-bullseye@sha256:3b6da2195a31505a321b674088525ee4d6803286d921b6d4df50d3e9c2a88a4b AS chef
+RUN cargo +nightly install cargo-chef
 WORKDIR app
 
 FROM chef AS planner
