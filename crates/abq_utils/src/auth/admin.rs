@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-use super::token::{Token, TokenError};
+use super::token::{RawToken, TokenError};
 
 const ADMIN_DISPLAY_PREFIX: &str = "abqadmin_";
 
@@ -16,7 +16,7 @@ const ADMIN_DISPLAY_PREFIX: &str = "abqadmin_";
 ///
 /// Tokens are exposed and parsed with an `abqadmin_` prefix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct AdminToken(Token);
+pub struct AdminToken(pub(crate) RawToken);
 
 #[derive(Debug, Error)]
 pub enum AdminTokenError {
@@ -35,10 +35,10 @@ impl From<TokenError> for AdminTokenError {
 impl AdminToken {
     /// Creates a new, randomly generated token.
     pub fn new_random() -> Self {
-        Self(Token::new_random())
+        Self(RawToken::new_random())
     }
 
-    #[allow(unused)] // for now
+    #[cfg(test)]
     pub(crate) fn raw_bytes(&self) -> &[u8] {
         &self.0 .0
     }
@@ -54,7 +54,10 @@ impl FromStr for AdminToken {
     type Err = AdminTokenError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Token::parse_human_readable(s, ADMIN_DISPLAY_PREFIX)?))
+        Ok(Self(RawToken::parse_human_readable(
+            s,
+            ADMIN_DISPLAY_PREFIX,
+        )?))
     }
 }
 

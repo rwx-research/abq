@@ -6,6 +6,8 @@ use std::{io, net::SocketAddr};
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::auth::Role;
+
 #[async_trait]
 pub trait ServerListener {
     fn local_addr(&self) -> io::Result<SocketAddr>;
@@ -38,6 +40,9 @@ pub struct UnverifiedServerStream(tokio::net::TcpStream);
 
 pub trait ServerStream: std::fmt::Debug + AsyncRead + AsyncWrite + Send + Sync + Unpin {
     fn peer_addr(&self) -> io::Result<SocketAddr>;
+
+    /// The [Role] of the connected client this stream represents.
+    fn role(&self) -> Role;
 }
 
 #[async_trait]

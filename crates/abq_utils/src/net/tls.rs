@@ -8,10 +8,13 @@ use std::sync::Arc;
 use rustls as tls;
 use tokio_rustls as tokio_tls;
 
-use crate::auth::{ClientAuthStrategy, ServerAuthStrategy};
+use crate::auth::{ClientAuthStrategy, Role, ServerAuthStrategy};
 
 #[derive(Debug)]
-pub struct ServerStream(tls::StreamOwned<tls::ServerConnection, std::net::TcpStream>);
+pub struct ServerStream(
+    tls::StreamOwned<tls::ServerConnection, std::net::TcpStream>,
+    Role,
+);
 
 impl Read for ServerStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -32,6 +35,10 @@ impl Write for ServerStream {
 impl super::ServerStream for ServerStream {
     fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         self.0.sock.set_nonblocking(nonblocking)
+    }
+
+    fn role(&self) -> Role {
+        self.1
     }
 }
 
@@ -70,13 +77,12 @@ impl super::ServerListener for ServerListener {
         let (sock, addr) = self.listener.accept()?;
 
         // Wrap the socket around the connection, moving us into speaking TLS
-        let stream = tls::StreamOwned::new(conn, sock);
-        let mut stream = ServerStream(stream);
+        let mut stream = tls::StreamOwned::new(conn, sock);
 
         // Before we give back the TLS stream, we must validate auth
-        self.auth_strategy.verify_header(&mut stream)?;
+        let role = self.auth_strategy.verify_header(&mut stream)?;
 
-        Ok((Box::new(stream), addr))
+        Ok((Box::new(ServerStream(stream, role)), addr))
     }
 
     fn into_async(self: Box<Self>) -> io::Result<Box<dyn crate::net_async::ServerListener>> {
@@ -119,13 +125,13 @@ impl Write for ClientStream {
 impl super::ClientStream for ClientStream {}
 
 #[derive(Clone)]
-pub struct ConfiguredClient {
+pub struct ConfiguredClient<Role> {
     tls_config: Arc<tls::ClientConfig>,
-    auth_strategy: ClientAuthStrategy,
+    auth_strategy: ClientAuthStrategy<Role>,
 }
 
-impl ConfiguredClient {
-    pub fn new(auth_strategy: ClientAuthStrategy) -> io::Result<Self> {
+impl<Role> ConfiguredClient<Role> {
+    pub fn new(auth_strategy: ClientAuthStrategy<Role>) -> io::Result<Self> {
         let tls_config = crate::tls::get_client_config()?;
 
         Ok(Self {
@@ -135,7 +141,10 @@ impl ConfiguredClient {
     }
 }
 
-impl super::ConfiguredClient for ConfiguredClient {
+impl<Role> super::ConfiguredClient for ConfiguredClient<Role>
+where
+    Role: Send + Sync + Clone + 'static,
+{
     fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn super::ClientStream>> {
         let server_name = crate::tls::get_server_name();
 

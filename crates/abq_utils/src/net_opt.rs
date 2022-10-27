@@ -66,13 +66,16 @@ impl ServerOptions {
 }
 
 #[derive(Clone, Copy)]
-pub struct ClientOptions {
-    auth_strategy: ClientAuthStrategy,
+pub struct ClientOptions<Role> {
+    auth_strategy: ClientAuthStrategy<Role>,
     tls: Tls,
 }
 
-impl ClientOptions {
-    pub fn new(auth_strategy: ClientAuthStrategy, tls: Tls) -> Self {
+impl<Role> ClientOptions<Role>
+where
+    Role: Send + Sync + Copy + 'static,
+{
+    pub fn new(auth_strategy: ClientAuthStrategy<Role>, tls: Tls) -> Self {
         Self { auth_strategy, tls }
     }
 

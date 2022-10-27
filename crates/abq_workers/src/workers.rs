@@ -1034,7 +1034,7 @@ mod test {
     #[test]
     #[traced_test]
     fn bad_message_doesnt_take_down_queue_negotiator_server() {
-        let listener = ServerOptions::new(ServerAuthStrategy::NoAuth, Tls::NO)
+        let listener = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
             .bind("0.0.0.0:0")
             .unwrap();
         let listener_addr = listener.local_addr().unwrap();
@@ -1047,7 +1047,7 @@ mod test {
         )
         .unwrap();
 
-        let client = ClientOptions::new(ClientAuthStrategy::NoAuth, Tls::NO)
+        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
             .build()
             .unwrap();
         let mut conn = client.connect(listener_addr).unwrap();

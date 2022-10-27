@@ -6,5 +6,6 @@
   --port "8080" \
   --work-port "8081" \
   --negotiator-port "8082" \
-  --token "$(cat /app/abq_server_token)" \
+  --user-token "$(cat /app/abq_user_token)" \
+  --admin-token "$(cat /app/abq_admin_token)" \
   --tls

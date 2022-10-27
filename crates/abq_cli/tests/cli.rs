@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use abq_utils::auth::{AdminToken, UserToken};
 use serial_test::serial;
 use std::process::{ExitStatus, Output};
 use std::{
@@ -147,7 +148,8 @@ fn port_active(port: u16) -> bool {
     TcpStream::connect(("0.0.0.0", port)).is_ok()
 }
 
-const TEST_AUTH_KEY: &str = "abqs_ckoUjQN4ufq1MiUeaNllztfyqjCtuz";
+const TEST_USER_AUTH_TOKEN: &str = "abqs_ckoUjQN4ufq1MiUeaNllztfyqjCtuz";
+const TEST_ADMIN_AUTH_TOKEN: &str = "abqadmin_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF";
 
 /// Configuration options for how clients and servers in an abq run communicate.
 /// Namely: whether they use an authentication header or not, and eventually, whether they use TLS
@@ -158,10 +160,22 @@ struct CSConfigOptions {
 }
 
 impl CSConfigOptions {
-    fn extend_args<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
+    fn extend_args_for_start<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
         let mut args = args.to_vec();
         if self.use_auth_token {
-            args.extend(["--token", TEST_AUTH_KEY]);
+            args.extend(["--user-token", TEST_USER_AUTH_TOKEN]);
+            args.extend(["--admin-token", TEST_ADMIN_AUTH_TOKEN]);
+        }
+        if self.tls {
+            args.extend(["--tls"]);
+        }
+        args
+    }
+
+    fn extend_args_for_clients<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
+        let mut args = args.to_vec();
+        if self.use_auth_token {
+            args.extend(["--token", TEST_USER_AUTH_TOKEN]);
         }
         if self.tls {
             args.extend(["--tls"]);
@@ -229,7 +243,7 @@ test_all_network_config_options! {
     yarn_jest_auto_workers_without_failure (|name, conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
         let args = &["test", "--reporter", "dot"];
-        let mut args = conf.extend_args(args);
+        let mut args = conf.extend_args_for_clients(args);
         args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -255,7 +269,7 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args(&[
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
             "start",
             "--bind",
             "0.0.0.0",
@@ -301,7 +315,7 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args(&[
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
             "start",
             "--bind",
             "0.0.0.0",
@@ -335,7 +349,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id
         ];
-        let worker_args = conf.extend_args(worker_args);
+        let worker_args = conf.extend_args_for_clients(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_worker"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
@@ -348,7 +362,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id,
         ];
-        let mut test_args = conf.extend_args(test_args);
+        let mut test_args = conf.extend_args_for_clients(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -385,7 +399,7 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args(&[
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
             "start",
             "--bind",
             "0.0.0.0",
@@ -419,7 +433,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id,
         ];
-        let mut test_args = conf.extend_args(test_args);
+        let mut test_args = conf.extend_args_for_clients(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let mut supervisor = spawn_abq(&(name.to_string() + "_test"), test_args);
 
@@ -454,7 +468,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id
         ];
-        let worker_args = conf.extend_args(worker_args);
+        let worker_args = conf.extend_args_for_clients(worker_args);
         let CmdOutput {
             stdout,
             stderr,
@@ -477,7 +491,7 @@ test_all_network_config_options! {
             "--reporter",
             "dot",
         ];
-        let mut test_args = conf.extend_args(test_args);
+        let mut test_args = conf.extend_args_for_clients(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -513,7 +527,7 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args(&[
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
                 "start",
                 "--bind",
                 "0.0.0.0",
@@ -547,7 +561,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id
         ];
-        let worker_args = conf.extend_args(worker_args);
+        let worker_args = conf.extend_args_for_clients(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
@@ -560,7 +574,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id,
         ];
-        let mut test_args = conf.extend_args(test_args);
+        let mut test_args = conf.extend_args_for_clients(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -598,7 +612,7 @@ test_all_network_config_options! {
         let negotiator_addr = format!("0.0.0.0:{negotiator_port}");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args(&[
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
             "start",
             "--bind",
             "0.0.0.0",
@@ -628,7 +642,7 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = run_abq(&(name.to_string() + "_health"), conf.extend_args(&[
+        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_clients(&[
             "health",
             "--queue",
             &queue_addr,
@@ -657,7 +671,7 @@ test_all_network_config_options! {
         let negotiator_addr = format!("0.0.0.0:{negotiator_port}");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args(&[
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
             "start",
             "--bind",
             "0.0.0.0",
@@ -677,7 +691,7 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = run_abq(&(name.to_string() + "_health"), conf.extend_args(&[
+        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_clients(&[
             "health",
             "--queue",
             &queue_addr,
@@ -722,6 +736,46 @@ fn work_no_queue_addr_or_api_key() {
 
 #[test]
 #[serial]
+fn work_user_token_without_admin_token() {
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq_forcing_capture(
+        "work_no_queue_addr_or_api_key",
+        [
+            "start",
+            &format!("--user-token={}", UserToken::new_random()),
+        ],
+    );
+
+    assert_eq!(exit_status.code().unwrap(), 2);
+    assert!(stdout.is_empty());
+    insta::assert_snapshot!(stderr);
+}
+
+#[test]
+#[serial]
+fn work_admin_token_without_user_token() {
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq_forcing_capture(
+        "work_no_queue_addr_or_api_key",
+        [
+            "start",
+            &format!("--admin-token={}", AdminToken::new_random()),
+        ],
+    );
+
+    assert_eq!(exit_status.code().unwrap(), 2);
+    assert!(stdout.is_empty());
+    insta::assert_snapshot!(stderr);
+}
+
+#[test]
+#[serial]
 fn test_with_invalid_command() {
     let name = "test_with_invalid_command";
     let conf = CSConfigOptions {
@@ -739,7 +793,7 @@ fn test_with_invalid_command() {
     // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
     let mut queue_proc = spawn_abq(
         name,
-        conf.extend_args(&[
+        conf.extend_args_for_start(&[
             "start",
             "--bind",
             "0.0.0.0",
@@ -774,7 +828,7 @@ fn test_with_invalid_command() {
         "--run-id",
         &run_id,
     ];
-    let worker_args = conf.extend_args(worker_args);
+    let worker_args = conf.extend_args_for_clients(worker_args);
     let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
 
     // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? \
@@ -788,7 +842,7 @@ fn test_with_invalid_command() {
         "--run-id",
         &run_id,
     ];
-    let mut test_args = conf.extend_args(test_args);
+    let mut test_args = conf.extend_args_for_clients(test_args);
     test_args.extend(["--", "__zzz_not_a_command__"]);
 
     let CmdOutput {

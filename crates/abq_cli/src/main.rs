@@ -17,7 +17,7 @@ use std::{
 use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
 use abq_utils::{
     api::ApiKey,
-    auth::{ClientAuthStrategy, ClientToken, ServerAuthStrategy},
+    auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     net_opt::{ClientOptions, ServerOptions, Tls},
     net_protocol::{
         entity::EntityId,
@@ -54,7 +54,7 @@ struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
 
 struct ConfigFromApi {
     queue_addr: SocketAddr,
-    token: ClientToken,
+    token: UserToken,
     tls: Tls,
 }
 
@@ -217,16 +217,29 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             port: server_port,
             work_port,
             negotiator_port,
-            token,
+            user_token,
+            admin_token,
             tls,
-        } => instance::start_abq_forever(
-            public_ip,
-            bind_ip,
-            server_port,
-            work_port,
-            negotiator_port,
-            ServerOptions::new(token.into(), tls),
-        ),
+        } => {
+            let server_auth = match (user_token, admin_token) {
+                (Some(user), Some(admin)) => {
+                    ServerAuthStrategy::from_set(user, admin)
+                }
+                (None, None) => {
+                    ServerAuthStrategy::no_auth()
+                }
+                _ => unreachable!("Mutual dependency of tokens should have been caught by clap during arg parsing!"),
+            };
+
+            instance::start_abq_forever(
+                public_ip,
+                bind_ip,
+                server_port,
+                work_port,
+                negotiator_port,
+                ServerOptions::new(server_auth, tls),
+            )
+        }
         Command::Work {
             working_dir,
             run_id,
@@ -285,13 +298,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let (resolved_token, resolved_queue_addr, resolved_tls) =
                 resolve_config(token, queue_addr, tls, api_key, &run_id)?;
 
-            let (server_auth, client_auth) = (resolved_token.into(), resolved_token.into());
+            let client_auth = resolved_token.into();
 
             let runner_params = validate_abq_test_args(args)?;
             let abq = find_or_create_abq(
                 entity,
                 resolved_queue_addr,
-                server_auth,
+                resolved_token,
                 client_auth,
                 resolved_tls,
             )?;
@@ -346,7 +359,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             Ok(reporting::ExitCode::new(exit))
         }
         Command::Token(Token::New) => {
-            let token = ClientToken::new_random();
+            let token = UserToken::new_random();
             println!("{token}");
             Ok(ExitCode::new(0))
         }
@@ -354,12 +367,12 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 }
 
 fn resolve_config(
-    token_from_cli: Option<ClientToken>,
+    token_from_cli: Option<UserToken>,
     queue_addr_from_cli: Option<SocketAddr>,
     tls_from_cli: Tls,
     api_key: Option<ApiKey>,
     run_id: &RunId,
-) -> anyhow::Result<(Option<ClientToken>, Option<SocketAddr>, Tls)> {
+) -> anyhow::Result<(Option<UserToken>, Option<SocketAddr>, Tls)> {
     let (queue_addr_from_api, token_from_api, tls_from_api) = match api_key {
         Some(key) => {
             let config = get_config_from_api(key, run_id)?;
@@ -424,8 +437,8 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
 fn find_or_create_abq(
     entity: EntityId,
     opt_queue_addr: Option<SocketAddr>,
-    server_auth: ServerAuthStrategy,
-    client_auth: ClientAuthStrategy,
+    opt_user_token: Option<UserToken>,
+    client_auth: ClientAuthStrategy<User>,
     tls: Tls,
 ) -> anyhow::Result<AbqInstance> {
     match opt_queue_addr {
@@ -433,7 +446,7 @@ fn find_or_create_abq(
             let instance = AbqInstance::from_remote(entity, queue_addr, client_auth, tls)?;
             Ok(instance)
         }
-        None => Ok(AbqInstance::new_ephemeral(server_auth, client_auth, tls)),
+        None => Ok(AbqInstance::new_ephemeral(opt_user_token, client_auth, tls)),
     }
 }
 
@@ -565,7 +578,7 @@ fn elaborate_invocation_error(
 fn start_test_result_reporter(
     entity: EntityId,
     abq_server_addr: SocketAddr,
-    client_opts: ClientOptions,
+    client_opts: ClientOptions<User>,
     test_id: RunId,
     runner: RunnerKind,
     batch_size: NonZeroU64,
