@@ -14,7 +14,7 @@ use abq_utils::net_async;
 use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
-use abq_utils::net_protocol::runners::{ManifestMessage, ManifestResult, TestCase, TestResult};
+use abq_utils::net_protocol::runners::{ManifestResult, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
@@ -340,6 +340,29 @@ impl RunQueues {
         }
 
         *state = RunState::Done { succeeded: false };
+        self.run_data.remove(&run_id);
+    }
+
+    /// Marks a run as complete because it had the trivial manifest.
+    pub fn mark_empty_manifest_complete(&mut self, run_id: RunId) {
+        let state = self
+            .queues
+            .get_mut(&run_id)
+            .expect("no queue state for run");
+        match state {
+            RunState::WaitingForManifest => {
+                // okay
+            }
+            RunState::Cancelled {} => {
+                // No-op, since the run was already cancelled.
+                return;
+            }
+            RunState::WaitingForFirstWorker | RunState::HasWork { .. } | RunState::Done { .. } => {
+                unreachable!("Invalid state - can only mark complete due to manifest while waiting for manifest");
+            }
+        }
+
+        *state = RunState::Done { succeeded: true };
         self.run_data.remove(&run_id);
     }
 
@@ -1233,17 +1256,41 @@ impl QueueServer {
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         match manifest_result {
             ManifestResult::Manifest(manifest) => {
-                Self::handle_manifest_success(queues, state_cache, entity, run_id, manifest, stream)
+                // Record the manifest for this run in its appropriate queue.
+                // TODO: actually record the manifest metadata
+                let flat_manifest = flatten_manifest(manifest.manifest);
+
+                if !flat_manifest.is_empty() {
+                    Self::handle_manifest_success(
+                        queues,
+                        state_cache,
+                        entity,
+                        run_id,
+                        flat_manifest,
+                        stream,
+                    )
                     .await
+                } else {
+                    Self::handle_manifest_empty_or_failure(
+                        queues,
+                        active_runs,
+                        state_cache,
+                        entity,
+                        run_id,
+                        Ok(()),
+                        stream,
+                    )
+                    .await
+                }
             }
             ManifestResult::TestRunnerError { error } => {
-                Self::handle_manifest_failure(
+                Self::handle_manifest_empty_or_failure(
                     queues,
                     active_runs,
                     state_cache,
                     entity,
                     run_id,
-                    error,
+                    Err(error),
                     stream,
                 )
                 .await
@@ -1251,19 +1298,15 @@ impl QueueServer {
         }
     }
 
-    #[instrument(level = "trace", skip(queues, state_cache, manifest))]
+    #[instrument(level = "trace", skip(queues, state_cache, flat_manifest))]
     async fn handle_manifest_success(
         queues: SharedRunQueues,
         state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
-        manifest: ManifestMessage,
+        flat_manifest: Vec<TestCase>,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // Record the manifest for this run in its appropriate queue.
-        // TODO: actually record the manifest metadata
-        let flat_manifest = flatten_manifest(manifest.manifest);
-
         tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
 
         let run_state = ActiveRunState {
@@ -1283,23 +1326,31 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(
-        level = "trace",
-        skip(queues, state_cache, opaque_manifest_generation_error)
-    )]
-    async fn handle_manifest_failure(
+    #[instrument(level = "trace", skip(queues, state_cache))]
+    async fn handle_manifest_empty_or_failure(
         queues: SharedRunQueues,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
-        opaque_manifest_generation_error: String,
+        manifest_result: Result<() /* empty */, String /* error */>,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        // If a worker failed to generate a manifest, we're going to immediately end the test run,
-        // as this indicates a failure in the underlying test runners.
+        // If a worker failed to generate a manifest, or the manifest is empty,
+        // we're going to immediately end the test run.
+        //
+        // In the former case this indicates a failure in the underlying test runners,
+        // and in the latter case we have nothing to do.
+        //
+        // Either way the steps we have to take are the same, just the status of
+        // the test run differs.
 
-        tracing::info!(?run_id, ?entity, "failure notification for manifest");
+        let is_empty_manifest = manifest_result.is_ok();
+        if is_empty_manifest {
+            tracing::info!(?run_id, ?entity, "exiting early on empty manifest");
+        } else {
+            tracing::info!(?run_id, ?entity, "failure notification for manifest");
+        }
 
         {
             // Immediately ACK to the worker responsible for the manifest, so they can relinquish
@@ -1321,18 +1372,20 @@ impl QueueServer {
             responder.into_inner()
         };
 
-        // Tell the client that the test has failed.
+        // Tell the client that the tests are done or that the test runners have failed, as
+        // appropriate.
         match responder {
             ClientResponder::DirectStream { mut stream, buffer } => {
                 debug_assert!(buffer.is_empty(), "messages before manifest received");
 
-                net_protocol::async_write(
-                    &mut stream,
-                    &InvokerTestResult::TestCommandError {
+                let test_result_msg = match manifest_result {
+                    Ok(()) => InvokerTestResult::EndOfResults,
+                    Err(opaque_manifest_generation_error) => InvokerTestResult::TestCommandError {
                         error: opaque_manifest_generation_error,
                     },
-                )
-                .await?;
+                };
+
+                net_protocol::async_write(&mut stream, &test_result_msg).await?;
 
                 drop(stream);
             }
@@ -1351,7 +1404,11 @@ impl QueueServer {
             }
         }
 
-        queues.lock().unwrap().mark_failed_to_start(run_id);
+        if is_empty_manifest {
+            queues.lock().unwrap().mark_empty_manifest_complete(run_id);
+        } else {
+            queues.lock().unwrap().mark_failed_to_start(run_id);
+        }
 
         Ok(())
     }
@@ -3625,5 +3682,80 @@ mod test {
 
         queue_shutdown.shutdown_immediately().unwrap();
         queue_thread.join().unwrap();
+    }
+
+    #[test]
+    fn empty_manifest_exits_gracefully() {
+        let mut queue = Abq::start(Default::default());
+
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest());
+
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
+        };
+
+        let queue_server_addr = queue.server_addr();
+
+        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+
+        let run_id = RunId::unique();
+        let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
+
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                runtime.block_on(async {
+                    let mut num_results = 0;
+
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
+                    )
+                    .await
+                    .unwrap();
+
+                    client
+                        .stream_results(|_, _| {
+                            num_results += 1;
+                        })
+                        .await
+                        .unwrap();
+
+                    num_results
+                })
+            }
+        });
+
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id,
+        )
+        .unwrap();
+
+        let num_results = results_handle.join().unwrap();
+
+        assert_eq!(num_results, 0);
+
+        let exit = workers.shutdown();
+        assert!(matches!(exit, WorkersExit::Success));
+
+        queue.shutdown().unwrap();
     }
 }
