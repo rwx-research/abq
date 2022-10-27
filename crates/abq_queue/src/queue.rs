@@ -23,6 +23,7 @@ use abq_utils::net_protocol::{
     workers::{NextWork, RunId, WorkId},
 };
 use abq_utils::net_protocol::{client, publicize_addr};
+use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunCompeleted, QueueNegotiator, QueueNegotiatorHandle,
 };
@@ -386,12 +387,12 @@ pub fn init() {
 }
 
 pub struct Abq {
+    shutdown_manager: ShutdownManager,
+
     server_addr: SocketAddr,
     server_handle: Option<JoinHandle<Result<(), QueueServerError>>>,
-    server_shutdown_tx: tokio::sync::mpsc::Sender<()>,
 
     work_scheduler_handle: Option<JoinHandle<Result<(), WorkSchedulerError>>>,
-    work_scheduler_shutdown_tx: tokio::sync::mpsc::Sender<()>,
     negotiator: QueueNegotiator,
 
     active: bool,
@@ -404,6 +405,9 @@ pub enum AbqError {
 
     #[error("{0}")]
     WorkScheduler(#[from] WorkSchedulerError),
+
+    #[error("{0}")]
+    Io(#[from] io::Error),
 }
 
 impl Abq {
@@ -428,14 +432,8 @@ impl Abq {
         self.active = false;
 
         // Shut down all of our servers.
-        self.server_shutdown_tx
-            .blocking_send(())
-            .map_err(|_| QueueServerError::Other("queue server channels have died".into()))?;
-        self.work_scheduler_shutdown_tx
-            .blocking_send(())
-            .map_err(|_| WorkSchedulerError::Other("work scheduler channels have died".into()))?;
-
-        self.negotiator.shutdown();
+        self.shutdown_manager.shutdown_immediately()?;
+        self.negotiator.join();
 
         self.server_handle
             .take()
@@ -512,6 +510,8 @@ fn start_queue(config: QueueConfig) -> Abq {
         server_options,
     } = config;
 
+    let mut shutdown_manager = ShutdownManager::default();
+
     let queues: SharedRunQueues = Default::default();
 
     let server_listener = server_options.bind((bind_ip, server_port)).unwrap();
@@ -521,8 +521,7 @@ fn start_queue(config: QueueConfig) -> Abq {
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
-    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
-
+    let server_shutdown_rx = shutdown_manager.add_receiver();
     let server_handle = thread::spawn({
         let queue_server = QueueServer::new(Arc::clone(&queues), public_negotiator_addr);
         move || queue_server.start_on(server_listener, server_shutdown_rx)
@@ -531,8 +530,7 @@ fn start_queue(config: QueueConfig) -> Abq {
     let new_work_server = server_options.bind((bind_ip, work_port)).unwrap();
     let new_work_server_addr = new_work_server.local_addr().unwrap();
 
-    let (work_scheduler_shutdown_tx, work_scheduler_shutdown_rx) = tokio::sync::mpsc::channel(1);
-
+    let work_scheduler_shutdown_rx = shutdown_manager.add_receiver();
     let work_scheduler_handle = thread::spawn({
         let scheduler = WorkScheduler {
             queues: Arc::clone(&queues),
@@ -561,9 +559,12 @@ fn start_queue(config: QueueConfig) -> Abq {
             }
         }
     };
+
+    let negotiator_shutdown_rx = shutdown_manager.add_receiver();
     let negotiator = QueueNegotiator::new(
         public_ip,
         negotiator_listener,
+        negotiator_shutdown_rx,
         new_work_server_addr,
         server_addr,
         choose_run_for_worker,
@@ -571,12 +572,12 @@ fn start_queue(config: QueueConfig) -> Abq {
     .unwrap();
 
     Abq {
+        shutdown_manager,
+
         server_addr,
         server_handle: Some(server_handle),
-        server_shutdown_tx,
 
         work_scheduler_handle: Some(work_scheduler_handle),
-        work_scheduler_shutdown_tx,
         negotiator,
 
         active: true,
@@ -834,6 +835,10 @@ struct QueueServerCtx {
     state_cache: RunStateCache,
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
+
+    /// Holds state on whether the queue is retired, and records retirement if the queue is asked
+    /// to retire by a priveleged process.
+    retirement: RetirementCell,
 }
 
 impl QueueServer {
@@ -847,7 +852,7 @@ impl QueueServer {
     fn start_on(
         self,
         server_listener: Box<dyn net::ServerListener>,
-        mut server_shutdown: tokio::sync::mpsc::Receiver<()>,
+        mut shutdown: ShutdownReceiver,
     ) -> Result<(), QueueServerError> {
         // Create a new tokio runtime solely for handling requests that come into the queue server.
         //
@@ -873,6 +878,8 @@ impl QueueServer {
                 state_cache: Default::default(),
                 public_negotiator_addr,
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
+
+                retirement: shutdown.get_retirement_cell(),
             };
 
             loop {
@@ -886,7 +893,7 @@ impl QueueServer {
                             }
                         }
                     }
-                    _ = server_shutdown.recv() => {
+                    _ = shutdown.recv_shutdown_immediately() => {
                         break;
                     }
                 };
@@ -929,8 +936,15 @@ impl QueueServer {
                 Self::handle_negotiator_addr(entity, stream, ctx.public_negotiator_addr).await
             }
             Message::InvokeWork(invoke_work) => {
-                Self::handle_invoked_work(ctx.active_runs, ctx.queues, entity, stream, invoke_work)
-                    .await
+                Self::handle_invoked_work(
+                    ctx.active_runs,
+                    ctx.queues,
+                    ctx.retirement,
+                    entity,
+                    stream,
+                    invoke_work,
+                )
+                .await
             }
             Message::CancelRun(run_id) => {
                 // The test supervisor will not wait for an ACK, so drop the stream immediately to
@@ -990,6 +1004,8 @@ impl QueueServer {
             Message::RequestTotalRunResult(run_id) => {
                 Self::handle_total_run_result_request(ctx.queues, run_id, stream).await
             }
+
+            Message::Retire => Self::handle_retirement(ctx.retirement, entity, stream).await,
         };
 
         result
@@ -1034,10 +1050,13 @@ impl QueueServer {
     async fn handle_invoked_work(
         active_runs: ActiveRunResponders,
         queues: SharedRunQueues,
+        retirement: RetirementCell,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
         invoke_work: InvokeWork,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Self::reject_if_retired(&entity, retirement)?;
+
         let InvokeWork {
             run_id,
             runner,
@@ -1497,6 +1516,39 @@ impl QueueServer {
 
         Ok(())
     }
+
+    #[instrument(level = "trace", skip(stream))]
+    async fn handle_retirement(
+        retirement: RetirementCell,
+        entity: EntityId,
+        mut stream: Box<dyn net_async::ServerStream>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if !stream.role().is_admin() {
+            tracing::warn!(?entity, "rejecting underprivileged request for retirement");
+            return Err("rejecting underprivileged request for retirement".into());
+        }
+
+        retirement.notify_asked_to_retire();
+
+        net_protocol::async_write(&mut stream, &net_protocol::queue::AckRetirement {}).await?;
+
+        Ok(())
+    }
+
+    fn reject_if_retired(entity: &EntityId, retirement: RetirementCell) -> io::Result<()> {
+        if !retirement.is_retired() {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            ?entity,
+            "rejecting request not permissible during retirement"
+        );
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "queue is retiring",
+        ))
+    }
 }
 
 /// Sends work as workers request it.
@@ -1530,7 +1582,7 @@ impl WorkScheduler {
     fn start_on(
         self,
         listener: Box<dyn net::ServerListener>,
-        mut shutdown: tokio::sync::mpsc::Receiver<()>,
+        mut shutdown: ShutdownReceiver,
     ) -> Result<(), WorkSchedulerError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1556,7 +1608,7 @@ impl WorkScheduler {
                             }
                         }
                     }
-                    _ = shutdown.recv() => {
+                    _ = shutdown.recv_shutdown_immediately() => {
                         break;
                     }
                 };
@@ -1650,9 +1702,11 @@ mod test {
         net_protocol::{
             self,
             entity::EntityId,
+            queue::InvokeWork,
             runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
             workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
         },
+        shutdown::ShutdownManager,
     };
     use abq_workers::{
         negotiate::{NegotiatedWorkers, WorkersConfig, WorkersNegotiator},
@@ -1719,12 +1773,57 @@ mod test {
         }
     }
 
-    pub fn build_random_strategies() -> (
+    fn faux_invoke_work() -> InvokeWork {
+        InvokeWork {
+            run_id: RunId::unique(),
+            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+            batch_size_hint: one_nonzero(),
+        }
+    }
+
+    fn build_random_strategies() -> (
         ServerAuthStrategy,
         ClientAuthStrategy<User>,
         ClientAuthStrategy<Admin>,
     ) {
         build_strategies(UserToken::new_random(), AdminToken::new_random())
+    }
+
+    fn create_queue_server(
+        server_auth: ServerAuthStrategy,
+    ) -> (JoinHandle<()>, ShutdownManager, SocketAddr) {
+        let server_opts = ServerOptions::new(server_auth, Tls::NO);
+        let server = server_opts.bind("0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
+
+        let queue_server = QueueServer {
+            queues: Default::default(),
+            public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
+        };
+        let server_thread = thread::spawn(|| {
+            queue_server.start_on(server, shutdown_rx).unwrap();
+        });
+
+        (server_thread, shutdown_tx, server_addr)
+    }
+
+    fn create_work_scheduler(
+        server_auth: ServerAuthStrategy,
+        queues: SharedRunQueues,
+    ) -> (JoinHandle<()>, ShutdownManager, SocketAddr) {
+        let server = WorkScheduler { queues };
+        let server_opts = ServerOptions::new(server_auth, Tls::NO);
+
+        let listener = server_opts.bind("0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        (server_thread, shutdown_tx, server_addr)
     }
 
     #[test]
@@ -2041,7 +2140,8 @@ mod test {
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
@@ -2050,7 +2150,7 @@ mod test {
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
-        shutdown_tx.blocking_send(()).unwrap();
+        shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
         logs_with_scope_contain("", "error handling connection");
@@ -2287,7 +2387,7 @@ mod test {
         let server = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let (mut server_shutdown_tx, server_shutdown_rx) = ShutdownManager::new_pair();
 
         let queue_server = QueueServer {
             queues: Default::default(),
@@ -2312,7 +2412,7 @@ mod test {
 
         assert_eq!(health_msg, net_protocol::health::HEALTHY);
 
-        server_shutdown_tx.blocking_send(()).unwrap();
+        server_shutdown_tx.shutdown_immediately().unwrap();
         queue_handle.join().unwrap();
     }
 
@@ -2324,7 +2424,7 @@ mod test {
         let server = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let (mut server_shutdown_tx, server_shutdown_rx) = ShutdownManager::new_pair();
 
         let work_scheduler = WorkScheduler {
             queues: Default::default(),
@@ -2344,7 +2444,7 @@ mod test {
 
         assert_eq!(health_msg, net_protocol::health::HEALTHY);
 
-        server_shutdown_tx.blocking_send(()).unwrap();
+        server_shutdown_tx.shutdown_immediately().unwrap();
         work_server_handle.join().unwrap();
     }
 
@@ -2360,7 +2460,7 @@ mod test {
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
@@ -2369,7 +2469,7 @@ mod test {
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
-        shutdown_tx.blocking_send(()).unwrap();
+        shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
         logs_with_scope_contain("", "error handling connection");
@@ -2388,7 +2488,7 @@ mod test {
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
@@ -2407,7 +2507,7 @@ mod test {
         let recv_negotiator_addr = net_protocol::read(&mut conn).unwrap();
         assert_eq!(negotiator_addr, recv_negotiator_addr);
 
-        shutdown_tx.blocking_send(()).unwrap();
+        shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
     }
 
@@ -2424,7 +2524,7 @@ mod test {
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
@@ -2440,7 +2540,7 @@ mod test {
         )
         .unwrap();
 
-        shutdown_tx.blocking_send(()).unwrap();
+        shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
         logs_with_scope_contain("", "error handling connection");
@@ -2459,7 +2559,7 @@ mod test {
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
@@ -2476,7 +2576,7 @@ mod test {
 
         assert_eq!(health_msg, net_protocol::health::HEALTHY);
 
-        shutdown_tx.blocking_send(()).unwrap();
+        shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
     }
 
@@ -2493,7 +2593,7 @@ mod test {
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server.start_on(listener, shutdown_rx).unwrap();
         });
@@ -2506,7 +2606,7 @@ mod test {
         )
         .unwrap();
 
-        shutdown_tx.blocking_send(()).unwrap();
+        shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
         logs_with_scope_contain("", "error handling connection");
@@ -2825,23 +2925,6 @@ mod test {
         queue.shutdown().unwrap();
     }
 
-    fn create_work_scheduler(
-        server_auth: ServerAuthStrategy,
-        queues: SharedRunQueues,
-    ) -> (JoinHandle<()>, tokio::sync::mpsc::Sender<()>, SocketAddr) {
-        let server = WorkScheduler { queues };
-        let server_opts = ServerOptions::new(server_auth, Tls::NO);
-
-        let listener = server_opts.bind("0.0.0.0:0").unwrap();
-        let server_addr = listener.local_addr().unwrap();
-        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
-        let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
-        });
-
-        (server_thread, shutdown_tx, server_addr)
-    }
-
     #[test]
     #[traced_test]
     fn get_work_from_work_server_waiting_for_first_worker() {
@@ -2864,7 +2947,7 @@ mod test {
             )
             .unwrap();
 
-        let (server_thread, server_shutdown, server_addr) =
+        let (server_thread, mut server_shutdown, server_addr) =
             create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
 
         let client_opts = ClientOptions::new(client_auth, Tls::NO);
@@ -2881,7 +2964,7 @@ mod test {
 
         assert!(matches!(response, NextTestResponse::WaitingForManifest));
 
-        server_shutdown.blocking_send(()).unwrap();
+        server_shutdown.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
     }
 
@@ -2910,7 +2993,7 @@ mod test {
         // the manifest.
         let _ = queues.get_run_for_worker(&run_id);
 
-        let (server_thread, server_shutdown, server_addr) =
+        let (server_thread, mut server_shutdown, server_addr) =
             create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
 
         let client_opts = ClientOptions::new(client_auth, Tls::NO);
@@ -2927,7 +3010,7 @@ mod test {
 
         assert!(matches!(response, NextTestResponse::WaitingForManifest));
 
-        server_shutdown.blocking_send(()).unwrap();
+        server_shutdown.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
     }
 
@@ -3464,5 +3547,83 @@ mod test {
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
         assert!(!state_cache.lock().unwrap().contains_key(&run_id));
+    }
+
+    #[test]
+    fn accept_retirement_request() {
+        use net_protocol::queue;
+
+        let (server_auth, client_auth, admin_auth) = build_random_strategies();
+
+        let (queue_thread, mut queue_shutdown, server_addr) = create_queue_server(server_auth);
+
+        {
+            let admin = ClientOptions::new(admin_auth, Tls::NO).build().unwrap();
+            let mut conn = admin.connect(server_addr).unwrap();
+
+            net_protocol::write(
+                &mut conn,
+                queue::Request {
+                    entity: EntityId::new(),
+                    message: net_protocol::queue::Message::Retire,
+                },
+            )
+            .unwrap();
+            let ack = net_protocol::read(&mut conn).unwrap();
+
+            assert!(matches!(ack, queue::AckRetirement {}));
+            assert!(queue_shutdown.is_retired());
+        }
+
+        // Retirement should now reject new test run connections.
+        {
+            let client = ClientOptions::new(client_auth, Tls::NO).build().unwrap();
+            let mut conn = client.connect(server_addr).unwrap();
+
+            net_protocol::write(
+                &mut conn,
+                queue::Request {
+                    entity: EntityId::new(),
+                    message: queue::Message::InvokeWork(faux_invoke_work()),
+                },
+            )
+            .unwrap();
+
+            let result: Result<queue::InvokeWorkResponse, _> = net_protocol::read(&mut conn);
+
+            assert!(result.is_err());
+        }
+
+        queue_shutdown.shutdown_immediately().unwrap();
+        queue_thread.join().unwrap();
+    }
+
+    #[test]
+    fn reject_retirement_request_from_non_admin() {
+        use net_protocol::queue;
+
+        let (server_auth, client_auth, _admin_auth) = build_random_strategies();
+
+        let (queue_thread, mut queue_shutdown, server_addr) = create_queue_server(server_auth);
+
+        let non_admin = ClientOptions::new(client_auth, Tls::NO).build().unwrap();
+        let mut conn = non_admin.connect(server_addr).unwrap();
+
+        net_protocol::write(
+            &mut conn,
+            queue::Request {
+                entity: EntityId::new(),
+                message: net_protocol::queue::Message::Retire,
+            },
+        )
+        .unwrap();
+
+        let result: Result<queue::AckRetirement, _> = net_protocol::read(&mut conn);
+
+        assert!(result.is_err());
+        assert!(!queue_shutdown.is_retired());
+
+        queue_shutdown.shutdown_immediately().unwrap();
+        queue_thread.join().unwrap();
     }
 }

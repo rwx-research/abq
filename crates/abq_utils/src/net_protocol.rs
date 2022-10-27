@@ -363,6 +363,12 @@ pub mod queue {
         pub message: Message,
     }
 
+    /// **ADMIN RESPONSE**
+    /// The queue acknowledges retirement.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub struct AckRetirement {}
+
     /// A message sent to the queue.
     #[derive(Serialize, Deserialize)]
     pub enum Message {
@@ -389,6 +395,10 @@ pub mod queue {
         /// A worker issues this request before exiting to determine whether they should exit
         /// cleanly, or fail.
         RequestTotalRunResult(RunId),
+
+        /// **ADMIN REQUEST**
+        /// Asks the queue to retire, rejecting any new test run requests.
+        Retire,
     }
 }
 
