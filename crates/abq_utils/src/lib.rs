@@ -7,6 +7,7 @@ pub mod net;
 pub mod net_async;
 pub mod net_opt;
 pub mod net_protocol;
+pub mod shutdown;
 mod tls;
 
 /// Flattens a manifest into only [TestId]s, preserving the manifest order.

@@ -597,6 +597,7 @@ mod test {
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, TestLikeRunner};
+    use abq_utils::shutdown::ShutdownManager;
     use abq_utils::{flatten_manifest, net_protocol};
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
@@ -1038,9 +1039,13 @@ mod test {
             .bind("0.0.0.0:0")
             .unwrap();
         let listener_addr = listener.local_addr().unwrap();
+
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
+
         let mut negotiator = QueueNegotiator::new(
             listener_addr.ip(),
             listener,
+            shutdown_rx,
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
             |_| panic!("should not ask for assigned run in this test"),
@@ -1053,7 +1058,8 @@ mod test {
         let mut conn = client.connect(listener_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
 
-        negotiator.shutdown();
+        shutdown_tx.shutdown_immediately().unwrap();
+        negotiator.join();
 
         logs_with_scope_contain("", "error handling connection");
     }

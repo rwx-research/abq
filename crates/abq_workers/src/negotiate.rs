@@ -27,6 +27,7 @@ use abq_utils::{
         publicize_addr,
         workers::{NextWorkBundle, RunId, RunnerKind},
     },
+    shutdown::ShutdownReceiver,
 };
 
 // TODO: send negotiation protocol versions
@@ -364,7 +365,6 @@ fn wait_for_next_work_bundle(
 /// The queue side of the negotiation.
 pub struct QueueNegotiator {
     addr: SocketAddr,
-    shutdown_tx: tokio::sync::mpsc::Sender<()>,
     listener_handle: Option<thread::JoinHandle<Result<(), QueueNegotiatorServerError>>>,
 }
 
@@ -473,6 +473,7 @@ impl QueueNegotiator {
     pub fn new<GetAssignedRun>(
         public_ip: IpAddr,
         listener: Box<dyn net::ServerListener>,
+        mut shutdown_rx: ShutdownReceiver,
         queue_work_scheduler_addr: SocketAddr,
         queue_results_addr: SocketAddr,
         get_assigned_run: GetAssignedRun,
@@ -487,8 +488,6 @@ impl QueueNegotiator {
         let advertised_queue_results_addr = publicize_addr(queue_results_addr, public_ip);
 
         tracing::debug!("Starting negotiator on {}", addr);
-
-        let (server_shutdown_tx, mut server_shutdown_rx) = tokio::sync::mpsc::channel(1);
 
         let listener_handle = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -518,7 +517,7 @@ impl QueueNegotiator {
                                 }
                             }
                         }
-                        _ = server_shutdown_rx.recv() => {
+                        _ = shutdown_rx.recv_shutdown_immediately() => {
                             break;
                         }
                     };
@@ -542,7 +541,6 @@ impl QueueNegotiator {
 
         Ok(Self {
             addr,
-            shutdown_tx: server_shutdown_tx,
             listener_handle: Some(listener_handle),
         })
     }
@@ -614,8 +612,7 @@ impl QueueNegotiator {
         QueueNegotiatorHandle(self.addr)
     }
 
-    pub fn shutdown(&mut self) {
-        self.shutdown_tx.blocking_send(()).unwrap();
+    pub fn join(&mut self) {
         self.listener_handle
             .take()
             .unwrap()
@@ -629,7 +626,7 @@ impl Drop for QueueNegotiator {
     fn drop(&mut self) {
         if self.listener_handle.is_some() {
             // `shutdown` was not called manually before this drop
-            self.shutdown();
+            self.join();
         }
     }
 }
@@ -658,6 +655,7 @@ mod test {
     use abq_utils::net_protocol::workers::{
         NextWork, NextWorkBundle, RunId, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
+    use abq_utils::shutdown::ShutdownManager;
     use abq_utils::{flatten_manifest, net, net_protocol};
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
@@ -861,11 +859,13 @@ mod test {
             })
         };
 
+        let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
             ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
                 .bind("0.0.0.0:0")
                 .unwrap(),
+            shutdown_rx,
             next_work_addr,
             results_addr,
             get_assigned_run,
@@ -899,7 +899,8 @@ mod test {
         let status = workers.shutdown();
         assert!(matches!(status, WorkersExit::Success));
 
-        queue_negotiator.shutdown();
+        shutdown_tx.shutdown_immediately().unwrap();
+        queue_negotiator.join();
 
         close_queue_servers(
             shutdown_next_work_server,
@@ -909,10 +910,13 @@ mod test {
         );
     }
 
-    fn test_negotiator(server: Box<dyn net::ServerListener>) -> QueueNegotiator {
-        QueueNegotiator::new(
+    fn test_negotiator(server: Box<dyn net::ServerListener>) -> (QueueNegotiator, ShutdownManager) {
+        let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
+
+        let negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
             server,
+            shutdown_rx,
             // Below parameters are faux because they are unnecessary for healthchecks.
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
@@ -929,7 +933,9 @@ mod test {
                 })
             },
         )
-        .unwrap()
+        .unwrap();
+
+        (negotiator, shutdown_tx)
     }
 
     #[test]
@@ -939,7 +945,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let mut queue_negotiator = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
             .build()
@@ -950,7 +956,8 @@ mod test {
 
         assert_eq!(health_msg, net_protocol::health::HEALTHY);
 
-        queue_negotiator.shutdown();
+        shutdown_tx.shutdown_immediately().unwrap();
+        queue_negotiator.join();
     }
 
     #[test]
@@ -963,7 +970,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let mut queue_negotiator = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
 
         let client = ClientOptions::new(client_auth, Tls::NO).build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
@@ -972,7 +979,8 @@ mod test {
 
         assert_eq!(health_msg, net_protocol::health::HEALTHY);
 
-        queue_negotiator.shutdown();
+        shutdown_tx.shutdown_immediately().unwrap();
+        queue_negotiator.join();
 
         logs_with_scope_contain("", "error handling connection");
     }
@@ -987,7 +995,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let mut queue_negotiator = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
             .build()
@@ -995,7 +1003,8 @@ mod test {
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
 
-        queue_negotiator.shutdown();
+        shutdown_tx.shutdown_immediately().unwrap();
+        queue_negotiator.join();
 
         logs_with_scope_contain("", "error handling connection");
     }
