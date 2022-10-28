@@ -35,6 +35,8 @@ WORKDIR /app
 
 # Get compiled binaries from the builder
 COPY --from=builder /app/target/release/abq /app/abq
+COPY crates/abq_utils/data/cert/server.crt /app/server.crt
+COPY crates/abq_utils/data/cert/server.key /app/server.key
 COPY bin/abq_user_token /app/abq_user_token
 COPY bin/abq_admin_token /app/abq_admin_token
 COPY bin/abq_api_key /app/abq_api_key

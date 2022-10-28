@@ -234,9 +234,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 _ => unreachable!("Mutual dependency of tokens should have been caught by clap during arg parsing!"),
             };
 
+            let tls_cert = read_opt_path_bytes(tls_cert)?;
+            let tls_key = read_opt_path_bytes(tls_key)?;
             let server_tls = match (tls_cert, tls_key) {
-                (Some(_cert_path), Some(_key_path)) => {
-                    ServerTlsStrategy::yes()
+                (Some(cert), Some(key)) => {
+                    ServerTlsStrategy::from_cert(&cert, &key)?
                 }
                 (None, None) => {
                     ServerTlsStrategy::no_tls()
@@ -290,13 +292,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             });
 
             let client_tls = match tls_cert {
-                Some(_cert) => ClientTlsStrategy::yes(),
+                Some(cert) => ClientTlsStrategy::from_cert(&cert)?,
                 None => ClientTlsStrategy::no_tls(),
             };
 
             let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), client_tls);
             let queue_negotiator =
-                QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts)?;
+                QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts.clone())?;
             workers::start_workers_forever(num, working_dir, queue_negotiator, client_opts, run_id)
         }
         Command::Test {
@@ -381,7 +383,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_cert = read_opt_path_bytes(tls_cert)?;
 
             let client_tls = match tls_cert {
-                Some(_cert) => ClientTlsStrategy::yes(),
+                Some(cert) => ClientTlsStrategy::from_cert(&cert)?,
                 None => ClientTlsStrategy::no_tls(),
             };
 
@@ -390,7 +392,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             let mut all_healthy = true;
             for service in to_check {
-                if !service.is_healthy(client_options) {
+                if !service.is_healthy(client_options.clone()) {
                     all_healthy = false;
                     println!("{service}: unhealthy");
                 }
@@ -506,7 +508,7 @@ fn find_or_create_abq(
     client_tls_cert: Option<Vec<u8>>,
 ) -> anyhow::Result<AbqInstance> {
     let client_tls = match &client_tls_cert {
-        Some(_cert) => ClientTlsStrategy::yes(),
+        Some(cert) => ClientTlsStrategy::from_cert(cert)?,
         None => ClientTlsStrategy::no_tls(),
     };
 
@@ -517,7 +519,7 @@ fn find_or_create_abq(
         }
         Err(opt_tls_key) => {
             let server_tls = match (client_tls_cert, opt_tls_key) {
-                (Some(_cert), Some(_key)) => ServerTlsStrategy::yes(),
+                (Some(cert), Some(key)) => ServerTlsStrategy::from_cert(&cert, &key)?,
                 (None, None) => ServerTlsStrategy::no_tls(),
                 _ => unreachable!(
                     "any other configuration would have been caught during arg parsing"
@@ -566,7 +568,7 @@ fn run_tests(
     let work_results_thread = start_test_result_reporter(
         entity,
         abq.server_addr(),
-        abq.client_options(),
+        abq.client_options().clone(),
         run_id.clone(),
         runner,
         batch_size,
@@ -580,7 +582,7 @@ fn run_tests(
             num_workers,
             working_dir,
             abq.negotiator_handle(),
-            abq.client_options(),
+            abq.client_options().clone(),
             run_id,
         )?;
         Some(workers)

@@ -2,11 +2,13 @@
 //! Must be created in a Tokio runtime.
 
 use async_trait::async_trait;
+use rustls as tls;
 use tokio_rustls as tokio_tls;
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::ToSocketAddrs;
 
@@ -73,10 +75,10 @@ pub struct ServerListener {
 impl ServerListener {
     pub async fn bind(
         auth_strategy: ServerAuthStrategy,
+        tls_config: Arc<tls::ServerConfig>,
         addr: impl ToSocketAddrs,
     ) -> io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        let tls_config = crate::tls::get_server_config()?;
         let acceptor = tokio_tls::TlsAcceptor::from(tls_config);
 
         Ok(Self {
@@ -179,8 +181,10 @@ pub struct ConfiguredClient<Role> {
 }
 
 impl<Role> ConfiguredClient<Role> {
-    pub fn new(auth_strategy: ClientAuthStrategy<Role>) -> io::Result<Self> {
-        let tls_config = crate::tls::get_client_config()?;
+    pub fn new(
+        auth_strategy: ClientAuthStrategy<Role>,
+        tls_config: Arc<tls::ClientConfig>,
+    ) -> io::Result<Self> {
         let connector = tokio_tls::TlsConnector::from(tls_config);
 
         Ok(Self {

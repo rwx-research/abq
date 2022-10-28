@@ -8,4 +8,5 @@
   --negotiator-port "8082" \
   --user-token "$(cat /app/abq_user_token)" \
   --admin-token "$(cat /app/abq_admin_token)" \
-  --tls
+  --tls-cert "$(cat /app/server.crt)" \
+  --tls-key "$(cat /app/server.key)"

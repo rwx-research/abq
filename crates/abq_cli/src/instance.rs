@@ -180,7 +180,7 @@ impl AbqInstance {
         // TODO: if we get an error here, there is a reasonable chance it's because the provided
         // client auth is invalid; we should provide a nice error message in such cases.
         let queue_negotiator =
-            QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_options)?;
+            QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_options.clone())?;
 
         let abq = AbqLocator::Remote {
             server_addr: queue_addr,
@@ -193,7 +193,7 @@ impl AbqInstance {
         })
     }
 
-    pub fn client_options(&self) -> ClientOptions {
-        self.client_options
+    pub fn client_options(&self) -> &ClientOptions {
+        &self.client_options
     }
 }
