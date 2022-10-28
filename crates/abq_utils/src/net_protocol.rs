@@ -486,10 +486,6 @@ fn validate_max_message_size(message_size: u32) -> Result<(), std::io::Error> {
 /// Reads a message from a stream communicating with abq.
 ///
 /// Note that [Read::read_exact] is used, and so the stream cannot be non-blocking.
-///
-/// NOTE: this is susceptible to DoS by sending a message size that is larger than what can be
-/// allocated. It's possible we'll be able to remove this as a plausible attack vector after adding
-/// TLS + auth.
 pub fn read<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<T, std::io::Error> {
     let mut msg_size_buf = [0; 4];
     reader.read_exact(&mut msg_size_buf)?;
@@ -537,10 +533,6 @@ where
 }
 
 /// Like [write], but async.
-///
-/// NOTE: this is susceptible to DoS by sending a message size that is larger than what can be
-/// allocated. It's possible we'll be able to remove this as a plausible attack vector after adding
-/// TLS + auth.
 pub async fn async_write<R, T: serde::Serialize>(
     writer: &mut R,
     msg: &T,
