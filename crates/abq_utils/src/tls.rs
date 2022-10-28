@@ -61,3 +61,43 @@ pub(crate) fn get_client_config() -> io::Result<Arc<tls::ClientConfig>> {
         .with_no_client_auth();
     Ok(Arc::new(tls_config))
 }
+
+#[derive(Clone, Copy)]
+pub(crate) enum ServerTlsStrategyInner {
+    NoTls,
+    Yes,
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct ServerTlsStrategy(pub(crate) ServerTlsStrategyInner);
+
+impl ServerTlsStrategy {
+    pub const fn no_tls() -> Self {
+        Self(ServerTlsStrategyInner::NoTls)
+    }
+
+    pub const fn yes() -> Self {
+        Self(ServerTlsStrategyInner::Yes)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ClientTlsStrategyInner {
+    NoTls,
+    Yes,
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct ClientTlsStrategy(pub(crate) ClientTlsStrategyInner);
+
+impl ClientTlsStrategy {
+    pub const fn no_tls() -> Self {
+        Self(ClientTlsStrategyInner::NoTls)
+    }
+
+    pub const fn yes() -> Self {
+        Self(ClientTlsStrategyInner::Yes)
+    }
+}

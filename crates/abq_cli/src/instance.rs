@@ -1,7 +1,8 @@
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
-use abq_utils::net_opt::{ServerOptions, Tls};
+use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::publicize_addr;
+use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
 use abq_workers::negotiate::{QueueNegotiatorHandle, QueueNegotiatorHandleError};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
@@ -139,7 +140,8 @@ impl AbqInstance {
     pub fn new_ephemeral(
         opt_user_token: Option<UserToken>,
         client_auth: ClientAuthStrategy,
-        tls: Tls,
+        server_tls: ServerTlsStrategy,
+        client_tls: ClientTlsStrategy,
     ) -> Self {
         tracing::debug!("Creating an ephemeral queue");
 
@@ -155,13 +157,13 @@ impl AbqInstance {
         };
 
         let queue = Abq::start(QueueConfig {
-            server_options: ServerOptions::new(server_auth, tls),
+            server_options: ServerOptions::new(server_auth, server_tls),
             ..Default::default()
         });
 
         AbqInstance {
             locator: AbqLocator::Local(queue),
-            client_options: ClientOptions::new(client_auth, tls),
+            client_options: ClientOptions::new(client_auth, client_tls),
         }
     }
 
@@ -169,11 +171,11 @@ impl AbqInstance {
         entity: EntityId,
         queue_addr: SocketAddr,
         auth: ClientAuthStrategy,
-        tls: Tls,
+        client_tls: ClientTlsStrategy,
     ) -> Result<Self, AbqInstanceError> {
         tracing::debug!("Creating instance from remote {}", queue_addr);
 
-        let client_options = ClientOptions::new(auth, tls);
+        let client_options = ClientOptions::new(auth, client_tls);
 
         // TODO: if we get an error here, there is a reasonable chance it's because the provided
         // client auth is invalid; we should provide a nice error message in such cases.

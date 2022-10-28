@@ -24,6 +24,7 @@ use abq_utils::{
         runners::TestResult,
         workers::{NativeTestRunnerParams, RunId, RunnerKind, WorkId},
     },
+    tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
 use abq_workers::negotiate::QueueNegotiatorHandle;
 
@@ -231,13 +232,19 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 _ => unreachable!("Mutual dependency of tokens should have been caught by clap during arg parsing!"),
             };
 
+            let server_tls = if tls == Tls::YES {
+                ServerTlsStrategy::yes()
+            } else {
+                ServerTlsStrategy::no_tls()
+            };
+
             instance::start_abq_forever(
                 public_ip,
                 bind_ip,
                 server_port,
                 work_port,
                 negotiator_port,
-                ServerOptions::new(server_auth, tls),
+                ServerOptions::new(server_auth, server_tls),
             )
         }
         Command::Work {
@@ -270,7 +277,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 clap::Error::exit(&error);
             });
 
-            let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), tls);
+            let client_tls = if tls == Tls::YES {
+                ClientTlsStrategy::yes()
+            } else {
+                ClientTlsStrategy::no_tls()
+            };
+
+            let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), client_tls);
             let queue_negotiator =
                 QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts)?;
             workers::start_workers_forever(num, working_dir, queue_negotiator, client_opts, run_id)
@@ -345,8 +358,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 ))?;
             }
 
+            let client_tls = if tls == Tls::YES {
+                ClientTlsStrategy::yes()
+            } else {
+                ClientTlsStrategy::no_tls()
+            };
+
             let client_auth = token.into();
-            let client_options = ClientOptions::new(client_auth, tls);
+            let client_options = ClientOptions::new(client_auth, client_tls);
 
             let mut all_healthy = true;
             for service in to_check {
@@ -441,12 +460,23 @@ fn find_or_create_abq(
     client_auth: ClientAuthStrategy<User>,
     tls: Tls,
 ) -> anyhow::Result<AbqInstance> {
+    let (server_tls, client_tls) = if tls == Tls::YES {
+        (ServerTlsStrategy::yes(), ClientTlsStrategy::yes())
+    } else {
+        (ServerTlsStrategy::no_tls(), ClientTlsStrategy::no_tls())
+    };
+
     match opt_queue_addr {
         Some(queue_addr) => {
-            let instance = AbqInstance::from_remote(entity, queue_addr, client_auth, tls)?;
+            let instance = AbqInstance::from_remote(entity, queue_addr, client_auth, client_tls)?;
             Ok(instance)
         }
-        None => Ok(AbqInstance::new_ephemeral(opt_user_token, client_auth, tls)),
+        None => Ok(AbqInstance::new_ephemeral(
+            opt_user_token,
+            client_auth,
+            server_tls,
+            client_tls,
+        )),
     }
 }
 

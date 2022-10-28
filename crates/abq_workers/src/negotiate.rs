@@ -679,7 +679,7 @@ mod test {
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
         UserToken,
     };
-    use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
+    use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestOrGroup, TestResult,
     };
@@ -690,6 +690,7 @@ mod test {
         NextWork, NextWorkBundle, RunId, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
     use abq_utils::shutdown::ShutdownManager;
+    use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{flatten_manifest, net, net_protocol};
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
@@ -709,7 +710,7 @@ mod test {
     type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
 
     fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
-        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
+        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -787,7 +788,7 @@ mod test {
         let msgs = Arc::new(Mutex::new(Vec::new()));
         let msgs2 = Arc::clone(&msgs);
 
-        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
+        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -911,7 +912,7 @@ mod test {
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let mut queue_negotiator = QueueNegotiator::new(
             "0.0.0.0".parse().unwrap(),
-            ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
                 .bind("0.0.0.0:0")
                 .unwrap(),
             shutdown_rx,
@@ -930,7 +931,7 @@ mod test {
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue_negotiator.get_handle(),
-            ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO),
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls()),
             run_id,
         )
         .unwrap();
@@ -992,14 +993,14 @@ mod test {
 
     #[test]
     fn queue_negotiator_healthcheck() {
-        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
+        let server = ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
 
-        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
+        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
@@ -1017,14 +1018,16 @@ mod test {
     fn queue_negotiator_with_auth_okay() {
         let (server_auth, client_auth, _) = build_random_strategies();
 
-        let server = ServerOptions::new(server_auth, Tls::NO)
+        let server = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls())
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
 
-        let client = ClientOptions::new(client_auth, Tls::NO).build().unwrap();
+        let client = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
+            .build()
+            .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
         let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
@@ -1042,14 +1045,14 @@ mod test {
     fn queue_negotiator_connect_with_no_auth_fails() {
         let (server_auth, _, _) = build_random_strategies();
 
-        let server = ServerOptions::new(server_auth, Tls::NO)
+        let server = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls())
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
 
-        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
+        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
