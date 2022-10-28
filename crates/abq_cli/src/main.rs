@@ -10,6 +10,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroU64,
     num::NonZeroUsize,
+    path::PathBuf,
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -56,7 +57,7 @@ struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
 struct ConfigFromApi {
     queue_addr: SocketAddr,
     token: UserToken,
-    tls: Tls,
+    tls_cert: Option<Vec<u8>>,
 }
 
 struct RunIdEnvironment {
@@ -220,7 +221,8 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             negotiator_port,
             user_token,
             admin_token,
-            tls,
+            tls_cert,
+            tls_key,
         } => {
             let server_auth = match (user_token, admin_token) {
                 (Some(user), Some(admin)) => {
@@ -232,10 +234,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 _ => unreachable!("Mutual dependency of tokens should have been caught by clap during arg parsing!"),
             };
 
-            let server_tls = if tls == Tls::YES {
-                ServerTlsStrategy::yes()
-            } else {
-                ServerTlsStrategy::no_tls()
+            let server_tls = match (tls_cert, tls_key) {
+                (Some(_cert_path), Some(_key_path)) => {
+                    ServerTlsStrategy::yes()
+                }
+                (None, None) => {
+                    ServerTlsStrategy::no_tls()
+                }
+                _ => unreachable!("Mutual dependency of TLS config should have been caught by clap during arg parsing!"),
             };
 
             instance::start_abq_forever(
@@ -254,7 +260,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             queue_addr,
             num,
             token,
-            tls,
+            tls_cert,
         } => {
             let mut cmd = Cli::command();
             let cmd = cmd.find_subcommand_mut("work").unwrap();
@@ -266,8 +272,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 );
                 clap::Error::exit(&error);
             });
-            let (token, queue_addr, tls) =
-                resolve_config(token, queue_addr, tls, api_key, &run_id)?;
+
+            let tls_cert = read_opt_path_bytes(tls_cert)?;
+
+            let ResolvedConfig {
+                token,
+                queue_addr,
+                tls_cert,
+            } = resolve_config(token, queue_addr, tls_cert, api_key, &run_id)?;
 
             let queue_addr = queue_addr.unwrap_or_else(|| {
                 let error = cmd.error(
@@ -277,10 +289,9 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 clap::Error::exit(&error);
             });
 
-            let client_tls = if tls == Tls::YES {
-                ClientTlsStrategy::yes()
-            } else {
-                ClientTlsStrategy::no_tls()
+            let client_tls = match tls_cert {
+                Some(_cert) => ClientTlsStrategy::yes(),
+                None => ClientTlsStrategy::no_tls(),
             };
 
             let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), client_tls);
@@ -296,7 +307,8 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             num_workers,
             reporter: reporters,
             token,
-            tls,
+            tls_cert,
+            tls_key,
             color,
             batch_size,
             result_timeout_seconds,
@@ -308,15 +320,23 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             // provided from an external source.
             let start_in_process_workers = api_key.is_none() && queue_addr.is_none();
 
-            let (resolved_token, resolved_queue_addr, resolved_tls) =
-                resolve_config(token, queue_addr, tls, api_key, &run_id)?;
+            let tls_cert = read_opt_path_bytes(tls_cert)?;
+            let tls_key = read_opt_path_bytes(tls_key)?;
+
+            let ResolvedConfig {
+                queue_addr: resolved_queue_addr,
+                token: resolved_token,
+                tls_cert: resolved_tls,
+            } = resolve_config(token, queue_addr, tls_cert, api_key, &run_id)?;
 
             let client_auth = resolved_token.into();
+
+            let queue_addr_or_opt_tls_key = resolved_queue_addr.ok_or(tls_key);
 
             let runner_params = validate_abq_test_args(args)?;
             let abq = find_or_create_abq(
                 entity,
-                resolved_queue_addr,
+                queue_addr_or_opt_tls_key,
                 resolved_token,
                 client_auth,
                 resolved_tls,
@@ -340,7 +360,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             work_scheduler,
             negotiator,
             token,
-            tls,
+            tls_cert,
         } => {
             let mut to_check = (queue.into_iter().map(HealthCheckKind::Queue))
                 .chain(
@@ -358,10 +378,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 ))?;
             }
 
-            let client_tls = if tls == Tls::YES {
-                ClientTlsStrategy::yes()
-            } else {
-                ClientTlsStrategy::no_tls()
+            let tls_cert = read_opt_path_bytes(tls_cert)?;
+
+            let client_tls = match tls_cert {
+                Some(_cert) => ClientTlsStrategy::yes(),
+                None => ClientTlsStrategy::no_tls(),
             };
 
             let client_auth = token.into();
@@ -385,30 +406,48 @@ fn abq_main() -> anyhow::Result<ExitCode> {
     }
 }
 
+fn read_opt_path_bytes(p: Option<PathBuf>) -> anyhow::Result<Option<Vec<u8>>> {
+    match p {
+        Some(p) => Ok(Some(read_path_bytes(p)?)),
+        None => Ok(None),
+    }
+}
+
+fn read_path_bytes(p: PathBuf) -> anyhow::Result<Vec<u8>> {
+    let bytes = std::fs::read(p)?;
+    Ok(bytes)
+}
+
+struct ResolvedConfig {
+    queue_addr: Option<SocketAddr>,
+    token: Option<UserToken>,
+    tls_cert: Option<Vec<u8>>,
+}
+
 fn resolve_config(
     token_from_cli: Option<UserToken>,
     queue_addr_from_cli: Option<SocketAddr>,
-    tls_from_cli: Tls,
+    tls_cert_from_cli: Option<Vec<u8>>,
     api_key: Option<ApiKey>,
     run_id: &RunId,
-) -> anyhow::Result<(Option<UserToken>, Option<SocketAddr>, Tls)> {
+) -> anyhow::Result<ResolvedConfig> {
     let (queue_addr_from_api, token_from_api, tls_from_api) = match api_key {
         Some(key) => {
             let config = get_config_from_api(key, run_id)?;
-            (
-                Some(config.queue_addr),
-                Some(config.token),
-                Some(config.tls),
-            )
+            (Some(config.queue_addr), Some(config.token), config.tls_cert)
         }
         None => (None, None, None),
     };
 
     let token = token_from_api.or(token_from_cli);
     let queue_addr = queue_addr_from_api.or(queue_addr_from_cli);
-    let tls = tls_from_api.unwrap_or(tls_from_cli);
+    let tls_cert = tls_from_api.or(tls_cert_from_cli);
 
-    Ok((token, queue_addr, tls))
+    Ok(ResolvedConfig {
+        queue_addr,
+        token,
+        tls_cert,
+    })
 }
 
 fn get_config_from_api(api_key: ApiKey, run_id: &RunId) -> anyhow::Result<ConfigFromApi> {
@@ -423,10 +462,16 @@ fn get_config_from_api(api_key: ApiKey, run_id: &RunId) -> anyhow::Result<Config
         tls,
     } = HostedQueueConfig::from_api(api_url, api_key, run_id)?;
 
+    let tls_cert = if tls == Tls::YES {
+        Some(include_bytes!("../../abq_utils/data/cert/server.crt").to_vec())
+    } else {
+        None
+    };
+
     Ok(ConfigFromApi {
         queue_addr: addr,
         token: auth_token,
-        tls,
+        tls_cert,
     })
 }
 
@@ -455,28 +500,37 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
 
 fn find_or_create_abq(
     entity: EntityId,
-    opt_queue_addr: Option<SocketAddr>,
+    queue_addr_or_opt_tls: Result<SocketAddr, Option<Vec<u8>>>,
     opt_user_token: Option<UserToken>,
     client_auth: ClientAuthStrategy<User>,
-    tls: Tls,
+    client_tls_cert: Option<Vec<u8>>,
 ) -> anyhow::Result<AbqInstance> {
-    let (server_tls, client_tls) = if tls == Tls::YES {
-        (ServerTlsStrategy::yes(), ClientTlsStrategy::yes())
-    } else {
-        (ServerTlsStrategy::no_tls(), ClientTlsStrategy::no_tls())
+    let client_tls = match &client_tls_cert {
+        Some(_cert) => ClientTlsStrategy::yes(),
+        None => ClientTlsStrategy::no_tls(),
     };
 
-    match opt_queue_addr {
-        Some(queue_addr) => {
+    match queue_addr_or_opt_tls {
+        Ok(queue_addr) => {
             let instance = AbqInstance::from_remote(entity, queue_addr, client_auth, client_tls)?;
             Ok(instance)
         }
-        None => Ok(AbqInstance::new_ephemeral(
-            opt_user_token,
-            client_auth,
-            server_tls,
-            client_tls,
-        )),
+        Err(opt_tls_key) => {
+            let server_tls = match (client_tls_cert, opt_tls_key) {
+                (Some(_cert), Some(_key)) => ServerTlsStrategy::yes(),
+                (None, None) => ServerTlsStrategy::no_tls(),
+                _ => unreachable!(
+                    "any other configuration would have been caught during arg parsing"
+                ),
+            };
+
+            Ok(AbqInstance::new_ephemeral(
+                opt_user_token,
+                client_auth,
+                server_tls,
+                client_tls,
+            ))
+        }
     }
 }
 

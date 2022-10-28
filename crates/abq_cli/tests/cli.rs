@@ -14,6 +14,16 @@ use abq_utils::net_protocol::workers::RunId;
 
 const WORKSPACE: &str = std::env!("ABQ_WORKSPACE_DIR");
 
+const TLS_CERT: &str = std::concat!(
+    std::env!("ABQ_WORKSPACE_DIR"),
+    "crates/abq_utils/data/cert/server.crt"
+);
+#[cfg(feature = "test-abq-jest")]
+const TLS_KEY: &str = std::concat!(
+    std::env!("ABQ_WORKSPACE_DIR"),
+    "crates/abq_utils/data/cert/server.key"
+);
+
 fn var_flag_set(var: &str) -> bool {
     match std::env::var(var) {
         Ok(s) => {
@@ -167,18 +177,33 @@ impl CSConfigOptions {
             args.extend(["--admin-token", TEST_ADMIN_AUTH_TOKEN]);
         }
         if self.tls {
-            args.extend(["--tls"]);
+            args.extend(["--tls-cert", TLS_CERT]);
+            args.extend(["--tls-key", TLS_CERT]);
         }
         args
     }
 
-    fn extend_args_for_clients<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
+    fn extend_args_for_client<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
         let mut args = args.to_vec();
         if self.use_auth_token {
             args.extend(["--token", TEST_USER_AUTH_TOKEN]);
         }
         if self.tls {
-            args.extend(["--tls"]);
+            args.extend(["--tls-cert", TLS_CERT]);
+        }
+        args
+    }
+
+    #[cfg(feature = "test-abq-jest")]
+    fn extend_args_for_in_band_client<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
+        let mut args = args.to_vec();
+        if self.use_auth_token {
+            args.extend(["--token", TEST_USER_AUTH_TOKEN]);
+        }
+        if self.tls {
+            dbg!(TLS_CERT, TLS_KEY);
+            args.extend(["--tls-cert", TLS_CERT]);
+            args.extend(["--tls-key", TLS_KEY]);
         }
         args
     }
@@ -247,7 +272,7 @@ test_all_network_config_options! {
     yarn_jest_auto_workers_without_failure (|name, conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
         let args = &["test", "--reporter", "dot"];
-        let mut args = conf.extend_args_for_clients(args);
+        let mut args = conf.extend_args_for_in_band_client(args);
         args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -352,7 +377,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id
         ];
-        let worker_args = conf.extend_args_for_clients(worker_args);
+        let worker_args = conf.extend_args_for_client(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_worker"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
@@ -365,7 +390,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id,
         ];
-        let mut test_args = conf.extend_args_for_clients(test_args);
+        let mut test_args = conf.extend_args_for_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -435,7 +460,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id,
         ];
-        let mut test_args = conf.extend_args_for_clients(test_args);
+        let mut test_args = conf.extend_args_for_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let mut supervisor = spawn_abq(&(name.to_string() + "_test"), test_args);
 
@@ -470,7 +495,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id
         ];
-        let worker_args = conf.extend_args_for_clients(worker_args);
+        let worker_args = conf.extend_args_for_client(worker_args);
         let CmdOutput {
             stdout,
             stderr,
@@ -493,7 +518,7 @@ test_all_network_config_options! {
             "--reporter",
             "dot",
         ];
-        let mut test_args = conf.extend_args_for_clients(test_args);
+        let mut test_args = conf.extend_args_for_in_band_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -563,7 +588,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id
         ];
-        let worker_args = conf.extend_args_for_clients(worker_args);
+        let worker_args = conf.extend_args_for_client(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
@@ -576,7 +601,7 @@ test_all_network_config_options! {
             "--run-id",
             &run_id,
         ];
-        let mut test_args = conf.extend_args_for_clients(test_args);
+        let mut test_args = conf.extend_args_for_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
             stdout,
@@ -643,7 +668,7 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_clients(&[
+        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_client(&[
             "health",
             "--queue",
             &queue_addr,
@@ -692,7 +717,7 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_clients(&[
+        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_client(&[
             "health",
             "--queue",
             &queue_addr,
@@ -829,7 +854,7 @@ fn test_with_invalid_command() {
         "--run-id",
         &run_id,
     ];
-    let worker_args = conf.extend_args_for_clients(worker_args);
+    let worker_args = conf.extend_args_for_client(worker_args);
     let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
 
     // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? \
@@ -843,7 +868,7 @@ fn test_with_invalid_command() {
         "--run-id",
         &run_id,
     ];
-    let mut test_args = conf.extend_args_for_clients(test_args);
+    let mut test_args = conf.extend_args_for_client(test_args);
     test_args.extend(["--", "__zzz_not_a_command__"]);
 
     let CmdOutput {
