@@ -616,13 +616,14 @@ mod test {
     use std::time::{Duration, Instant};
 
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
-    use abq_utils::net_opt::{ClientOptions, ServerOptions, Tls};
+    use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, TestLikeRunner};
     use abq_utils::shutdown::ShutdownManager;
+    use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{flatten_manifest, net_protocol};
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
@@ -1071,9 +1072,10 @@ mod test {
     #[test]
     #[traced_test]
     fn bad_message_doesnt_take_down_queue_negotiator_server() {
-        let listener = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO)
-            .bind("0.0.0.0:0")
-            .unwrap();
+        let listener =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
+                .bind("0.0.0.0:0")
+                .unwrap();
         let listener_addr = listener.local_addr().unwrap();
 
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
@@ -1088,7 +1090,7 @@ mod test {
         )
         .unwrap();
 
-        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO)
+        let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()
             .unwrap();
         let mut conn = client.connect(listener_addr).unwrap();

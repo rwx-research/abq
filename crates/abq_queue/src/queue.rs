@@ -11,7 +11,7 @@ use abq_utils::auth::ServerAuthStrategy;
 use abq_utils::flatten_manifest;
 use abq_utils::net;
 use abq_utils::net_async;
-use abq_utils::net_opt::{ServerOptions, Tls};
+use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
 use abq_utils::net_protocol::runners::{ManifestResult, MetadataMap, TestCase, TestResult};
@@ -24,6 +24,7 @@ use abq_utils::net_protocol::{
 };
 use abq_utils::net_protocol::{client, publicize_addr};
 use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
+use abq_utils::tls::ServerTlsStrategy;
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunCompeleted, QueueNegotiator, QueueNegotiatorHandle,
 };
@@ -567,7 +568,10 @@ impl Default for QueueConfig {
             server_port: 0,
             work_port: 0,
             negotiator_port: 0,
-            server_options: ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO),
+            server_options: ServerOptions::new(
+                ServerAuthStrategy::no_auth(),
+                ServerTlsStrategy::no_tls(),
+            ),
         }
     }
 }
@@ -1825,7 +1829,7 @@ mod test {
             UserToken,
         },
         net_async,
-        net_opt::{ClientOptions, ServerOptions, Tls},
+        net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
             self,
             entity::EntityId,
@@ -1837,6 +1841,7 @@ mod test {
             workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
         },
         shutdown::ShutdownManager,
+        tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_workers::{
         negotiate::{NegotiatedWorkers, WorkersConfig, WorkersNegotiator},
@@ -1929,7 +1934,7 @@ mod test {
     fn create_queue_server(
         server_auth: ServerAuthStrategy,
     ) -> (JoinHandle<()>, ShutdownManager, SocketAddr) {
-        let server_opts = ServerOptions::new(server_auth, Tls::NO);
+        let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
         let server = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
@@ -1951,7 +1956,7 @@ mod test {
         queues: SharedRunQueues,
     ) -> (JoinHandle<()>, ShutdownManager, SocketAddr) {
         let server = WorkScheduler { queues };
-        let server_opts = ServerOptions::new(server_auth, Tls::NO);
+        let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -1990,7 +1995,8 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run_id = RunId::unique();
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
@@ -2086,7 +2092,8 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run1 = RunId::unique();
         let run2 = RunId::unique();
@@ -2210,7 +2217,8 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run = RunId::unique();
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
@@ -2276,8 +2284,10 @@ mod test {
     fn bad_message_doesnt_take_down_server() {
         let server = QueueServer::new(Default::default(), "0.0.0.0:0".parse().unwrap());
 
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -2302,8 +2312,10 @@ mod test {
         let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
 
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         // Set up an initial connection for streaming test results targetting the given run ID
         let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
@@ -2365,8 +2377,10 @@ mod test {
         let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
 
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
@@ -2411,8 +2425,10 @@ mod test {
             },
         );
 
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
@@ -2473,7 +2489,8 @@ mod test {
         );
         let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let mut client = Client {
@@ -2522,8 +2539,10 @@ mod test {
 
     #[test]
     fn queue_server_healthcheck() {
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let server = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -2559,8 +2578,10 @@ mod test {
 
     #[test]
     fn work_server_healthcheck() {
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let server = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -2592,8 +2613,10 @@ mod test {
     #[test]
     #[traced_test]
     fn bad_message_doesnt_take_down_work_scheduling_server() {
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let server = WorkScheduler {
             queues: Default::default(),
@@ -2624,8 +2647,8 @@ mod test {
 
         let (server_auth, client_auth, _) =
             build_strategies(UserToken::new_random(), AdminToken::new_random());
-        let server_opts = ServerOptions::new(server_auth, Tls::NO);
-        let client_opts = ClientOptions::new(client_auth, Tls::NO);
+        let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
+        let client_opts = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls());
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -2660,8 +2683,9 @@ mod test {
 
         let (server_auth, _, _) = build_random_strategies();
 
-        let server_opts = ServerOptions::new(server_auth, Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -2695,8 +2719,8 @@ mod test {
         };
 
         let (server_auth, client_auth, _) = build_random_strategies();
-        let server_opts = ServerOptions::new(server_auth, Tls::NO);
-        let client_opts = ClientOptions::new(client_auth, Tls::NO);
+        let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
+        let client_opts = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls());
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -2729,8 +2753,9 @@ mod test {
         };
 
         let (server_auth, _, _) = build_random_strategies();
-        let server_opts = ServerOptions::new(server_auth, Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -2776,7 +2801,8 @@ mod test {
         };
 
         let queue_server_addr = queue.server_addr();
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
         let run_id = RunId::unique();
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
@@ -2854,7 +2880,8 @@ mod test {
         };
 
         let queue_server_addr = queue.server_addr();
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
         let run_id = RunId::unique();
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
@@ -2931,7 +2958,8 @@ mod test {
         let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run_id = RunId::unique();
 
@@ -3004,7 +3032,8 @@ mod test {
         };
 
         let queue_server_addr = queue.server_addr();
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
         let run_id = RunId::unique();
         let (_cancellation_tx1, cancellation_rx1) = run_cancellation_pair();
         let (_cancellation_tx2, cancellation_rx2) = run_cancellation_pair();
@@ -3098,7 +3127,7 @@ mod test {
         let (server_thread, mut server_shutdown, server_addr) =
             create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
 
-        let client_opts = ClientOptions::new(client_auth, Tls::NO);
+        let client_opts = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls());
         let client = client_opts.build().unwrap();
 
         let mut conn = client.connect(server_addr).unwrap();
@@ -3147,7 +3176,7 @@ mod test {
         let (server_thread, mut server_shutdown, server_addr) =
             create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
 
-        let client_opts = ClientOptions::new(client_auth, Tls::NO);
+        let client_opts = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls());
         let client = client_opts.build().unwrap();
 
         let mut conn = client.connect(server_addr).unwrap();
@@ -3191,7 +3220,8 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run_id = RunId::unique();
 
@@ -3293,7 +3323,8 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run_id = RunId::unique();
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
@@ -3561,7 +3592,8 @@ mod test {
         };
 
         let queue_server_addr = queue.server_addr();
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
         let run_id = RunId::unique();
 
         let (cancel_tx, cancel_rx) = run_cancellation_pair();
@@ -3618,8 +3650,10 @@ mod test {
 
     #[tokio::test]
     async fn receiving_cancellation_during_last_test_results_is_cancellation() {
-        let server_opts = ServerOptions::new(ServerAuthStrategy::no_auth(), Tls::NO);
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
@@ -3711,7 +3745,9 @@ mod test {
         let (queue_thread, mut queue_shutdown, server_addr) = create_queue_server(server_auth);
 
         {
-            let admin = ClientOptions::new(admin_auth, Tls::NO).build().unwrap();
+            let admin = ClientOptions::new(admin_auth, ClientTlsStrategy::no_tls())
+                .build()
+                .unwrap();
             let mut conn = admin.connect(server_addr).unwrap();
 
             net_protocol::write(
@@ -3730,7 +3766,9 @@ mod test {
 
         // Retirement should now reject new test run connections.
         {
-            let client = ClientOptions::new(client_auth, Tls::NO).build().unwrap();
+            let client = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
+                .build()
+                .unwrap();
             let mut conn = client.connect(server_addr).unwrap();
 
             net_protocol::write(
@@ -3759,7 +3797,9 @@ mod test {
 
         let (queue_thread, mut queue_shutdown, server_addr) = create_queue_server(server_auth);
 
-        let non_admin = ClientOptions::new(client_auth, Tls::NO).build().unwrap();
+        let non_admin = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
+            .build()
+            .unwrap();
         let mut conn = non_admin.connect(server_addr).unwrap();
 
         net_protocol::write(
@@ -3796,7 +3836,8 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run_id = RunId::unique();
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
@@ -3885,7 +3926,8 @@ mod test {
 
         let queue_server_addr = queue.server_addr();
 
-        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
         let run_id = RunId::unique();
         let results_handle = thread::spawn({

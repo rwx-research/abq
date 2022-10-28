@@ -8,7 +8,7 @@ pub mod net_async;
 pub mod net_opt;
 pub mod net_protocol;
 pub mod shutdown;
-mod tls;
+pub mod tls;
 
 /// Flattens a manifest into only [TestId]s, preserving the manifest order.
 pub fn flatten_manifest(manifest: Manifest) -> (Vec<TestCase>, MetadataMap) {
