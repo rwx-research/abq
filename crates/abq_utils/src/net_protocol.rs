@@ -43,6 +43,14 @@ pub mod runners {
     pub type MetadataMap = serde_json::Map<String, serde_json::Value>;
 
     #[derive(Debug, Serialize, Deserialize)]
+    pub struct InitMessage {
+        pub init_meta: MetadataMap,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct InitSuccessMessage {}
+
+    #[derive(Debug, Serialize, Deserialize)]
     pub struct TestCaseMessage {
         pub test_case: TestCase,
     }
@@ -146,6 +154,7 @@ pub mod runners {
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct Manifest {
         pub members: Vec<TestOrGroup>,
+        pub init_meta: MetadataMap,
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
@@ -226,6 +235,8 @@ pub mod workers {
     pub enum TestLikeRunner {
         /// A worker that echos strings given to it.
         Echo,
+        /// A worker that echos initialization context.
+        EchoInitContext,
         /// A worker that executes commands given to it.
         Exec,
         /// A worker that always times out.
@@ -405,15 +416,34 @@ pub mod queue {
 pub mod work_server {
     use serde_derive::{Deserialize, Serialize};
 
-    use super::workers::{self, RunId};
+    use super::{
+        runners::MetadataMap,
+        workers::{self, RunId},
+    };
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum WorkServerRequest {
         HealthCheck,
+        /// An ask to get the initialization metadata for a
+        InitContext {
+            run_id: RunId,
+        },
         /// An ask to get the next test for a particular run for the queue.
         NextTest {
             run_id: RunId,
         },
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct InitContext {
+        pub init_meta: MetadataMap,
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub enum InitContextResponse {
+        /// The manifest is yet to be received; try again later
+        WaitingForManifest,
+        InitContext(InitContext),
     }
 
     #[derive(Serialize, Deserialize, Debug)]

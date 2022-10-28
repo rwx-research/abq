@@ -94,6 +94,7 @@ jobs:
       # End setup testdata
 
       - name: Dogfood abq
+        timeout-minutes: 3
         run: |
           make dogfood
         env:

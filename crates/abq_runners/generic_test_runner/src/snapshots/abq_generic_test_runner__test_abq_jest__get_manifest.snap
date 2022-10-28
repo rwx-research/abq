@@ -20,5 +20,6 @@ expression: manifest
         "fileName": "names.test.js"
       }
     }
-  ]
+  ],
+  "init_meta": {}
 }

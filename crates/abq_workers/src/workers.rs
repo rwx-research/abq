@@ -13,6 +13,7 @@ use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::runners::{
     ManifestMessage, ManifestResult, Status, TestId, TestResult,
 };
+use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
 use abq_utils::net_protocol::workers::{
     NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext, WorkId,
@@ -27,6 +28,7 @@ enum MessageFromPool {
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
+pub type GetInitContext = Arc<dyn Fn() -> InitContext + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResult = Arc<dyn Fn(EntityId, &RunId, WorkId, TestResult) + Send + Sync + 'static>;
 /// Did a given run complete successfully? Returns true if so.
@@ -59,6 +61,8 @@ pub struct WorkerPoolConfig {
     /// When [`Some`], one worker must be chosen to generate and return the manifest the following
     /// way.
     pub notify_manifest: Option<NotifyManifest>,
+    /// How should workers initialize their native test runners?
+    pub get_init_context: GetInitContext,
     /// How should a worker get the next unit of work it needs to run?
     pub get_next_work: GetNextWorkBundle,
     /// How should results be communicated back?
@@ -149,6 +153,7 @@ impl WorkerPool {
             size,
             runner_kind,
             run_id,
+            get_init_context,
             get_next_work,
             notify_result,
             notify_manifest,
@@ -183,12 +188,14 @@ impl WorkerPool {
             // TODO: consider hiding this behind a macro for code duplication purposes
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let notify_result = Arc::clone(&notify_result);
+            let get_init_context = Arc::clone(&get_init_context);
             let get_next_work = Arc::clone(&get_next_work);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
+                get_init_context,
                 get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
@@ -206,12 +213,14 @@ impl WorkerPool {
         for _id in 1..num_workers {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let notify_result = Arc::clone(&notify_result);
+            let get_init_context = Arc::clone(&get_init_context);
             let get_next_work = Arc::clone(&get_next_work);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
+                get_init_context,
                 get_next_work_bundle: get_next_work,
                 notify_result,
                 context: worker_context.clone(),
@@ -302,6 +311,7 @@ struct WorkerEnv {
     msg_from_pool_rx: MessageFromPoolRx,
     run_id: RunId,
     notify_manifest: Option<NotifyManifest>,
+    get_init_context: GetInitContext,
     get_next_work_bundle: GetNextWorkBundle,
     notify_result: NotifyResult,
     context: WorkerContext,
@@ -336,6 +346,7 @@ fn start_generic_test_runner(
     let WorkerEnv {
         get_next_work_bundle,
         run_id,
+        get_init_context,
         notify_result,
         notify_manifest,
         context,
@@ -355,6 +366,8 @@ fn start_generic_test_runner(
         let run_id = run_id.clone();
         move |manifest_result| notify_manifest(entity, &run_id, manifest_result)
     });
+
+    let get_init_context = move || get_init_context();
 
     let get_next_work_bundle = move || get_next_work_bundle();
 
@@ -379,6 +392,7 @@ fn start_generic_test_runner(
         &working_dir,
         polling_should_shutdown,
         notify_manifest,
+        get_init_context,
         get_next_work_bundle,
         send_test_result,
         debug_native_runner,
@@ -393,6 +407,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
     let WorkerEnv {
         msg_from_pool_rx,
         get_next_work_bundle: get_next_work,
+        get_init_context,
         run_id,
         notify_result,
         context,
@@ -408,6 +423,8 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
     if let Some(notify_manifest) = notify_manifest {
         notify_manifest(entity, &run_id, ManifestResult::Manifest(manifest));
     }
+
+    let init_context = get_init_context();
 
     'tests_done: loop {
         // First, check if we have a message from our owner.
@@ -448,6 +465,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                             &context,
                             runner.clone(),
                             test_case.id.clone(),
+                            init_context.clone(),
                             &work_context,
                             work_timeout,
                             attempt_number,
@@ -488,6 +506,7 @@ fn attempt_test_id_for_test_like_runner(
     my_context: &WorkerContext,
     runner: TestLikeRunner,
     test_id: TestId,
+    init_context: InitContext,
     requested_context: &WorkContext,
     timeout: Duration,
     attempt: u8,
@@ -497,12 +516,17 @@ fn attempt_test_id_for_test_like_runner(
 
     use TestLikeRunner as R;
 
+    let init_context = serde_json::to_string(&init_context).unwrap();
+
     let result_handle = proc::spawn!(
-        (runner, test_id, working_dir, attempt) || {
+        (runner, test_id, working_dir, attempt, init_context) || {
             std::env::set_current_dir(working_dir).unwrap();
             let _attempt = attempt;
             match (runner, test_id) {
                 (R::Echo, s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
+                (R::EchoInitContext, _) => echo::EchoWorker::run(echo::EchoWork {
+                    message: init_context,
+                }),
                 (R::Exec, cmd_and_args) => {
                     let mut args = cmd_and_args
                         .split(' ')
@@ -596,6 +620,7 @@ mod test {
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestCase, TestOrGroup, TestResult,
     };
+    use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, TestLikeRunner};
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::{flatten_manifest, net_protocol};
@@ -656,6 +681,12 @@ mod test {
         (results, notify_result, get_completed_status)
     }
 
+    fn empty_init_context() -> InitContext {
+        InitContext {
+            init_meta: Default::default(),
+        }
+    }
+
     fn setup_pool(
         runner: TestLikeRunner,
         run_id: RunId,
@@ -669,6 +700,7 @@ mod test {
         let config = WorkerPoolConfig {
             size: NonZeroUsize::new(1).unwrap(),
             get_next_work,
+            get_init_context: Arc::new(empty_init_context),
             runner_kind: RunnerKind::TestLikeRunner(runner, manifest),
             run_id,
             notify_manifest: Some(notify_manifest),
@@ -719,7 +751,7 @@ mod test {
         loop {
             match manifest.lock().unwrap().take() {
                 Some(ManifestResult::Manifest(manifest)) => {
-                    return flatten_manifest(manifest.manifest)
+                    return flatten_manifest(manifest.manifest).0
                 }
                 Some(ManifestResult::TestRunnerError { .. }) => unreachable!(),
                 None => continue,
@@ -760,7 +792,10 @@ mod test {
             })
             .collect();
         let manifest = ManifestMessage {
-            manifest: Manifest { members: tests },
+            manifest: Manifest {
+                members: tests,
+                init_meta: Default::default(),
+            },
         };
 
         let (default_config, manifest_collector) = setup_pool(
@@ -981,6 +1016,7 @@ mod test {
         let manifest = ManifestMessage {
             manifest: Manifest {
                 members: vec![exec_test("cat", &["testfile"])],
+                init_meta: Default::default(),
             },
         };
 

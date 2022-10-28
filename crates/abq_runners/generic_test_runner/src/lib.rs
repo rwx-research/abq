@@ -6,10 +6,11 @@ use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
 
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersionMessage, ManifestMessage, ManifestResult, Status, TestCaseMessage,
-    TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    AbqProtocolVersionMessage, InitSuccessMessage, ManifestMessage, ManifestResult, Status,
+    TestCaseMessage, TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
     ACTIVE_PROTOCOL_VERSION_MAJOR, ACTIVE_PROTOCOL_VERSION_MINOR,
 };
+use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
     NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
 };
@@ -202,11 +203,12 @@ impl From<ProtocolVersionMessageError> for RunnerError {
 }
 
 impl GenericTestRunner {
-    pub fn run<ShouldShutdown, SendManifest, GetNextWorkBundle, SendTestResult>(
+    pub fn run<ShouldShutdown, SendManifest, GetInitContext, GetNextWorkBundle, SendTestResult>(
         input: NativeTestRunnerParams,
         working_dir: &Path,
         _polling_should_shutdown: ShouldShutdown,
         send_manifest: Option<SendManifest>,
+        get_init_context: GetInitContext,
         mut get_next_test_bundle: GetNextWorkBundle,
         mut send_test_result: SendTestResult,
         debug_native_runner: bool,
@@ -214,6 +216,7 @@ impl GenericTestRunner {
     where
         ShouldShutdown: Fn() -> bool,
         SendManifest: FnMut(ManifestResult),
+        GetInitContext: Fn() -> InitContext,
         GetNextWorkBundle: FnMut() -> NextWorkBundle + std::marker::Send + 'static,
         SendTestResult: FnMut(WorkId, TestResult),
     {
@@ -258,18 +261,23 @@ impl GenericTestRunner {
         //
         // In short: the protocol is
         //
-        // Queue |                       | Worker (us) |                           | Native runner
-        //       | <- send Next-Test -   |             |                           |
-        //       | - recv Next-Test ->   |             |                           |
-        //       |                       |             | - send TestCaseMessage -> |
-        //       |                       |             | <- recv TestResult -      |
-        //       | <- send Test-Result - |             |                           |
-        //       |                       |             |                           |
-        //       |          ...          |             |          ...              |
-        //       |                       |             |                           |
-        //       | <- send Next-Test -   |             |                           |
-        //       | -   recv Done    ->   |             |      <close conn>         |
-        // Queue |                       | Worker (us) |                           | Native runner
+        // Queue |                       | Worker (us) |                              | Native runner
+        //       |                       |             | <- recv ProtocolVersion -    |
+        //       | <- send Init-Meta -   |             |                              |
+        //       | - recv Init-Meta ->   |             |                              |
+        //       |                       |             | - send InitMessage    ->     |
+        //       |                       |             | <- recv InitSuccessMessage - |
+        //       | <- send Next-Test -   |             |                              |
+        //       | - recv Next-Test ->   |             |                              |
+        //       |                       |             | - send TestCaseMessage ->    |
+        //       |                       |             | <- recv TestResult -         |
+        //       | <- send Test-Result - |             |                              |
+        //       |                       |             |                              |
+        //       |          ...          |             |          ...                 |
+        //       |                       |             |                              |
+        //       | <- send Next-Test -   |             |                              |
+        //       | -   recv Done    ->   |             |      <close conn>            |
+        // Queue |                       | Worker (us) |                              | Native runner
         let mut our_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let our_addr = our_listener.local_addr().unwrap();
 
@@ -300,6 +308,14 @@ impl GenericTestRunner {
             protocol_version_timeout,
             is_native_runner_alive,
         )?;
+
+        // Wait for the native runner to initialize.
+        {
+            let InitContext { init_meta } = get_init_context();
+            let init_message = net_protocol::runners::InitMessage { init_meta };
+            net_protocol::write(&mut runner_conn, init_message)?;
+            let InitSuccessMessage {} = net_protocol::read(&mut runner_conn)?;
+        }
 
         // We establish one connection with the native runner and repeatedly send tests until we're
         // done.
@@ -520,15 +536,18 @@ pub fn execute_wrapped_runner(
             }
         }
     };
+    let get_init_context = || InitContext {
+        init_meta: Default::default(),
+    };
 
     let get_next_test = {
         let manifest = Arc::clone(&flat_manifest);
         let working_dir = working_dir.clone();
         move || {
             loop {
-                let manifest = manifest.lock().unwrap();
-                let next_test = match &(*manifest) {
-                    Some(manifest) => manifest.get(test_case_index),
+                let manifest_and_data = manifest.lock().unwrap();
+                let next_test = match &(*manifest_and_data) {
+                    Some((manifest, _)) => manifest.get(test_case_index),
                     None => {
                         // still waiting for the manifest, spin
                         continue;
@@ -560,6 +579,7 @@ pub fn execute_wrapped_runner(
         &working_dir,
         || false,
         Some(send_manifest),
+        get_init_context,
         get_next_test,
         send_test_result,
         false,
@@ -649,7 +669,10 @@ mod test_validate_protocol_version_message {
         let socket_addr = listener.local_addr().unwrap();
         thread::spawn(move || {
             let mut stream = TcpStream::connect(socket_addr).unwrap();
-            let message = net_protocol::runners::Manifest { members: vec![] };
+            let message = net_protocol::runners::Manifest {
+                members: vec![],
+                init_meta: Default::default(),
+            };
             net_protocol::write(&mut stream, message).unwrap();
         })
         .join()
@@ -745,6 +768,7 @@ mod test_validate_protocol_version_message {
 mod test_abq_jest {
     use crate::{execute_wrapped_runner, GenericTestRunner};
     use abq_utils::net_protocol::runners::{ManifestMessage, ManifestResult, Status, TestOrGroup};
+    use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
 
     use std::path::PathBuf;
@@ -766,6 +790,9 @@ mod test_abq_jest {
         let mut test_results = vec![];
 
         let send_manifest = |real_manifest| manifest = Some(real_manifest);
+        let get_init_context = || InitContext {
+            init_meta: Default::default(),
+        };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
         let send_test_result = |_, test_result| test_results.push(test_result);
 
@@ -774,6 +801,7 @@ mod test_abq_jest {
             &npm_jest_project_path(),
             || false,
             Some(send_manifest),
+            get_init_context,
             get_next_test,
             send_test_result,
             false,
@@ -822,6 +850,7 @@ mod test_abq_jest {
 mod test {
     use crate::{GenericTestRunner, RunnerError};
     use abq_utils::net_protocol::runners::ManifestResult;
+    use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
 
     #[test]
@@ -835,6 +864,9 @@ mod test {
         let mut manifest_result = None;
 
         let send_manifest = |result| manifest_result = Some(result);
+        let get_init_context = || InitContext {
+            init_meta: Default::default(),
+        };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
         let send_test_result = |_, _| {};
 
@@ -843,6 +875,7 @@ mod test {
             &std::env::current_dir().unwrap(),
             || false,
             Some(send_manifest),
+            get_init_context,
             get_next_test,
             send_test_result,
             false,

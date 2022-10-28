@@ -14,7 +14,7 @@ use abq_utils::net_async;
 use abq_utils::net_opt::{ServerOptions, Tls};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
-use abq_utils::net_protocol::runners::{ManifestResult, TestCase, TestResult};
+use abq_utils::net_protocol::runners::{ManifestResult, MetadataMap, TestCase, TestResult};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
@@ -61,6 +61,9 @@ enum RunState {
     WaitingForManifest,
     HasWork {
         queue: JobQueue,
+
+        /// Top-level test suite metadata workers should initialize with.
+        init_metadata: MetadataMap,
 
         /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
         // Co-locate this here so that we don't have to index `run_data` when grabbing a
@@ -215,7 +218,12 @@ impl RunQueues {
         AssignedRunLookup::Some(assigned_run)
     }
 
-    pub fn add_manifest(&mut self, run_id: RunId, flat_manifest: Vec<TestCase>) {
+    pub fn add_manifest(
+        &mut self,
+        run_id: RunId,
+        flat_manifest: Vec<TestCase>,
+        init_metadata: MetadataMap,
+    ) {
         let state = self.queues.get_mut(&run_id).expect("no queue for run");
 
         match state {
@@ -256,6 +264,28 @@ impl RunQueues {
                 .get(&run_id)
                 .expect("no data for run")
                 .batch_size_hint,
+            init_metadata,
+        }
+    }
+
+    pub fn init_metadata(&mut self, run_id: RunId) -> Result<MetadataMap, WaitingForManifestError> {
+        match self
+            .queues
+            .get_mut(&run_id)
+            .expect("no queue state for run")
+        {
+            RunState::WaitingForFirstWorker => Err(WaitingForManifestError),
+            RunState::WaitingForManifest => Err(WaitingForManifestError),
+            RunState::HasWork {
+                init_metadata,
+                queue: _,
+                batch_size_hint: _,
+            } => Ok(init_metadata.clone()),
+            RunState::Done { .. } | RunState::Cancelled { .. } => {
+                // TODO: really, we should tell the worker that the run is already done at this
+                // point.
+                Ok(Default::default())
+            }
         }
     }
 
@@ -269,6 +299,7 @@ impl RunQueues {
             RunState::WaitingForManifest => Err(WaitingForManifestError),
             RunState::HasWork {
                 queue,
+                init_metadata: _,
                 batch_size_hint,
             } => {
                 // NB: in the future, the batch size is likely to be determined intellegently, i.e.
@@ -299,6 +330,7 @@ impl RunQueues {
         match state {
             RunState::HasWork {
                 queue,
+                init_metadata: _,
                 batch_size_hint: _,
             } => {
                 assert!(queue.is_empty(), "Invalid state - queue is not complete!");
@@ -1282,7 +1314,7 @@ impl QueueServer {
             ManifestResult::Manifest(manifest) => {
                 // Record the manifest for this run in its appropriate queue.
                 // TODO: actually record the manifest metadata
-                let flat_manifest = flatten_manifest(manifest.manifest);
+                let (flat_manifest, metadata) = flatten_manifest(manifest.manifest);
 
                 if !flat_manifest.is_empty() {
                     Self::handle_manifest_success(
@@ -1291,6 +1323,7 @@ impl QueueServer {
                         entity,
                         run_id,
                         flat_manifest,
+                        metadata,
                         stream,
                     )
                     .await
@@ -1329,6 +1362,7 @@ impl QueueServer {
         entity: EntityId,
         run_id: RunId,
         flat_manifest: Vec<TestCase>,
+        init_metadata: MetadataMap,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
@@ -1343,7 +1377,10 @@ impl QueueServer {
             .unwrap()
             .insert(run_id.clone(), run_state);
 
-        queues.lock().unwrap().add_manifest(run_id, flat_manifest);
+        queues
+            .lock()
+            .unwrap()
+            .add_manifest(run_id, flat_manifest, init_metadata);
 
         net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
 
@@ -1729,6 +1766,21 @@ impl WorkScheduler {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
             }
+            WorkServerRequest::InitContext { run_id } => {
+                let opt_init_metadata =
+                    { ctx.queues.lock().unwrap().init_metadata(run_id.clone()) };
+
+                use net_protocol::work_server::{InitContext, InitContextResponse};
+                let response = match opt_init_metadata {
+                    Ok(init_meta) => InitContextResponse::InitContext(InitContext { init_meta }),
+                    Err(WaitingForManifestError) => {
+                        // Nothing yet; have the worker ask again later.
+                        InitContextResponse::WaitingForManifest
+                    }
+                };
+
+                net_protocol::async_write(&mut stream, &response).await?;
+            }
             WorkServerRequest::NextTest { run_id } => {
                 // Pull the next bundle of work.
                 let opt_work_bundle = { ctx.queues.lock().unwrap().next_work(run_id.clone()) };
@@ -1784,7 +1836,10 @@ mod test {
             self,
             entity::EntityId,
             queue::InvokeWork,
-            runners::{Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult},
+            runners::{
+                Manifest, ManifestMessage, MetadataMap, Status, Test, TestOrGroup, TestResult,
+            },
+            work_server::InitContext,
             workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
         },
         shutdown::ShutdownManager,
@@ -1848,16 +1903,23 @@ mod test {
             .unwrap()
     }
 
-    fn empty_manifest() -> ManifestMessage {
+    fn empty_manifest() -> Manifest {
+        Manifest {
+            members: vec![],
+            init_meta: Default::default(),
+        }
+    }
+
+    fn empty_manifest_msg() -> ManifestMessage {
         ManifestMessage {
-            manifest: Manifest { members: vec![] },
+            manifest: empty_manifest(),
         }
     }
 
     fn faux_invoke_work() -> InvokeWork {
         InvokeWork {
             run_id: RunId::unique(),
-            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
             batch_size_hint: one_nonzero(),
         }
     }
@@ -1918,6 +1980,7 @@ mod test {
                     echo_test("echo1".to_string()),
                     echo_test("echo2".to_string()),
                 ],
+                ..empty_manifest()
             },
         };
 
@@ -2000,6 +2063,7 @@ mod test {
                     echo_test("echo1".to_string()),
                     echo_test("echo2".to_string()),
                 ],
+                ..empty_manifest()
             },
         };
 
@@ -2012,6 +2076,7 @@ mod test {
                     echo_test("echo4".to_string()),
                     echo_test("echo5".to_string()),
                 ],
+                ..empty_manifest()
             },
         };
 
@@ -2135,6 +2200,7 @@ mod test {
                     echo_test("echo3".to_string()),
                     echo_test("echo4".to_string()),
                 ],
+                ..empty_manifest()
             },
         };
 
@@ -2701,6 +2767,7 @@ mod test {
         let manifest = ManifestMessage {
             manifest: Manifest {
                 members: vec![echo_test("echo1".to_string())],
+                ..empty_manifest()
             },
         };
 
@@ -2776,6 +2843,7 @@ mod test {
                     echo_test("echo3".to_string()),
                     echo_test("echo4".to_string()),
                 ],
+                init_meta: Default::default(),
             },
         };
 
@@ -2862,6 +2930,7 @@ mod test {
                     echo_test("echo1".to_string()),
                     echo_test("echo2".to_string()),
                 ],
+                ..empty_manifest()
             },
         };
 
@@ -2927,6 +2996,7 @@ mod test {
         let manifest = ManifestMessage {
             manifest: Manifest {
                 members: vec![echo_test("echo1".to_string())],
+                ..empty_manifest()
             },
         };
 
@@ -3021,7 +3091,10 @@ mod test {
                 RunnerKind::TestLikeRunner(
                     TestLikeRunner::Echo,
                     ManifestMessage {
-                        manifest: Manifest { members: vec![] },
+                        manifest: Manifest {
+                            members: vec![],
+                            init_meta: Default::default(),
+                        },
                     },
                 ),
                 one_nonzero(),
@@ -3064,7 +3137,10 @@ mod test {
                 RunnerKind::TestLikeRunner(
                     TestLikeRunner::Echo,
                     ManifestMessage {
-                        manifest: Manifest { members: vec![] },
+                        manifest: Manifest {
+                            members: vec![],
+                            init_meta: Default::default(),
+                        },
                     },
                 ),
                 one_nonzero(),
@@ -3105,6 +3181,7 @@ mod test {
                     echo_test("echo1".to_string()),
                     echo_test("echo2".to_string()),
                 ],
+                init_meta: Default::default(),
             },
         };
 
@@ -3289,7 +3366,7 @@ mod test {
         queues
             .create_queue(
                 RunId::unique(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3306,7 +3383,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3325,13 +3402,13 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
-        queues.add_manifest(run_id, vec![]);
+        queues.add_manifest(run_id, vec![], Default::default());
 
         assert_eq!(queues.num_active_runs(), 1);
     }
@@ -3345,13 +3422,13 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
-        queues.add_manifest(run_id.clone(), vec![]);
+        queues.add_manifest(run_id.clone(), vec![], Default::default());
         queues.mark_complete(run_id, true);
 
         assert_eq!(queues.num_active_runs(), 0);
@@ -3371,7 +3448,7 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                 )
                 .unwrap();
@@ -3380,7 +3457,7 @@ mod test {
         }
 
         for run_id in [&run_id1, &run_id2, &run_id4] {
-            queues.add_manifest(run_id.clone(), vec![]);
+            queues.add_manifest(run_id.clone(), vec![], Default::default());
         }
 
         for run_id in [run_id1, run_id2] {
@@ -3398,7 +3475,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3423,7 +3500,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3450,13 +3527,13 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
-        queues.add_manifest(run_id.clone(), vec![]);
+        queues.add_manifest(run_id.clone(), vec![], Default::default());
 
         assert_eq!(queues.num_active_runs(), 1);
 
@@ -3476,6 +3553,7 @@ mod test {
         let manifest = ManifestMessage {
             manifest: Manifest {
                 members: vec![echo_test("echo1".to_string())],
+                ..empty_manifest()
             },
         };
 
@@ -3567,12 +3645,12 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest()),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                 )
                 .unwrap();
             queues.get_run_for_worker(&run_id);
-            queues.add_manifest(run_id.clone(), vec![]);
+            queues.add_manifest(run_id.clone(), vec![], Default::default());
             Arc::new(std::sync::Mutex::new(queues))
         };
         let active_runs: ActiveRunResponders = {
@@ -3712,7 +3790,7 @@ mod test {
     fn empty_manifest_exits_gracefully() {
         let mut queue = Abq::start(Default::default());
 
-        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest());
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
 
         let workers_config = WorkersConfig {
             num_workers: 4.try_into().unwrap(),
@@ -3781,5 +3859,97 @@ mod test {
         assert!(matches!(exit, WorkersExit::Success));
 
         queue.shutdown().unwrap();
+    }
+
+    #[test]
+    fn lifecycle_get_initialization_context_from_work_server() {
+        let mut queue = Abq::start(Default::default());
+
+        let init_meta = {
+            let mut meta = MetadataMap::default();
+            meta.insert("hello".to_string(), "world".into());
+            meta.insert("ab".to_string(), "queue".into());
+            meta
+        };
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![echo_test("get-metadata".to_string())],
+                init_meta: init_meta.clone(),
+            },
+        };
+
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::EchoInitContext, manifest);
+
+        let workers_config = WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
+        };
+
+        let queue_server_addr = queue.server_addr();
+
+        let client_opts = ClientOptions::new(ClientAuthStrategy::no_auth(), Tls::NO);
+
+        let run_id = RunId::unique();
+        let results_handle = thread::spawn({
+            let run_id = run_id.clone();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                runtime.block_on(async {
+                    let mut results = Vec::default();
+
+                    let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
+                    )
+                    .await
+                    .unwrap();
+
+                    client
+                        .stream_results(|id, result| {
+                            results.push((id.0, result));
+                        })
+                        .await
+                        .unwrap();
+
+                    results
+                })
+            }
+        });
+
+        let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+            workers_config,
+            queue.get_negotiator_handle(),
+            client_opts,
+            run_id,
+        )
+        .unwrap();
+
+        let mut results = results_handle.join().unwrap();
+
+        let exit = workers.shutdown();
+        assert!(matches!(exit, WorkersExit::Success));
+        queue.shutdown().unwrap();
+
+        let results = sort_results(&mut results);
+        let InitContext {
+            init_meta: result_init_meta,
+        } = serde_json::from_str(results[0]).unwrap();
+
+        assert_eq!(init_meta, result_init_meta);
     }
 }

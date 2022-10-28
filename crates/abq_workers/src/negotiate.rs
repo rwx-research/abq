@@ -14,8 +14,8 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::workers::{
-    GetNextWorkBundle, NotifyManifest, NotifyResult, RunCompletedSuccessfully, WorkerContext,
-    WorkerPool, WorkerPoolConfig, WorkersExit,
+    GetInitContext, GetNextWorkBundle, NotifyManifest, NotifyResult, RunCompletedSuccessfully,
+    WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
 };
 use abq_utils::{
     auth::User,
@@ -25,6 +25,7 @@ use abq_utils::{
         self,
         entity::EntityId,
         publicize_addr,
+        work_server::InitContext,
         workers::{NextWorkBundle, RunId, RunnerKind},
     },
     shutdown::ShutdownReceiver,
@@ -224,6 +225,19 @@ impl WorkersNegotiator {
             }
         });
 
+        let get_init_context: GetInitContext = Arc::new({
+            let client = client.boxed_clone();
+            let run_id = run_id.clone();
+
+            move || {
+                let span = tracing::trace_span!("get_init_context", run_id=?run_id, new_work_server=?queue_new_work_addr);
+                let _get_next_work = span.enter();
+
+                // TODO: error handling
+                wait_for_init_context(&*client, queue_new_work_addr, run_id.clone()).unwrap()
+            }
+        });
+
         let get_next_work: GetNextWorkBundle = Arc::new({
             let client = client.boxed_clone();
             let run_id = run_id.clone();
@@ -310,6 +324,7 @@ impl WorkersNegotiator {
             size: num_workers,
             runner_kind,
             get_next_work,
+            get_init_context,
             notify_result,
             run_completed_successfully,
             worker_context,
@@ -325,6 +340,39 @@ impl WorkersNegotiator {
         tracing::debug!("Started worker pool");
 
         Ok(NegotiatedWorkers::Pool(pool))
+    }
+}
+
+/// Asks the work server for native runner initialization context.
+/// Blocks on the result, repeatedly pinging the server until work is available.
+fn wait_for_init_context(
+    client: &dyn net::ConfiguredClient,
+    work_server_addr: SocketAddr,
+    run_id: RunId,
+) -> Result<InitContext, io::Error> {
+    use net_protocol::work_server::{InitContextResponse, WorkServerRequest};
+
+    let next_test_request = WorkServerRequest::InitContext { run_id };
+
+    // The work server may be waiting for the manifest, which the initialization context is blocked on;
+    // to avoid pinging the server too often, let's decay on the frequency of our requests.
+    let mut decay = Duration::from_millis(10);
+    let max_decay = Duration::from_secs(3);
+    loop {
+        let mut stream = client.connect(work_server_addr)?;
+        net_protocol::write(&mut stream, next_test_request.clone())?;
+        match net_protocol::read(&mut stream)? {
+            InitContextResponse::WaitingForManifest => {
+                thread::sleep(decay);
+                decay *= 2;
+                if decay >= max_decay {
+                    tracing::info!("hit max decay limit for requesting initialization context");
+                    decay = max_decay;
+                }
+                continue;
+            }
+            InitContextResponse::InitContext(init_context) => return Ok(init_context),
+        }
     }
 }
 
@@ -651,7 +699,9 @@ mod test {
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestOrGroup, TestResult,
     };
-    use abq_utils::net_protocol::work_server::{NextTestResponse, WorkServerRequest};
+    use abq_utils::net_protocol::work_server::{
+        InitContext, InitContextResponse, NextTestResponse, WorkServerRequest,
+    };
     use abq_utils::net_protocol::workers::{
         NextWork, NextWorkBundle, RunId, RunnerKind, TestLikeRunner, WorkContext, WorkId,
     };
@@ -687,6 +737,7 @@ mod test {
                 match manifest_collector.lock().unwrap().take() {
                     Some(man) => {
                         let work: Vec<_> = flatten_manifest(man.manifest)
+                            .0
                             .into_iter()
                             .enumerate()
                             .map(|(i, test_case)| NextWork::Work {
@@ -706,16 +757,29 @@ mod test {
 
             work_to_write.reverse();
             server.set_nonblocking(true).unwrap();
+            let mut recv_init_context = false;
             loop {
                 match server.accept() {
                     Ok((mut worker, _)) => {
                         worker.set_nonblocking(false).unwrap();
-                        let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
-                        let work_bundle = NextWorkBundle(vec![work]);
 
-                        let _msg: WorkServerRequest = net_protocol::read(&mut worker).unwrap();
-                        let response = NextTestResponse::Bundle(work_bundle);
-                        net_protocol::write(&mut worker, response).unwrap();
+                        if !recv_init_context {
+                            recv_init_context = true;
+                            net_protocol::write(
+                                &mut worker,
+                                InitContextResponse::InitContext(InitContext {
+                                    init_meta: Default::default(),
+                                }),
+                            )
+                            .unwrap();
+                        } else {
+                            let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
+                            let work_bundle = NextWorkBundle(vec![work]);
+
+                            let _msg: WorkServerRequest = net_protocol::read(&mut worker).unwrap();
+                            let response = NextTestResponse::Bundle(work_bundle);
+                            net_protocol::write(&mut worker, response).unwrap();
+                        }
                     }
 
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -850,6 +914,7 @@ mod test {
             let manifest = ManifestMessage {
                 manifest: Manifest {
                     members: vec![echo_test("hello".to_string())],
+                    init_meta: Default::default(),
                 },
             };
             Ok(AssignedRun {
@@ -926,7 +991,10 @@ mod test {
                     runner_kind: RunnerKind::TestLikeRunner(
                         TestLikeRunner::Echo,
                         ManifestMessage {
-                            manifest: Manifest { members: vec![] },
+                            manifest: Manifest {
+                                members: vec![],
+                                init_meta: Default::default(),
+                            },
                         },
                     ),
                     should_generate_manifest: true,
