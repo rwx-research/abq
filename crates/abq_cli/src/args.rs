@@ -7,11 +7,10 @@ use std::{
 use abq_hosted::ApiKey;
 use abq_utils::{
     auth::{AdminToken, UserToken},
-    net_opt::Tls,
     net_protocol::workers::RunId,
 };
 
-use clap::{ArgAction, ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
 
@@ -95,10 +94,19 @@ pub enum Command {
         #[clap(long, requires("user_token"))]
         admin_token: Option<AdminToken>,
 
-        /// Whether to accept messages only with TLS; false by default.
-        /// When set, workers and test clients must also be set to send messages only with TLS.
-        #[clap(long, action = ArgAction::SetTrue, required = false)]
-        tls: Tls,
+        /// If the queue should accept messages only with TLS, the path of the TLS certificate to
+        /// use.
+        ///
+        /// If provided, must also provide `--tls-key`.
+        #[clap(long, requires("tls_key"))]
+        tls_cert: Option<PathBuf>,
+
+        /// If the queue should accept messages only with TLS, the path of the TLS private key to
+        /// use.
+        ///
+        /// If provided, must also provide `--tls-cert`.
+        #[clap(long, requires("tls_cert"))]
+        tls_key: Option<PathBuf>,
     },
     /// Starts a pool of abq workers in a working directory.
     ///
@@ -144,13 +152,14 @@ pub enum Command {
         #[clap(long, required = false)]
         token: Option<UserToken>,
 
-        /// Whether to send messages only with TLS; false by default.
-        /// When set, only queues configured with TLS as well should be provided via
-        /// `--queue-addr`.
+        /// If the worker should send messages only with TLS, the path of the TLS cert to
+        /// anticipate from the communicating queue.
+        ///
+        /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
         ///
         /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
-        #[clap(long, action = ArgAction::SetTrue, required = false)]
-        tls: Tls,
+        #[clap(long)]
+        tls_cert: Option<PathBuf>,
     },
     /// Starts an instance of `abq test`.
     ///
@@ -166,7 +175,15 @@ pub enum Command {
         ArgGroup::new("execution") // don't allow both queue_addr and num_workers params
             .multiple(false)
             .args(["api_key", "queue_addr", "num_workers"]),
-        ))]
+        )
+    )]
+    #[command(group(
+        ArgGroup::new("server-key-exclusion") // don't allow server-side cert key if running in non-local mode
+            .multiple(false)
+            .args(["api_key", "queue_addr"])
+            .conflicts_with("tls_key"),
+        )
+    )]
     Test {
         /// Run ID for workers to connect to. If not specified, workers are started in-process.
         /// In CI environments, this can be inferred from CI environment variables.
@@ -201,13 +218,22 @@ pub enum Command {
         #[clap(long, required = false)]
         token: Option<UserToken>,
 
-        /// Whether to send messages only with TLS; false by default.
-        /// When set, only queues configured with TLS as well should be provided via
-        /// `--queue-addr`.
+        /// If message should only be sent with TLS, the path of the TLS cert to
+        /// anticipate from the communicating queue.
+        ///
+        /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
         ///
         /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
-        #[clap(long, action = ArgAction::SetTrue, required = false)]
-        tls: Tls,
+        #[clap(long)]
+        tls_cert: Option<PathBuf>,
+
+        /// If running in local mode, and if messages should only be sent with TLS,
+        /// the path of the TLS cert to anticipate from the communicating queue.
+        ///
+        /// Cannot be used with either `--api-key` or `--queue-addr`, both of which anticipate
+        /// running in non-local modes. If provided, must provide `--tls-cert` as well.
+        #[clap(long, requires("tls_cert"))]
+        tls_key: Option<PathBuf>,
 
         /// Test result reporter to use for a test run.
         #[clap(long, default_value = "line")]
@@ -262,9 +288,12 @@ pub enum Command {
         #[clap(long, required = false)]
         token: Option<UserToken>,
 
-        /// Whether the services being checked are configured with TLS.
-        #[clap(long, action=ArgAction::SetTrue, required = false)]
-        tls: Tls,
+        /// If message should only be sent with TLS, the path of the TLS cert to
+        /// anticipate from the communicating queue.
+        ///
+        /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
+        #[clap(long)]
+        tls_cert: Option<PathBuf>,
     },
     /// Utilities related to auth tokens.
     #[clap(subcommand)]
