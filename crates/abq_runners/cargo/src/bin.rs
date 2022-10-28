@@ -12,10 +12,10 @@ use std::{
 use abq_utils::net_protocol::{
     self,
     runners::{
-        AbqProtocolVersionMessage, AbqProtocolVersionTag, Manifest, ManifestMessage, Status, Test,
-        TestCase, TestCaseMessage, TestOrGroup, TestResult, TestResultMessage,
-        ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
-        ACTIVE_PROTOCOL_VERSION_MINOR,
+        AbqProtocolVersionMessage, AbqProtocolVersionTag, InitMessage, InitSuccessMessage,
+        Manifest, ManifestMessage, Status, Test, TestCase, TestCaseMessage, TestOrGroup,
+        TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+        ACTIVE_PROTOCOL_VERSION_MAJOR, ACTIVE_PROTOCOL_VERSION_MINOR,
     },
 };
 
@@ -73,11 +73,17 @@ fn main() -> anyhow::Result<()> {
             .collect::<Result<Vec<TestOrGroup>, FromUtf8Error>>()?;
 
         let manifest = ManifestMessage {
-            manifest: Manifest { members: tests },
+            manifest: Manifest {
+                members: tests,
+                init_meta: Default::default(),
+            },
         };
 
         net_protocol::write(&mut worker_conn, manifest)?;
     } else {
+        let _init_message: InitMessage = net_protocol::read(&mut worker_conn)?;
+        net_protocol::write(&mut worker_conn, InitSuccessMessage {})?;
+
         let args: Vec<_> = args.collect();
 
         #[allow(clippy::while_let_loop)]

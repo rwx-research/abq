@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use net_protocol::runners::{Group, Manifest, Test, TestCase, TestOrGroup};
+use net_protocol::runners::{Group, Manifest, MetadataMap, Test, TestCase, TestOrGroup};
 
 pub mod auth;
 pub mod net;
@@ -11,9 +11,14 @@ pub mod shutdown;
 mod tls;
 
 /// Flattens a manifest into only [TestId]s, preserving the manifest order.
-pub fn flatten_manifest(manifest: Manifest) -> Vec<TestCase> {
-    let mut collected = Vec::with_capacity(manifest.members.len());
-    let mut queue: VecDeque<_> = manifest.members.into_iter().collect();
+pub fn flatten_manifest(manifest: Manifest) -> (Vec<TestCase>, MetadataMap) {
+    let Manifest {
+        members,
+        init_meta: meta,
+    } = manifest;
+
+    let mut collected = Vec::with_capacity(members.len());
+    let mut queue: VecDeque<_> = members.into_iter().collect();
     while let Some(test_or_group) = queue.pop_front() {
         match test_or_group {
             TestOrGroup::Test(Test { id, meta, .. }) => {
@@ -26,5 +31,5 @@ pub fn flatten_manifest(manifest: Manifest) -> Vec<TestCase> {
             }
         }
     }
-    collected
+    (collected, meta)
 }
