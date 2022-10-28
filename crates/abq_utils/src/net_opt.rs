@@ -28,7 +28,7 @@ impl std::str::FromStr for Tls {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ServerOptions {
     auth_strategy: ServerAuthStrategy,
     tls_strategy: ServerTlsStrategy,
@@ -52,7 +52,9 @@ impl ServerOptions {
         use crate::tls::ServerTlsStrategyInner::*;
 
         let client: Box<dyn net::ServerListener> = match tls_strategy.0 {
-            Yes => net::tls::ServerListener::bind(auth_strategy, addr).map(Box::new)?,
+            Config(tls_config) => {
+                net::tls::ServerListener::bind(auth_strategy, tls_config, addr).map(Box::new)?
+            }
             NoTls => net::tcp::ServerListener::bind(auth_strategy, addr).map(Box::new)?,
         };
         Ok(client)
@@ -70,9 +72,11 @@ impl ServerOptions {
         use crate::tls::ServerTlsStrategyInner::*;
 
         let client: Box<dyn net_async::ServerListener> = match tls_strategy.0 {
-            Yes => net_async::tls::ServerListener::bind(auth_strategy, addr)
-                .await
-                .map(Box::new)?,
+            Config(tls_config) => {
+                net_async::tls::ServerListener::bind(auth_strategy, tls_config, addr)
+                    .await
+                    .map(Box::new)?
+            }
             NoTls => net_async::tcp::ServerListener::bind(auth_strategy, addr)
                 .await
                 .map(Box::new)?,
@@ -81,7 +85,7 @@ impl ServerOptions {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct ClientOptions<Role> {
     auth_strategy: ClientAuthStrategy<Role>,
     tls_strategy: ClientTlsStrategy,
@@ -108,7 +112,9 @@ where
         use crate::tls::ClientTlsStrategyInner::*;
 
         let client: Box<dyn net::ConfiguredClient> = match tls_strategy.0 {
-            Yes => net::tls::ConfiguredClient::new(auth_strategy).map(Box::new)?,
+            Config(tls_config) => {
+                Box::new(net::tls::ConfiguredClient::new(auth_strategy, tls_config))
+            }
             NoTls => net::tcp::ConfiguredClient::new(auth_strategy).map(Box::new)?,
         };
         Ok(client)
@@ -123,7 +129,9 @@ where
         use crate::tls::ClientTlsStrategyInner::*;
 
         let client: Box<dyn net_async::ConfiguredClient> = match tls_strategy.0 {
-            Yes => net_async::tls::ConfiguredClient::new(auth_strategy).map(Box::new)?,
+            Config(tls_config) => {
+                net_async::tls::ConfiguredClient::new(auth_strategy, tls_config).map(Box::new)?
+            }
             NoTls => net_async::tcp::ConfiguredClient::new(auth_strategy).map(Box::new)?,
         };
         Ok(client)

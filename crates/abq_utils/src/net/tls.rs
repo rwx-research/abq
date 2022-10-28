@@ -49,8 +49,11 @@ pub struct ServerListener {
 }
 
 impl ServerListener {
-    pub fn bind(auth_strategy: ServerAuthStrategy, addr: impl ToSocketAddrs) -> io::Result<Self> {
-        let tls_config = crate::tls::get_server_config()?;
+    pub fn bind(
+        auth_strategy: ServerAuthStrategy,
+        tls_config: Arc<tls::ServerConfig>,
+        addr: impl ToSocketAddrs,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
 
         Ok(Self {
@@ -131,13 +134,14 @@ pub struct ConfiguredClient<Role> {
 }
 
 impl<Role> ConfiguredClient<Role> {
-    pub fn new(auth_strategy: ClientAuthStrategy<Role>) -> io::Result<Self> {
-        let tls_config = crate::tls::get_client_config()?;
-
-        Ok(Self {
+    pub fn new(
+        auth_strategy: ClientAuthStrategy<Role>,
+        tls_config: Arc<tls::ClientConfig>,
+    ) -> Self {
+        Self {
             tls_config,
             auth_strategy,
-        })
+        }
     }
 }
 

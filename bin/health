@@ -5,4 +5,4 @@
   --work-scheduler=0.0.0.0:8081 \
   --negotiator=0.0.0.0:8082 \
   --token "$(cat /app/abq_user_token)" \
-  --tls
+  --tls-cert "$(cat /app/server.crt)"

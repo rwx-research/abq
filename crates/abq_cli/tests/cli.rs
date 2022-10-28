@@ -18,7 +18,6 @@ const TLS_CERT: &str = std::concat!(
     std::env!("ABQ_WORKSPACE_DIR"),
     "crates/abq_utils/data/cert/server.crt"
 );
-#[cfg(feature = "test-abq-jest")]
 const TLS_KEY: &str = std::concat!(
     std::env!("ABQ_WORKSPACE_DIR"),
     "crates/abq_utils/data/cert/server.key"
@@ -178,7 +177,7 @@ impl CSConfigOptions {
         }
         if self.tls {
             args.extend(["--tls-cert", TLS_CERT]);
-            args.extend(["--tls-key", TLS_CERT]);
+            args.extend(["--tls-key", TLS_KEY]);
         }
         args
     }
@@ -201,7 +200,6 @@ impl CSConfigOptions {
             args.extend(["--token", TEST_USER_AUTH_TOKEN]);
         }
         if self.tls {
-            dbg!(TLS_CERT, TLS_KEY);
             args.extend(["--tls-cert", TLS_CERT]);
             args.extend(["--tls-key", TLS_KEY]);
         }

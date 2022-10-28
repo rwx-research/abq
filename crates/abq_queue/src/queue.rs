@@ -593,10 +593,13 @@ fn start_queue(config: QueueConfig) -> Abq {
 
     let queues: SharedRunQueues = Default::default();
 
-    let server_listener = server_options.bind((bind_ip, server_port)).unwrap();
+    let server_listener = server_options.clone().bind((bind_ip, server_port)).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
 
-    let negotiator_listener = server_options.bind((bind_ip, negotiator_port)).unwrap();
+    let negotiator_listener = server_options
+        .clone()
+        .bind((bind_ip, negotiator_port))
+        .unwrap();
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
@@ -2002,6 +2005,7 @@ mod test {
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -2101,6 +2105,7 @@ mod test {
         let (_cancellation_tx2, cancellation_rx2) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let (run1, run2) = (run1.clone(), run2.clone());
+            let client_opts = client_opts.clone();
 
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2115,7 +2120,7 @@ mod test {
                     let client1 = Client::invoke_work(
                         EntityId::new(),
                         queue_server_addr,
-                        client_opts,
+                        client_opts.clone(),
                         run1,
                         runner1,
                         one_nonzero(),
@@ -2156,7 +2161,7 @@ mod test {
         let mut workers_for_run1 = WorkersNegotiator::negotiate_and_start_pool(
             workers_config.clone(),
             queue.get_negotiator_handle(),
-            client_opts,
+            client_opts.clone(),
             run1,
         )
         .unwrap();
@@ -2224,6 +2229,7 @@ mod test {
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run = run.clone();
+            let client_opts = client_opts.clone();
 
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2807,6 +2813,7 @@ mod test {
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
 
             move || {
                 let runtime = make_runtime();
@@ -2886,9 +2893,11 @@ mod test {
         let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
 
             move || {
                 let runtime = make_runtime();
+                let client_opts = client_opts.clone();
 
                 runtime.block_on(async {
                     let client = Client::invoke_work(
@@ -2918,7 +2927,7 @@ mod test {
         let mut workers1 = WorkersNegotiator::negotiate_and_start_pool(
             workers_config.clone(),
             queue.get_negotiator_handle(),
-            client_opts,
+            client_opts.clone(),
             run_id.clone(),
         )
         .unwrap();
@@ -2967,13 +2976,15 @@ mod test {
         let (_cancellation_tx2, cancellation_rx2) = run_cancellation_pair();
         let handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts;
+
             move || {
                 make_runtime().block_on(async {
                     // Start one client with the run ID
                     let _client1 = Client::invoke_work(
                         EntityId::new(),
                         queue_server_addr,
-                        client_opts,
+                        client_opts.clone(),
                         run_id.clone(),
                         runner.clone(),
                         one_nonzero(),
@@ -3039,6 +3050,7 @@ mod test {
         let (_cancellation_tx2, cancellation_rx2) = run_cancellation_pair();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
 
             move || {
                 make_runtime().block_on(async {
@@ -3046,7 +3058,7 @@ mod test {
                     let client = Client::invoke_work(
                         EntityId::new(),
                         queue_server_addr,
-                        client_opts,
+                        client_opts.clone(),
                         run_id.clone(),
                         runner.clone(),
                         one_nonzero(),
@@ -3231,6 +3243,8 @@ mod test {
         {
             let results_handle = thread::spawn({
                 let run_id = run_id.clone();
+                let client_opts = client_opts.clone();
+
                 move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -3265,7 +3279,7 @@ mod test {
             let mut workers = WorkersNegotiator::negotiate_and_start_pool(
                 workers_config.clone(),
                 queue.get_negotiator_handle(),
-                client_opts,
+                client_opts.clone(),
                 run_id.clone(),
             )
             .unwrap();
@@ -3331,6 +3345,8 @@ mod test {
 
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
+
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -3601,6 +3617,7 @@ mod test {
 
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
             let all_results = Arc::clone(&all_results);
 
             move || {
@@ -3844,6 +3861,8 @@ mod test {
 
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
+
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -3932,6 +3951,8 @@ mod test {
         let run_id = RunId::unique();
         let results_handle = thread::spawn({
             let run_id = run_id.clone();
+            let client_opts = client_opts.clone();
+
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
