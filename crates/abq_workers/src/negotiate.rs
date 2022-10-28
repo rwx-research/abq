@@ -387,26 +387,10 @@ fn wait_for_next_work_bundle(
 
     let next_test_request = net_protocol::work_server::WorkServerRequest::NextTest { run_id };
 
-    // The work server may be waiting for the manifest, in which case there won't be any work yet
-    // available; to avoid pinging the server too often, let's decay on the frequency of our
-    // requests.
-    let mut decay = Duration::from_millis(10);
-    let max_decay = Duration::from_secs(3);
-    loop {
-        let mut stream = client.connect(work_server_addr)?;
-        net_protocol::write(&mut stream, next_test_request.clone())?;
-        match net_protocol::read(&mut stream)? {
-            NextTestResponse::WaitingForManifest => {
-                thread::sleep(decay);
-                decay *= 2;
-                if decay >= max_decay {
-                    tracing::info!("hit max decay limit for requesting next test");
-                    decay = max_decay;
-                }
-                continue;
-            }
-            NextTestResponse::Bundle(bundle) => return Ok(bundle),
-        }
+    let mut stream = client.connect(work_server_addr)?;
+    net_protocol::write(&mut stream, next_test_request)?;
+    match net_protocol::read(&mut stream)? {
+        NextTestResponse::Bundle(bundle) => Ok(bundle),
     }
 }
 

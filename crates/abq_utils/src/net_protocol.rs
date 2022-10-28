@@ -448,8 +448,6 @@ pub mod work_server {
 
     #[derive(Serialize, Deserialize, Debug)]
     pub enum NextTestResponse {
-        /// The manifest is yet to be received; try again later
-        WaitingForManifest,
         /// The set of tests to run next
         Bundle(workers::NextWorkBundle),
     }

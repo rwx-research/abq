@@ -289,14 +289,12 @@ impl RunQueues {
         }
     }
 
-    pub fn next_work(&mut self, run_id: RunId) -> Result<NextWorkBundle, WaitingForManifestError> {
+    pub fn next_work(&mut self, run_id: RunId) -> NextWorkBundle {
         match self
             .queues
             .get_mut(&run_id)
             .expect("no queue state for run")
         {
-            RunState::WaitingForFirstWorker => Err(WaitingForManifestError),
-            RunState::WaitingForManifest => Err(WaitingForManifestError),
             RunState::HasWork {
                 queue,
                 init_metadata: _,
@@ -314,11 +312,13 @@ impl RunQueues {
                     // round-trip.
                     bundle.push(NextWork::EndOfWork);
                 }
-                Ok(NextWorkBundle(bundle))
+                NextWorkBundle(bundle)
             }
             RunState::Done { .. } | RunState::Cancelled {} => {
-                Ok(NextWorkBundle(vec![NextWork::EndOfWork]))
+                NextWorkBundle(vec![NextWork::EndOfWork])
             }
+            RunState::WaitingForFirstWorker |
+            RunState::WaitingForManifest => unreachable!("Invalid state - work can only be requested after initialization metadata, at which point the manifest is known.")
         }
     }
 
@@ -1783,16 +1783,10 @@ impl WorkScheduler {
             }
             WorkServerRequest::NextTest { run_id } => {
                 // Pull the next bundle of work.
-                let opt_work_bundle = { ctx.queues.lock().unwrap().next_work(run_id.clone()) };
+                let bundle = { ctx.queues.lock().unwrap().next_work(run_id.clone()) };
 
                 use net_protocol::work_server::NextTestResponse;
-                let response = match opt_work_bundle {
-                    Ok(bundle) => NextTestResponse::Bundle(bundle),
-                    Err(WaitingForManifestError) => {
-                        // Nothing yet; have the worker ask again later.
-                        NextTestResponse::WaitingForManifest
-                    }
-                };
+                let response = NextTestResponse::Bundle(bundle);
 
                 net_protocol::async_write(&mut stream, &response).await?;
             }
@@ -1839,7 +1833,7 @@ mod test {
             runners::{
                 Manifest, ManifestMessage, MetadataMap, Status, Test, TestOrGroup, TestResult,
             },
-            work_server::InitContext,
+            work_server::{InitContext, InitContextResponse},
             workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
         },
         shutdown::ShutdownManager,
@@ -3078,7 +3072,7 @@ mod test {
 
     #[test]
     #[traced_test]
-    fn get_work_from_work_server_waiting_for_first_worker() {
+    fn get_init_context_from_work_server_waiting_for_first_worker() {
         let (server_auth, client_auth, _) = build_random_strategies();
 
         let run_id = RunId::unique();
@@ -3109,14 +3103,14 @@ mod test {
 
         let mut conn = client.connect(server_addr).unwrap();
 
-        use net_protocol::work_server::{NextTestResponse, WorkServerRequest};
+        use net_protocol::work_server::WorkServerRequest;
 
         // Ask the server for the next test; we should be told a manifest is still TBD.
-        net_protocol::write(&mut conn, WorkServerRequest::NextTest { run_id }).unwrap();
+        net_protocol::write(&mut conn, WorkServerRequest::InitContext { run_id }).unwrap();
 
-        let response: NextTestResponse = net_protocol::read(&mut conn).unwrap();
+        let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
 
-        assert!(matches!(response, NextTestResponse::WaitingForManifest));
+        assert!(matches!(response, InitContextResponse::WaitingForManifest));
 
         server_shutdown.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
@@ -3124,7 +3118,7 @@ mod test {
 
     #[test]
     #[traced_test]
-    fn get_work_from_work_server_waiting_for_manifest() {
+    fn get_init_context_from_work_server_waiting_for_manifest() {
         let (server_auth, client_auth, _) = build_random_strategies();
 
         let run_id = RunId::unique();
@@ -3158,14 +3152,14 @@ mod test {
 
         let mut conn = client.connect(server_addr).unwrap();
 
-        use net_protocol::work_server::{NextTestResponse, WorkServerRequest};
+        use net_protocol::work_server::WorkServerRequest;
 
         // Ask the server for the next test; we should be told a manifest is still TBD.
-        net_protocol::write(&mut conn, WorkServerRequest::NextTest { run_id }).unwrap();
+        net_protocol::write(&mut conn, WorkServerRequest::InitContext { run_id }).unwrap();
 
-        let response: NextTestResponse = net_protocol::read(&mut conn).unwrap();
+        let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
 
-        assert!(matches!(response, NextTestResponse::WaitingForManifest));
+        assert!(matches!(response, InitContextResponse::WaitingForManifest));
 
         server_shutdown.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
