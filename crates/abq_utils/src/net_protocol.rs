@@ -45,6 +45,7 @@ pub mod runners {
     #[derive(Debug, Serialize, Deserialize)]
     pub struct InitMessage {
         pub init_meta: MetadataMap,
+        pub fast_exit: bool,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -304,6 +305,11 @@ pub mod queue {
         workers::{RunId, RunnerKind, WorkId},
     };
 
+    /// A marker that a test run has already completed.
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+    #[serde(tag = "type")]
+    pub struct RunAlreadyCompleted {}
+
     /// An ask to run some work by an invoker.
     #[derive(Serialize, Deserialize, Debug)]
     pub struct InvokeWork {
@@ -444,6 +450,8 @@ pub mod work_server {
         /// The manifest is yet to be received; try again later
         WaitingForManifest,
         InitContext(InitContext),
+        /// The run is already done, the worker can exit.
+        RunAlreadyCompleted,
     }
 
     #[derive(Serialize, Deserialize, Debug)]

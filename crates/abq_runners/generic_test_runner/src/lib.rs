@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
 
+use abq_utils::net_protocol::queue::RunAlreadyCompleted;
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersionMessage, InitSuccessMessage, ManifestMessage, ManifestResult, Status,
     TestCaseMessage, TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
@@ -216,7 +217,7 @@ impl GenericTestRunner {
     where
         ShouldShutdown: Fn() -> bool,
         SendManifest: FnMut(ManifestResult),
-        GetInitContext: Fn() -> InitContext,
+        GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
         GetNextWorkBundle: FnMut() -> NextWorkBundle + std::marker::Send + 'static,
         SendTestResult: FnMut(WorkId, TestResult),
     {
@@ -309,12 +310,35 @@ impl GenericTestRunner {
             is_native_runner_alive,
         )?;
 
-        // Wait for the native runner to initialize.
+        // Wait for the native runner to initialize, and send it the initialization context.
+        //
+        // If the initialization context informs us that the run is already complete, we can exit
+        // immediately. While this case is possible, it is far more likely that the initialization
+        // context will be material. As such, we want to spawn the native runner before fetching
+        // the initialization context; that way we can pay the price of startup and
+        // context-fetching in parallel.
         {
-            let InitContext { init_meta } = get_init_context();
-            let init_message = net_protocol::runners::InitMessage { init_meta };
-            net_protocol::write(&mut runner_conn, init_message)?;
-            let InitSuccessMessage {} = net_protocol::read(&mut runner_conn)?;
+            match get_init_context() {
+                Ok(InitContext { init_meta }) => {
+                    let init_message = net_protocol::runners::InitMessage {
+                        init_meta,
+                        fast_exit: false,
+                    };
+                    net_protocol::write(&mut runner_conn, init_message)?;
+                    let InitSuccessMessage {} = net_protocol::read(&mut runner_conn)?;
+                }
+                Err(RunAlreadyCompleted {}) => {
+                    // There is nothing more for the native runner to do, so we tell it to
+                    // fast-exit and wait for it to terminate.
+                    let init_message = net_protocol::runners::InitMessage {
+                        init_meta: Default::default(),
+                        fast_exit: true,
+                    };
+                    net_protocol::write(&mut runner_conn, init_message)?;
+                    native_runner_handle.wait()?;
+                    return Ok(());
+                }
+            };
         }
 
         // We establish one connection with the native runner and repeatedly send tests until we're
@@ -536,8 +560,10 @@ pub fn execute_wrapped_runner(
             }
         }
     };
-    let get_init_context = || InitContext {
-        init_meta: Default::default(),
+    let get_init_context = || {
+        Ok(InitContext {
+            init_meta: Default::default(),
+        })
     };
 
     let get_next_test = {
@@ -767,9 +793,14 @@ mod test_validate_protocol_version_message {
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
     use crate::{execute_wrapped_runner, GenericTestRunner};
-    use abq_utils::net_protocol::runners::{ManifestMessage, ManifestResult, Status, TestOrGroup};
+    use abq_utils::net_protocol::queue::RunAlreadyCompleted;
+    use abq_utils::net_protocol::runners::{
+        ManifestMessage, ManifestResult, Status, TestCase, TestOrGroup,
+    };
     use abq_utils::net_protocol::work_server::InitContext;
-    use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
+    use abq_utils::net_protocol::workers::{
+        NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
+    };
 
     use std::path::PathBuf;
 
@@ -790,8 +821,10 @@ mod test_abq_jest {
         let mut test_results = vec![];
 
         let send_manifest = |real_manifest| manifest = Some(real_manifest);
-        let get_init_context = || InitContext {
-            init_meta: Default::default(),
+        let get_init_context = || {
+            Ok(InitContext {
+                init_meta: Default::default(),
+            })
         };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
         let send_test_result = |_, test_result| test_results.push(test_result);
@@ -844,6 +877,44 @@ mod test_abq_jest {
         assert_eq!(test_results[1].status, Status::Success);
         assert!(test_results[1].id.ends_with("names.test.js"));
     }
+
+    #[test]
+    fn quick_exit_if_init_context_says_run_is_complete() {
+        let input = NativeTestRunnerParams {
+            cmd: "npm".to_string(),
+            args: vec!["test".to_string()],
+            extra_env: Default::default(),
+        };
+
+        let get_init_context = || Err(RunAlreadyCompleted {});
+        let get_next_test = || {
+            NextWorkBundle(vec![NextWork::Work {
+                test_case: TestCase {
+                    id: "unreachable".to_string(),
+                    meta: Default::default(),
+                },
+                context: WorkContext {
+                    working_dir: std::env::current_dir().unwrap(),
+                },
+                run_id: RunId::unique(),
+                work_id: WorkId("unreachable".to_string()),
+            }])
+        };
+        let send_test_result = |_, _| {};
+
+        let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _, _, _>(
+            input,
+            &npm_jest_project_path(),
+            || false,
+            None,
+            get_init_context,
+            get_next_test,
+            send_test_result,
+            false,
+        );
+
+        assert!(runner_result.is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -864,8 +935,10 @@ mod test {
         let mut manifest_result = None;
 
         let send_manifest = |result| manifest_result = Some(result);
-        let get_init_context = || InitContext {
-            init_meta: Default::default(),
+        let get_init_context = || {
+            Ok(InitContext {
+                init_meta: Default::default(),
+            })
         };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
         let send_test_result = |_, _| {};

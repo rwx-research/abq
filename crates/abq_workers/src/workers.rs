@@ -10,6 +10,7 @@ use abq_exec_worker as exec;
 use abq_generic_test_runner::{GenericTestRunner, RunnerError};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::queue::RunAlreadyCompleted;
 use abq_utils::net_protocol::runners::{
     ManifestMessage, ManifestResult, Status, TestId, TestResult,
 };
@@ -27,8 +28,10 @@ enum MessageFromPool {
 
 type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
+pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
+
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
-pub type GetInitContext = Arc<dyn Fn() -> InitContext + Send + Sync + 'static>;
+pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResult = Arc<dyn Fn(EntityId, &RunId, WorkId, TestResult) + Send + Sync + 'static>;
 /// Did a given run complete successfully? Returns true if so.
@@ -424,7 +427,10 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         notify_manifest(entity, &run_id, ManifestResult::Manifest(manifest));
     }
 
-    let init_context = get_init_context();
+    let init_context = match get_init_context() {
+        Ok(ctx) => ctx,
+        Err(RunAlreadyCompleted {}) => return,
+    };
 
     'tests_done: loop {
         // First, check if we have a message from our owner.
@@ -630,8 +636,8 @@ mod test {
     use tracing_test::traced_test;
 
     use super::{
-        GetNextWorkBundle, NotifyManifest, NotifyResult, RunCompletedSuccessfully, WorkerContext,
-        WorkerPool, WorkersExit,
+        GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResult,
+        RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkersExit,
     };
     use crate::negotiate::QueueNegotiator;
     use crate::workers::WorkerPoolConfig;
@@ -682,10 +688,10 @@ mod test {
         (results, notify_result, get_completed_status)
     }
 
-    fn empty_init_context() -> InitContext {
-        InitContext {
+    fn empty_init_context() -> InitContextResult {
+        Ok(InitContext {
             init_meta: Default::default(),
-        }
+        })
     }
 
     fn setup_pool(
