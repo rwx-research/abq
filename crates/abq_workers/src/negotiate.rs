@@ -14,8 +14,8 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::workers::{
-    GetInitContext, GetNextWorkBundle, NotifyManifest, NotifyResult, RunCompletedSuccessfully,
-    WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
+    GetInitContext, GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResult,
+    RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
 };
 use abq_utils::{
     auth::User,
@@ -25,7 +25,7 @@ use abq_utils::{
         self,
         entity::EntityId,
         publicize_addr,
-        work_server::InitContext,
+        queue::RunAlreadyCompleted,
         workers::{NextWorkBundle, RunId, RunnerKind},
     },
     shutdown::ShutdownReceiver,
@@ -349,7 +349,7 @@ fn wait_for_init_context(
     client: &dyn net::ConfiguredClient,
     work_server_addr: SocketAddr,
     run_id: RunId,
-) -> Result<InitContext, io::Error> {
+) -> Result<InitContextResult, io::Error> {
     use net_protocol::work_server::{InitContextResponse, WorkServerRequest};
 
     let next_test_request = WorkServerRequest::InitContext { run_id };
@@ -371,7 +371,8 @@ fn wait_for_init_context(
                 }
                 continue;
             }
-            InitContextResponse::InitContext(init_context) => return Ok(init_context),
+            InitContextResponse::InitContext(init_context) => return Ok(Ok(init_context)),
+            InitContextResponse::RunAlreadyCompleted => return Ok(Err(RunAlreadyCompleted {})),
         }
     }
 }
