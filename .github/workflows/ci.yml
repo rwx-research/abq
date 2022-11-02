@@ -185,7 +185,7 @@ jobs:
 
       - name: Install system deps
         run: |
-          yum install openssl-devel sudo -y
+          yum install openssl-devel sudo jq -y
 
       - name: Build release
         run: cargo build --release
