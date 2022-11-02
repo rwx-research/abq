@@ -156,7 +156,9 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux_x86-64
+            container: quay.io/pypa/manylinux2014_x86_64
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     if: github.ref == 'refs/heads/main'
     needs: test
     steps:
@@ -177,7 +179,13 @@ jobs:
           restore-keys: |
             cargo-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: rwx-research/rust-toolchain@abq
+        with:
+          toolchain: stable
+
+      - name: Install openssl
+        run: |
+          yum install openssl-devel -y
 
       - name: Build release
         run: cargo build --release
