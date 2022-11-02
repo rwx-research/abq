@@ -156,9 +156,7 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux_x86-64
-            container: quay.io/pypa/manylinux2014_x86_64
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
     if: github.ref == 'refs/heads/main'
     needs: test
     steps:
