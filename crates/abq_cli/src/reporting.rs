@@ -1,7 +1,10 @@
 use std::{fmt::Display, io, path::PathBuf, str::FromStr};
 
 use abq_output::{format_result_dot, format_result_line, format_result_summary};
-use abq_utils::net_protocol::runners::{Status, TestResult};
+use abq_utils::{
+    exit,
+    net_protocol::runners::{Status, TestResult},
+};
 use termcolor::{ColorChoice, StandardStream};
 use thiserror::Error;
 
@@ -84,6 +87,7 @@ impl From<io::Error> for ReportingError {
     }
 }
 
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) struct ExitCode(i32);
 
 impl ExitCode {
@@ -106,12 +110,16 @@ pub(crate) struct SuiteResult {
 impl SuiteResult {
     fn account_result(&mut self, test_result: &TestResult) {
         match test_result.status {
-            Status::Failure | Status::Error | Status::PrivateNativeRunnerError => {
+            Status::PrivateNativeRunnerError => {
+                self.success = false;
+                self.suggested_exit_code = ExitCode(exit::CODE_ERROR);
+            }
+            Status::Failure | Status::Error if self.success => {
+                // If we already recorded a failure or error, that takes priority.
                 self.success = false;
                 self.suggested_exit_code = ExitCode(1);
             }
-
-            Status::Pending | Status::Skipped | Status::Success => {}
+            _ => {}
         }
     }
 }
@@ -864,5 +872,61 @@ mod test_dot_reporter {
         default output
         (completed in 1 m, 15 s, 3 ms)
         "###);
+    }
+}
+
+#[cfg(test)]
+mod suite {
+    use abq_utils::{
+        exit,
+        net_protocol::runners::{Status, TestResult},
+    };
+
+    use crate::reporting::ExitCode;
+
+    use super::{default_result, ColorPreference, SuiteReporters, SuiteResult};
+
+    fn get_overall_result<'a>(results: impl IntoIterator<Item = &'a TestResult>) -> SuiteResult {
+        let mut suite = SuiteReporters::new([], ColorPreference::Auto, "test");
+        results
+            .into_iter()
+            .for_each(|r| suite.push_result(r).unwrap());
+        let (suite_result, _) = suite.finish();
+        suite_result
+    }
+
+    macro_rules! test_status {
+        ($($test_name:ident, $status_order:expr, $expect_success:expr, $expect_exit:expr)*) => {$(
+            #[test]
+            fn $test_name() {
+                use Status::*;
+
+                let results = $status_order.into_iter().map(|status| TestResult {
+                    status,
+                    ..default_result()
+                }).collect::<Vec<_>>();
+
+                let SuiteResult {
+                    success, suggested_exit_code
+                } = get_overall_result(&results);
+
+                assert_eq!(success, $expect_success);
+                assert_eq!(suggested_exit_code, $expect_exit);
+            }
+        )*};
+    }
+
+    test_status! {
+        success_if_no_errors, [Success, Pending, Skipped], true, ExitCode(0)
+        fail_if_success_then_error, [Success, Error], false, ExitCode(1)
+        fail_if_error_then_success, [Error, Success], false, ExitCode(1)
+        fail_if_success_then_failure, [Success, Failure], false, ExitCode(1)
+        fail_if_failure_then_success, [Failure, Success], false, ExitCode(1)
+        error_if_success_then_internal_error, [Success, PrivateNativeRunnerError], false, ExitCode(exit::CODE_ERROR)
+        error_if_internal_error_then_success, [PrivateNativeRunnerError, Success], false, ExitCode(exit::CODE_ERROR)
+        error_if_error_then_internal_error, [Error, PrivateNativeRunnerError], false, ExitCode(exit::CODE_ERROR)
+        error_if_internal_error_then_error, [PrivateNativeRunnerError, Error], false, ExitCode(exit::CODE_ERROR)
+        error_if_failure_then_internal_error, [Failure, PrivateNativeRunnerError], false, ExitCode(exit::CODE_ERROR)
+        error_if_internal_error_then_failure, [PrivateNativeRunnerError, Failure], false, ExitCode(exit::CODE_ERROR)
     }
 }
