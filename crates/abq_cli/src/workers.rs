@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
+use abq_utils::exit;
 use abq_utils::net_protocol::workers::RunId;
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
@@ -89,7 +90,7 @@ pub fn start_workers_forever(
             let exit_code = match exit_status {
                 WorkersExit::Success => 0,
                 WorkersExit::Failure => 1,
-                WorkersExit::Error => 101,
+                WorkersExit::Error => exit::CODE_ERROR,
             };
             std::process::exit(exit_code);
         }

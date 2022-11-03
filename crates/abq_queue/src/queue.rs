@@ -3388,7 +3388,7 @@ mod test {
         ));
 
         let exit = workers.shutdown();
-        assert!(matches!(exit, WorkersExit::Failure));
+        assert!(matches!(exit, WorkersExit::Error));
 
         queue.shutdown().unwrap();
     }

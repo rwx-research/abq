@@ -282,9 +282,12 @@ impl WorkerPool {
             }
         }
 
-        match !worker_has_error && (self.run_completed_successfully)(self.entity) {
-            true => WorkersExit::Success,
-            false => WorkersExit::Failure,
+        if worker_has_error {
+            WorkersExit::Error
+        } else if (self.run_completed_successfully)(self.entity) {
+            WorkersExit::Success
+        } else {
+            WorkersExit::Failure
         }
     }
 }
@@ -627,7 +630,9 @@ mod test {
         Manifest, ManifestMessage, ManifestResult, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::InitContext;
-    use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, TestLikeRunner};
+    use abq_utils::net_protocol::workers::{
+        NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
+    };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{flatten_manifest, net_protocol};
@@ -695,9 +700,8 @@ mod test {
     }
 
     fn setup_pool(
-        runner: TestLikeRunner,
+        runner_kind: RunnerKind,
         run_id: RunId,
-        manifest: ManifestMessage,
         get_next_work: GetNextWorkBundle,
         notify_result: NotifyResult,
         run_completed_successfully: RunCompletedSuccessfully,
@@ -708,7 +712,7 @@ mod test {
             size: NonZeroUsize::new(1).unwrap(),
             get_next_work,
             get_init_context: Arc::new(empty_init_context),
-            runner_kind: RunnerKind::TestLikeRunner(runner, manifest),
+            runner_kind,
             run_id,
             notify_manifest: Some(notify_manifest),
             notify_result,
@@ -806,9 +810,8 @@ mod test {
         };
 
         let (default_config, manifest_collector) = setup_pool(
-            TestLikeRunner::Echo,
+            RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
             run_id.clone(),
-            manifest,
             get_next_work,
             notify_result,
             run_completed_successfully,
@@ -1028,9 +1031,8 @@ mod test {
         };
 
         let (default_config, manifest_collector) = setup_pool(
-            TestLikeRunner::Exec,
+            RunnerKind::TestLikeRunner(TestLikeRunner::Exec, manifest),
             run_id.clone(),
-            manifest,
             get_next_work,
             notify_result,
             run_completed_successfully,
@@ -1106,5 +1108,29 @@ mod test {
         negotiator.join();
 
         logs_with_scope_contain("", "error handling connection");
+    }
+
+    #[test]
+    fn exit_with_error_if_worker_errors() {
+        let (_write_work, get_next_work) = work_writer();
+        let (_results, notify_result, run_completed_successfully) = results_collector();
+        let (default_config, _manifest_collector) = setup_pool(
+            RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+                // This command should cause the worker to error, since it can't even be executed
+                cmd: "__zzz_not_a_command__".into(),
+                args: Default::default(),
+                extra_env: Default::default(),
+            }),
+            RunId::unique(),
+            get_next_work,
+            notify_result,
+            run_completed_successfully,
+        );
+
+        let mut pool = WorkerPool::new(default_config);
+
+        let pool_exit = pool.shutdown();
+
+        assert!(matches!(pool_exit, WorkersExit::Error));
     }
 }
