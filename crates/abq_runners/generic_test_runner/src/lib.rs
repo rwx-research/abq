@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
 
+use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::RunAlreadyCompleted;
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersionMessage, InitSuccessMessage, ManifestMessage, ManifestResult, Status,
@@ -133,7 +134,6 @@ fn retrieve_manifest<'a>(
     additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
     working_dir: &Path,
     protocol_version_timeout: Duration,
-    debug_native_runner: bool,
 ) -> Result<ManifestMessage, RetrieveManifestError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
@@ -147,13 +147,11 @@ fn retrieve_manifest<'a>(
         native_runner.env(ABQ_GENERATE_MANIFEST, "1");
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
-        if debug_native_runner {
-            native_runner.stdout(process::Stdio::inherit());
-            native_runner.stderr(process::Stdio::inherit());
-        } else {
-            native_runner.stdout(process::Stdio::piped());
-            native_runner.stderr(process::Stdio::piped());
-        }
+        // NB(130): we'd like to surface native runner output today, but tomorrow
+        // (with https://github.com/rwx-research/abq/issues/130) this should either
+        // be captured or hidden behind a debug flag.
+        native_runner.stdout(process::Stdio::inherit());
+        native_runner.stderr(process::Stdio::inherit());
 
         let mut native_runner_handle = native_runner.spawn()?;
 
@@ -205,6 +203,7 @@ impl From<ProtocolVersionMessageError> for RunnerError {
 
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetInitContext, GetNextWorkBundle, SendTestResult>(
+        worker_entity: EntityId,
         input: NativeTestRunnerParams,
         working_dir: &Path,
         _polling_should_shutdown: ShouldShutdown,
@@ -212,7 +211,7 @@ impl GenericTestRunner {
         get_init_context: GetInitContext,
         mut get_next_test_bundle: GetNextWorkBundle,
         mut send_test_result: SendTestResult,
-        debug_native_runner: bool,
+        _debug_native_runner: bool,
     ) -> Result<(), RunnerError>
     where
         ShouldShutdown: Fn() -> bool,
@@ -232,14 +231,12 @@ impl GenericTestRunner {
 
         // If we need to retrieve the manifest, do that first.
         if let Some(mut send_manifest) = send_manifest {
-            // TODO: error handling
             let manifest_or_error = retrieve_manifest(
                 &cmd,
                 &args,
                 &additional_env,
                 working_dir,
                 protocol_version_timeout,
-                debug_native_runner,
             );
 
             match manifest_or_error {
@@ -287,13 +284,11 @@ impl GenericTestRunner {
         native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
-        if debug_native_runner {
-            native_runner.stdout(process::Stdio::inherit());
-            native_runner.stderr(process::Stdio::inherit());
-        } else {
-            native_runner.stdout(process::Stdio::null());
-            native_runner.stderr(process::Stdio::null());
-        }
+        // NB(130): we'd like to surface native runner output today, but tomorrow
+        // (with https://github.com/rwx-research/abq/issues/130) this should either
+        // be captured or hidden behind the `debug_native_runner` flag.
+        native_runner.stdout(process::Stdio::inherit());
+        native_runner.stderr(process::Stdio::inherit());
 
         // If launching the native runner fails here, it should have failed during manifest
         // generation as well (unless this is a flakey error in the underlying test runner, channel
@@ -389,6 +384,7 @@ impl GenericTestRunner {
                                 });
 
                                 handle_native_runner_failure(
+                                    worker_entity,
                                     send_test_result,
                                     cmd,
                                     native_runner_handle,
@@ -413,6 +409,7 @@ impl GenericTestRunner {
 const INDENT: &str = "    ";
 
 #[allow(clippy::format_push_string)] // write! can fail, push can't
+#[allow(unused)] // NB(130): will once again become relevant with https://github.com/rwx-research/abq/issues/130
 fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
     let read_result = fd.map(|mut fd| {
         let mut out_buf = Vec::new();
@@ -440,6 +437,7 @@ fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
 
 #[allow(clippy::format_push_string)] // write! can fail, push can't
 fn handle_native_runner_failure<SendTestResult, I>(
+    worker_entity: EntityId,
     mut send_test_result: SendTestResult,
     args: Vec<String>,
     mut native_runner_handle: process::Child,
@@ -493,16 +491,19 @@ fn handle_native_runner_failure<SendTestResult, I>(
         }
     }
 
-    format_failed_fd(
-        native_runner_handle.stdout.take(),
-        &mut error_message,
-        "stdout",
-    );
-    format_failed_fd(
-        native_runner_handle.stderr.take(),
-        &mut error_message,
-        "stderr",
-    );
+    error_message.push_str("\n\n");
+    error_message.push_str(&format!(
+        indoc!(
+            r#"
+            Please see the standard output/error for worker
+
+            {}{:?}
+
+            to see the native test runner failure.
+            "#
+        ),
+        INDENT, worker_entity
+    ));
 
     tracing::warn!(?error_message, "native test runner failure");
 
@@ -601,6 +602,7 @@ pub fn execute_wrapped_runner(
     let send_test_result = |_, test_result| test_results.push(test_result);
 
     GenericTestRunner::run(
+        EntityId::new(),
         native_runner_params,
         &working_dir,
         || false,
@@ -793,6 +795,7 @@ mod test_validate_protocol_version_message {
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
     use crate::{execute_wrapped_runner, GenericTestRunner};
+    use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::RunAlreadyCompleted;
     use abq_utils::net_protocol::runners::{
         ManifestMessage, ManifestResult, Status, TestCase, TestOrGroup,
@@ -830,6 +833,7 @@ mod test_abq_jest {
         let send_test_result = |_, test_result| test_results.push(test_result);
 
         GenericTestRunner::run(
+            EntityId::new(),
             input,
             &npm_jest_project_path(),
             || false,
@@ -903,6 +907,7 @@ mod test_abq_jest {
         let send_test_result = |_, _| {};
 
         let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _, _, _>(
+            EntityId::new(),
             input,
             &npm_jest_project_path(),
             || false,
@@ -920,6 +925,7 @@ mod test_abq_jest {
 #[cfg(test)]
 mod test {
     use crate::{GenericTestRunner, RunnerError};
+    use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::runners::ManifestResult;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
@@ -944,6 +950,7 @@ mod test {
         let send_test_result = |_, _| {};
 
         let runner_result = GenericTestRunner::run(
+            EntityId::new(),
             input,
             &std::env::current_dir().unwrap(),
             || false,
