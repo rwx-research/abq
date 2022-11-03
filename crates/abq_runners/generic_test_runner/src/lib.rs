@@ -75,9 +75,6 @@ pub fn open_native_runner_connection(
 
         match listener.accept() {
             Ok((mut conn, _)) => {
-                conn.set_nonblocking(false).map_err(Io)?;
-                listener.set_nonblocking(false).map_err(Io)?;
-
                 let version_message: AbqProtocolVersionMessage =
                     net_protocol::read(&mut conn).map_err(Io)?;
 

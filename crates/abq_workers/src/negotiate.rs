@@ -747,8 +747,6 @@ mod test {
             loop {
                 match server.accept() {
                     Ok((mut worker, _)) => {
-                        worker.set_nonblocking(false).unwrap();
-
                         if !recv_init_context {
                             recv_init_context = true;
                             net_protocol::write(
@@ -812,7 +810,6 @@ mod test {
                 Err(_) => unreachable!(),
             };
 
-            client.set_nonblocking(false).unwrap();
             let request: net_protocol::queue::Request = net_protocol::read(&mut client).unwrap();
             match request.message {
                 net_protocol::queue::Message::WorkerResult(_, _, result) => {

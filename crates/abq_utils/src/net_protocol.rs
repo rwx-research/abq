@@ -3,8 +3,9 @@
 //! https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-IPQ-Interface-0959f5a9144741d798ac122566a3d887#f480d133e2c942719b1a0c0a9e76fb3a
 
 use std::{
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{IpAddr, SocketAddr},
+    time::{Duration, Instant},
 };
 
 pub mod health {
@@ -491,20 +492,71 @@ fn validate_max_message_size(message_size: u32) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const POLL_READ: Duration = Duration::from_micros(10);
+
 /// Reads a message from a stream communicating with abq.
 ///
-/// Note that [Read::read_exact] is used, and so the stream cannot be non-blocking.
+/// The provided stream must be non-blocking.
 pub fn read<T: serde::de::DeserializeOwned>(reader: &mut impl Read) -> Result<T, std::io::Error> {
+    read_help(reader, READ_TIMEOUT)
+}
+
+fn read_help<T: serde::de::DeserializeOwned>(
+    reader: &mut impl Read,
+    timeout: Duration,
+) -> Result<T, std::io::Error> {
+    // Do not timeout waiting for the first four bytes, since it may well be reasonable that we are
+    // waiting on an open connection for a new message.
     let mut msg_size_buf = [0; 4];
-    reader.read_exact(&mut msg_size_buf)?;
+    read_exact_help(reader, &mut msg_size_buf, Duration::MAX)?;
+
     let msg_size = u32::from_be_bytes(msg_size_buf);
     validate_max_message_size(msg_size)?;
 
     let mut msg_buf = vec![0; msg_size as usize];
-    reader.read_exact(&mut msg_buf)?;
+    read_exact_help(reader, &mut msg_buf, timeout)?;
 
     let msg = serde_json::from_slice(&msg_buf)?;
     Ok(msg)
+}
+
+fn read_exact_help(
+    reader: &mut impl Read,
+    mut buf: &mut [u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    // Derived from the Rust standard library implementation of `default_read_exact`, found at
+    // https://github.com/rust-lang/rust/blob/160b19429523ea44c4c3b7cad4233b2a35f58b8f/library/std/src/io/mod.rs#L449
+    // Dual-licensed under MIT and Apache. Thank you, Rust contributors.
+
+    let start = Instant::now();
+    while !buf.is_empty() {
+        if start.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out attempting to read exact message size",
+            ));
+        }
+        match reader.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(POLL_READ),
+            Err(e) => return Err(e),
+        }
+    }
+    if !buf.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Writes a message to a stream communicating with abq.
@@ -528,13 +580,34 @@ pub async fn async_read<R, T: serde::de::DeserializeOwned>(
 where
     R: tokio::io::AsyncReadExt + Unpin,
 {
+    async_read_help(reader, READ_TIMEOUT).await
+}
+
+async fn async_read_help<R, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+    timeout: Duration,
+) -> Result<T, std::io::Error>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    // Do not timeout reading the message size, since we might just be waiting indefinitely for a
+    // new message to come in.
     let mut msg_size_buf = [0; 4];
     reader.read_exact(&mut msg_size_buf).await?;
+
     let msg_size = u32::from_be_bytes(msg_size_buf);
     validate_max_message_size(msg_size)?;
 
     let mut msg_buf = vec![0; msg_size as usize];
-    reader.read_exact(&mut msg_buf).await?;
+
+    tokio::select! {
+        read_result = reader.read_exact(&mut msg_buf) => {
+            read_result?;
+        }
+        _ = tokio::time::sleep(timeout) => {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out attempting to read exact message size"));
+        }
+    }
 
     let msg = serde_json::from_slice(&msg_buf)?;
     Ok(msg)
@@ -562,9 +635,14 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::io::Write;
+    use std::{
+        io::{self, Write},
+        time::Duration,
+    };
 
     use tokio::io::AsyncWriteExt;
+
+    use crate::net_protocol::{async_read_help, read_help};
 
     use super::{async_read, read};
 
@@ -575,6 +653,7 @@ mod test {
         let server = TcpListener::bind("0.0.0.0:0").unwrap();
         let mut client_conn = TcpStream::connect(server.local_addr().unwrap()).unwrap();
         let (mut server_conn, _) = server.accept().unwrap();
+        server_conn.set_nonblocking(true).unwrap();
 
         let two_mb_msg_size = 2_000_000_u32.to_be_bytes();
         client_conn.write_all(&two_mb_msg_size).unwrap();
@@ -586,6 +665,24 @@ mod test {
             err.to_string(),
             "message size 2000000 bytes exceeds the maximum"
         );
+    }
+
+    #[test]
+    fn error_reads_that_timeout() {
+        use std::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        let (mut server_conn, _) = server.accept().unwrap();
+        server_conn.set_nonblocking(true).unwrap();
+
+        let msg_size = 10_u32.to_be_bytes();
+        client_conn.write_all(&msg_size).unwrap();
+
+        let read_result: Result<(), _> = read_help(&mut server_conn, Duration::from_secs(0));
+        assert!(read_result.is_err());
+        let err = read_result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
@@ -608,5 +705,25 @@ mod test {
             err.to_string(),
             "message size 2000000 bytes exceeds the maximum"
         );
+    }
+
+    #[tokio::test]
+    async fn error_reads_that_timeout_async() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_conn, _) = server.accept().await.unwrap();
+
+        let msg_size = 10_u32.to_be_bytes();
+        client_conn.write_all(&msg_size).await.unwrap();
+
+        let read_result: Result<(), _> =
+            async_read_help(&mut server_conn, Duration::from_secs(0)).await;
+        assert!(read_result.is_err());
+        let err = read_result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 }
