@@ -978,7 +978,7 @@ pub enum QueueServerError {
 
     /// Any other opaque error that occured.
     #[error("{0}")]
-    Other(#[from] Box<dyn Error + Send + Sync>),
+    Other(#[from] AnyError),
 }
 
 /// An error that occurs when an abq client attempts to re-connect to the queue.
@@ -987,6 +987,35 @@ enum ClientReconnectionError {
     /// The client sent an initial test run request to the queue.
     #[error("{0} was never used to invoke work on the queue")]
     NeverInvoked(RunId),
+}
+
+type AnyError = Box<dyn Error + Send + Sync>;
+
+#[derive(Debug)]
+struct EntityfulError {
+    error: AnyError,
+    entity: Option<EntityId>,
+}
+
+impl From<io::Error> for EntityfulError {
+    fn from(e: io::Error) -> Self {
+        Self {
+            error: e.into(),
+            entity: None,
+        }
+    }
+}
+
+impl std::fmt::Display for EntityfulError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl Error for EntityfulError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.error.source()
+    }
 }
 
 #[derive(Clone)]
@@ -1065,8 +1094,12 @@ impl QueueServer {
                     let ctx = ctx.clone();
                     async move {
                         let result = Self::handle(ctx, client).await;
-                        if let Err(err) = result {
-                            tracing::error!("error handling connection to queue: {:?}", err);
+                        if let Err(EntityfulError { error, entity }) = result {
+                            tracing::error!(
+                                ?entity,
+                                "error handling connection to queue: {}",
+                                error
+                            );
                         }
                     }
                 });
@@ -1082,11 +1115,11 @@ impl QueueServer {
     async fn handle(
         ctx: QueueServerCtx,
         stream: net_async::UnverifiedServerStream,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), EntityfulError> {
         let mut stream = ctx.handshake_ctx.handshake(stream).await?;
         let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
 
-        let result: Result<(), Box<dyn Error + Send + Sync>> = match message {
+        let result: Result<(), AnyError> = match message {
             Message::HealthCheck => {
                 // TODO here and in other servers - healthchecks currently require auth, whenever
                 // auth is configured. Should they?
@@ -1171,7 +1204,10 @@ impl QueueServer {
             Message::Retire => Self::handle_retirement(ctx.retirement, entity, stream).await,
         };
 
-        result
+        result.map_err(|error| EntityfulError {
+            error,
+            entity: Some(entity),
+        })
     }
 
     #[inline(always)]
@@ -1179,7 +1215,7 @@ impl QueueServer {
     async fn handle_healthcheck(
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         // Right now nothing interesting is owned by the queue, so nothing extra to check.
         net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await?;
         Ok(())
@@ -1191,7 +1227,7 @@ impl QueueServer {
         queues: SharedRuns,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         let active_runs = queues.estimate_num_active_runs();
         let response = net_protocol::queue::ActiveTestRunsResponse { active_runs };
         net_protocol::async_write(&mut stream, &response).await?;
@@ -1204,7 +1240,7 @@ impl QueueServer {
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
         public_negotiator_addr: SocketAddr,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         net_protocol::async_write(&mut stream, &public_negotiator_addr).await?;
         Ok(())
     }
@@ -1217,7 +1253,7 @@ impl QueueServer {
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
         invoke_work: InvokeWork,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         Self::reject_if_retired(&entity, retirement)?;
 
         let InvokeWork {
@@ -1318,7 +1354,7 @@ impl QueueServer {
         state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         tracing::info!(?run_id, ?entity, "test supervisor cancelled a test run");
 
         {
@@ -1389,7 +1425,7 @@ impl QueueServer {
         run_id: RunId,
         manifest_result: ManifestResult,
         stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         match manifest_result {
             ManifestResult::Manifest(manifest) => {
                 // Record the manifest for this run in its appropriate queue.
@@ -1444,7 +1480,7 @@ impl QueueServer {
         flat_manifest: Vec<TestCase>,
         init_metadata: MetadataMap,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
 
         let run_state = ActiveRunState {
@@ -1470,7 +1506,7 @@ impl QueueServer {
         run_id: RunId,
         manifest_result: Result<() /* empty */, String /* error */>,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         // If a worker failed to generate a manifest, or the manifest is empty,
         // we're going to immediately end the test run.
         //
@@ -1557,7 +1593,7 @@ impl QueueServer {
         run_id: RunId,
         work_id: WorkId,
         result: TestResult,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         let test_status = result.status;
 
         {
@@ -1682,7 +1718,7 @@ impl QueueServer {
         queues: SharedRuns,
         run_id: RunId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         let response = {
             let queues = queues;
             let liveness = queues
@@ -1710,7 +1746,7 @@ impl QueueServer {
         retirement: RetirementCell,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    ) -> Result<(), AnyError> {
         if !stream.role().is_admin() {
             tracing::warn!(?entity, "rejecting underprivileged request for retirement");
             return Err("rejecting underprivileged request for retirement".into());
@@ -1757,7 +1793,7 @@ pub enum WorkSchedulerError {
 
     /// Any other opaque error that occured.
     #[error("{0}")]
-    Other(#[from] Box<dyn Error + Send + Sync>),
+    Other(#[from] AnyError),
 }
 
 #[derive(Clone)]
