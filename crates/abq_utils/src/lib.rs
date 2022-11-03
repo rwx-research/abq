@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use net_protocol::runners::{Group, Manifest, MetadataMap, Test, TestCase, TestOrGroup};
 
+pub mod atomic;
 pub mod auth;
 pub mod exit;
 pub mod net;

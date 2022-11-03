@@ -127,10 +127,12 @@ dependencies = [
  "anyhow",
  "futures",
  "ntest",
+ "parking_lot",
  "procspawn",
  "serde",
  "serde_derive",
  "serde_json",
+ "static_assertions",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1639,6 +1641,12 @@ name = "spin"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e63cff320ae2c57904679ba7cb63280a3dc4613885beafb148ee7bf9aa9042d"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strip-ansi-escapes"

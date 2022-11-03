@@ -1,13 +1,11 @@
 use std::{
     io,
-    sync::{
-        atomic::{self, AtomicBool},
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
 };
 
 use tokio::sync::broadcast;
-const ORDERING: atomic::Ordering = atomic::Ordering::SeqCst; // keep it simple
+
+use crate::atomic::ORDERING;
 
 pub struct ShutdownManager {
     retired: Arc<AtomicBool>,
