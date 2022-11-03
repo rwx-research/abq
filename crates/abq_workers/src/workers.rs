@@ -368,6 +368,10 @@ fn start_generic_test_runner(
 
     tracing::debug!(?entity, "Starting new generic test runner");
 
+    // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
+    // so that they can correlate failures observed in workers with the workers they've launched.
+    eprintln!("Worker starter with id {:?}", entity);
+
     let notify_manifest = notify_manifest.map(|notify_manifest| {
         let run_id = run_id.clone();
         move |manifest_result| notify_manifest(entity, &run_id, manifest_result)
@@ -394,6 +398,7 @@ fn start_generic_test_runner(
     };
 
     let opt_runner_err = GenericTestRunner::run(
+        entity,
         native_runner_params,
         &working_dir,
         polling_should_shutdown,
