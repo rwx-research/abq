@@ -3,7 +3,7 @@ use std::{env, fs, path::Path, process::Command};
 /// Writes the currently-build ABQ version to $OUT_DIR/abq_version.txt
 fn write_abq_version() {
     let version_output = Command::new("git")
-        .args(&["describe", "--dirty"])
+        .args(["describe", "--dirty"])
         .output()
         .unwrap();
     let version = String::from_utf8(version_output.stdout).unwrap();

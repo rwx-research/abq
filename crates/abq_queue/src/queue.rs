@@ -3,12 +3,13 @@ use std::error::Error;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use std::ops::Deref;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use abq_utils::auth::ServerAuthStrategy;
-use abq_utils::flatten_manifest;
 use abq_utils::net;
 use abq_utils::net_async;
 use abq_utils::net_opt::ServerOptions;
@@ -25,10 +26,12 @@ use abq_utils::net_protocol::{
 use abq_utils::net_protocol::{client, publicize_addr};
 use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
+use abq_utils::{atomic, flatten_manifest};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunCompeleted, QueueNegotiator, QueueNegotiatorHandle,
 };
 
+use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tracing::instrument;
 
@@ -78,20 +81,66 @@ enum RunState {
 }
 
 struct RunData {
-    runner: RunnerKind,
+    runner: Box<RunnerKind>,
     /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
     batch_size_hint: NonZeroU64,
 }
+
+// Just the stack size of the RunData, the closure of RunData may be much larger.
+static_assertions::assert_eq_size!(RunData, (usize, u64));
+static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
 
 struct WaitingForManifestError;
 
+/// A individual test run ever invoked on the queue.
+struct Run {
+    /// The state of the test run.
+    state: RunState,
+    /// Data for the test run, persisted only while a test run is enqueued or active.
+    /// One a run is done (or cancelled), its state is persisted, but its run data is dropped to
+    /// minimize memory leaks.
+    data: Option<RunData>,
+}
+
+/// Sync-safe storage of all runs ever invoked on the queue.
 #[derive(Default)]
-struct RunQueues {
-    /// One queue per `abq test ...` run, at least for now.
-    queues: HashMap<RunId, RunState>,
-    run_data: HashMap<RunId, RunData>,
+struct AllRuns {
+    /// Representation:
+    ///   - read/write lock to insert and access runs. Insertion of runs is monotonically increasing,
+    ///     and reading of run state is far more common than writing a new run.
+    ///   - mutex to access run data. Writes are far more common during an active test run as
+    ///     workers move the active test pointer.
+    ///     TODO: switch to RwLock for #185
+    runs: RwLock<
+        //
+        HashMap<RunId, Mutex<Run>>,
+    >,
+    /// An intentionally-conservative estimation of the number of active runs, possibly
+    /// over-estimating the number of active runs. The exact behavior is as follows:
+    ///
+    ///   - When a run is added, the number of active runs may be reflected to include that new
+    ///     run before all other threads see the run in the `runs` map.
+    ///   - When a run is removed, the number of active runs may NOT be reflected to exclude that
+    ///     run before all other threads see the run removed from the `runs` map.
+    ///
+    /// This is done because `num_active` should only be used as an estimation for determining
+    /// whether a queue should be shutdown anyway, since new run requests may come in any time.
+    /// Since we are okay with estimates in these cases, we can avoid taking locks in adjusting
+    /// the number of active runs in tandem with the `runs` map.
+    num_active: AtomicU64,
+}
+
+#[derive(Default, Clone)]
+struct SharedRuns(Arc<AllRuns>);
+
+impl Deref for SharedRuns {
+    type Target = AllRuns;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 /// A reason a new queue for a run could not be created.
@@ -113,17 +162,25 @@ enum AssignedRunLookup {
     },
 }
 
-impl RunQueues {
+enum RunLive {
+    Active,
+    Done { succeeded: bool },
+    Cancelled,
+}
+
+impl AllRuns {
     /// Attempts to create a new queue for a run.
     /// If the given run ID already has an associated queue, an error is returned.
     pub fn create_queue(
-        &mut self,
+        &self,
         run_id: RunId,
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
     ) -> Result<(), NewQueueError> {
-        if let Some(state) = self.queues.get(&run_id) {
-            let err = match state {
+        let mut runs = self.runs.write();
+
+        if let Some(state) = runs.get(&run_id) {
+            let err = match &state.lock().state {
                 RunState::WaitingForFirstWorker
                 | RunState::WaitingForManifest
                 | RunState::HasWork { .. } => NewQueueError::RunIdAlreadyInProgress,
@@ -135,39 +192,43 @@ impl RunQueues {
             return Err(err);
         }
 
-        // The run ID is fresh; create a new queue for it.
-        let old_queue = self
-            .queues
-            .insert(run_id.clone(), RunState::WaitingForFirstWorker);
-        debug_assert!(old_queue.is_none());
+        // NB: Always add first for conversative estimation.
+        self.num_active.fetch_add(1, atomic::ORDERING);
 
-        let old_run_data = self.run_data.insert(
-            run_id,
-            RunData {
-                runner,
+        // The run ID is fresh; create a new queue for it.
+        let run = Run {
+            state: RunState::WaitingForFirstWorker,
+            data: Some(RunData {
+                runner: Box::new(runner),
                 batch_size_hint,
-            },
-        );
-        debug_assert!(old_run_data.is_none());
+            }),
+        };
+        let old_run = runs.insert(run_id, Mutex::new(run));
+        debug_assert!(old_run.is_none());
 
         Ok(())
     }
 
     // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
     // found.
-    pub fn get_run_for_worker(&mut self, run_id: &RunId) -> AssignedRunLookup {
-        let run_state = match self.queues.get_mut(run_id) {
-            Some(st) => st,
+    pub fn get_run_for_worker(&self, run_id: &RunId) -> AssignedRunLookup {
+        let runs = self.runs.read();
+
+        let mut run = match runs.get(run_id) {
+            Some(st) => st.lock(),
             None => return AssignedRunLookup::NotFound,
         };
 
-        let run_data = match self.run_data.get(run_id) {
-            Some(data) => data,
+        let runner = match &run.data {
+            Some(RunData {
+                runner,
+                batch_size_hint: _,
+            }) => (**runner).clone(),
             None => {
                 // If there is an active run, then the run data exists iff the run state exists;
                 // however, if the run state is known to be complete, the run data will already
                 // have been pruned, and the worker should not be given a run.
-                match run_state {
+                match &run.state {
                     RunState::Done { succeeded } => {
                         return AssignedRunLookup::AlreadyDone {
                             success: *succeeded,
@@ -190,18 +251,13 @@ impl RunQueues {
             }
         };
 
-        let RunData {
-            runner,
-            batch_size_hint: _,
-        } = run_data;
-
-        let assigned_run = match run_state {
+        let assigned_run = match run.state {
             RunState::WaitingForFirstWorker => {
                 // This is the first worker to attach; ask it to generate the manifest.
-                *run_state = RunState::WaitingForManifest;
+                run.state = RunState::WaitingForManifest;
                 AssignedRun {
                     run_id: run_id.clone(),
-                    runner_kind: runner.clone(),
+                    runner_kind: runner,
                     should_generate_manifest: true,
                 }
             }
@@ -210,7 +266,7 @@ impl RunQueues {
                 // the worker what runner it should set up.
                 AssignedRun {
                     run_id: run_id.clone(),
-                    runner_kind: runner.clone(),
+                    runner_kind: runner,
                     should_generate_manifest: false,
                 }
             }
@@ -220,14 +276,16 @@ impl RunQueues {
     }
 
     pub fn add_manifest(
-        &mut self,
+        &self,
         run_id: RunId,
         flat_manifest: Vec<TestCase>,
         init_metadata: MetadataMap,
     ) {
-        let state = self.queues.get_mut(&run_id).expect("no queue for run");
+        let runs = self.runs.read();
 
-        match state {
+        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+
+        match run.state {
             RunState::WaitingForManifest => {
                 // expected state, pass through
             }
@@ -258,23 +316,19 @@ impl RunQueues {
         let mut queue = JobQueue::default();
         queue.add_batch_work(work_from_manifest);
 
-        *state = RunState::HasWork {
+        run.state = RunState::HasWork {
             queue,
-            batch_size_hint: self
-                .run_data
-                .get(&run_id)
-                .expect("no data for run")
-                .batch_size_hint,
+            batch_size_hint: run.data.as_ref().expect("no data for run").batch_size_hint,
             init_metadata,
         }
     }
 
-    pub fn init_metadata(&mut self, run_id: RunId) -> Result<MetadataMap, WaitingForManifestError> {
-        match self
-            .queues
-            .get_mut(&run_id)
-            .expect("no queue state for run")
-        {
+    pub fn init_metadata(&self, run_id: RunId) -> Result<MetadataMap, WaitingForManifestError> {
+        let runs = self.runs.read();
+
+        let run = runs.get(&run_id).expect("no run recorded").lock();
+
+        match &run.state {
             RunState::WaitingForFirstWorker => Err(WaitingForManifestError),
             RunState::WaitingForManifest => Err(WaitingForManifestError),
             RunState::HasWork {
@@ -290,11 +344,12 @@ impl RunQueues {
         }
     }
 
-    pub fn next_work(&mut self, run_id: RunId) -> NextWorkBundle {
-        match self
-            .queues
-            .get_mut(&run_id)
-            .expect("no queue state for run")
+    pub fn next_work(&self, run_id: RunId) -> NextWorkBundle {
+        let runs = self.runs.read();
+
+        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+
+        match &mut run.state
         {
             RunState::HasWork {
                 queue,
@@ -323,12 +378,12 @@ impl RunQueues {
         }
     }
 
-    pub fn mark_complete(&mut self, run_id: RunId, succeeded: bool) {
-        let state = self
-            .queues
-            .get_mut(&run_id)
-            .expect("no queue state for run");
-        match state {
+    pub fn mark_complete(&self, run_id: RunId, succeeded: bool) {
+        let runs = self.runs.read();
+
+        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+
+        match &mut run.state {
             RunState::HasWork {
                 queue,
                 init_metadata: _,
@@ -347,19 +402,22 @@ impl RunQueues {
             }
         }
 
-        // TODO: right now, we are just marking something complete so that future workers asking
-        // for work about the run get an EndOfWork message. But this leaks memory, how can
-        // we avoid that?
-        *state = RunState::Done { succeeded };
-        self.run_data.remove(&run_id);
+        run.state = RunState::Done { succeeded };
+
+        // Drop the run data, since we no longer need it.
+        debug_assert!(run.data.is_some());
+        std::mem::take(&mut run.data);
+
+        // NB: Always sub last for conversative estimation.
+        self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
-    pub fn mark_failed_to_start(&mut self, run_id: RunId) {
-        let state = self
-            .queues
-            .get_mut(&run_id)
-            .expect("no queue state for run");
-        match state {
+    pub fn mark_failed_to_start(&self, run_id: RunId) {
+        let runs = self.runs.read();
+
+        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+
+        match run.state {
             RunState::WaitingForManifest => {
                 // okay
             }
@@ -372,17 +430,23 @@ impl RunQueues {
             }
         }
 
-        *state = RunState::Done { succeeded: false };
-        self.run_data.remove(&run_id);
+        run.state = RunState::Done { succeeded: false };
+
+        // Drop the run data, since we no longer need it.
+        debug_assert!(run.data.is_some());
+        std::mem::take(&mut run.data);
+
+        // NB: Always sub last for conversative estimation.
+        self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
     /// Marks a run as complete because it had the trivial manifest.
-    pub fn mark_empty_manifest_complete(&mut self, run_id: RunId) {
-        let state = self
-            .queues
-            .get_mut(&run_id)
-            .expect("no queue state for run");
-        match state {
+    pub fn mark_empty_manifest_complete(&self, run_id: RunId) {
+        let runs = self.runs.read();
+
+        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+
+        match run.state {
             RunState::WaitingForManifest => {
                 // okay
             }
@@ -395,12 +459,20 @@ impl RunQueues {
             }
         }
 
-        *state = RunState::Done { succeeded: true };
-        self.run_data.remove(&run_id);
+        run.state = RunState::Done { succeeded: true };
+
+        // Drop the run data, since we no longer need it.
+        debug_assert!(run.data.is_some());
+        std::mem::take(&mut run.data);
+
+        // NB: Always sub last for conversative estimation.
+        self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
-    pub fn mark_cancelled(&mut self, run_id: &RunId) {
-        let state = self.queues.get_mut(run_id).expect("no queue state for run");
+    pub fn mark_cancelled(&self, run_id: &RunId) {
+        let runs = self.runs.read();
+
+        let mut run = runs.get(run_id).expect("no run recorded").lock();
 
         // Cancellation can happen at any time, including after the test run is determined to have
         // completed with a particular success status by one party, because that observation may
@@ -408,29 +480,34 @@ impl RunQueues {
         //
         // We prefer the observation of the test supervisor, so test cancellation is always marked
         // as a failure.
-        *state = RunState::Cancelled {};
+        run.state = RunState::Cancelled {};
 
-        self.run_data.remove(run_id);
+        // Drop the run data if it exists, since we no longer need it.
+        // It might already be missing if this cancellation happened after we saw a run complete.
+        std::mem::take(&mut run.data);
+
+        // NB: Always sub last for conversative estimation.
+        self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
-    fn get_run_state(&self, run_id: &RunId) -> Option<&RunState> {
-        self.queues.get(run_id)
+    fn get_run_liveness(&self, run_id: &RunId) -> Option<RunLive> {
+        let runs = self.runs.read();
+
+        let run = runs.get(run_id)?.lock();
+
+        match run.state {
+            RunState::WaitingForFirstWorker
+            | RunState::WaitingForManifest
+            | RunState::HasWork { .. } => Some(RunLive::Active),
+            RunState::Done { succeeded } => Some(RunLive::Done { succeeded }),
+            RunState::Cancelled {} => Some(RunLive::Cancelled),
+        }
     }
 
-    fn num_active_runs(&self) -> usize {
-        self.queues
-            .values()
-            .filter(|state| match state {
-                RunState::WaitingForFirstWorker
-                | RunState::WaitingForManifest
-                | RunState::HasWork { .. } => true,
-                RunState::Done { .. } | RunState::Cancelled {} => false,
-            })
-            .count()
+    fn estimate_num_active_runs(&self) -> u64 {
+        self.num_active.load(atomic::ORDERING)
     }
 }
-
-type SharedRunQueues = Arc<Mutex<RunQueues>>;
 
 /// Executes an initialization sequence that must be performed before any queue can be created.
 /// [init] only needs to be run once in a process, even if multiple [Abq] instances are crated, but
@@ -445,7 +522,7 @@ pub fn init() {
 pub struct Abq {
     shutdown_manager: ShutdownManager,
 
-    queues: SharedRunQueues,
+    queues: SharedRuns,
 
     server_addr: SocketAddr,
     server_handle: Option<JoinHandle<Result<(), QueueServerError>>>,
@@ -497,7 +574,7 @@ impl Abq {
     /// Checks whether the queue has no more active runs.
     /// Guaranteed to be eventually consistent if the queue is [retiring][Self::retire].
     pub fn is_drained(&self) -> bool {
-        self.queues.lock().unwrap().num_active_runs() == 0
+        self.queues.estimate_num_active_runs() == 0
     }
 
     /// Sends a signal to shutdown immediately.
@@ -591,7 +668,7 @@ fn start_queue(config: QueueConfig) -> Abq {
 
     let mut shutdown_manager = ShutdownManager::default();
 
-    let queues: SharedRunQueues = Default::default();
+    let queues: SharedRuns = Default::default();
 
     let server_listener = server_options.clone().bind((bind_ip, server_port)).unwrap();
     let server_addr = server_listener.local_addr().unwrap();
@@ -605,7 +682,7 @@ fn start_queue(config: QueueConfig) -> Abq {
 
     let server_shutdown_rx = shutdown_manager.add_receiver();
     let server_handle = thread::spawn({
-        let queue_server = QueueServer::new(Arc::clone(&queues), public_negotiator_addr);
+        let queue_server = QueueServer::new(queues.clone(), public_negotiator_addr);
         move || queue_server.start_on(server_listener, server_shutdown_rx)
     });
 
@@ -615,7 +692,7 @@ fn start_queue(config: QueueConfig) -> Abq {
     let work_scheduler_shutdown_rx = shutdown_manager.add_receiver();
     let work_scheduler_handle = thread::spawn({
         let scheduler = WorkScheduler {
-            queues: Arc::clone(&queues),
+            queues: queues.clone(),
         };
         move || scheduler.start_on(new_work_server, work_scheduler_shutdown_rx)
     });
@@ -626,9 +703,9 @@ fn start_queue(config: QueueConfig) -> Abq {
     // for a test run to be established. Make this cede control to a runtime if the worker's run is
     // not yet available.
     let choose_run_for_worker = {
-        let queues = Arc::clone(&queues);
+        let queues = queues.clone();
         move |wanted_run_id: &RunId| loop {
-            let opt_assigned = { queues.lock().unwrap().get_run_for_worker(wanted_run_id) };
+            let opt_assigned = { queues.get_run_for_worker(wanted_run_id) };
             match opt_assigned {
                 AssignedRunLookup::NotFound => {
                     // Nothing yet; release control and sleep for a bit in case something comes.
@@ -885,7 +962,7 @@ type RunStateCache = Arc<Mutex<HashMap<RunId, ActiveRunState>>>;
 
 /// Central server listening for new test run runs and results.
 struct QueueServer {
-    queues: SharedRunQueues,
+    queues: SharedRuns,
     public_negotiator_addr: SocketAddr,
 }
 
@@ -914,7 +991,7 @@ enum ClientReconnectionError {
 
 #[derive(Clone)]
 struct QueueServerCtx {
-    queues: SharedRunQueues,
+    queues: SharedRuns,
     /// When all results for a particular run are communicated, we want to make sure that the
     /// responder thread is closed and that the entry here is dropped.
     active_runs: ActiveRunResponders,
@@ -928,7 +1005,7 @@ struct QueueServerCtx {
 }
 
 impl QueueServer {
-    fn new(queues: SharedRunQueues, public_negotiator_addr: SocketAddr) -> Self {
+    fn new(queues: SharedRuns, public_negotiator_addr: SocketAddr) -> Self {
         Self {
             queues,
             public_negotiator_addr,
@@ -1111,11 +1188,11 @@ impl QueueServer {
     #[inline(always)]
     #[instrument(level = "trace", skip(queues, stream))]
     async fn handle_active_test_runs(
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let active_runs = queues.lock().unwrap().num_active_runs().try_into()?;
+        let active_runs = queues.estimate_num_active_runs();
         let response = net_protocol::queue::ActiveTestRunsResponse { active_runs };
         net_protocol::async_write(&mut stream, &response).await?;
         Ok(())
@@ -1135,7 +1212,7 @@ impl QueueServer {
     #[instrument(level = "trace", skip(active_runs, queues, stream))]
     async fn handle_invoked_work(
         active_runs: ActiveRunResponders,
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         retirement: RetirementCell,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
@@ -1163,11 +1240,7 @@ impl QueueServer {
             batch_size_hint
         };
 
-        let could_create_queue =
-            queues
-                .lock()
-                .unwrap()
-                .create_queue(run_id.clone(), runner, batch_size_hint);
+        let could_create_queue = queues.create_queue(run_id.clone(), runner, batch_size_hint);
 
         match could_create_queue {
             Ok(()) => {
@@ -1240,7 +1313,7 @@ impl QueueServer {
     /// A supervisor cancels a test run.
     #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
     async fn handle_run_cancellation(
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
         entity: EntityId,
@@ -1251,12 +1324,12 @@ impl QueueServer {
         {
             // Mark the cancellation in the queue first, so that new queries from workers will be
             // told to terminate.
-            queues.lock().unwrap().mark_cancelled(&run_id);
+            queues.mark_cancelled(&run_id);
         }
 
         {
             // Drop the entry from the state cache
-            state_cache.lock().unwrap().remove(&run_id);
+            state_cache.lock().remove(&run_id);
         }
 
         {
@@ -1309,7 +1382,7 @@ impl QueueServer {
 
     #[instrument(level = "trace", skip(queues, state_cache))]
     async fn handle_manifest_result(
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
         entity: EntityId,
@@ -1364,7 +1437,7 @@ impl QueueServer {
 
     #[instrument(level = "trace", skip(queues, state_cache, flat_manifest))]
     async fn handle_manifest_success(
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
@@ -1379,15 +1452,9 @@ impl QueueServer {
             is_successful: true,
         };
 
-        state_cache
-            .lock()
-            .unwrap()
-            .insert(run_id.clone(), run_state);
+        state_cache.lock().insert(run_id.clone(), run_state);
 
-        queues
-            .lock()
-            .unwrap()
-            .add_manifest(run_id, flat_manifest, init_metadata);
+        queues.add_manifest(run_id, flat_manifest, init_metadata);
 
         net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
 
@@ -1396,7 +1463,7 @@ impl QueueServer {
 
     #[instrument(level = "trace", skip(queues, state_cache))]
     async fn handle_manifest_empty_or_failure(
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
         entity: EntityId,
@@ -1430,7 +1497,7 @@ impl QueueServer {
         {
             // We should not have an entry for the run in the state cache, since we only ever know
             // the initial state of a run after receiving the manifest.
-            debug_assert!(!state_cache.lock().unwrap().contains_key(&run_id));
+            debug_assert!(!state_cache.lock().contains_key(&run_id));
         }
 
         let responder = {
@@ -1473,9 +1540,9 @@ impl QueueServer {
         }
 
         if is_empty_manifest {
-            queues.lock().unwrap().mark_empty_manifest_complete(run_id);
+            queues.mark_empty_manifest_complete(run_id);
         } else {
-            queues.lock().unwrap().mark_failed_to_start(run_id);
+            queues.mark_failed_to_start(run_id);
         }
 
         Ok(())
@@ -1483,7 +1550,7 @@ impl QueueServer {
 
     #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
     async fn handle_worker_result(
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
         entity: EntityId,
@@ -1520,7 +1587,7 @@ impl QueueServer {
         let (no_more_work, is_successful) = {
             // Update the amount of work we have left; again, steal the map of work for only as
             // long is it takes for us to do that.
-            let mut state_cache = state_cache.lock().unwrap();
+            let mut state_cache = state_cache.lock();
             let run_state = match state_cache.get_mut(&run_id) {
                 Some(state) => state,
                 None => {
@@ -1603,8 +1670,8 @@ impl QueueServer {
                 }
             }
 
-            state_cache.lock().unwrap().remove(&run_id);
-            queues.lock().unwrap().mark_complete(run_id, is_successful);
+            state_cache.lock().remove(&run_id);
+            queues.mark_complete(run_id, is_successful);
         }
 
         Ok(())
@@ -1612,26 +1679,22 @@ impl QueueServer {
 
     #[instrument(level = "trace", skip(queues, stream))]
     async fn handle_total_run_result_request(
-        queues: SharedRunQueues,
+        queues: SharedRuns,
         run_id: RunId,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let response = {
-            let queues = queues.lock().unwrap();
-            let run_state = queues
-                .get_run_state(&run_id)
+            let queues = queues;
+            let liveness = queues
+                .get_run_liveness(&run_id)
                 .ok_or("Invalid state: worker is requesting run result for non-existent ID")?;
 
-            match run_state {
-                RunState::WaitingForFirstWorker | RunState::WaitingForManifest => return Err(
-                    "Invalid state: worker is requesting run result before any tests have been run"
-                        .into(),
-                ),
-                RunState::HasWork { .. } => net_protocol::queue::TotalRunResult::Pending,
-                RunState::Done { succeeded } => net_protocol::queue::TotalRunResult::Completed {
-                    succeeded: *succeeded,
-                },
-                RunState::Cancelled {} => {
+            match liveness {
+                RunLive::Active => net_protocol::queue::TotalRunResult::Pending,
+                RunLive::Done { succeeded } => {
+                    net_protocol::queue::TotalRunResult::Completed { succeeded }
+                }
+                RunLive::Cancelled => {
                     net_protocol::queue::TotalRunResult::Completed { succeeded: false }
                 }
             }
@@ -1679,7 +1742,7 @@ impl QueueServer {
 /// Sends work as workers request it.
 /// This does not schedule work in any interesting way today, but it may in the future.
 struct WorkScheduler {
-    queues: SharedRunQueues,
+    queues: SharedRuns,
 }
 
 /// An error that happens in the construction or execution of the work-scheduling server.
@@ -1699,7 +1762,7 @@ pub enum WorkSchedulerError {
 
 #[derive(Clone)]
 struct SchedulerCtx {
-    queues: SharedRunQueues,
+    queues: SharedRuns,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
@@ -1774,8 +1837,7 @@ impl WorkScheduler {
                 }
             }
             WorkServerRequest::InitContext { run_id } => {
-                let opt_init_metadata =
-                    { ctx.queues.lock().unwrap().init_metadata(run_id.clone()) };
+                let opt_init_metadata = { ctx.queues.init_metadata(run_id.clone()) };
 
                 use net_protocol::work_server::{InitContext, InitContextResponse};
                 let response = match opt_init_metadata {
@@ -1790,7 +1852,7 @@ impl WorkScheduler {
             }
             WorkServerRequest::NextTest { run_id } => {
                 // Pull the next bundle of work.
-                let bundle = { ctx.queues.lock().unwrap().next_work(run_id.clone()) };
+                let bundle = { ctx.queues.next_work(run_id.clone()) };
 
                 use net_protocol::work_server::NextTestResponse;
                 let response = NextTestResponse::Bundle(bundle);
@@ -1823,7 +1885,7 @@ mod test {
         },
         queue::{
             ActiveRunResponders, BufferedResults, ClientReconnectionError, ClientResponder,
-            QueueServer, RunQueues, RunState, SharedRunQueues, WorkScheduler,
+            QueueServer, RunLive, SharedRuns, WorkScheduler,
         },
     };
     use abq_utils::{
@@ -1852,6 +1914,7 @@ mod test {
     };
     use futures::future;
     use ntest::timeout;
+    use parking_lot as pl;
     use tokio::{
         io::AsyncWriteExt,
         sync::{Mutex, RwLock},
@@ -1956,7 +2019,7 @@ mod test {
 
     fn create_work_scheduler(
         server_auth: ServerAuthStrategy,
-        queues: SharedRunQueues,
+        queues: SharedRuns,
     ) -> (JoinHandle<()>, ShutdownManager, SocketAddr) {
         let server = WorkScheduler { queues };
         let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
@@ -2417,13 +2480,13 @@ mod test {
     async fn client_disconnect_then_connect_gets_buffered_results() {
         let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
-        let run_queues = SharedRunQueues::default();
+        let run_queues = SharedRuns::default();
         let run_state = RunStateCache::default();
 
         let client_entity = EntityId::new();
 
         // Pretend we have infinite work so the queue always streams back results to the client.
-        run_state.lock().unwrap().insert(
+        run_state.lock().insert(
             run_id.clone(),
             super::ActiveRunState {
                 work_left: usize::MAX,
@@ -2466,7 +2529,7 @@ mod test {
         {
             // Send a test result, will force the responder to go into disconnected mode
             QueueServer::handle_worker_result(
-                Arc::clone(&run_queues),
+                run_queues.clone(),
                 Arc::clone(&active_runs),
                 Arc::clone(&run_state),
                 EntityId::new(),
@@ -3119,7 +3182,7 @@ mod test {
         let run_id = RunId::unique();
 
         // Set up the queue so that a run ID is invoked, but no worker has connected yet.
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
         queues
             .create_queue(
                 run_id.clone(),
@@ -3137,7 +3200,7 @@ mod test {
             .unwrap();
 
         let (server_thread, mut server_shutdown, server_addr) =
-            create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
+            create_work_scheduler(server_auth, queues);
 
         let client_opts = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls());
         let client = client_opts.build().unwrap();
@@ -3165,7 +3228,7 @@ mod test {
         let run_id = RunId::unique();
 
         // Set up the queue so a run ID is invoked, but the manifest is still unknown.
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
         queues
             .create_queue(
                 run_id.clone(),
@@ -3186,7 +3249,7 @@ mod test {
         let _ = queues.get_run_for_worker(&run_id);
 
         let (server_thread, mut server_shutdown, server_addr) =
-            create_work_scheduler(server_auth, Arc::new(std::sync::Mutex::new(queues)));
+            create_work_scheduler(server_auth, queues);
 
         let client_opts = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls());
         let client = client_opts.build().unwrap();
@@ -3395,14 +3458,14 @@ mod test {
 
     #[test]
     fn no_active_runs_when_non_enqueued() {
-        let queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
-        assert_eq!(queues.num_active_runs(), 0);
+        assert_eq!(queues.estimate_num_active_runs(), 0);
     }
 
     #[test]
     fn active_runs_when_some_waiting_on_workers() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
         queues
             .create_queue(
@@ -3412,12 +3475,12 @@ mod test {
             )
             .unwrap();
 
-        assert_eq!(queues.num_active_runs(), 1);
+        assert_eq!(queues.estimate_num_active_runs(), 1);
     }
 
     #[test]
     fn active_runs_when_some_waiting_on_manifest() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
@@ -3431,12 +3494,12 @@ mod test {
 
         queues.get_run_for_worker(&run_id);
 
-        assert_eq!(queues.num_active_runs(), 1);
+        assert_eq!(queues.estimate_num_active_runs(), 1);
     }
 
     #[test]
     fn active_runs_when_running() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
@@ -3451,12 +3514,12 @@ mod test {
         queues.get_run_for_worker(&run_id);
         queues.add_manifest(run_id, vec![], Default::default());
 
-        assert_eq!(queues.num_active_runs(), 1);
+        assert_eq!(queues.estimate_num_active_runs(), 1);
     }
 
     #[test]
     fn active_runs_when_all_done() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
@@ -3472,12 +3535,12 @@ mod test {
         queues.add_manifest(run_id.clone(), vec![], Default::default());
         queues.mark_complete(run_id, true);
 
-        assert_eq!(queues.num_active_runs(), 0);
+        assert_eq!(queues.estimate_num_active_runs(), 0);
     }
 
     #[test]
     fn active_runs_multiple_in_various_states() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
         let run_id1 = RunId::unique(); // DONE
         let run_id2 = RunId::unique(); // DONE
@@ -3505,12 +3568,12 @@ mod test {
             queues.mark_complete(run_id, true);
         }
 
-        assert_eq!(queues.num_active_runs(), expected_active);
+        assert_eq!(queues.estimate_num_active_runs(), expected_active);
     }
 
     #[test]
     fn mark_cancellation_when_waiting_on_workers() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
         let run_id = RunId::unique();
 
         queues
@@ -3521,20 +3584,20 @@ mod test {
             )
             .unwrap();
 
-        assert_eq!(queues.num_active_runs(), 1);
+        assert_eq!(queues.estimate_num_active_runs(), 1);
 
         queues.mark_cancelled(&run_id);
 
-        assert_eq!(queues.num_active_runs(), 0);
+        assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
-            queues.get_run_state(&run_id).unwrap(),
-            RunState::Cancelled {}
+            queues.get_run_liveness(&run_id).unwrap(),
+            RunLive::Cancelled
         ));
     }
 
     #[test]
     fn mark_cancellation_when_some_waiting_on_manifest() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
@@ -3548,20 +3611,20 @@ mod test {
 
         queues.get_run_for_worker(&run_id);
 
-        assert_eq!(queues.num_active_runs(), 1);
+        assert_eq!(queues.estimate_num_active_runs(), 1);
 
         queues.mark_cancelled(&run_id);
 
-        assert_eq!(queues.num_active_runs(), 0);
+        assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
-            queues.get_run_state(&run_id).unwrap(),
-            RunState::Cancelled {}
+            queues.get_run_liveness(&run_id).unwrap(),
+            RunLive::Cancelled
         ));
     }
 
     #[test]
     fn mark_cancellation_when_running() {
-        let mut queues = RunQueues::default();
+        let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
@@ -3576,14 +3639,14 @@ mod test {
         queues.get_run_for_worker(&run_id);
         queues.add_manifest(run_id.clone(), vec![], Default::default());
 
-        assert_eq!(queues.num_active_runs(), 1);
+        assert_eq!(queues.estimate_num_active_runs(), 1);
 
         queues.mark_cancelled(&run_id);
 
-        assert_eq!(queues.num_active_runs(), 0);
+        assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
-            queues.get_run_state(&run_id).unwrap(),
-            RunState::Cancelled {}
+            queues.get_run_liveness(&run_id).unwrap(),
+            RunLive::Cancelled
         ));
     }
 
@@ -3686,7 +3749,7 @@ mod test {
 
         let run_id = RunId::unique();
         let queues = {
-            let mut queues = RunQueues::default();
+            let queues = SharedRuns::default();
             queues
                 .create_queue(
                     run_id.clone(),
@@ -3696,7 +3759,7 @@ mod test {
                 .unwrap();
             queues.get_run_for_worker(&run_id);
             queues.add_manifest(run_id.clone(), vec![], Default::default());
-            Arc::new(std::sync::Mutex::new(queues))
+            queues
         };
         let active_runs: ActiveRunResponders = {
             let mut map = HashMap::default();
@@ -3715,13 +3778,13 @@ mod test {
                     is_successful: true,
                 },
             );
-            Arc::new(std::sync::Mutex::new(cache))
+            Arc::new(pl::Mutex::new(cache))
         };
 
         let entity = EntityId::new();
 
         let send_last_result_fut = QueueServer::handle_worker_result(
-            Arc::clone(&queues),
+            queues.clone(),
             Arc::clone(&active_runs),
             Arc::clone(&state_cache),
             entity,
@@ -3730,7 +3793,7 @@ mod test {
             fake_test_result(),
         );
         let cancellation_fut = QueueServer::handle_run_cancellation(
-            Arc::clone(&queues),
+            queues.clone(),
             Arc::clone(&active_runs),
             Arc::clone(&state_cache),
             entity,
@@ -3746,11 +3809,11 @@ mod test {
         assert!(client_exit_end.is_ok());
 
         assert!(matches!(
-            queues.lock().unwrap().get_run_state(&run_id).unwrap(),
-            RunState::Cancelled {}
+            queues.get_run_liveness(&run_id).unwrap(),
+            RunLive::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
-        assert!(!state_cache.lock().unwrap().contains_key(&run_id));
+        assert!(!state_cache.lock().contains_key(&run_id));
     }
 
     #[test]
