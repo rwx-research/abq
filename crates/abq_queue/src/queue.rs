@@ -949,16 +949,17 @@ type ActiveRunResponders = Arc<
     >,
 >;
 
-struct ActiveRunState {
+struct RunResultState {
     /// Amount of work items left for the run.
     work_left: usize,
     /// So far, has the run been entirely successful?
     is_successful: bool,
 }
 
-/// Cache of the current state of active runs, so that we don't have to lock the queue all the time.
-// TODO: consider using DashMap
-type RunStateCache = Arc<Mutex<HashMap<RunId, ActiveRunState>>>;
+/// Cache of the current state of active runs and their result, so that we don't have to
+/// lock the run queue to understand what results we are waiting on.
+// TODO: consider using DashMap or RwLock<Map<RunId, Mutex<RunResultState>>>
+type RunResultStateCache = Arc<Mutex<HashMap<RunId, RunResultState>>>;
 
 /// Central server listening for new test run runs and results.
 struct QueueServer {
@@ -1024,7 +1025,7 @@ struct QueueServerCtx {
     /// When all results for a particular run are communicated, we want to make sure that the
     /// responder thread is closed and that the entry here is dropped.
     active_runs: ActiveRunResponders,
-    state_cache: RunStateCache,
+    state_cache: RunResultStateCache,
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 
@@ -1351,7 +1352,7 @@ impl QueueServer {
     async fn handle_run_cancellation(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
+        state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
     ) -> Result<(), AnyError> {
@@ -1420,7 +1421,7 @@ impl QueueServer {
     async fn handle_manifest_result(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
+        state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
         manifest_result: ManifestResult,
@@ -1474,7 +1475,7 @@ impl QueueServer {
     #[instrument(level = "trace", skip(queues, state_cache, flat_manifest))]
     async fn handle_manifest_success(
         queues: SharedRuns,
-        state_cache: RunStateCache,
+        state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
         flat_manifest: Vec<TestCase>,
@@ -1483,7 +1484,7 @@ impl QueueServer {
     ) -> Result<(), AnyError> {
         tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
 
-        let run_state = ActiveRunState {
+        let run_state = RunResultState {
             work_left: flat_manifest.len(),
             is_successful: true,
         };
@@ -1501,7 +1502,7 @@ impl QueueServer {
     async fn handle_manifest_empty_or_failure(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
+        state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
         manifest_result: Result<() /* empty */, String /* error */>,
@@ -1588,7 +1589,7 @@ impl QueueServer {
     async fn handle_worker_result(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
+        state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
         work_id: WorkId,
@@ -1913,7 +1914,7 @@ mod test {
         time::Duration,
     };
 
-    use super::{Abq, ActiveRunState, RunStateCache};
+    use super::{Abq, RunResultState, RunResultStateCache};
     use crate::{
         invoke::{
             run_cancellation_pair, Client, InvocationError, TestResultError,
@@ -2517,14 +2518,14 @@ mod test {
         let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
         let run_queues = SharedRuns::default();
-        let run_state = RunStateCache::default();
+        let run_state = RunResultStateCache::default();
 
         let client_entity = EntityId::new();
 
         // Pretend we have infinite work so the queue always streams back results to the client.
         run_state.lock().insert(
             run_id.clone(),
-            super::ActiveRunState {
+            super::RunResultState {
                 work_left: usize::MAX,
                 is_successful: true,
             },
@@ -3805,11 +3806,11 @@ mod test {
             );
             Arc::new(RwLock::new(map))
         };
-        let state_cache: RunStateCache = {
+        let state_cache: RunResultStateCache = {
             let mut cache = HashMap::default();
             cache.insert(
                 run_id.clone(),
-                ActiveRunState {
+                RunResultState {
                     work_left: 1,
                     is_successful: true,
                 },
