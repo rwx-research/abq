@@ -156,7 +156,9 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux_x86-64
+            container: quay.io/pypa/manylinux2014_x86_64
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     if: github.ref == 'refs/heads/main'
     needs: test
     steps:
@@ -177,7 +179,13 @@ jobs:
           restore-keys: |
             cargo-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: rwx-research/rust-toolchain@abq
+        with:
+          toolchain: stable
+
+      - name: Install build + deploy deps
+        run: |
+          yum install sudo jq -y
 
       - name: Build release
         run: cargo build --release
@@ -194,6 +202,12 @@ jobs:
             target/release/abq
             target/release/abq_cargo
             target/release/abq_worker_harness
+
+      - name: Install aws CLI
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
 
       - name: Set up aws production profile
         run: |
