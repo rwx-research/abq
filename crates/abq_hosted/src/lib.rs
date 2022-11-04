@@ -16,7 +16,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
-pub const DEFAULT_RWX_ABQ_API_URL: &str = "https://captain.build/abq/api/";
+pub const DEFAULT_RWX_ABQ_API_URL: &str = "https://abq.build/abq/api/";
 
 #[derive(Debug)]
 pub struct HostedQueueConfig {
