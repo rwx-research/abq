@@ -92,8 +92,6 @@ static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
 
-struct WaitingForManifestError;
-
 /// A individual test run ever invoked on the queue.
 struct Run {
     /// The state of the test run.
@@ -166,6 +164,12 @@ enum RunLive {
     Active,
     Done { succeeded: bool },
     Cancelled,
+}
+
+enum InitMetadata {
+    Metadata(MetadataMap),
+    WaitingForManifest,
+    RunAlreadyCompleted,
 }
 
 impl AllRuns {
@@ -323,24 +327,21 @@ impl AllRuns {
         }
     }
 
-    pub fn init_metadata(&self, run_id: RunId) -> Result<MetadataMap, WaitingForManifestError> {
+    pub fn init_metadata(&self, run_id: RunId) -> InitMetadata {
         let runs = self.runs.read();
 
         let run = runs.get(&run_id).expect("no run recorded").lock();
 
         match &run.state {
-            RunState::WaitingForFirstWorker => Err(WaitingForManifestError),
-            RunState::WaitingForManifest => Err(WaitingForManifestError),
+            RunState::WaitingForFirstWorker | RunState::WaitingForManifest => {
+                InitMetadata::WaitingForManifest
+            }
             RunState::HasWork {
                 init_metadata,
                 queue: _,
                 batch_size_hint: _,
-            } => Ok(init_metadata.clone()),
-            RunState::Done { .. } | RunState::Cancelled { .. } => {
-                // TODO: really, we should tell the worker that the run is already done at this
-                // point.
-                Ok(Default::default())
-            }
+            } => InitMetadata::Metadata(init_metadata.clone()),
+            RunState::Done { .. } | RunState::Cancelled { .. } => InitMetadata::RunAlreadyCompleted,
         }
     }
 
@@ -1874,15 +1875,15 @@ impl WorkScheduler {
                 }
             }
             WorkServerRequest::InitContext { run_id } => {
-                let opt_init_metadata = { ctx.queues.init_metadata(run_id.clone()) };
+                let init_metadata = { ctx.queues.init_metadata(run_id.clone()) };
 
                 use net_protocol::work_server::{InitContext, InitContextResponse};
-                let response = match opt_init_metadata {
-                    Ok(init_meta) => InitContextResponse::InitContext(InitContext { init_meta }),
-                    Err(WaitingForManifestError) => {
-                        // Nothing yet; have the worker ask again later.
-                        InitContextResponse::WaitingForManifest
+                let response = match init_metadata {
+                    InitMetadata::Metadata(init_meta) => {
+                        InitContextResponse::InitContext(InitContext { init_meta })
                     }
+                    InitMetadata::RunAlreadyCompleted => InitContextResponse::RunAlreadyCompleted,
+                    InitMetadata::WaitingForManifest => InitContextResponse::WaitingForManifest,
                 };
 
                 net_protocol::async_write(&mut stream, &response).await?;
@@ -4108,5 +4109,53 @@ mod test {
         } = serde_json::from_str(results[0]).unwrap();
 
         assert_eq!(init_meta, result_init_meta);
+    }
+
+    #[test]
+    fn work_server_init_context_after_run_already_completed() {
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
+
+        let server = server_opts.bind("0.0.0.0:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let (mut server_shutdown_tx, server_shutdown_rx) = ShutdownManager::new_pair();
+
+        let run_id = RunId::unique();
+
+        let queues = SharedRuns::default();
+        queues
+            .create_queue(
+                run_id.clone(),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                one_nonzero(),
+            )
+            .unwrap();
+        queues.get_run_for_worker(&run_id);
+        queues.add_manifest(run_id.clone(), vec![], Default::default());
+        queues.mark_cancelled(&run_id);
+
+        let work_scheduler = WorkScheduler { queues };
+        let work_server_handle = thread::spawn(|| {
+            work_scheduler.start_on(server, server_shutdown_rx).unwrap();
+        });
+
+        let client = client_opts.build().unwrap();
+        let mut conn = client.connect(server_addr).unwrap();
+
+        use net_protocol::work_server::{InitContextResponse, WorkServerRequest};
+
+        net_protocol::write(&mut conn, WorkServerRequest::InitContext { run_id }).unwrap();
+        let init_response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
+
+        assert!(matches!(
+            init_response,
+            InitContextResponse::RunAlreadyCompleted
+        ));
+
+        server_shutdown_tx.shutdown_immediately().unwrap();
+        work_server_handle.join().unwrap();
     }
 }
