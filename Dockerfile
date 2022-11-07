@@ -1,5 +1,5 @@
 # https://hub.docker.com/layers/rustlang/rust/nightly-bullseye-slim/images/sha256-bcfd21c359b6f64f40cb40a0284b2ed573695dc5910dd9db0367630fa285af4c
-FROM rustlang/rust:nightly-bullseye@sha256:3b6da2195a31505a321b674088525ee4d6803286d921b6d4df50d3e9c2a88a4b AS chef
+FROM rustlang/rust:nightly-bullseye@sha256:2ce116186d98dec86ea2c84eeeb3d5f12af456bca675b62872e1ac751c5696cf AS chef
 RUN cargo +nightly install cargo-chef
 WORKDIR app
 
