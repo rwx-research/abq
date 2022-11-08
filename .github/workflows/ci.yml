@@ -133,6 +133,14 @@ jobs:
         with:
           fetch-depth: 0 # get whole history for versioning
 
+      - name: Mark safe directory
+        run: |
+          # For some reason we need this, even though actions/checkout sets
+          # safe.directory by default?
+          # Perhaps it is because we work in a container?
+          git config --global --add safe.directory $PWD
+          git describe
+
       - name: Restore cargo cache
         uses: actions/cache@v3.0.11
         env:
