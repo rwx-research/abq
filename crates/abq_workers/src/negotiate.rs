@@ -592,7 +592,7 @@ impl QueueNegotiator {
         match msg {
             HealthCheck => {
                 let write_result =
-                    net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await;
+                    net_protocol::async_write(&mut stream, &net_protocol::health::healthy()).await;
                 if let Err(err) = write_result {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
@@ -1003,9 +1003,9 @@ mod test {
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
-        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+        let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
-        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+        assert_eq!(health_msg, net_protocol::health::healthy());
 
         shutdown_tx.shutdown_immediately().unwrap();
         queue_negotiator.join();
@@ -1028,9 +1028,9 @@ mod test {
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
-        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+        let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
-        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+        assert_eq!(health_msg, net_protocol::health::healthy());
 
         shutdown_tx.shutdown_immediately().unwrap();
         queue_negotiator.join();

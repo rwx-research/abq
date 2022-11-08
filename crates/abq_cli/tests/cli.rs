@@ -681,7 +681,7 @@ test_all_network_config_options! {
         ]));
 
         assert!(exit_status.success(), "{}\n{}", stdout, stderr);
-        assert!(stdout.is_empty());
+        assert!(!stdout.contains("UNHEALTHY"));
         assert!(stderr.is_empty());
 
         term_queue(queue_proc);
@@ -733,9 +733,9 @@ test_all_network_config_options! {
         assert_eq!(
             stdout,
             format!(
-                r#"Queue at {queue_addr}: unhealthy
-Work scheduler at {work_scheduler_addr}: unhealthy
-Negotiator at {negotiator_addr}: unhealthy
+                r#"Queue at {queue_addr}: UNHEALTHY
+Work scheduler at {work_scheduler_addr}: UNHEALTHY
+Negotiator at {negotiator_addr}: UNHEALTHY
 "#
             )
         );

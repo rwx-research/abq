@@ -22,6 +22,7 @@ use abq_utils::{
     net_opt::{ClientOptions, ServerOptions, Tls},
     net_protocol::{
         entity::EntityId,
+        health::Health,
         runners::TestResult,
         workers::{NativeTestRunnerParams, RunId, RunnerKind, WorkId},
     },
@@ -392,9 +393,21 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             let mut all_healthy = true;
             for service in to_check {
-                if !service.is_healthy(client_options.clone()) {
-                    all_healthy = false;
-                    println!("{service}: unhealthy");
+                match service.get_health(client_options.clone()) {
+                    Some(Health {
+                        healthy: true,
+                        version,
+                    }) => {
+                        println!("{service}: HEALTHY ({version})");
+                    }
+                    Some(Health {
+                        healthy: false,
+                        version: _,
+                    })
+                    | None => {
+                        all_healthy = false;
+                        println!("{service}: UNHEALTHY");
+                    }
                 }
             }
             let exit = if all_healthy { 0 } else { 1 };

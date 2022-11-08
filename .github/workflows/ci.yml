@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # get whole history for versioning
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -32,6 +34,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # get whole history for versioning
 
       - name: Restore cargo cache
         uses: actions/cache@v3
@@ -93,29 +97,6 @@ jobs:
 
       # End setup testdata
 
-      - name: Dogfood abq
-        timeout-minutes: 5
-        run: |
-          make dogfood
-        env:
-          CI: false
-
-      - name: Upload artifacts to captain
-        uses: rwx-research/upload-captain-artifact@v1
-        with:
-          artifacts: |
-            [
-              {
-                "name": "test",
-                "path": "abq-test-results.xml",
-                "kind": "test_results",
-                "parser": "junit_xml"
-              }
-            ]
-          job-name: 'Lint, test'
-          job-matrix: '${{ toJSON(matrix) }}'
-          captain-token: '${{ secrets.VANGUARD_PRODUCTION_RWX_TOKEN }}'
-
       - name: Run tests with cargo
         timeout-minutes: 2
         if: github.run_attempt == 1
@@ -149,6 +130,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # get whole history for versioning
+
       - name: Restore cargo cache
         uses: actions/cache@v3.0.11
         env:
