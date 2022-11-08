@@ -9,6 +9,7 @@ node_modules/
 
 # Produced as debug output in CLI tests
 *.debug
+build_artifact/
 
 .DS_Store
 

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use abq_utils::net_protocol::{self, entity::EntityId, queue};
+use abq_utils::net_protocol::{self, entity::EntityId, health::Health, queue};
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
@@ -35,12 +35,12 @@ impl HealthCheckKind {
         }
     }
 
-    pub fn is_healthy(&self, client_opts: ClientOptions) -> bool {
+    pub fn get_health(&self, client_opts: ClientOptions) -> Option<Health> {
         macro_rules! bail {
             ($e:expr) => {
                 match $e {
                     Ok(v) => v,
-                    Err(_) => return false,
+                    Err(_) => return None,
                 }
             };
         }
@@ -75,7 +75,7 @@ impl HealthCheckKind {
             }
         }
 
-        let health_msg: net_protocol::health::HEALTH = bail!(net_protocol::read(&mut conn));
-        health_msg == net_protocol::health::HEALTHY
+        let health_msg: net_protocol::health::Health = bail!(net_protocol::read(&mut conn));
+        Some(health_msg)
     }
 }

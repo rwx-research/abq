@@ -1219,7 +1219,7 @@ impl QueueServer {
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), AnyError> {
         // Right now nothing interesting is owned by the queue, so nothing extra to check.
-        net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await?;
+        net_protocol::async_write(&mut stream, &net_protocol::health::healthy()).await?;
         Ok(())
     }
 
@@ -1869,7 +1869,7 @@ impl WorkScheduler {
         match request {
             WorkServerRequest::HealthCheck => {
                 let write_result =
-                    net_protocol::async_write(&mut stream, &net_protocol::health::HEALTHY).await;
+                    net_protocol::async_write(&mut stream, &net_protocol::health::healthy()).await;
                 if let Err(err) = write_result {
                     tracing::debug!("error sending health check: {}", err.to_string());
                 }
@@ -2675,9 +2675,9 @@ mod test {
             },
         )
         .unwrap();
-        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+        let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
-        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+        assert_eq!(health_msg, net_protocol::health::healthy());
 
         server_shutdown_tx.shutdown_immediately().unwrap();
         queue_handle.join().unwrap();
@@ -2709,9 +2709,9 @@ mod test {
             net_protocol::work_server::WorkServerRequest::HealthCheck,
         )
         .unwrap();
-        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+        let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
-        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+        assert_eq!(health_msg, net_protocol::health::healthy());
 
         server_shutdown_tx.shutdown_immediately().unwrap();
         work_server_handle.join().unwrap();
@@ -2844,9 +2844,9 @@ mod test {
         )
         .unwrap();
 
-        let health_msg: net_protocol::health::HEALTH = net_protocol::read(&mut conn).unwrap();
+        let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
-        assert_eq!(health_msg, net_protocol::health::HEALTHY);
+        assert_eq!(health_msg, net_protocol::health::healthy());
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();

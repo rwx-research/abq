@@ -9,8 +9,20 @@ use std::{
 };
 
 pub mod health {
-    pub type HEALTH = String;
-    pub static HEALTHY: &str = "HEALTHY";
+    use serde_derive::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+    pub struct Health {
+        pub healthy: bool,
+        pub version: String,
+    }
+
+    pub fn healthy() -> Health {
+        Health {
+            healthy: true,
+            version: crate::VERSION.to_string(),
+        }
+    }
 }
 
 pub mod entity {

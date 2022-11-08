@@ -35,3 +35,8 @@ pub fn flatten_manifest(manifest: Manifest) -> (Vec<TestCase>, MetadataMap) {
     }
     (collected, meta)
 }
+
+pub const VERSION: &str = include_str!(concat!(
+    env!("ABQ_WORKSPACE_DIR"),
+    "build_artifact/abq_version.txt"
+));
