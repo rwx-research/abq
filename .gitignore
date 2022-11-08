@@ -11,3 +11,7 @@ node_modules/
 *.debug
 
 .DS_Store
+
+# nix stuff
+.direnv
+result
