@@ -3,5 +3,4 @@ testdata/
 native-runners/
 .git/
 Dockerfile
-fly.toml
 .dockerignore
