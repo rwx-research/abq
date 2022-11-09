@@ -127,6 +127,9 @@ jobs:
     container: ${{ matrix.container }}
     if: github.ref == 'refs/heads/main'
     needs: test
+    env:
+      AWS_DEFAULT_REGION: us-east-2
+      AWS_DEFAULT_OUTPUT: json
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -186,28 +189,59 @@ jobs:
           unzip awscliv2.zip
           sudo ./aws/install
 
-      - name: Set up aws production profile
+      - name: Prepare nightly release environment
+        run: |
+          RELEASE_NAME="abq_nightly_${{ matrix.platform }}"
+          RELEASE_TARBALL="$RELEASE_NAME.tar.gz"
+          RELEASE_S3_OBJECT="abq/nightly/$RELEASE_TARBALL"
+          echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
+          echo "RELEASE_TARBALL=$RELEASE_TARBALL" >> $GITHUB_ENV
+          echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT" >> $GITHUB_ENV
+
+      - name: Prepare nightly release
+        run: |
+          mkdir "$RELEASE_NAME"
+          cp target/release/abq "$RELEASE_NAME"
+          tar -czvf "$RELEASE_TARBALL" "$RELEASE_NAME"
+
+      - name: Push nightly release to development S3
+        env:
+          RELEASE_BUCKET: abq-releases-development
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_ACCESS_KEY_ID }} --profile development
+          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_SECRET_ACCESS_KEY }} --profile development
+
+          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile development
+          aws s3api put-object-tagging \
+            --bucket "$RELEASE_BUCKET" \
+            --key "$RELEASE_S3_OBJECT" \
+            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
+            --profile development
+
+      - name: Push nightly release to staging S3
+        env:
+          RELEASE_BUCKET: abq-releases-staging
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
+          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
+
+          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile staging
+          aws s3api put-object-tagging \
+            --bucket "$RELEASE_BUCKET" \
+            --key "$RELEASE_S3_OBJECT" \
+            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
+            --profile staging
+
+      - name: Push nightly release to production S3
+        env:
+          RELEASE_BUCKET: abq-releases
         run: |
           aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID }} --profile production
           aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY }} --profile production
 
-      - name: Cut nightly to S3
-        env:
-          AWS_DEFAULT_REGION: us-east-2
-          AWS_DEFAULT_OUTPUT: json
-        run: |
-          RELEASE_NAME="abq_nightly_${{ matrix.platform }}"
-          RELEASE_TARBALL="$RELEASE_NAME.tar.gz"
-
-          RELEASE_BUCKET="abq-releases"
-          RELEASE_OBJECT="abq/nightly/$RELEASE_TARBALL"
-
-          mkdir "$RELEASE_NAME"
-          cp target/release/abq "$RELEASE_NAME"
-          tar -czvf "$RELEASE_TARBALL" "$RELEASE_NAME"
-          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_OBJECT" --profile production
+          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile production
           aws s3api put-object-tagging \
             --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_OBJECT" \
+            --key "$RELEASE_S3_OBJECT" \
             --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
             --profile production
