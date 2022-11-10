@@ -623,8 +623,11 @@ fn run_tests(
         return Err(elaborate_invocation_error(invoke_error, runner_params));
     }
 
-    // TODO: is there a reasonable way to surface the errors?
-    let (suite_result, _errors) = reporters.finish();
+    let (suite_result, errors) = reporters.finish();
+
+    for error in errors {
+        eprintln!("{error}");
+    }
 
     Ok(suite_result.suggested_exit_code)
 }

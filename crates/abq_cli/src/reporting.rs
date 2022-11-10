@@ -79,12 +79,8 @@ pub enum ReportingError {
     FailedToFormat,
     #[error("failed to write a report to an output buffer")]
     FailedToWrite,
-}
-
-impl From<io::Error> for ReportingError {
-    fn from(_: io::Error) -> Self {
-        Self::FailedToWrite
-    }
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -262,12 +258,16 @@ impl Reporter for JUnitXmlReporter {
     }
 
     fn finish(self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+
         let fd = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(self.path)
-            .map_err(|_| ReportingError::FailedToWrite)?;
+            .open(self.path)?;
+
         self.collector
             .write_xml(fd)
             .map_err(|_| ReportingError::FailedToFormat)?;
