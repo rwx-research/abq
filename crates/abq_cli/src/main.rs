@@ -40,7 +40,10 @@ use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
-use crate::{args::Token, health::HealthCheckKind};
+use crate::{
+    args::{default_num_workers_for_test, Token},
+    health::HealthCheckKind,
+};
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
@@ -331,7 +334,8 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             // Workers are run in-band only if a queue for `abq test` is not going to be
             // provided from an external source.
-            let start_in_process_workers = api_key.is_none() && queue_addr.is_none();
+            let start_in_process_workers =
+                num_workers.is_some() || (api_key.is_none() && queue_addr.is_none());
 
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
@@ -364,7 +368,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 color,
                 batch_size,
                 results_timeout,
-                num_workers,
+                num_workers.unwrap_or_else(default_num_workers_for_test),
                 start_in_process_workers,
             )
         }
