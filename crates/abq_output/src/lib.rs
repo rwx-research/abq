@@ -84,7 +84,7 @@ fn format_status(writer: &mut impl WriteColor, status: Status) -> io::Result<()>
     with_color(writer, color, |w| write!(w, "{status}"))
 }
 
-fn format_duration(writer: &mut impl WriteColor, millis: Milliseconds) -> io::Result<()> {
+pub fn format_duration(writer: &mut impl io::Write, millis: Milliseconds) -> io::Result<()> {
     const MILLIS_IN_SECOND: u64 = 1000;
     const MILLIS_IN_MINUTE: u64 = 60 * MILLIS_IN_SECOND;
 

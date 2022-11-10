@@ -16,6 +16,7 @@ use std::{
 };
 
 use abq_hosted::ApiKey;
+use abq_output::format_duration;
 use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
@@ -659,6 +660,25 @@ fn elaborate_invocation_error(
                         HELP: Test commands run by ABQ must have support for the ABQ protocol."#
                     ),
                     cmd, opaque_error,
+                );
+                anyhow::Error::msg(msg)
+            }
+            TestResultError::TimedOut(after) => {
+                let mut s = Vec::new();
+                format_duration(&mut s, after.as_millis() as _)
+                    .expect("formatting duration to vec is infallible");
+                let timeout_s = String::from_utf8_lossy(&s);
+
+                let msg = format!(
+                    indoc::indoc!(
+                        r#"
+                        The test run timed out after {}.
+
+                        This likely indicates a problem in your test suite, or in an ABQ worker setup.
+                        Please check the logs of your ABQ workers.
+                        "#
+                    ),
+                    timeout_s
                 );
                 anyhow::Error::msg(msg)
             }

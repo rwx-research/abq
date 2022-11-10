@@ -69,7 +69,7 @@ pub mod runners {
         pub test_case: TestCase,
     }
 
-    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
     pub struct TestCase {
         pub id: String,
         pub meta: MetadataMap,
@@ -281,13 +281,13 @@ pub mod workers {
     }
 
     /// Context for a unit of work.
-    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
     pub struct WorkContext {
         pub working_dir: PathBuf,
     }
 
     /// A unit of work sent to a worker to be run.
-    #[derive(Serialize, Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
     pub enum NextWork {
         Work {
             test_case: TestCase,
@@ -308,7 +308,7 @@ pub mod workers {
 }
 
 pub mod queue {
-    use std::num::NonZeroU64;
+    use std::{num::NonZeroU64, time::Duration};
 
     use serde_derive::{Deserialize, Serialize};
 
@@ -361,6 +361,13 @@ pub mod queue {
         Results(Vec<AssociatedTestResult>),
         /// No more results are known.
         EndOfResults,
+        /// The present test run has timed out, and not all test results have been reported in
+        /// time.
+        /// This is likely due to an error on a worker.
+        TimedOut {
+            /// How long after the timeout was set that it fired.
+            after: Duration,
+        },
         /// The given test command is determined to have failed for all workers associated with
         /// this test run, and the test run will not continue.
         TestCommandError {
@@ -484,7 +491,7 @@ pub mod client {
     /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "type")]
-    pub struct AckEndOfTests {}
+    pub struct AckTestRunEnded {}
 }
 
 pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketAddr {

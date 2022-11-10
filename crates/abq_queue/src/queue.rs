@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use abq_utils::auth::ServerAuthStrategy;
 use abq_utils::net;
-use abq_utils::net_async;
+use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
@@ -34,6 +34,8 @@ use abq_workers::negotiate::{
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tracing::instrument;
+
+use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun};
 
 // TODO: we probably want something more sophisticated here, in particular a concurrent
 // work-stealing queue.
@@ -60,6 +62,12 @@ impl JobQueue {
 }
 
 #[derive(Debug)]
+enum CancelReason {
+    User,
+    Timeout,
+}
+
+#[derive(Debug)]
 enum RunState {
     WaitingForFirstWorker,
     WaitingForManifest,
@@ -77,7 +85,10 @@ enum RunState {
     Done {
         succeeded: bool,
     },
-    Cancelled {},
+    Cancelled {
+        #[allow(unused)] // so far
+        reason: CancelReason,
+    },
 }
 
 struct RunData {
@@ -188,7 +199,7 @@ impl AllRuns {
                 RunState::WaitingForFirstWorker
                 | RunState::WaitingForManifest
                 | RunState::HasWork { .. } => NewQueueError::RunIdAlreadyInProgress,
-                RunState::Done { .. } | RunState::Cancelled {} => {
+                RunState::Done { .. } | RunState::Cancelled { .. } => {
                     NewQueueError::RunIdPreviouslyCompleted
                 }
             };
@@ -238,7 +249,7 @@ impl AllRuns {
                             success: *succeeded,
                         }
                     }
-                    RunState::Cancelled {} => {
+                    RunState::Cancelled { .. } => {
                         return AssignedRunLookup::AlreadyDone { success: false }
                     }
                     st => {
@@ -298,7 +309,7 @@ impl AllRuns {
                     "Invalid state - can only provide manifest while waiting for manifest"
                 );
             }
-            RunState::Cancelled {} => {
+            RunState::Cancelled { .. } => {
                 // If cancelled, do nothing.
                 return;
             }
@@ -345,7 +356,8 @@ impl AllRuns {
         }
     }
 
-    pub fn next_work(&self, run_id: RunId) -> NextWorkBundle {
+    /// Returns (next_work, pulled_last_test)
+    pub fn next_work(&self, run_id: RunId) -> (NextWorkBundle, bool) {
         let runs = self.runs.read();
 
         let mut run = runs.get(&run_id).expect("no run recorded").lock();
@@ -363,26 +375,34 @@ impl AllRuns {
 
                 let mut bundle = Vec::with_capacity(batch_size.get() as _);
                 bundle.extend(queue.get_work(batch_size));
+
+                let pulled_last_test = queue.is_empty();
+
                 if bundle.len() < batch_size.get() as _ {
                     // We've hit the end of the manifest but have space for more tests to send in
                     // this batch. Let the worker know this is the end, so they don't have to
                     // round-trip.
                     bundle.push(NextWork::EndOfWork);
                 }
-                NextWorkBundle(bundle)
+
+                (
+                    NextWorkBundle(bundle), pulled_last_test
+                )
             }
-            RunState::Done { .. } | RunState::Cancelled {} => {
-                NextWorkBundle(vec![NextWork::EndOfWork])
+            RunState::Done { .. } | RunState::Cancelled {..} => {
+                (
+                    NextWorkBundle(vec![NextWork::EndOfWork]), false
+                )
             }
             RunState::WaitingForFirstWorker |
             RunState::WaitingForManifest => unreachable!("Invalid state - work can only be requested after initialization metadata, at which point the manifest is known.")
         }
     }
 
-    pub fn mark_complete(&self, run_id: RunId, succeeded: bool) {
+    pub fn mark_complete(&self, run_id: &RunId, succeeded: bool) {
         let runs = self.runs.read();
 
-        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+        let mut run = runs.get(run_id).expect("no run recorded").lock();
 
         match &mut run.state {
             RunState::HasWork {
@@ -422,7 +442,7 @@ impl AllRuns {
             RunState::WaitingForManifest => {
                 // okay
             }
-            RunState::Cancelled {} => {
+            RunState::Cancelled { .. } => {
                 // No-op, since the run was already cancelled.
                 return;
             }
@@ -451,7 +471,7 @@ impl AllRuns {
             RunState::WaitingForManifest => {
                 // okay
             }
-            RunState::Cancelled {} => {
+            RunState::Cancelled { .. } => {
                 // No-op, since the run was already cancelled.
                 return;
             }
@@ -470,7 +490,7 @@ impl AllRuns {
         self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
-    pub fn mark_cancelled(&self, run_id: &RunId) {
+    pub fn mark_cancelled(&self, run_id: &RunId, reason: CancelReason) {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").lock();
@@ -481,7 +501,7 @@ impl AllRuns {
         //
         // We prefer the observation of the test supervisor, so test cancellation is always marked
         // as a failure.
-        run.state = RunState::Cancelled {};
+        run.state = RunState::Cancelled { reason };
 
         // Drop the run data if it exists, since we no longer need it.
         // It might already be missing if this cancellation happened after we saw a run complete.
@@ -501,7 +521,7 @@ impl AllRuns {
             | RunState::WaitingForManifest
             | RunState::HasWork { .. } => Some(RunLive::Active),
             RunState::Done { succeeded } => Some(RunLive::Done { succeeded }),
-            RunState::Cancelled {} => Some(RunLive::Cancelled),
+            RunState::Cancelled { .. } => Some(RunLive::Cancelled),
         }
     }
 
@@ -681,10 +701,14 @@ fn start_queue(config: QueueConfig) -> Abq {
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
+    let timeout_manager = RunTimeoutManager::default();
+    let timeout_strategy = RunTimeoutStrategy::RunBased;
+
     let server_shutdown_rx = shutdown_manager.add_receiver();
     let server_handle = thread::spawn({
         let queue_server = QueueServer::new(queues.clone(), public_negotiator_addr);
-        move || queue_server.start_on(server_listener, server_shutdown_rx)
+        let timeout_manager = timeout_manager.clone();
+        move || queue_server.start_on(server_listener, timeout_manager, server_shutdown_rx)
     });
 
     let new_work_server = server_options.bind((bind_ip, work_port)).unwrap();
@@ -695,7 +719,14 @@ fn start_queue(config: QueueConfig) -> Abq {
         let scheduler = WorkScheduler {
             queues: queues.clone(),
         };
-        move || scheduler.start_on(new_work_server, work_scheduler_shutdown_rx)
+        move || {
+            scheduler.start_on(
+                new_work_server,
+                timeout_manager,
+                timeout_strategy,
+                work_scheduler_shutdown_rx,
+            )
+        }
     });
 
     // Chooses a test run for a set of workers to attach to.
@@ -1046,6 +1077,7 @@ impl QueueServer {
     fn start_on(
         self,
         server_listener: Box<dyn net::ServerListener>,
+        timeouts: RunTimeoutManager,
         mut shutdown: ShutdownReceiver,
     ) -> Result<(), QueueServerError> {
         // Create a new tokio runtime solely for handling requests that come into the queue server.
@@ -1076,35 +1108,61 @@ impl QueueServer {
                 retirement: shutdown.get_retirement_cell(),
             };
 
+            enum Task {
+                HandleConn(UnverifiedServerStream),
+                HandleTimeout(TimedOutRun),
+            }
+            use Task::*;
+
             loop {
-                let (client, _) = tokio::select! {
+                let task = tokio::select! {
                     conn = server_listener.accept() => {
                         match conn {
-                            Ok(conn) => conn,
+                            Ok((conn, _)) => HandleConn(conn),
                             Err(e) => {
                                 tracing::error!("error accepting connection: {:?}", e);
                                 continue;
                             }
                         }
                     }
+                    fired_timeout = timeouts.next_timeout() => {
+                        HandleTimeout(fired_timeout)
+                    }
                     _ = shutdown.recv_shutdown_immediately() => {
                         break;
                     }
                 };
 
-                tokio::spawn({
-                    let ctx = ctx.clone();
-                    async move {
-                        let result = Self::handle(ctx, client).await;
-                        if let Err(EntityfulError { error, entity }) = result {
-                            tracing::error!(
-                                ?entity,
-                                "error handling connection to queue: {}",
-                                error
-                            );
-                        }
+                match task {
+                    HandleConn(client) => {
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            let result = Self::handle(ctx, client).await;
+                            if let Err(EntityfulError { error, entity }) = result {
+                                tracing::error!(
+                                    ?entity,
+                                    "error handling connection to queue: {}",
+                                    error
+                                );
+                            }
+                        });
                     }
-                });
+                    HandleTimeout(timeout) => {
+                        let ctx = ctx.clone();
+                        tokio::spawn(async move {
+                            let result = Self::handle_fired_timeout(
+                                ctx.queues,
+                                ctx.active_runs,
+                                ctx.state_cache,
+                                timeout,
+                            )
+                            .await;
+                            if let Err(err) = result {
+                                tracing::error!("error handling timeout of run: {}", err);
+                            }
+                        });
+                    }
+                }
             }
 
             Ok(())
@@ -1362,7 +1420,7 @@ impl QueueServer {
         {
             // Mark the cancellation in the queue first, so that new queries from workers will be
             // told to terminate.
-            queues.mark_cancelled(&run_id);
+            queues.mark_cancelled(&run_id, CancelReason::User);
         }
 
         {
@@ -1596,6 +1654,8 @@ impl QueueServer {
         work_id: WorkId,
         result: TestResult,
     ) -> Result<(), AnyError> {
+        // IFTTT: handle_fired_timeout
+
         let test_status = result.status;
 
         {
@@ -1644,7 +1704,8 @@ impl QueueServer {
         };
 
         if no_more_work {
-            tracing::info!(?run_id, ?entity, "run completed");
+            let run_complete_span = tracing::info_span!("run completion", ?run_id, ?entity);
+            let _run_complete_enter = run_complete_span.enter();
 
             // Now, we have to take both the active runs, and the map of work left, to mark
             // the work for the current run as complete in both cases. It's okay for this to
@@ -1684,7 +1745,7 @@ impl QueueServer {
                     // client will have seen a proper completion as well. Otherwise, in the
                     // presence of a cancellation, the stream will break before the ACK, and this
                     // request will be dropped while the cancellation will be fulfilled.
-                    let client::AckEndOfTests {} = net_protocol::async_read(&mut stream).await?;
+                    let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
 
                     drop(stream);
 
@@ -1709,8 +1770,109 @@ impl QueueServer {
             }
 
             state_cache.lock().remove(&run_id);
-            queues.mark_complete(run_id, is_successful);
+            queues.mark_complete(&run_id, is_successful);
         }
+
+        Ok(())
+    }
+
+    /// Handles fired timeouts for test results, instuted by a [RunTimeoutManager].
+    /// A timeout is always fired for a test, whether it completes or not. There are two cases:
+    ///
+    /// - The test run completed (successfully or not). In this case the firing of the timeout is
+    ///   benign.
+    /// - The test run is still pending, i.e. we have not yet received all test results. In this
+    ///   case the timeout is material, and we mark the test run as failed due to timeout.
+    #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
+    async fn handle_fired_timeout(
+        queues: SharedRuns,
+        active_runs: ActiveRunResponders,
+        state_cache: RunResultStateCache,
+        timeout: TimedOutRun,
+    ) -> Result<(), AnyError> {
+        // IFTTT: handle_worker_result
+        //
+        // We must now take exclusive access on `active_runs` - since that is the first thing that
+        // handle_worker_result will lock on, our taking a lock ensures that any test runs that
+        // come in after this timeout will not race.
+        // We must keep this lock alive until the end of this function.
+        let mut locked_active_runs = active_runs.write().await;
+
+        let TimedOutRun { run_id, after } = timeout;
+
+        // NB: taking a persistent lock on the queue or state cache is not necessary,
+        // since we've already guarded against other modification above.
+        // By not blocking the queue we allow other work to continue freely.
+        match queues.get_run_liveness(&run_id) {
+            Some(liveness) => match liveness {
+                RunLive::Active => {
+                    // pass through, the run needs to be timed out.
+                }
+                RunLive::Done { .. } | RunLive::Cancelled => {
+                    return Ok(()); // run was already complete, disregard the timeout
+                }
+            },
+            None => {
+                tracing::error!(
+                    ?run_id,
+                    "timeout for run was fired, but it's not known in the queue"
+                );
+                return Err("run not known in the queue".into());
+            }
+        }
+
+        tracing::info!(?run_id, timeout=?after, "timing out active test run");
+
+        // Remove the responder, and notify the supervisor that this run has timed out.
+        let mut responder = locked_active_runs
+            .remove(&run_id)
+            .expect("invalid state - run is live, but no responder is known")
+            .into_inner();
+
+        // Flush all test results still pending prior to the timeout.
+        responder.flush_results().await;
+
+        match responder {
+            ClientResponder::DirectStream { mut stream, buffer } => {
+                assert!(
+                    buffer.is_empty(),
+                    "no results should be buffered after drainage"
+                );
+
+                net_protocol::async_write(&mut stream, &InvokerTestResult::TimedOut { after })
+                    .await?;
+
+                // To avoid a race between perceived cancellation by the supervisor and perceived
+                // timeout by the queue, require an ACK for the induced timeout notification. If
+                // instead the supervisor cancels prior to an ACK, this stream will break before
+                // the ACK is fulfilled, and the cancellation will be recorded.
+                let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
+
+                drop(stream);
+
+                tracing::info!(?run_id, "closed connected results responder");
+            }
+            ClientResponder::Disconnected {
+                results: _,
+                buffer_size: _,
+            } => {
+                tracing::error!(
+                    ?run_id,
+                    "dropping disconnected results responder after timeout"
+                );
+
+                // Unfortunately, nothing more we can do at this point, since
+                // the supervisor has been lost!
+            }
+        }
+
+        // Store the cancellation state
+        queues.mark_cancelled(&run_id, CancelReason::Timeout);
+
+        // Drop the run from the state cache.
+        state_cache.lock().remove(&run_id);
+
+        let _ = locked_active_runs; // make sure the lock isn't dropped before here
 
         Ok(())
     }
@@ -1801,6 +1963,8 @@ pub enum WorkSchedulerError {
 #[derive(Clone)]
 struct SchedulerCtx {
     queues: SharedRuns,
+    timeouts: RunTimeoutManager,
+    timeout_strategy: RunTimeoutStrategy,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
@@ -1808,6 +1972,8 @@ impl WorkScheduler {
     fn start_on(
         self,
         listener: Box<dyn net::ServerListener>,
+        timeouts: RunTimeoutManager,
+        timeout_strategy: RunTimeoutStrategy,
         mut shutdown: ShutdownReceiver,
     ) -> Result<(), WorkSchedulerError> {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1820,6 +1986,8 @@ impl WorkScheduler {
             let Self { queues } = self;
             let ctx = SchedulerCtx {
                 queues,
+                timeouts,
+                timeout_strategy,
                 handshake_ctx: Arc::new(listener.handshake_ctx()),
             };
 
@@ -1890,12 +2058,26 @@ impl WorkScheduler {
             }
             WorkServerRequest::NextTest { run_id } => {
                 // Pull the next bundle of work.
-                let bundle = { ctx.queues.next_work(run_id.clone()) };
+                let (bundle, pulled_last_test) = { ctx.queues.next_work(run_id.clone()) };
 
                 use net_protocol::work_server::NextTestResponse;
                 let response = NextTestResponse::Bundle(bundle);
 
                 net_protocol::async_write(&mut stream, &response).await?;
+
+                if pulled_last_test {
+                    // This was the last test, so start a timeout for the whole test run to
+                    // complete - if it doesn't, we'll fire and timeout the run.
+                    let timeout = ctx.timeout_strategy.timeout();
+
+                    tracing::info!(
+                        ?run_id,
+                        ?timeout,
+                        "issued last test in the manifest to a worker"
+                    );
+
+                    ctx.timeouts.insert_run(run_id, timeout).await;
+                }
             }
         }
 
@@ -1918,13 +2100,15 @@ mod test {
     use super::{Abq, RunResultState, RunResultStateCache};
     use crate::{
         invoke::{
-            run_cancellation_pair, Client, InvocationError, TestResultError,
+            run_cancellation_pair, Client, InvocationError, RunCancellationTx, TestResultError,
             DEFAULT_CLIENT_POLL_TIMEOUT,
         },
         queue::{
-            ActiveRunResponders, BufferedResults, ClientReconnectionError, ClientResponder,
-            QueueServer, RunLive, SharedRuns, WorkScheduler,
+            ActiveRunResponders, AssignedRunLookup, BufferedResults, CancelReason,
+            ClientReconnectionError, ClientResponder, QueueServer, RunLive, SharedRuns,
+            WorkScheduler,
         },
+        timeout::{RunTimeoutManager, RunTimeoutStrategy},
     };
     use abq_utils::{
         auth::{
@@ -1936,12 +2120,16 @@ mod test {
         net_protocol::{
             self,
             entity::EntityId,
-            queue::InvokeWork,
+            queue::{self, InvokeWork},
             runners::{
-                Manifest, ManifestMessage, MetadataMap, Status, Test, TestOrGroup, TestResult,
+                Manifest, ManifestMessage, ManifestResult, MetadataMap, Status, Test, TestOrGroup,
+                TestResult,
             },
-            work_server::{InitContext, InitContextResponse},
-            workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
+            work_server::{InitContext, InitContextResponse, NextTestResponse, WorkServerRequest},
+            workers::{
+                AckManifest, NativeTestRunnerParams, NextWorkBundle, RunId, RunnerKind,
+                TestLikeRunner, WorkId,
+            },
         },
         shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -2049,7 +2237,9 @@ mod test {
             public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
         };
         let server_thread = thread::spawn(|| {
-            queue_server.start_on(server, shutdown_rx).unwrap();
+            queue_server
+                .start_on(server, RunTimeoutManager::default(), shutdown_rx)
+                .unwrap();
         });
 
         (server_thread, shutdown_tx, server_addr)
@@ -2066,7 +2256,14 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
+            server
+                .start_on(
+                    listener,
+                    RunTimeoutManager::default(),
+                    RunTimeoutStrategy::default(),
+                    shutdown_rx,
+                )
+                .unwrap();
         });
 
         (server_thread, shutdown_tx, server_addr)
@@ -2401,7 +2598,9 @@ mod test {
 
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
+            server
+                .start_on(listener, RunTimeoutManager::default(), shutdown_rx)
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2661,7 +2860,9 @@ mod test {
             public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
         };
         let queue_handle = thread::spawn(|| {
-            queue_server.start_on(server, server_shutdown_rx).unwrap();
+            queue_server
+                .start_on(server, RunTimeoutManager::default(), server_shutdown_rx)
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2699,7 +2900,14 @@ mod test {
             queues: Default::default(),
         };
         let work_server_handle = thread::spawn(|| {
-            work_scheduler.start_on(server, server_shutdown_rx).unwrap();
+            work_scheduler
+                .start_on(
+                    server,
+                    RunTimeoutManager::default(),
+                    RunTimeoutStrategy::default(),
+                    server_shutdown_rx,
+                )
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2733,7 +2941,14 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
+            server
+                .start_on(
+                    listener,
+                    RunTimeoutManager::default(),
+                    RunTimeoutStrategy::default(),
+                    shutdown_rx,
+                )
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2761,7 +2976,9 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
+            server
+                .start_on(listener, RunTimeoutManager::default(), shutdown_rx)
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2798,7 +3015,9 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
+            server
+                .start_on(listener, RunTimeoutManager::default(), shutdown_rx)
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2833,7 +3052,14 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
+            server
+                .start_on(
+                    listener,
+                    RunTimeoutManager::default(),
+                    RunTimeoutStrategy::default(),
+                    shutdown_rx,
+                )
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2868,7 +3094,14 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server.start_on(listener, shutdown_rx).unwrap();
+            server
+                .start_on(
+                    listener,
+                    RunTimeoutManager::default(),
+                    RunTimeoutStrategy::default(),
+                    shutdown_rx,
+                )
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -3571,7 +3804,7 @@ mod test {
 
         queues.get_run_for_worker(&run_id);
         queues.add_manifest(run_id.clone(), vec![], Default::default());
-        queues.mark_complete(run_id, true);
+        queues.mark_complete(&run_id, true);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
@@ -3603,7 +3836,7 @@ mod test {
         }
 
         for run_id in [run_id1, run_id2] {
-            queues.mark_complete(run_id, true);
+            queues.mark_complete(&run_id, true);
         }
 
         assert_eq!(queues.estimate_num_active_runs(), expected_active);
@@ -3624,7 +3857,7 @@ mod test {
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
-        queues.mark_cancelled(&run_id);
+        queues.mark_cancelled(&run_id, CancelReason::User);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
@@ -3651,7 +3884,7 @@ mod test {
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
-        queues.mark_cancelled(&run_id);
+        queues.mark_cancelled(&run_id, CancelReason::User);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
@@ -3679,7 +3912,7 @@ mod test {
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
-        queues.mark_cancelled(&run_id);
+        queues.mark_cancelled(&run_id, CancelReason::User);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
@@ -4135,11 +4368,18 @@ mod test {
             .unwrap();
         queues.get_run_for_worker(&run_id);
         queues.add_manifest(run_id.clone(), vec![], Default::default());
-        queues.mark_cancelled(&run_id);
+        queues.mark_cancelled(&run_id, CancelReason::User);
 
         let work_scheduler = WorkScheduler { queues };
         let work_server_handle = thread::spawn(|| {
-            work_scheduler.start_on(server, server_shutdown_rx).unwrap();
+            work_scheduler
+                .start_on(
+                    server,
+                    RunTimeoutManager::default(),
+                    RunTimeoutStrategy::default(),
+                    server_shutdown_rx,
+                )
+                .unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -4157,5 +4397,232 @@ mod test {
 
         server_shutdown_tx.shutdown_immediately().unwrap();
         work_server_handle.join().unwrap();
+    }
+
+    struct StartedTriple {
+        queue_server_handle: JoinHandle<()>,
+        queue_server_addr: SocketAddr,
+
+        work_server_handle: JoinHandle<()>,
+        work_server_addr: SocketAddr,
+
+        supervisor_handle: JoinHandle<Result<(), TestResultError>>,
+
+        server_shutdown: ShutdownManager,
+        supervisor_cancel_run: RunCancellationTx,
+        client_opts: ClientOptions<User>,
+    }
+
+    fn start_queue_work_and_supervisor(
+        queues: SharedRuns,
+        run_id: RunId,
+        runner: RunnerKind,
+        timeout_strategy: RunTimeoutStrategy,
+    ) -> StartedTriple {
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
+
+        let queue_server_listener = server_opts.clone().bind("0.0.0.0:0").unwrap();
+        let queue_server_addr = queue_server_listener.local_addr().unwrap();
+
+        let work_server_listener = server_opts.bind("0.0.0.0:0").unwrap();
+        let work_server_addr = work_server_listener.local_addr().unwrap();
+
+        let (mut server_shutdown_tx, server_shutdown_rx) = ShutdownManager::new_pair();
+
+        let timeout_manager = RunTimeoutManager::default();
+
+        let queue_server = QueueServer {
+            queues: queues.clone(),
+            public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
+        };
+        let queue_server_handle = {
+            let timeout_manager = timeout_manager.clone();
+            let server_shutdown_rx = server_shutdown_tx.add_receiver();
+            thread::spawn(move || {
+                queue_server
+                    .start_on(queue_server_listener, timeout_manager, server_shutdown_rx)
+                    .unwrap();
+            })
+        };
+
+        let work_scheduler = WorkScheduler { queues };
+        let work_server_handle = thread::spawn(move || {
+            work_scheduler
+                .start_on(
+                    work_server_listener,
+                    timeout_manager,
+                    timeout_strategy,
+                    server_shutdown_rx,
+                )
+                .unwrap();
+        });
+
+        let (cancellation_tx, cancellation_rx) = run_cancellation_pair();
+
+        let supervisor_handle = thread::spawn({
+            let client_opts = client_opts.clone();
+
+            move || {
+                let runtime = make_runtime();
+
+                runtime.block_on(async {
+                    let client = Client::invoke_work(
+                        EntityId::new(),
+                        queue_server_addr,
+                        client_opts,
+                        run_id,
+                        runner,
+                        one_nonzero(),
+                        DEFAULT_CLIENT_POLL_TIMEOUT,
+                        cancellation_rx,
+                    )
+                    .await
+                    .unwrap();
+
+                    client.stream_results(|_, _| {}).await
+                })
+            }
+        });
+
+        StartedTriple {
+            queue_server_handle,
+            queue_server_addr,
+
+            work_server_handle,
+            work_server_addr,
+
+            supervisor_handle,
+
+            server_shutdown: server_shutdown_tx,
+            supervisor_cancel_run: cancellation_tx,
+            client_opts,
+        }
+    }
+
+    fn wait_for_assigned_run(queues: &SharedRuns, run_id: &RunId) {
+        // Wait until the run is registered, then simulate attaching one worker
+        loop {
+            match queues.get_run_for_worker(run_id) {
+                AssignedRunLookup::Some(_) => break,
+                AssignedRunLookup::NotFound => continue,
+                AssignedRunLookup::AlreadyDone { .. } => unreachable!(),
+            }
+        }
+    }
+
+    fn send_manifest(
+        client: &dyn abq_utils::net::ConfiguredClient,
+        run_id: &RunId,
+        queue_addr: SocketAddr,
+        manifest: ManifestMessage,
+    ) {
+        let mut conn = client.connect(queue_addr).unwrap();
+
+        net_protocol::write(
+            &mut conn,
+            queue::Request {
+                entity: EntityId::new(),
+                message: queue::Message::ManifestResult(
+                    run_id.clone(),
+                    ManifestResult::Manifest(manifest),
+                ),
+            },
+        )
+        .unwrap();
+
+        let _: AckManifest = net_protocol::read(&mut conn).unwrap();
+    }
+
+    fn pull_tests(
+        client: &dyn abq_utils::net::ConfiguredClient,
+        work_server_addr: SocketAddr,
+        run_id: &RunId,
+    ) -> NextWorkBundle {
+        let mut conn = client.connect(work_server_addr).unwrap();
+        net_protocol::write(
+            &mut conn,
+            WorkServerRequest::NextTest {
+                run_id: run_id.clone(),
+            },
+        )
+        .unwrap();
+        let NextTestResponse::Bundle(tests) = net_protocol::read(&mut conn).unwrap();
+        tests
+    }
+
+    fn wait_for_total_run_result(
+        client: Box<dyn abq_utils::net::ConfiguredClient>,
+        queue_server_addr: SocketAddr,
+        run_id: RunId,
+    ) -> bool {
+        let mut conn = client.connect(queue_server_addr).unwrap();
+        net_protocol::write(
+            &mut conn,
+            queue::Request {
+                entity: EntityId::new(),
+                message: queue::Message::RequestTotalRunResult(run_id),
+            },
+        )
+        .unwrap();
+        match net_protocol::read(&mut conn).unwrap() {
+            queue::TotalRunResult::Pending => unreachable!(),
+            queue::TotalRunResult::Completed { succeeded } => succeeded,
+        }
+    }
+
+    #[test]
+    fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
+        let run_id = RunId::unique();
+
+        let manifest = ManifestMessage {
+            manifest: Manifest {
+                members: vec![echo_test("echo1".to_string())],
+                ..empty_manifest()
+            },
+        };
+        let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest.clone());
+
+        let queues = SharedRuns::default();
+
+        let StartedTriple {
+            queue_server_handle,
+            queue_server_addr,
+            work_server_handle,
+            work_server_addr,
+            supervisor_handle,
+            mut server_shutdown,
+            supervisor_cancel_run: _cancel_run,
+            client_opts,
+        } = start_queue_work_and_supervisor(
+            queues.clone(),
+            run_id.clone(),
+            runner,
+            RunTimeoutStrategy::Constant(Duration::ZERO),
+        );
+
+        let client = client_opts.build().unwrap();
+
+        wait_for_assigned_run(&queues, &run_id);
+
+        send_manifest(&*client, &run_id, queue_server_addr, manifest);
+
+        let bundle = pull_tests(&*client, work_server_addr, &run_id);
+        assert_eq!(bundle.0.len(), 1);
+
+        // Now, after pulling the test, we should eventually timeout.
+        let supervisor_result = supervisor_handle.join().unwrap();
+        assert!(supervisor_result.is_err());
+        let err = supervisor_result.unwrap_err();
+        assert!(matches!(err, TestResultError::TimedOut(..)));
+
+        // Now, when we query the test result it should be marked as expired.
+        wait_for_total_run_result(client, queue_server_addr, run_id);
+
+        server_shutdown.shutdown_immediately().unwrap();
+        work_server_handle.join().unwrap();
+        queue_server_handle.join().unwrap();
     }
 }

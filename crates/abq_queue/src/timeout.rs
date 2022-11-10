@@ -1,4 +1,3 @@
-#![allow(dead_code)] // TODO(#185) remove
 use std::{
     pin::Pin,
     sync::Arc,
@@ -7,25 +6,55 @@ use std::{
 };
 
 use abq_utils::net_protocol::workers::RunId;
-use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 use std::future::Future;
 use tokio::sync::RwLock;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RunTimeoutStrategy {
+    /// Determine the timeout from the parameters of a test run.
+    RunBased,
+    /// Constant timeout, for use in testing.
+    #[cfg(test)]
+    Constant(Duration),
+}
+
+impl Default for RunTimeoutStrategy {
+    fn default() -> Self {
+        Self::RunBased
+    }
+}
+
+impl RunTimeoutStrategy {
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    pub fn timeout(&self) -> Duration {
+        match self {
+            RunTimeoutStrategy::RunBased => {
+                // TODO: eventually get this from the run data
+                Self::DEFAULT_TIMEOUT
+            }
+            #[cfg(test)]
+            RunTimeoutStrategy::Constant(timeout) => *timeout,
+        }
+    }
+}
+
 /// Records runs that should timeout after a certain amount of time.
 /// Fires [RunTimeoutManager::next_timeout] when a timeout is reached.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct RunTimeoutManager {
     timeouts: Arc<RwLock<FuturesUnordered<TimeoutCell>>>,
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct TimedOutRun {
-    run_id: RunId,
-    after: Duration,
+    pub run_id: RunId,
+    pub after: Duration,
 }
 
 struct TimeoutCell {
-    timeout: BoxFuture<'static, TimedOutRun>,
+    timeout: Pin<Box<dyn Future<Output = TimedOutRun> + Send + Sync + 'static>>,
 }
 
 impl Future for TimeoutCell {
@@ -37,8 +66,6 @@ impl Future for TimeoutCell {
 }
 
 impl RunTimeoutManager {
-    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
-
     const MAX_TIMEOUT_WAIT_TIME: Duration = Duration::from_micros(10);
 
     /// Inserts a new timeout for a given run ID.
