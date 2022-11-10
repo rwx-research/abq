@@ -159,10 +159,19 @@ fn setup_tracing() -> TracingGuards {
             _file_appender_guard: None,
         }
     } else {
+        let with_ansi_colors = match std::env::var("ABQ_LOG_COLORS").as_deref() {
+            Ok(s) => !matches!(s.trim(), "0"),
+            Err(_) => {
+                // color by default if unset
+                true
+            }
+        };
+
         // Otherwise, log to stderr as appropriate.
         let stderr_layer = fmt::Layer::default()
             .with_writer(std::io::stderr)
             .with_span_events(fmt::format::FmtSpan::ACTIVE)
+            .with_ansi(with_ansi_colors)
             .with_filter(env_filter);
 
         Registry::default().with(stderr_layer).init();
