@@ -26,7 +26,7 @@ impl Default for RunTimeoutStrategy {
 }
 
 impl RunTimeoutStrategy {
-    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
 
     pub fn timeout(&self) -> Duration {
         match self {
