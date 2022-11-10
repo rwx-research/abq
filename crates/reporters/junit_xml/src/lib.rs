@@ -37,29 +37,32 @@ impl Collector {
 
         let duration = junit::Duration::milliseconds(*runtime as _);
 
+        let raw_output = output.to_owned().unwrap_or_default();
+        // ANSI escape codes can be valid UTF-8, but they are not valid XML -
+        // strip them from our XML output.
+        let cleaned_output = {
+            let cleaned_bytes = strip_ansi_escapes::strip(raw_output)
+                .expect("writing to a fresh buffer must not fail");
+
+            // The test output was valid UTF-8 before we stripped the ANSI escape codes; the
+            // closure consisting of stripping the codes, which themselves are valid UTF-8,
+            // which must leave us with a UTF-8 valid string.
+            String::from_utf8(cleaned_bytes).expect("ABQ results must always be valid UTF-8")
+        };
+
         let test_case = match status {
             Status::Failure => {
                 // TODO: expose optional failure type on `TestResult`?
                 let failure_type = "failure";
 
-                junit::TestCase::failure(
-                    display_name,
-                    duration,
-                    failure_type,
-                    output.as_deref().unwrap_or_default(),
-                )
+                junit::TestCase::failure(display_name, duration, failure_type, &cleaned_output)
             }
             Status::Success => junit::TestCase::success(display_name, duration),
             Status::Error | Status::PrivateNativeRunnerError => {
                 // TODO: expose optional error type on `TestResult`?
                 let error_type = "error";
 
-                junit::TestCase::error(
-                    display_name,
-                    duration,
-                    error_type,
-                    output.as_deref().unwrap_or_default(),
-                )
+                junit::TestCase::error(display_name, duration, error_type, &cleaned_output)
             }
             Status::Pending => junit::TestCase::skipped(display_name),
             Status::Skipped => junit::TestCase::skipped(display_name),
@@ -262,6 +265,37 @@ mod test {
                 r#"<testsuite id="0" name="suite" package="testsuite/suite" tests="1" errors="1" failures="0" hostname="localhost" timestamp="1970-01-01T00:00:00Z" time="0.011">"#,
                 r#"<testcase name="app::module::test1" time="0.011">"#,
                 r#"<error type="error" message=""/>"#,
+                r#"</testcase>"#,
+                r#"</testsuite>"#,
+                r#"</testsuites>"#
+            )
+        );
+    }
+
+    #[test]
+    fn strip_ansi_escape_codes() {
+        let mut collector = Collector::new("suite");
+        collector.extend_with_results(&[TestResult {
+            status: Status::Error,
+            id: "id1".to_string(),
+            display_name: "app::module::test1".to_string(),
+            output: Some(String::from_utf8(b"\x1b[32mRESULT\x1b[m of test".to_vec()).unwrap()),
+            runtime: 11.0,
+            meta: Default::default(),
+        }]);
+
+        let mut buf = vec![];
+        collector.write_xml(&mut buf).expect("failed to write");
+        let xml = String::from_utf8(buf).expect("not utf8 XML");
+
+        assert_eq!(
+            xml,
+            concat!(
+                r#"<?xml version="1.0" encoding="utf-8"?>"#,
+                r#"<testsuites>"#,
+                r#"<testsuite id="0" name="suite" package="testsuite/suite" tests="1" errors="1" failures="0" hostname="localhost" timestamp="1970-01-01T00:00:00Z" time="0.011">"#,
+                r#"<testcase name="app::module::test1" time="0.011">"#,
+                r#"<error type="error" message="RESULT of test"/>"#,
                 r#"</testcase>"#,
                 r#"</testsuite>"#,
                 r#"</testsuites>"#

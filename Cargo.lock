@@ -102,6 +102,7 @@ dependencies = [
  "abq_utils",
  "insta",
  "junit-report",
+ "strip-ansi-escapes",
 ]
 
 [[package]]
