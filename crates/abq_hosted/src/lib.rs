@@ -9,7 +9,6 @@ use std::thread;
 use std::time::Duration;
 
 use abq_utils::auth::UserToken;
-use abq_utils::net_opt::Tls;
 use abq_utils::net_protocol::workers::RunId;
 use reqwest::{blocking::RequestBuilder, StatusCode};
 use serde::Deserialize;
@@ -23,7 +22,8 @@ pub struct HostedQueueConfig {
     pub addr: SocketAddr,
     pub run_id: RunId,
     pub auth_token: UserToken,
-    pub tls: Tls,
+    /// `Some` is TLS should be used, `None` otherwise.
+    pub tls_public_certificate: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Error)]
@@ -60,6 +60,7 @@ impl From<reqwest::Error> for Error {
 #[derive(Deserialize, Debug)]
 struct HostedQueueResponse {
     queue_url: Url,
+    tls_public_certificate: Option<String>,
 }
 
 impl HostedQueueConfig {
@@ -87,13 +88,10 @@ impl HostedQueueConfig {
             .error_for_status()?
             .json()?;
 
-        let HostedQueueResponse { queue_url } = resp;
-
-        let tls = match queue_url.scheme() {
-            "abq" => Tls::NO,
-            "abqs" => Tls::YES,
-            s => return Err(Error::SchemaError(format!("invalid URL schema {s}"))),
-        };
+        let HostedQueueResponse {
+            queue_url,
+            tls_public_certificate,
+        } = resp;
 
         let addr = match queue_url.socket_addrs(|| None).as_deref() {
             Ok([one]) => *one,
@@ -130,7 +128,7 @@ impl HostedQueueConfig {
             addr,
             run_id: resolved_run_id,
             auth_token,
-            tls,
+            tls_public_certificate: tls_public_certificate.map(String::into_bytes),
         })
     }
 }
@@ -208,7 +206,7 @@ fn send_request_with_decay_help(
 mod test {
     use std::str::FromStr;
 
-    use abq_utils::{auth::UserToken, net_opt::Tls, net_protocol::workers::RunId};
+    use abq_utils::{auth::UserToken, net_protocol::workers::RunId};
     use reqwest::StatusCode;
 
     use crate::{send_request_with_decay_help, ApiKey};
@@ -223,6 +221,15 @@ mod test {
 
     fn test_auth_token() -> UserToken {
         UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
+    }
+
+    fn test_mock_cert() -> String {
+        "\
+        -----BEGIN CERTIFICATE-----\
+        FAKEFAKEFAKEFAKEFAKEFAKEFAKE\
+        -----END CERTIFICATE-----\
+        "
+        .to_string()
     }
 
     #[test]
@@ -241,8 +248,9 @@ mod test {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
-                r#"{{"queue_url":"abqs://168.220.85.45:8080?run_id=1234\u0026token={}"}}"#,
-                test_auth_token()
+                r#"{{"queue_url":"abqs://168.220.85.45:8080?run_id=1234\u0026token={}","tls_public_certificate":"{}"}}"#,
+                test_auth_token(),
+                test_mock_cert()
             ))
             .create();
 
@@ -250,13 +258,13 @@ mod test {
             addr,
             run_id,
             auth_token,
-            tls,
+            tls_public_certificate,
         } = HostedQueueConfig::from_api(mockito::server_url(), test_api_key(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
         assert_eq!(auth_token, test_auth_token());
-        assert_eq!(tls, Tls::YES);
+        assert_eq!(tls_public_certificate.unwrap(), test_mock_cert().as_bytes());
     }
 
     #[test]
@@ -284,13 +292,13 @@ mod test {
             addr,
             run_id,
             auth_token,
-            tls,
+            tls_public_certificate,
         } = HostedQueueConfig::from_api(mockito::server_url(), test_api_key(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
         assert_eq!(auth_token, test_auth_token());
-        assert_eq!(tls, Tls::NO);
+        assert!(tls_public_certificate.is_none());
     }
 
     #[test]

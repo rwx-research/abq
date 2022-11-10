@@ -6,28 +6,6 @@ use crate::{
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub struct Tls(bool);
-
-impl Tls {
-    pub const YES: Self = Tls(true);
-    pub const NO: Self = Tls(false);
-}
-
-impl From<bool> for Tls {
-    fn from(tls: bool) -> Self {
-        Self(tls)
-    }
-}
-
-impl std::str::FromStr for Tls {
-    type Err = std::str::ParseBoolError;
-
-    fn from_str(tls: &str) -> Result<Self, Self::Err> {
-        bool::from_str(tls).map(Self)
-    }
-}
-
 #[derive(Clone)]
 pub struct ServerOptions {
     auth_strategy: ServerAuthStrategy,
