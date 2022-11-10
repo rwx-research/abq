@@ -170,9 +170,9 @@ pub enum Command {
     ///
     #[clap(verbatim_doc_comment)]
     #[command(group(
-        ArgGroup::new("execution") // don't allow both queue_addr and num_workers params
+        ArgGroup::new("execution") // don't allow both queue_addr and api_key params
             .multiple(false)
-            .args(["api_key", "queue_addr", "num_workers"]),
+            .args(["api_key", "queue_addr"]),
         )
     )]
     #[command(group(
@@ -205,9 +205,9 @@ pub enum Command {
         /// Specifices the number of workers to start when running in standalone. Must be >= 1. Defaults to the number of available (physical)
         /// CPUs - 1.
         ///
-        /// Cannot be used with api_key (will fetch address from ABQ API) or queue_addr (implies: not using the ABQ API)
-        #[clap(long, short = 'n', required = false, default_value_t = default_num_workers_for_test())]
-        num_workers: NonZeroUsize,
+        /// If present, will always launch in standalone mode.
+        #[clap(long, short = 'n', required = false)]
+        num_workers: Option<NonZeroUsize>,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
