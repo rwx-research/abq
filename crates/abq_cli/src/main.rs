@@ -19,7 +19,7 @@ use abq_hosted::ApiKey;
 use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
-    net_opt::{ClientOptions, ServerOptions, Tls},
+    net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
         entity::EntityId,
         health::Health,
@@ -58,7 +58,7 @@ struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
 struct ConfigFromApi {
     queue_addr: SocketAddr,
     token: UserToken,
-    tls_cert: Option<Vec<u8>>,
+    tls_public_certificate: Option<Vec<u8>>,
 }
 
 struct RunIdEnvironment {
@@ -449,7 +449,11 @@ fn resolve_config(
     let (queue_addr_from_api, token_from_api, tls_from_api) = match api_key {
         Some(key) => {
             let config = get_config_from_api(key, run_id)?;
-            (Some(config.queue_addr), Some(config.token), config.tls_cert)
+            (
+                Some(config.queue_addr),
+                Some(config.token),
+                config.tls_public_certificate,
+            )
         }
         None => (None, None, None),
     };
@@ -474,19 +478,13 @@ fn get_config_from_api(api_key: ApiKey, run_id: &RunId) -> anyhow::Result<Config
         addr,
         run_id: _,
         auth_token,
-        tls,
+        tls_public_certificate,
     } = HostedQueueConfig::from_api(api_url, api_key, run_id)?;
-
-    let tls_cert = if tls == Tls::YES {
-        Some(include_bytes!("../../abq_utils/data/cert/server.crt").to_vec())
-    } else {
-        None
-    };
 
     Ok(ConfigFromApi {
         queue_addr: addr,
         token: auth_token,
-        tls_cert,
+        tls_public_certificate,
     })
 }
 
