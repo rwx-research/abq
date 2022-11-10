@@ -72,6 +72,9 @@ pub enum TestResultError {
     #[error("The given test command failed to be executed by all workers. The recorded error message is:\n{0}")]
     TestCommandError(String),
 
+    #[error("The given test command timed out.")]
+    TimedOut(Duration),
+
     #[error("The test run was cancelled.")]
     Cancelled,
 }
@@ -223,7 +226,7 @@ impl Client {
                     // interfere with us here.
                     net_protocol::async_write(
                         &mut self.stream,
-                        &net_protocol::client::AckEndOfTests {},
+                        &net_protocol::client::AckTestRunEnded {},
                     )
                     .await?;
 
@@ -231,6 +234,17 @@ impl Client {
                 }
                 Ok(InvokerTestResult::TestCommandError { error }) => {
                     return Err(TestResultError::TestCommandError(error))
+                }
+                Ok(InvokerTestResult::TimedOut { after }) => {
+                    // Send a final ACK of the test results, so that cancellation signals do not
+                    // interfere with us here.
+                    net_protocol::async_write(
+                        &mut self.stream,
+                        &net_protocol::client::AckTestRunEnded {},
+                    )
+                    .await?;
+
+                    return Err(TestResultError::TimedOut(after));
                 }
                 Err(err) => {
                     // Attempt to reconnect once. If it's successful, just re-read the next message.
