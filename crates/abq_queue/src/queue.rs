@@ -375,7 +375,7 @@ impl AllRuns {
                 let mut bundle = Vec::with_capacity(batch_size.get() as _);
                 bundle.extend(queue.get_work(batch_size));
 
-                let pulled_last_test = queue.is_empty();
+                let pulled_last_test = queue.is_empty() && !bundle.is_empty();
 
                 if bundle.len() < batch_size.get() as _ {
                     // We've hit the end of the manifest but have space for more tests to send in
