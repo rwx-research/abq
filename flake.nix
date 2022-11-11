@@ -51,13 +51,20 @@
           drv = abq;
         };
 
+        # note, we have a dev shell working, but rust-analyzer doesn't totally work because of
+        # https://github.com/rust-lang/rust-analyzer/issues/13393
+        # so I wouldn't recommend using the nix dev shell until that's fixed
         devShells.default = pkgs.mkShell {
           inputsFrom = builtins.attrValues self.checks;
+          # see: https://discourse.nixos.org/t/rust-src-not-found-and-other-misadventures-of-developing-rust-on-nixos/11570/3
+          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
 
           # Extra inputs can be added here
           nativeBuildInputs = with pkgs; [
             cargo
             rustc
+            rust-analyzer
           ] ++ nativeBuildInputs ++ buildInputs;
         };
 
