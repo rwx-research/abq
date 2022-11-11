@@ -7,7 +7,6 @@ use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use abq_utils::auth::ServerAuthStrategy;
 use abq_utils::net;
@@ -28,7 +27,7 @@ use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::{atomic, flatten_manifest};
 use abq_workers::negotiate::{
-    AssignedRun, AssignedRunCompeleted, QueueNegotiator, QueueNegotiatorHandle,
+    AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -729,26 +728,18 @@ fn start_queue(config: QueueConfig) -> Abq {
         }
     });
 
-    // Chooses a test run for a set of workers to attach to.
-    // This blocks until there is an run available for the particular worker.
-    // TODO: blocking is not good; workers that can connect fast may be blocked on workers waiting
-    // for a test run to be established. Make this cede control to a runtime if the worker's run is
-    // not yet available.
+    // Provide the execution context a set of workers should attach with, if it is known at the
+    // time of polling. We must not to block here, since that can take a lock over the shared
+    // queues indefinitely.
     let choose_run_for_worker = {
         let queues = queues.clone();
-        move |wanted_run_id: &RunId| loop {
+        move |wanted_run_id: &RunId| {
             let opt_assigned = { queues.get_run_for_worker(wanted_run_id) };
             match opt_assigned {
-                AssignedRunLookup::NotFound => {
-                    // Nothing yet; release control and sleep for a bit in case something comes.
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
+                AssignedRunLookup::Some(assigned) => AssignedRunStatus::Run(assigned),
+                AssignedRunLookup::NotFound => AssignedRunStatus::RunUnknown,
                 AssignedRunLookup::AlreadyDone { success } => {
-                    return Err(AssignedRunCompeleted { success })
-                }
-                AssignedRunLookup::Some(assigned) => {
-                    return Ok(assigned);
+                    AssignedRunStatus::AlreadyDone { success }
                 }
             }
         }
@@ -2221,6 +2212,16 @@ mod test {
         ClientAuthStrategy<Admin>,
     ) {
         build_strategies(UserToken::new_random(), AdminToken::new_random())
+    }
+
+    fn fake_workers_config() -> WorkersConfig {
+        WorkersConfig {
+            num_workers: 4.try_into().unwrap(),
+            worker_context: WorkerContext::AssumeLocal,
+            work_retries: 0,
+            work_timeout: Duration::from_secs(1),
+            debug_native_runner: false,
+        }
     }
 
     fn create_queue_server(
@@ -4624,5 +4625,94 @@ mod test {
         server_shutdown.shutdown_immediately().unwrap();
         work_server_handle.join().unwrap();
         queue_server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn pending_worker_attachment_does_not_block_other_attachers() {
+        let mut queue = Abq::start(Default::default());
+        let queue_server_addr = queue.server_addr();
+
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
+
+        // Start a set of workers that will never find their execution context, and just
+        // continuously poll the queue.
+        let workers_that_never_attach = {
+            let client_opts = client_opts.clone();
+            let run_id = RunId::unique();
+            let negotiator = queue.get_negotiator_handle();
+
+            thread::spawn(move || {
+                WorkersNegotiator::negotiate_and_start_pool(
+                    fake_workers_config(),
+                    negotiator,
+                    client_opts,
+                    run_id,
+                )
+            })
+        };
+
+        // In the meantime, start and execute a run that should complete successfully.
+        {
+            let run_id = RunId::unique();
+            let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
+            let (_cancellation_tx, cancellation_rx) = run_cancellation_pair();
+            let results_handle = thread::spawn({
+                let run_id = run_id.clone();
+                let client_opts = client_opts.clone();
+
+                move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+
+                    runtime.block_on(async {
+                        let mut num_results = 0;
+
+                        let client = Client::invoke_work(
+                            EntityId::new(),
+                            queue_server_addr,
+                            client_opts,
+                            run_id,
+                            runner,
+                            one_nonzero(),
+                            DEFAULT_CLIENT_POLL_TIMEOUT,
+                            cancellation_rx,
+                        )
+                        .await
+                        .unwrap();
+
+                        client
+                            .stream_results(|_, _| {
+                                num_results += 1;
+                            })
+                            .await
+                            .unwrap();
+
+                        num_results
+                    })
+                }
+            });
+
+            let mut workers = WorkersNegotiator::negotiate_and_start_pool(
+                fake_workers_config(),
+                queue.get_negotiator_handle(),
+                client_opts,
+                run_id,
+            )
+            .unwrap();
+
+            let num_results = results_handle.join().unwrap();
+            assert_eq!(num_results, 0);
+
+            let exit = workers.shutdown();
+            assert!(matches!(exit, WorkersExit::Success));
+        }
+
+        queue.shutdown().unwrap();
+
+        let never_attached_result = workers_that_never_attach.join().unwrap();
+        assert!(never_attached_result.is_err());
     }
 }

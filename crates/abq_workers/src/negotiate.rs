@@ -19,7 +19,8 @@ use crate::workers::{
 };
 use abq_utils::{
     auth::User,
-    net, net_async,
+    net::{self, ConfiguredClient},
+    net_async,
     net_opt::ClientOptions,
     net_protocol::{
         self,
@@ -75,9 +76,12 @@ struct ExecutionContext {
 enum MessageFromQueueNegotiator {
     /// The run a worker set is negotiating for has already completed, and the set should
     /// immediately exit.
-    RunAlreadyCompleted { success: bool },
+    RunAlreadyCompleted {
+        success: bool,
+    },
     /// The context a worker set should execute a run with.
     ExecutionContext(ExecutionContext),
+    RunUnknown,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,19 +162,10 @@ impl WorkersNegotiator {
         client_options: ClientOptions<User>,
         wanted_run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
-        use WorkersNegotiateError::*;
-
         let client = client_options.build()?;
-        let mut conn = client
-            .connect(queue_negotiator_handle.0)
-            .map_err(|_| CouldNotConnect)?;
 
-        let wants_to_attach = MessageToQueueNegotiator::WantsToAttach { run: wanted_run_id };
-        tracing::debug!("Writing attach message");
-        net_protocol::write(&mut conn, wants_to_attach).map_err(|_| CouldNotConnect)?;
-        tracing::debug!("Wrote attach message");
-
-        tracing::debug!("Awaiting execution message");
+        let execution_decision =
+            wait_for_execution_context(&*client, &wanted_run_id, queue_negotiator_handle.0)?;
 
         let ExecutionContext {
             run_id,
@@ -178,11 +173,9 @@ impl WorkersNegotiator {
             queue_results_addr,
             runner_kind,
             worker_should_generate_manifest,
-        } = match net_protocol::read(&mut conn).map_err(|_| BadQueueMessage)? {
-            MessageFromQueueNegotiator::RunAlreadyCompleted { success } => {
-                return Ok(NegotiatedWorkers::Redundant { success });
-            }
-            MessageFromQueueNegotiator::ExecutionContext(ctx) => ctx,
+        } = match execution_decision {
+            Ok(ctx) => ctx,
+            Err(redundnant_workers) => return Ok(redundnant_workers),
         };
 
         tracing::debug!(
@@ -343,6 +336,51 @@ impl WorkersNegotiator {
     }
 }
 
+/// Waits to receive worker execution context from a queue negotiator.
+/// This call will block on the result, but be composed of only non-blocking calls to the queue
+/// negotiator.
+/// Turns Ok(Err(redundant)) if this set of workers would be redundant, and
+/// Ok(Ok(context)) if instead the set of workers should start with the given context.
+#[instrument(level = "debug", skip(client))]
+fn wait_for_execution_context(
+    client: &dyn ConfiguredClient,
+    wanted_run_id: &RunId,
+    queue_negotiator_addr: SocketAddr,
+) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
+    use WorkersNegotiateError::*;
+
+    let mut decay = Duration::from_millis(10);
+    let max_decay = Duration::from_secs(3);
+    loop {
+        let mut conn = client.connect(queue_negotiator_addr)?;
+        let wants_to_attach = MessageToQueueNegotiator::WantsToAttach {
+            run: wanted_run_id.clone(),
+        };
+        net_protocol::write(&mut conn, wants_to_attach)?;
+
+        let worker_set_decision =
+            match net_protocol::read(&mut conn).map_err(|_| BadQueueMessage)? {
+                MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
+                MessageFromQueueNegotiator::RunAlreadyCompleted { success } => {
+                    Err(NegotiatedWorkers::Redundant { success })
+                }
+                MessageFromQueueNegotiator::RunUnknown => {
+                    // We are still waiting for this run, sleep on the decay and retry.
+                    // TODO: timeout if we go too long without finding the run or its execution context.
+                    thread::sleep(decay);
+                    decay *= 2;
+                    if decay >= max_decay {
+                        tracing::info!("hit max decay limit for requesting initialization context");
+                        decay = max_decay;
+                    }
+                    continue;
+                }
+            };
+
+        return Ok(worker_set_decision);
+    }
+}
+
 /// Asks the work server for native runner initialization context.
 /// Blocks on the result, repeatedly pinging the server until work is available.
 fn wait_for_init_context(
@@ -460,7 +498,11 @@ pub struct AssignedRunCompeleted {
     pub success: bool,
 }
 
-pub type AssignedRunResult = Result<AssignedRun, AssignedRunCompeleted>;
+pub enum AssignedRunStatus {
+    RunUnknown,
+    Run(AssignedRun),
+    AlreadyDone { success: bool },
+}
 
 /// An error that happens in the construction or execution of the queue negotiation server.
 ///
@@ -479,8 +521,9 @@ pub enum QueueNegotiatorServerError {
 
 struct QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
 {
+    /// Fetches the status of an assigned run, and yields immediately.
     get_assigned_run: Arc<GetAssignedRun>,
     advertised_queue_work_scheduler_addr: SocketAddr,
     advertised_queue_results_addr: SocketAddr,
@@ -489,7 +532,7 @@ where
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -503,6 +546,8 @@ where
 
 impl QueueNegotiator {
     /// Starts a queue negotiator on a new thread.
+    ///
+    /// * `get_assigned_run` - should fetch the status of an assigned run and yield immediately.
     pub fn new<GetAssignedRun>(
         public_ip: IpAddr,
         listener: Box<dyn net::ServerListener>,
@@ -512,7 +557,7 @@ impl QueueNegotiator {
         get_assigned_run: GetAssignedRun,
     ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
     {
         let addr = listener.local_addr()?;
 
@@ -583,7 +628,7 @@ impl QueueNegotiator {
         stream: net_async::UnverifiedServerStream,
     ) -> io::Result<()>
     where
-        GetAssignedRun: Fn(&RunId) -> AssignedRunResult + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
     {
         let mut stream = ctx.handshake_ctx.handshake(stream).await?;
         let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut stream).await?;
@@ -598,26 +643,26 @@ impl QueueNegotiator {
                 }
             }
             WantsToAttach { run: wanted_run_id } => {
-                tracing::debug!("New worker set negotiating");
-
-                // Choose an `abq test ...` run the workers should perform work
-                // for.
-                // TODO: this fully blocks the negotiator, so nothing else can connect
-                // while we wait for an run, and moreover we won't respect
-                // shutdown messages.
-                tracing::debug!("Finding assigned run");
+                let attach = tracing::debug_span!("Worker set negotiating", ?wanted_run_id);
+                let _attach_span = attach.enter();
+                tracing::debug!(?wanted_run_id, "New worker set negotiating");
 
                 let assigned_run_result = (ctx.get_assigned_run)(&wanted_run_id);
 
-                tracing::debug!("Found assigned run");
-
+                use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
-                    Ok(AssignedRun {
+                    Run(AssignedRun {
                         run_id,
                         runner_kind,
                         should_generate_manifest,
                     }) => {
                         debug_assert_eq!(run_id, wanted_run_id);
+
+                        tracing::debug!(
+                            ?should_generate_manifest,
+                            ?run_id,
+                            "found run for worker set"
+                        );
 
                         MessageFromQueueNegotiator::ExecutionContext(ExecutionContext {
                             queue_new_work_addr: ctx.advertised_queue_work_scheduler_addr,
@@ -627,14 +672,17 @@ impl QueueNegotiator {
                             run_id,
                         })
                     }
-                    Err(AssignedRunCompeleted { success }) => {
+                    AlreadyDone { success } => {
+                        tracing::debug!(?wanted_run_id, "run already completed");
                         MessageFromQueueNegotiator::RunAlreadyCompleted { success }
+                    }
+                    RunUnknown => {
+                        tracing::debug!(?wanted_run_id, "run not yet known");
+                        MessageFromQueueNegotiator::RunUnknown
                     }
                 };
 
-                tracing::debug!("Sending execution context");
                 net_protocol::async_write(&mut stream, &msg).await?;
-                tracing::debug!("Sent execution context");
             }
         }
 
@@ -674,7 +722,7 @@ mod test {
     use std::time::{Duration, Instant};
 
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
-    use crate::negotiate::WorkersConfig;
+    use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExit};
     use abq_utils::auth::{
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
@@ -900,7 +948,7 @@ mod test {
                     init_meta: Default::default(),
                 },
             };
-            Ok(AssignedRun {
+            AssignedRunStatus::Run(AssignedRun {
                 run_id: run_id.clone(),
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
                 should_generate_manifest: true,
@@ -969,7 +1017,7 @@ mod test {
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
             |_| {
-                Ok(AssignedRun {
+                AssignedRunStatus::Run(AssignedRun {
                     run_id: RunId::unique(),
                     runner_kind: RunnerKind::TestLikeRunner(
                         TestLikeRunner::Echo,
