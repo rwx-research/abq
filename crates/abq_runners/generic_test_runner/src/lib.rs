@@ -204,6 +204,7 @@ impl GenericTestRunner {
         input: NativeTestRunnerParams,
         working_dir: &Path,
         _polling_should_shutdown: ShouldShutdown,
+        results_batch_size: u64,
         send_manifest: Option<SendManifest>,
         get_init_context: GetInitContext,
         mut get_next_test_bundle: GetNextWorkBundle,
@@ -215,7 +216,7 @@ impl GenericTestRunner {
         SendManifest: FnMut(ManifestResult),
         GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
         GetNextWorkBundle: FnMut() -> NextWorkBundle + std::marker::Send + 'static,
-        SendTestResult: FnMut(WorkId, TestResult),
+        SendTestResult: FnMut(Vec<(WorkId, TestResult)>),
     {
         let NativeTestRunnerParams {
             cmd,
@@ -333,6 +334,9 @@ impl GenericTestRunner {
             };
         }
 
+        let results_batch_size = results_batch_size as usize;
+        let mut pending_test_results = Vec::with_capacity(results_batch_size);
+
         // We establish one connection with the native runner and repeatedly send tests until we're
         // done.
         'test_all: loop {
@@ -362,7 +366,13 @@ impl GenericTestRunner {
 
                         match opt_test_result_cycle {
                             Ok(TestResultMessage { test_result }) => {
-                                send_test_result(work_id, test_result);
+                                pending_test_results.push((work_id, test_result));
+
+                                if pending_test_results.len() >= results_batch_size as _ {
+                                    let results = std::mem::take(&mut pending_test_results);
+                                    pending_test_results.reserve(results_batch_size as _);
+                                    send_test_result(results);
+                                }
                             }
                             Err(err) => {
                                 // Our connection with the native test runner failed, for some
@@ -394,6 +404,10 @@ impl GenericTestRunner {
                     }
                 }
             }
+        }
+
+        if !pending_test_results.is_empty() {
+            send_test_result(pending_test_results);
         }
 
         drop(our_listener);
@@ -441,7 +455,7 @@ fn handle_native_runner_failure<SendTestResult, I>(
     estimated_time_to_failure: Duration,
     remaining_work: I,
 ) where
-    SendTestResult: FnMut(WorkId, TestResult),
+    SendTestResult: FnMut(Vec<(WorkId, TestResult)>),
     I: IntoIterator<Item = WorkId>,
 {
     let formatted_cmd = args.join(" ");
@@ -504,6 +518,7 @@ fn handle_native_runner_failure<SendTestResult, I>(
 
     tracing::warn!(?error_message, "native test runner failure");
 
+    let mut final_results = vec![];
     for work_id in remaining_work.into_iter() {
         let error_result = TestResult {
             status: Status::PrivateNativeRunnerError,
@@ -514,8 +529,10 @@ fn handle_native_runner_failure<SendTestResult, I>(
             meta: Default::default(),
         };
 
-        send_test_result(work_id, error_result);
+        final_results.push((work_id, error_result));
     }
+
+    send_test_result(final_results);
 }
 
 /// Executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.
@@ -596,13 +613,15 @@ pub fn execute_wrapped_runner(
             }
         }
     };
-    let send_test_result = |_, test_result| test_results.push(test_result);
+    let send_test_result =
+        |results: Vec<_>| test_results.extend(results.into_iter().map(|(_, r)| r));
 
     GenericTestRunner::run(
         EntityId::new(),
         native_runner_params,
         &working_dir,
         || false,
+        5,
         Some(send_manifest),
         get_init_context,
         get_next_test,
@@ -827,13 +846,15 @@ mod test_abq_jest {
             })
         };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
-        let send_test_result = |_, test_result| test_results.push(test_result);
+        let send_test_result =
+            |results: Vec<_>| test_results.extend(results.into_iter().map(|(_, r)| r));
 
         GenericTestRunner::run(
             EntityId::new(),
             input,
             &npm_jest_project_path(),
             || false,
+            5,
             Some(send_manifest),
             get_init_context,
             get_next_test,
@@ -901,13 +922,14 @@ mod test_abq_jest {
                 work_id: WorkId("unreachable".to_string()),
             }])
         };
-        let send_test_result = |_, _| {};
+        let send_test_result = |_| {};
 
         let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _, _, _>(
             EntityId::new(),
             input,
             &npm_jest_project_path(),
             || false,
+            5,
             None,
             get_init_context,
             get_next_test,
@@ -944,13 +966,14 @@ mod test {
             })
         };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
-        let send_test_result = |_, _| {};
+        let send_test_result = |_| {};
 
         let runner_result = GenericTestRunner::run(
             EntityId::new(),
             input,
             &std::env::current_dir().unwrap(),
             || false,
+            5,
             Some(send_manifest),
             get_init_context,
             get_next_test,

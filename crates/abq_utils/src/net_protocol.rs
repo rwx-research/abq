@@ -427,7 +427,7 @@ pub mod queue {
         /// A work manifest for a given run.
         ManifestResult(RunId, ManifestResult),
         /// The result of some work from the queue.
-        WorkerResult(RunId, WorkId, TestResult),
+        WorkerResult(RunId, Vec<(WorkId, TestResult)>),
         /// An ask to return information about whether a given test run failed or not.
         /// A worker issues this request before exiting to determine whether they should exit
         /// cleanly, or fail.

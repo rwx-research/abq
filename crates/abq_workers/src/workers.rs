@@ -33,7 +33,8 @@ pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
 pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
-pub type NotifyResult = Arc<dyn Fn(EntityId, &RunId, WorkId, TestResult) + Send + Sync + 'static>;
+pub type NotifyResults =
+    Arc<dyn Fn(EntityId, &RunId, Vec<(WorkId, TestResult)>) + Send + Sync + 'static>;
 /// Did a given run complete successfully? Returns true if so.
 pub type RunCompletedSuccessfully = Arc<dyn Fn(EntityId) -> bool + Send + Sync + 'static>;
 
@@ -69,7 +70,9 @@ pub struct WorkerPoolConfig {
     /// How should a worker get the next unit of work it needs to run?
     pub get_next_work: GetNextWorkBundle,
     /// How should results be communicated back?
-    pub notify_result: NotifyResult,
+    pub notify_result: NotifyResults,
+    /// How many results should be sent back at a time?
+    pub results_batch_size_hint: u64,
     /// Query whether the assigned run completed successfully, without any failure.
     /// Will block until the result is well-known.
     pub run_completed_successfully: RunCompletedSuccessfully,
@@ -158,6 +161,7 @@ impl WorkerPool {
             run_id,
             get_init_context,
             get_next_work,
+            results_batch_size_hint: results_batch_size,
             notify_result,
             notify_manifest,
             run_completed_successfully,
@@ -171,7 +175,7 @@ impl WorkerPool {
         let mut workers = Vec::with_capacity(num_workers);
 
         let live_count = LiveWorkers::new(num_workers);
-        tracing::debug!("Starting workers with live count {}", live_count.read());
+        tracing::debug!(live_count=?live_count.read(), ?results_batch_size, ?run_id, "Starting worker pool");
 
         let (worker_msg_tx, worker_msg_rx) = mpsc::channel();
         let shared_worker_msg_rx = Arc::new(Mutex::new(worker_msg_rx));
@@ -200,6 +204,7 @@ impl WorkerPool {
                 run_id: run_id.clone(),
                 get_init_context,
                 get_next_work_bundle: get_next_work,
+                results_batch_size,
                 notify_result,
                 context: worker_context.clone(),
                 work_timeout,
@@ -225,6 +230,7 @@ impl WorkerPool {
                 run_id: run_id.clone(),
                 get_init_context,
                 get_next_work_bundle: get_next_work,
+                results_batch_size,
                 notify_result,
                 context: worker_context.clone(),
                 work_timeout,
@@ -319,7 +325,8 @@ struct WorkerEnv {
     notify_manifest: Option<NotifyManifest>,
     get_init_context: GetInitContext,
     get_next_work_bundle: GetNextWorkBundle,
-    notify_result: NotifyResult,
+    results_batch_size: u64,
+    notify_result: NotifyResults,
     context: WorkerContext,
     work_timeout: Duration,
     work_retries: u8,
@@ -355,6 +362,7 @@ fn start_generic_test_runner(
         get_init_context,
         notify_result,
         notify_manifest,
+        results_batch_size,
         context,
         msg_from_pool_rx,
         // TODO: actually use these
@@ -366,7 +374,7 @@ fn start_generic_test_runner(
 
     let entity = EntityId::new();
 
-    tracing::debug!(?entity, "Starting new generic test runner");
+    tracing::debug!(?entity, ?run_id, "Starting new generic test runner");
 
     // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
     // so that they can correlate failures observed in workers with the workers they've launched.
@@ -381,9 +389,7 @@ fn start_generic_test_runner(
 
     let get_next_work_bundle = move || get_next_work_bundle();
 
-    let send_test_result = move |work_id, test_result: TestResult| {
-        notify_result(entity, &run_id, work_id, test_result)
-    };
+    let send_test_result = move |results| notify_result(entity, &run_id, results);
 
     let polling_should_shutdown = || {
         matches!(
@@ -402,6 +408,7 @@ fn start_generic_test_runner(
         native_runner_params,
         &working_dir,
         polling_should_shutdown,
+        results_batch_size,
         notify_manifest,
         get_init_context,
         get_next_work_bundle,
@@ -420,6 +427,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         get_next_work_bundle: get_next_work,
         get_init_context,
         run_id,
+        results_batch_size: _,
         notify_result,
         context,
         work_timeout,
@@ -504,7 +512,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                             meta: Default::default(),
                         };
 
-                        notify_result(entity, &run_id, work_id.clone(), result);
+                        notify_result(entity, &run_id, vec![(work_id.clone(), result)]);
                         break 'attempts;
                     }
                 }
@@ -646,7 +654,7 @@ mod test {
     use tracing_test::traced_test;
 
     use super::{
-        GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResult,
+        GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResults,
         RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkersExit,
     };
     use crate::negotiate::QueueNegotiator;
@@ -680,12 +688,14 @@ mod test {
         (man, notify_result)
     }
 
-    fn results_collector() -> (ResultsCollector, NotifyResult, RunCompletedSuccessfully) {
+    fn results_collector() -> (ResultsCollector, NotifyResults, RunCompletedSuccessfully) {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
-        let notify_result: NotifyResult = Arc::new(move |_, _, work_id, result| {
-            let old_result = results2.lock().unwrap().insert(work_id.0, result);
-            debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
+        let notify_result: NotifyResults = Arc::new(move |_, _, results| {
+            for (work_id, result) in results {
+                let old_result = results2.lock().unwrap().insert(work_id.0, result);
+                debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
+            }
         });
         let results3 = Arc::clone(&results);
         let get_completed_status: RunCompletedSuccessfully = Arc::new(move |_| {
@@ -708,7 +718,7 @@ mod test {
         runner_kind: RunnerKind,
         run_id: RunId,
         get_next_work: GetNextWorkBundle,
-        notify_result: NotifyResult,
+        notify_result: NotifyResults,
         run_completed_successfully: RunCompletedSuccessfully,
     ) -> (WorkerPoolConfig, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
@@ -717,6 +727,7 @@ mod test {
             size: NonZeroUsize::new(1).unwrap(),
             get_next_work,
             get_init_context: Arc::new(empty_init_context),
+            results_batch_size_hint: 5,
             runner_kind,
             run_id,
             notify_manifest: Some(notify_manifest),
