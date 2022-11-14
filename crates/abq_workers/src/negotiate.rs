@@ -14,7 +14,7 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::workers::{
-    GetInitContext, GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResult,
+    GetInitContext, GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResults,
     RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
 };
 use abq_utils::{
@@ -68,6 +68,8 @@ struct ExecutionContext {
     runner_kind: RunnerKind,
     /// Whether the queue wants a worker to generate the work manifest.
     worker_should_generate_manifest: bool,
+    /// Hint for how many test results should be sent back in a batch by a worker.
+    results_batch_size_hint: u64,
     // TODO: do we want the queue to be able to modify the # workers configured and their
     // capabilities (timeout, retries, etc)?
 }
@@ -173,6 +175,7 @@ impl WorkersNegotiator {
             queue_results_addr,
             runner_kind,
             worker_should_generate_manifest,
+            results_batch_size_hint,
         } = match execution_decision {
             Ok(ctx) => ctx,
             Err(redundnant_workers) => return Ok(redundnant_workers),
@@ -192,11 +195,11 @@ impl WorkersNegotiator {
             debug_native_runner,
         } = workers_config;
 
-        let notify_result: NotifyResult = Arc::new({
+        let notify_result: NotifyResults = Arc::new({
             let client = client.boxed_clone();
 
-            move |entity, run_id, work_id, result| {
-                let span = tracing::trace_span!("notify_result", run_id=?run_id, work_id=?work_id, queue_server=?queue_results_addr);
+            move |entity, run_id, results| {
+                let span = tracing::trace_span!("notify_result", run_id=?run_id, results=?results.len(), queue_server=?queue_results_addr);
                 let _notify_result = span.enter();
 
                 // TODO: error handling
@@ -206,11 +209,7 @@ impl WorkersNegotiator {
 
                 let request = net_protocol::queue::Request {
                     entity,
-                    message: net_protocol::queue::Message::WorkerResult(
-                        run_id.clone(),
-                        work_id,
-                        result,
-                    ),
+                    message: net_protocol::queue::Message::WorkerResult(run_id.clone(), results),
                 };
 
                 // TODO: error handling
@@ -320,6 +319,7 @@ impl WorkersNegotiator {
             get_init_context,
             notify_result,
             run_completed_successfully,
+            results_batch_size_hint,
             worker_context,
             work_timeout,
             work_retries,
@@ -490,6 +490,7 @@ pub struct AssignedRun {
     pub run_id: RunId,
     pub runner_kind: RunnerKind,
     pub should_generate_manifest: bool,
+    pub results_batch_size_hint: u64,
 }
 
 /// A marker that a test run should work on has already completed by the time the worker started
@@ -655,6 +656,7 @@ impl QueueNegotiator {
                         run_id,
                         runner_kind,
                         should_generate_manifest,
+                        results_batch_size_hint,
                     }) => {
                         debug_assert_eq!(run_id, wanted_run_id);
 
@@ -667,6 +669,7 @@ impl QueueNegotiator {
                         MessageFromQueueNegotiator::ExecutionContext(ExecutionContext {
                             queue_new_work_addr: ctx.advertised_queue_work_scheduler_addr,
                             queue_results_addr: ctx.advertised_queue_results_addr,
+                            results_batch_size_hint,
                             runner_kind,
                             worker_should_generate_manifest: should_generate_manifest,
                             run_id,
@@ -860,8 +863,10 @@ mod test {
 
             let request: net_protocol::queue::Request = net_protocol::read(&mut client).unwrap();
             match request.message {
-                net_protocol::queue::Message::WorkerResult(_, _, result) => {
-                    msgs2.lock().unwrap().push(result);
+                net_protocol::queue::Message::WorkerResult(_, results) => {
+                    for (_, result) in results {
+                        msgs2.lock().unwrap().push(result);
+                    }
                 }
                 net_protocol::queue::Message::ManifestResult(_, manifest_result) => {
                     let manifest = match manifest_result {
@@ -952,6 +957,7 @@ mod test {
                 run_id: run_id.clone(),
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
                 should_generate_manifest: true,
+                results_batch_size_hint: 2,
             })
         };
 
@@ -1029,6 +1035,7 @@ mod test {
                         },
                     ),
                     should_generate_manifest: true,
+                    results_batch_size_hint: 2,
                 })
             },
         )

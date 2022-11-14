@@ -14,7 +14,7 @@ use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
-use abq_utils::net_protocol::runners::{ManifestResult, MetadataMap, TestCase, TestResult};
+use abq_utils::net_protocol::runners::{ManifestResult, MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
 use abq_utils::net_protocol::{
@@ -233,11 +233,11 @@ impl AllRuns {
             None => return AssignedRunLookup::NotFound,
         };
 
-        let runner = match &run.data {
+        let (runner, batch_size_hint) = match &run.data {
             Some(RunData {
                 runner,
-                batch_size_hint: _,
-            }) => (**runner).clone(),
+                batch_size_hint,
+            }) => ((**runner).clone(), *batch_size_hint),
             None => {
                 // If there is an active run, then the run data exists iff the run state exists;
                 // however, if the run state is known to be complete, the run data will already
@@ -265,6 +265,12 @@ impl AllRuns {
             }
         };
 
+        // Instruct the worker to batch test results in packages of the same size as the batches of
+        // test-to-run that they will receive.
+        // NB: in the future, the worker may not obey this hint explicitly, and we may want to more
+        // intelligently determine the batch size here.
+        let results_batch_size_hint = batch_size_hint.get();
+
         let assigned_run = match run.state {
             RunState::WaitingForFirstWorker => {
                 // This is the first worker to attach; ask it to generate the manifest.
@@ -273,6 +279,7 @@ impl AllRuns {
                     run_id: run_id.clone(),
                     runner_kind: runner,
                     should_generate_manifest: true,
+                    results_batch_size_hint,
                 }
             }
             _ => {
@@ -282,6 +289,7 @@ impl AllRuns {
                     run_id: run_id.clone(),
                     runner_kind: runner,
                     should_generate_manifest: false,
+                    results_batch_size_hint,
                 }
             }
         };
@@ -790,8 +798,11 @@ impl BufferedResults {
 
     /// Adds a new test result to the buffer. If the buffer capacity is exceeded, all test results
     /// to be drained are returned.
-    fn push(&mut self, result: AssociatedTestResult) -> Option<Vec<AssociatedTestResult>> {
-        self.buffer.push(result);
+    fn extend(
+        &mut self,
+        results: impl IntoIterator<Item = AssociatedTestResult>,
+    ) -> Option<Vec<AssociatedTestResult>> {
+        self.buffer.extend(results);
         if self.buffer.len() >= self.max_size {
             return Some(self.buffer.drain(..).collect());
         }
@@ -833,7 +844,7 @@ impl ClientResponder {
         }
     }
 
-    async fn send_test_result_batch_help(
+    async fn stream_test_result_batch_help(
         stream: &mut Box<dyn net_async::ServerStream>,
         buffer: &mut BufferedResults,
         results: Vec<AssociatedTestResult>,
@@ -874,14 +885,17 @@ impl ClientResponder {
         Ok(())
     }
 
-    async fn send_test_result(&mut self, test_result: AssociatedTestResult) {
+    async fn send_test_results(
+        &mut self,
+        test_results: impl IntoIterator<Item = AssociatedTestResult>,
+    ) {
         match self {
             ClientResponder::DirectStream { stream, buffer } => {
-                let opt_results_to_drain = buffer.push(test_result);
+                let opt_results_to_drain = buffer.extend(test_results);
 
                 if let Some(results) = opt_results_to_drain {
                     let opt_disconnected =
-                        Self::send_test_result_batch_help(stream, buffer, results).await;
+                        Self::stream_test_result_batch_help(stream, buffer, results).await;
                     if let Err(disconnected) = opt_disconnected {
                         *self = disconnected;
                     }
@@ -891,7 +905,7 @@ impl ClientResponder {
                 results,
                 buffer_size: _,
             } => {
-                results.push(test_result);
+                results.extend(test_results);
             }
         }
     }
@@ -903,7 +917,8 @@ impl ClientResponder {
 
                 if !remaining_results.is_empty() {
                     let opt_disconnected =
-                        Self::send_test_result_batch_help(stream, buffer, remaining_results).await;
+                        Self::stream_test_result_batch_help(stream, buffer, remaining_results)
+                            .await;
 
                     debug_assert!(
                         buffer.is_empty(),
@@ -950,12 +965,7 @@ impl ClientResponder {
 
         match old_conn {
             ClientResponder::Disconnected { results, .. } => {
-                // We need to send back all the buffered results to the new stream.
-                // Must send all test results in sequence, since each writes to the
-                // same stream back to the client.
-                for test_result in results {
-                    self.send_test_result(test_result).await;
-                }
+                self.send_test_results(results).await;
             }
             ClientResponder::DirectStream { .. } => {
                 // nothing more to do
@@ -1225,7 +1235,7 @@ impl QueueServer {
                 )
                 .await
             }
-            Message::WorkerResult(run_id, work_id, result) => {
+            Message::WorkerResult(run_id, results) => {
                 // Recording and sending the test result back to the abq test client may
                 // be expensive, with multiple IO transactions. There is no reason to block the
                 // client connection on that; recall that the worker side of the connection will
@@ -1235,15 +1245,14 @@ impl QueueServer {
                 // and we'd prefer to close it immediately.
                 drop(stream);
 
-                // Record the test result and notify the test client out-of-band.
-                Self::handle_worker_result(
+                // Record the test results and notify the test client out-of-band.
+                Self::handle_worker_results(
                     ctx.queues,
                     ctx.active_runs,
                     ctx.state_cache,
                     entity,
                     run_id,
-                    work_id,
-                    result,
+                    results,
                 )
                 .await
             }
@@ -1636,18 +1645,20 @@ impl QueueServer {
     }
 
     #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
-    async fn handle_worker_result(
+    async fn handle_worker_results(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
-        work_id: WorkId,
-        result: TestResult,
+        results: Vec<AssociatedTestResult>,
     ) -> Result<(), AnyError> {
         // IFTTT: handle_fired_timeout
 
-        let test_status = result.status;
+        let num_results = results.len();
+        let any_result_is_fail_like = results
+            .iter()
+            .any(|(_, result)| result.status.is_fail_like());
 
         {
             // First up, chuck the test result back over to `abq test`. Make sure we don't steal
@@ -1659,18 +1670,13 @@ impl QueueServer {
                 None => {
                     tracing::info!(
                         ?run_id,
-                        ?work_id,
                         "got test result for no-longer active (cancelled) run"
                     );
                     return Err("run no longer active".into());
                 }
             };
 
-            invoker_stream
-                .lock()
-                .await
-                .send_test_result((work_id, result))
-                .await;
+            invoker_stream.lock().await.send_test_results(results).await;
         }
 
         let (no_more_work, is_successful) = {
@@ -1688,8 +1694,10 @@ impl QueueServer {
                 }
             };
 
-            run_state.work_left -= 1;
-            run_state.is_successful = run_state.is_successful && !test_status.is_fail_like();
+            // TODO: hedge against underflow here
+            run_state.work_left -= num_results;
+
+            run_state.is_successful = run_state.is_successful && !any_result_is_fail_like;
 
             (run_state.work_left == 0, run_state.is_successful)
         };
@@ -1781,10 +1789,10 @@ impl QueueServer {
         state_cache: RunResultStateCache,
         timeout: TimedOutRun,
     ) -> Result<(), AnyError> {
-        // IFTTT: handle_worker_result
+        // IFTTT: handle_worker_results
         //
         // We must now take exclusive access on `active_runs` - since that is the first thing that
-        // handle_worker_result will lock on, our taking a lock ensures that any test runs that
+        // handle_worker_results will lock on, our taking a lock ensures that any test runs that
         // come in after this timeout will not race.
         // We must keep this lock alive until the end of this function.
         let mut locked_active_runs = active_runs.write().await;
@@ -2766,14 +2774,13 @@ mod test {
         let buffered_work_id = WorkId("test1".to_string());
         {
             // Send a test result, will force the responder to go into disconnected mode
-            QueueServer::handle_worker_result(
+            QueueServer::handle_worker_results(
                 run_queues.clone(),
                 Arc::clone(&active_runs),
                 Arc::clone(&run_state),
                 EntityId::new(),
                 run_id.clone(),
-                buffered_work_id.clone(),
-                fake_test_result(),
+                vec![(buffered_work_id.clone(), fake_test_result())],
             )
             .await
             .unwrap();
@@ -2827,14 +2834,13 @@ mod test {
         {
             // Make sure that new test results also get send to the new client connectiion.
             let second_work_id = WorkId("test2".to_string());
-            let worker_result_future = tokio::spawn(QueueServer::handle_worker_result(
+            let worker_result_future = tokio::spawn(QueueServer::handle_worker_results(
                 run_queues,
                 Arc::clone(&active_runs),
                 run_state,
                 EntityId::new(),
                 run_id,
-                second_work_id.clone(),
-                fake_test_result(),
+                vec![(second_work_id.clone(), fake_test_result())],
             ));
 
             let (work_id, _) = client.next().await.unwrap().unwrap().pop().unwrap();
@@ -4055,14 +4061,13 @@ mod test {
 
         let entity = EntityId::new();
 
-        let send_last_result_fut = QueueServer::handle_worker_result(
+        let send_last_result_fut = QueueServer::handle_worker_results(
             queues.clone(),
             Arc::clone(&active_runs),
             Arc::clone(&state_cache),
             entity,
             run_id.clone(),
-            WorkId("work".into()),
-            fake_test_result(),
+            vec![(WorkId("work".into()), fake_test_result())],
         );
         let cancellation_fut = QueueServer::handle_run_cancellation(
             queues.clone(),
