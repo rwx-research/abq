@@ -170,19 +170,6 @@ jobs:
       - name: Build release
         run: cargo build --release
 
-      - name: Cut GitHub release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: ABQ Nightly
-          tag_name: init
-          prerelease: true
-          body: ''
-          fail_on_unmatched_files: true
-          files: |
-            target/release/abq
-            target/release/abq_cargo
-            target/release/abq_worker_harness
-
       - name: Install aws CLI
         run: |
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
