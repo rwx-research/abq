@@ -7,7 +7,7 @@ use std::{sync::mpsc, thread};
 
 use abq_echo_worker as echo;
 use abq_exec_worker as exec;
-use abq_generic_test_runner::{GenericTestRunner, RunnerError};
+use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::RunAlreadyCompleted;
@@ -308,7 +308,7 @@ impl Drop for WorkerPool {
 }
 
 struct ThreadWorker {
-    handle: Option<thread::JoinHandle<Result<(), RunnerError>>>,
+    handle: Option<thread::JoinHandle<Result<(), GenericRunnerError>>>,
 }
 
 enum AttemptError {
@@ -355,7 +355,7 @@ impl ThreadWorker {
 fn start_generic_test_runner(
     env: WorkerEnv,
     native_runner_params: NativeTestRunnerParams,
-) -> Result<(), RunnerError> {
+) -> Result<(), GenericRunnerError> {
     let WorkerEnv {
         get_next_work_bundle,
         run_id,
