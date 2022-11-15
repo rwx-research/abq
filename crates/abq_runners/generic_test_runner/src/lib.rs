@@ -1,15 +1,16 @@
 use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
 
 use abq_utils::net_protocol::entity::EntityId;
-use abq_utils::net_protocol::queue::RunAlreadyCompleted;
+use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersionMessage, InitSuccessMessage, ManifestMessage, ManifestResult, Status,
-    TestCaseMessage, TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    TestCase, TestCaseMessage, TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
     ACTIVE_PROTOCOL_VERSION_MAJOR, ACTIVE_PROTOCOL_VERSION_MINOR,
 };
 use abq_utils::net_protocol::work_server::InitContext;
@@ -20,6 +21,8 @@ use abq_utils::{flatten_manifest, net_protocol};
 use indoc::indoc;
 use thiserror::Error;
 use tracing::instrument;
+
+mod message_buffer;
 
 pub struct GenericTestRunner;
 
@@ -173,14 +176,16 @@ fn retrieve_manifest<'a>(
 }
 
 #[derive(Debug, Error)]
-pub enum RunnerError {
+pub enum GenericRunnerError {
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("{0}")]
     ProtocolVersion(ProtocolVersionError),
+    #[error("{0}")]
+    NativeRunner(#[from] NativeTestRunnerError),
 }
 
-impl From<RetrieveManifestError> for RunnerError {
+impl From<RetrieveManifestError> for GenericRunnerError {
     fn from(e: RetrieveManifestError) -> Self {
         match e {
             RetrieveManifestError::Io(e) => Self::Io(e),
@@ -189,7 +194,7 @@ impl From<RetrieveManifestError> for RunnerError {
     }
 }
 
-impl From<ProtocolVersionMessageError> for RunnerError {
+impl From<ProtocolVersionMessageError> for GenericRunnerError {
     fn from(e: ProtocolVersionMessageError) -> Self {
         match e {
             ProtocolVersionMessageError::Io(e) => Self::Io(e),
@@ -210,7 +215,7 @@ impl GenericTestRunner {
         mut get_next_test_bundle: GetNextWorkBundle,
         mut send_test_result: SendTestResult,
         _debug_native_runner: bool,
-    ) -> Result<(), RunnerError>
+    ) -> Result<(), GenericRunnerError>
     where
         ShouldShutdown: Fn() -> bool,
         SendManifest: FnMut(ManifestResult),
@@ -354,52 +359,30 @@ impl GenericTestRunner {
                         run_id: _,
                         work_id,
                     } => {
-                        let test_case_message = TestCaseMessage { test_case };
-
                         let estimated_start = Instant::now();
 
-                        let opt_test_result_cycle: Result<TestResultMessage, _> =
-                            net_protocol::write(&mut runner_conn, test_case_message)
-                                .and_then(|_| net_protocol::read(&mut runner_conn));
+                        let handled_test = handle_one_test(
+                            &mut runner_conn,
+                            work_id,
+                            test_case,
+                            &mut pending_test_results,
+                            results_batch_size,
+                            &mut send_test_result,
+                        )?;
 
                         let estimated_runtime = estimated_start.elapsed();
 
-                        match opt_test_result_cycle {
-                            Ok(TestResultMessage { test_result }) => {
-                                pending_test_results.push((work_id, test_result));
-
-                                if pending_test_results.len() >= results_batch_size as _ {
-                                    let results = std::mem::take(&mut pending_test_results);
-                                    pending_test_results.reserve(results_batch_size as _);
-                                    send_test_result(results);
-                                }
-                            }
-                            Err(err) => {
-                                // Our connection with the native test runner failed, for some
-                                // reason. Consider this a fatal error, and report internal errors
-                                // back to the queue for the remaining test in the batch.
-                                let cmd = std::iter::once(native_runner.get_program())
-                                    .chain(native_runner.get_args())
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .collect();
-
-                                tracing::error!(?cmd, "underlying native test runner failed");
-
-                                let remaining_work = test_iter.filter_map(|w| match w {
-                                    NextWork::Work { work_id, .. } => Some(work_id),
-                                    NextWork::EndOfWork => None,
-                                });
-
-                                handle_native_runner_failure(
-                                    worker_entity,
-                                    send_test_result,
-                                    cmd,
-                                    native_runner_handle,
-                                    estimated_runtime,
-                                    std::iter::once(work_id).chain(remaining_work),
-                                );
-                                return Err(err.into());
-                            }
+                        if let Err((work_id, native_error)) = handled_test {
+                            handle_native_runner_failure(
+                                worker_entity,
+                                send_test_result,
+                                &native_runner,
+                                native_runner_handle,
+                                estimated_runtime,
+                                work_id,
+                                test_iter,
+                            );
+                            return Err(native_error.into());
                         }
                     }
                 }
@@ -414,6 +397,45 @@ impl GenericTestRunner {
         native_runner_handle.wait()?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NativeTestRunnerError {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+}
+
+fn handle_one_test<SendTestResult>(
+    runner_conn: &mut RunnerConnection,
+    work_id: WorkId,
+    test_case: TestCase,
+    pending_test_results: &mut Vec<AssociatedTestResult>,
+    results_batch_size: usize,
+    send_test_result: &mut SendTestResult,
+) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError>
+where
+    SendTestResult: FnMut(Vec<(WorkId, TestResult)>),
+{
+    let test_case_message = TestCaseMessage { test_case };
+
+    let opt_test_result_cycle: Result<TestResultMessage, _> =
+        net_protocol::write(runner_conn, test_case_message)
+            .and_then(|_| net_protocol::read(runner_conn));
+
+    match opt_test_result_cycle {
+        Ok(TestResultMessage { test_result }) => {
+            pending_test_results.push((work_id, test_result));
+
+            if pending_test_results.len() >= results_batch_size as _ {
+                let results = std::mem::take(pending_test_results);
+                pending_test_results.reserve(results_batch_size as _);
+                send_test_result(results);
+            }
+
+            Ok(Ok(()))
+        }
+        Err(err) => Ok(Err((work_id, err.into()))),
     }
 }
 
@@ -450,14 +472,32 @@ fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
 fn handle_native_runner_failure<SendTestResult, I>(
     worker_entity: EntityId,
     mut send_test_result: SendTestResult,
-    args: Vec<String>,
+    native_runner: &Command,
     mut native_runner_handle: process::Child,
     estimated_time_to_failure: Duration,
+    failed_on: WorkId,
     remaining_work: I,
 ) where
     SendTestResult: FnMut(Vec<(WorkId, TestResult)>),
-    I: IntoIterator<Item = WorkId>,
+    I: IntoIterator<Item = NextWork>,
 {
+    // Our connection with the native test runner failed, for some
+    // reason. Consider this a fatal error, and report internal errors
+    // back to the queue for the remaining test in the batch.
+    let args: Vec<String> = std::iter::once(native_runner.get_program())
+        .chain(native_runner.get_args())
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+
+    tracing::error!(?args, "underlying native test runner failed");
+
+    let remaining_work = Some(failed_on)
+        .into_iter()
+        .chain(remaining_work.into_iter().filter_map(|w| match w {
+            NextWork::Work { work_id, .. } => Some(work_id),
+            NextWork::EndOfWork => None,
+        }));
+
     let formatted_cmd = args.join(" ");
 
     // Let's try to figure out why the native test runner failed, and print a nice error message
@@ -519,7 +559,7 @@ fn handle_native_runner_failure<SendTestResult, I>(
     tracing::warn!(?error_message, "native test runner failure");
 
     let mut final_results = vec![];
-    for work_id in remaining_work.into_iter() {
+    for work_id in remaining_work {
         let error_result = TestResult {
             status: Status::PrivateNativeRunnerError,
             id: format!("internal-error-{}", uuid::Uuid::new_v4()),
@@ -540,7 +580,7 @@ fn handle_native_runner_failure<SendTestResult, I>(
 pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
     working_dir: PathBuf,
-) -> Result<(ManifestMessage, Vec<TestResult>), RunnerError> {
+) -> Result<(ManifestMessage, Vec<TestResult>), GenericRunnerError> {
     let mut test_case_index = 0;
 
     let mut manifest_message = None;
@@ -630,7 +670,7 @@ pub fn execute_wrapped_runner(
     )?;
 
     if let Some(error) = opt_error_cell {
-        return Err(RunnerError::Io(io::Error::new(
+        return Err(GenericRunnerError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             error,
         )));
@@ -943,7 +983,7 @@ mod test_abq_jest {
 
 #[cfg(test)]
 mod test {
-    use crate::{GenericTestRunner, RunnerError};
+    use crate::{GenericRunnerError, GenericTestRunner};
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::runners::ManifestResult;
     use abq_utils::net_protocol::work_server::InitContext;
@@ -987,6 +1027,6 @@ mod test {
             manifest_result,
             ManifestResult::TestRunnerError { .. }
         ));
-        assert!(matches!(runner_result, Err(RunnerError::Io(..))));
+        assert!(matches!(runner_result, Err(GenericRunnerError::Io(..))));
     }
 }
