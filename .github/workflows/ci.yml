@@ -189,20 +189,22 @@ jobs:
           unzip awscliv2.zip
           sudo ./aws/install
 
-      - name: Prepare nightly release environment
+      - name: Prepare release environment
         run: |
-          RELEASE_NAME="abq_nightly_${{ matrix.platform }}"
-          RELEASE_TARBALL="$RELEASE_NAME.tar.gz"
-          RELEASE_S3_OBJECT="abq/nightly/$RELEASE_TARBALL"
+          ABQ_VERSION="$(cat build_artifact/abq_version.txt)"
+          RELEASE_NAME="abq_${ABQ_VERSION}_${{ matrix.platform }}"
+          RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
+          RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
+          echo "ABQ_VERSION=$ABQ_VERSION" >> $GITHUB_ENV
           echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
-          echo "RELEASE_TARBALL=$RELEASE_TARBALL" >> $GITHUB_ENV
+          echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE" >> $GITHUB_ENV
           echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT" >> $GITHUB_ENV
 
-      - name: Prepare nightly release
+      - name: Prepare release
         run: |
-          mkdir "$RELEASE_NAME"
-          cp target/release/abq "$RELEASE_NAME"
-          tar -czvf "$RELEASE_TARBALL" "$RELEASE_NAME"
+          mkdir "${RELEASE_NAME}"
+          cp target/release/abq "${RELEASE_NAME}"
+          tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
 
       - name: Push nightly release to development S3
         env:
@@ -211,11 +213,16 @@ jobs:
           aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_ACCESS_KEY_ID }} --profile development
           aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_SECRET_ACCESS_KEY }} --profile development
 
-          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile development
+          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile development
           aws s3api put-object-tagging \
             --bucket "$RELEASE_BUCKET" \
             --key "$RELEASE_S3_OBJECT" \
             --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
+            --profile development
+          
+          aws s3 cp \
+            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
+            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
             --profile development
 
       - name: Push nightly release to staging S3
@@ -225,11 +232,16 @@ jobs:
           aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
           aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
 
-          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile staging
+          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile staging
           aws s3api put-object-tagging \
             --bucket "$RELEASE_BUCKET" \
             --key "$RELEASE_S3_OBJECT" \
             --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
+            --profile staging
+          
+          aws s3 cp \
+            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
+            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
             --profile staging
 
       - name: Push nightly release to production S3
@@ -239,9 +251,14 @@ jobs:
           aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID }} --profile production
           aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY }} --profile production
 
-          aws s3 cp "$RELEASE_TARBALL" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile production
+          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile production
           aws s3api put-object-tagging \
             --bucket "$RELEASE_BUCKET" \
             --key "$RELEASE_S3_OBJECT" \
             --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
+            --profile production
+          
+          aws s3 cp \
+            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
+            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
             --profile production
