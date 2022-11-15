@@ -20,7 +20,7 @@ thiserror = "1.0.37"
 async-trait = "0.1.58"
 
 [dependencies.uuid]
-version = "1.2.1"
+version = "1.2.2"
 features = [
     "v4",                # Lets you generate random UUIDs
     "fast-rng",          # Use a faster (but still sufficiently random) RNG

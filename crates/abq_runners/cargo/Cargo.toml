@@ -15,11 +15,11 @@ serde_derive = "1.0.147"
 serde_json = "1.0.87"
 
 tracing = "0.1.37"
-clap = { version = "4.0.19", features = ["derive"] }
+clap = { version = "4.0.24", features = ["derive"] }
 anyhow = "1.0.66"
 
 [features]
 test-abq-jest = []
 
 [dev-dependencies]
-insta = "1.21.0"
+insta = "1.21.1"

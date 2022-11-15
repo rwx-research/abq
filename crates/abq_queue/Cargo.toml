@@ -25,7 +25,7 @@ tokio = { version = "1.21.2", features = ["net", "rt", "rt-multi-thread", "sync"
 futures = "0.3.25"
 
 [dependencies.uuid]
-version = "1.2.1"
+version = "1.2.2"
 features = [
     "v4",                # Lets you generate random UUIDs
     "fast-rng",          # Use a faster (but still sufficiently random) RNG
@@ -33,7 +33,7 @@ features = [
 ]
 
 [dev-dependencies]
-ntest = "0.8.1"
+ntest = "0.9.0"
 # Needed for testing abq_workers.
 # TODO: figure out a better way to implement abq_workers::test_support to avoid this!
 procspawn = { version = "0.10.1", features = ["test-support"] }
