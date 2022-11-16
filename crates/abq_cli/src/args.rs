@@ -234,7 +234,7 @@ pub enum Command {
         tls_key: Option<PathBuf>,
 
         /// Test result reporter to use for a test run.
-        #[clap(long, default_value = "line")]
+        #[clap(long, default_value = "dot")]
         reporter: Vec<ReporterKind>,
 
         /// How many tests to send to a worker a time.
