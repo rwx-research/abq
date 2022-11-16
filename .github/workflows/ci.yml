@@ -125,6 +125,8 @@ jobs:
             container: quay.io/pypa/manylinux2014_x86_64
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
+    outputs:
+      abq_version: ${{ steps.abq_version.outputs.abq_version }}
     if: github.ref == 'refs/heads/main'
     needs: test
     env:
@@ -206,7 +208,7 @@ jobs:
             --key "$RELEASE_S3_OBJECT" \
             --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
             --profile development
-          
+
           aws s3 cp \
             "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
             "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
@@ -225,12 +227,11 @@ jobs:
             --key "$RELEASE_S3_OBJECT" \
             --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
             --profile staging
-          
+
           aws s3 cp \
             "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
             "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
             --profile staging
-
       - name: Push nightly release to production S3
         env:
           RELEASE_BUCKET: abq-releases
@@ -244,8 +245,25 @@ jobs:
             --key "$RELEASE_S3_OBJECT" \
             --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
             --profile production
-          
+
           aws s3 cp \
             "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
             "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
             --profile production
+      - name: export abq version
+        id: abq_version
+        run: |
+          echo "abq_version=$ABQ_VERSION" >> $GITHUB_OUTPUT
+  notify-api:
+    name: Release new abq to API
+    needs: nightly-release
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.nightly-release.outputs.abq_version }}
+      release_channel: latest
+    secrets:
+      RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN: ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}
+      RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN: ${{ secrets.RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN }}
+
+
+  # for manual release on the v1 release channel

@@ -1,0 +1,53 @@
+name: register ABQ version with api
+
+on:
+  # for manual release on the v1 release channel
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release'
+        required: true
+        type: string
+      release_channel:
+        description: 'release channel'
+        required: true
+        type: choice
+        options:
+        - "v1"
+        - "latest"
+  # for automatic release from main on the latest release channel
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to release'
+        required: true
+        type: string
+      release_channel:
+        description: 'release channel'
+        required: true
+        type: string
+    secrets:
+      RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
+        required: true
+      RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN:
+        required: true
+
+jobs:
+  release:
+    name: Release ABQ
+    strategy:
+      matrix:
+        include:
+          - api_host: abq.build
+            access_token_name: RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN
+          - api_host: staging.abq.build
+            access_token_name: RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN
+    runs-on: ubuntu-latest
+    steps:
+      - name: Register new release abq api
+        run: |
+          curl -X "POST" "https://${{matrix.api_host}}/api/releases" \
+          -H 'Authorization: Bearer ${{ secrets[matrix.access_token_name] }}' \
+          -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+          --data-urlencode "version=${{inputs.version}}" \
+          --data-urlencode "release_channel=${{inputs.release_channel}}"
