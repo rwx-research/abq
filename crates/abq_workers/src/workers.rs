@@ -393,7 +393,7 @@ fn start_generic_test_runner(
     let get_next_work_bundle = move || get_next_work_bundle();
 
     let send_test_result: abq_generic_test_runner::SendTestResults =
-        Box::new(move |results| notify_results(entity, &run_id, results));
+        &move |results| notify_results(entity, &run_id, results);
 
     let polling_should_shutdown = || {
         matches!(
