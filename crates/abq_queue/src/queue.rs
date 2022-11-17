@@ -16,7 +16,7 @@ use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
 use abq_utils::net_protocol::runners::{ManifestResult, MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
-use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext};
+use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext, WorkerTest};
 use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, Message},
@@ -323,7 +323,7 @@ impl AllRuns {
         }
 
         let work_from_manifest = flat_manifest.into_iter().map(|test_case| {
-            NextWork::Work {
+            NextWork::Work(WorkerTest {
                 test_case,
                 run_id: run_id.clone(),
                 // TODO: populate correctly
@@ -332,7 +332,7 @@ impl AllRuns {
                 context: WorkContext {
                     working_dir: std::env::current_dir().unwrap(),
                 },
-            }
+            })
         });
 
         let mut queue = JobQueue::default();
