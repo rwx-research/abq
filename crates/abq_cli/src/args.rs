@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroU64,
     path::PathBuf,
 };
 
@@ -13,17 +13,6 @@ use abq_utils::{
 use clap::{ArgGroup, Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
-
-pub(crate) fn default_num_workers() -> NonZeroUsize {
-    let cpus = num_cpus::get_physical();
-    NonZeroUsize::new(cpus).expect("No CPUs detected on this machine")
-}
-
-pub(crate) fn default_num_workers_for_test() -> NonZeroUsize {
-    let cpus_without_one = num_cpus::get_physical() - 1;
-    NonZeroUsize::new(std::cmp::Ord::max(cpus_without_one, 1))
-        .expect("No CPUs detected on this machine")
-}
 
 /// Always be queueing
 ///
@@ -138,10 +127,9 @@ pub enum Command {
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
-        /// Number of workers to start. Must be >= 1. Defaults to the number of available (physical)
-        /// CPUs
-        #[clap(long, short = 'n', required = false, default_value_t = default_num_workers())]
-        num: NonZeroUsize,
+        /// Number of workers to start. 0 implies the number of available (physical) CPUs.
+        #[clap(long, short = 'n', required = false, default_value_t = 1)]
+        num: usize,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
@@ -202,12 +190,12 @@ pub enum Command {
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
-        /// Specifices the number of workers to start when running in standalone. Must be >= 1. Defaults to the number of available (physical)
-        /// CPUs - 1.
+        /// Number of workers to start when running in standalone mode.
+        /// NOTE: If present, will always launch in standalone mode.
+        /// 0 implies the number of available (physical) CPUs - 1.
         ///
-        /// If present, will always launch in standalone mode.
         #[clap(long, short = 'n', required = false)]
-        num_workers: Option<NonZeroUsize>,
+        num_workers: Option<usize>,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
