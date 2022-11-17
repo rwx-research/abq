@@ -15,7 +15,7 @@ use abq_utils::net_protocol::runners::{
     ManifestMessage, ManifestResult, Status, TestId, TestResult,
 };
 use abq_utils::net_protocol::work_server::InitContext;
-use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
+use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner, WorkerTest};
 use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext};
 
 use futures::future::BoxFuture;
@@ -484,12 +484,12 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                     // Shut down the worker
                     break 'tests_done;
                 }
-                NextWork::Work {
+                NextWork::Work(WorkerTest {
                     test_case,
                     context: work_context,
                     run_id,
                     work_id,
-                } => {
+                }) => {
                     // Try the test_id once + how ever many retries were requested.
                     let allowed_attempts = 1 + work_retries;
                     'attempts: for attempt_number in 1.. {
@@ -659,7 +659,7 @@ mod test {
     };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
+        NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner, WorkerTest,
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
@@ -760,14 +760,14 @@ mod test {
     }
 
     fn local_work(test: TestCase, run_id: RunId, work_id: WorkId) -> NextWork {
-        NextWork::Work {
+        NextWork::Work(WorkerTest {
             test_case: test,
             context: WorkContext {
                 working_dir: std::env::current_dir().unwrap(),
             },
             run_id,
             work_id,
-        }
+        })
     }
 
     pub fn echo_test(echo_msg: String) -> TestOrGroup {
@@ -1087,12 +1087,12 @@ mod test {
         };
 
         for test_case in await_manifest_test_cases(manifest_collector) {
-            write_work(NextWork::Work {
+            write_work(NextWork::Work(WorkerTest {
                 test_case,
                 context: context.clone(),
                 run_id: run_id.clone(),
                 work_id: WorkId("id1".to_string()),
-            });
+            }));
         }
         write_work(NextWork::EndOfWork);
 

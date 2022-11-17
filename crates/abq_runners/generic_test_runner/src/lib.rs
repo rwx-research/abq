@@ -18,7 +18,7 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
-    NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
+    NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId, WorkerTest,
 };
 use abq_utils::{atomic, flatten_manifest, net_protocol};
 use futures::future::{self, BoxFuture};
@@ -391,12 +391,12 @@ where
                     drop(runner_conn);
                     break 'test_all;
                 }
-                NextWork::Work {
+                NextWork::Work(WorkerTest {
                     test_case,
                     context: _,
                     run_id: _,
                     work_id,
-                } => {
+                }) => {
                     let estimated_start = Instant::now();
 
                     let handled_test = handle_one_test(
@@ -527,7 +527,7 @@ fn handle_native_runner_failure<I>(
     let remaining_work = Some(failed_on)
         .into_iter()
         .chain(remaining_work.into_iter().filter_map(|w| match w {
-            NextWork::Work { work_id, .. } => Some(work_id),
+            NextWork::Work(WorkerTest { work_id, .. }) => Some(work_id),
             NextWork::EndOfWork => None,
         }));
 
@@ -671,14 +671,14 @@ pub fn execute_wrapped_runner(
                     Some(test_case) => {
                         test_case_index.fetch_add(1, atomic::ORDERING);
 
-                        NextWork::Work {
+                        NextWork::Work(WorkerTest {
                             test_case: test_case.clone(),
                             context: WorkContext {
                                 working_dir: working_dir.clone(),
                             },
                             run_id: RunId::unique(),
                             work_id: WorkId(Default::default()),
-                        }
+                        })
                     }
                     None => NextWork::EndOfWork,
                 };
@@ -930,7 +930,7 @@ mod test_abq_jest {
     };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
+        NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId, WorkerTest,
     };
     use futures::FutureExt;
 
@@ -1035,7 +1035,7 @@ mod test_abq_jest {
         let get_init_context = || Err(RunAlreadyCompleted {});
         let get_next_test = &|| {
             async {
-                NextWorkBundle(vec![NextWork::Work {
+                NextWorkBundle(vec![NextWork::Work(WorkerTest {
                     test_case: TestCase {
                         id: "unreachable".to_string(),
                         meta: Default::default(),
@@ -1045,7 +1045,7 @@ mod test_abq_jest {
                     },
                     run_id: RunId::unique(),
                     work_id: WorkId("unreachable".to_string()),
-                }])
+                })])
             }
             .boxed()
         };

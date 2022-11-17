@@ -286,15 +286,18 @@ pub mod workers {
         pub working_dir: PathBuf,
     }
 
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    pub struct WorkerTest {
+        pub test_case: TestCase,
+        pub context: WorkContext,
+        pub run_id: RunId,
+        pub work_id: WorkId,
+    }
+
     /// A unit of work sent to a worker to be run.
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
     pub enum NextWork {
-        Work {
-            test_case: TestCase,
-            context: WorkContext,
-            run_id: RunId,
-            work_id: WorkId,
-        },
+        Work(WorkerTest),
         EndOfWork,
     }
 

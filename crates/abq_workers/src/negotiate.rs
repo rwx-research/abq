@@ -759,6 +759,7 @@ mod test {
     };
     use abq_utils::net_protocol::workers::{
         NextWork, NextWorkBundle, RunId, RunnerKind, TestLikeRunner, WorkContext, WorkId,
+        WorkerTest,
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
@@ -796,13 +797,15 @@ mod test {
                             .0
                             .into_iter()
                             .enumerate()
-                            .map(|(i, test_case)| NextWork::Work {
-                                test_case,
-                                context: WorkContext {
-                                    working_dir: PathBuf::from("/"),
-                                },
-                                run_id: RunId::unique(),
-                                work_id: WorkId(i.to_string()),
+                            .map(|(i, test_case)| {
+                                NextWork::Work(WorkerTest {
+                                    test_case,
+                                    context: WorkContext {
+                                        working_dir: PathBuf::from("/"),
+                                    },
+                                    run_id: RunId::unique(),
+                                    work_id: WorkId(i.to_string()),
+                                })
                             })
                             .collect();
                         break work;
