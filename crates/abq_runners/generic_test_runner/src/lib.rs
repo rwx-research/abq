@@ -205,7 +205,7 @@ impl From<ProtocolVersionMessageError> for GenericRunnerError {
     }
 }
 
-pub type SendTestResults = Box<dyn Fn(Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>>;
+pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>;
 
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetInitContext, GetNextWorkBundle>(
@@ -654,7 +654,7 @@ pub fn execute_wrapped_runner(
     };
     let send_test_result: SendTestResults = {
         let test_results = test_results.clone();
-        Box::new(move |results| {
+        &move |results| {
             let test_results = test_results.clone();
             Box::pin(async move {
                 test_results
@@ -662,7 +662,7 @@ pub fn execute_wrapped_runner(
                     .unwrap()
                     .extend(results.into_iter().map(|(_id, result)| result))
             })
-        })
+        }
     };
 
     GenericTestRunner::run(
@@ -685,9 +685,11 @@ pub fn execute_wrapped_runner(
         )));
     }
 
+    let test_results = test_results.lock();
+
     Ok((
         manifest_message.expect("manifest never received!"),
-        Arc::try_unwrap(test_results).unwrap().into_inner().unwrap(),
+        test_results.as_deref().unwrap().clone(),
     ))
 }
 
@@ -898,7 +900,7 @@ mod test_abq_jest {
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
         let send_test_result: SendTestResults = {
             let test_results = test_results.clone();
-            Box::new(move |results| {
+            &move |results| {
                 let test_results = test_results.clone();
                 Box::pin(async move {
                     test_results
@@ -906,7 +908,7 @@ mod test_abq_jest {
                         .unwrap()
                         .push(results.into_iter().map(|(_, result)| result))
                 })
-            })
+            }
         };
 
         GenericTestRunner::run(
@@ -982,7 +984,7 @@ mod test_abq_jest {
                 work_id: WorkId("unreachable".to_string()),
             }])
         };
-        let send_test_result: SendTestResults = Box::new(|_| Box::pin(async {}));
+        let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
         let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _, _>(
             EntityId::new(),
@@ -1026,7 +1028,7 @@ mod test {
             })
         };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
-        let send_test_result: SendTestResults = Box::new(|_| Box::pin(async {}));
+        let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
         let runner_result = GenericTestRunner::run(
             EntityId::new(),

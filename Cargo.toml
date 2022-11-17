@@ -13,3 +13,59 @@ members = [
   "crates/abq_runners/cargo",
   "crates/reporters/junit_xml",
 ]
+
+[workspace.dependencies]
+serde = "1.0.147"
+serde_derive = "1.0.147"
+serde_json = "1.0.87"
+
+rustls = "0.20.7"
+rustls-pemfile = "1.0.1"
+
+tokio = { version = "1.21.2", features = ["io-util", "net", "rt", "macros", "sync", "time"] }
+tokio-rustls = "0.23.4"
+futures = "0.3.25"
+
+procspawn = "0.10.1"
+
+parking_lot = "0.12.1"
+
+signal-hook = "0.3.14"
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter"] }
+tracing-appender = "0.2.2"
+
+thiserror = "1.0.37"
+anyhow = "1.0.66"
+indoc = "1.0.7"
+
+clap = { version = "4.0.24", features = ["derive", "env"] }
+atty = "0.2.14"
+num_cpus = "1.14.0"
+termcolor = "1.1.3"
+
+async-trait = "0.1.58"
+static_assertions = "1.1.0"
+
+# --- Development ---
+
+insta = { version = "1.21.1", features = ["json"] }
+paste = "1.0.9"
+
+tempfile = "3.3.0"
+tracing-test = "0.2.3"
+
+ntest = "0.9.0"
+serial_test = "0.9.0"
+nix = "0.25.0"
+
+[workspace.dependencies.uuid]
+version = "1.2.2"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+]
