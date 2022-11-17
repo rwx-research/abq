@@ -164,7 +164,8 @@ impl WorkersNegotiator {
         client_options: ClientOptions<User>,
         wanted_run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
-        let client = client_options.build()?;
+        let client = client_options.clone().build()?;
+        let async_client = client_options.build_async()?;
 
         let execution_decision =
             wait_for_execution_context(&*client, &wanted_run_id, queue_negotiator_handle.0)?;
@@ -195,25 +196,35 @@ impl WorkersNegotiator {
             debug_native_runner,
         } = workers_config;
 
-        let notify_result: NotifyResults = Arc::new({
-            let client = client.boxed_clone();
+        let notify_results: NotifyResults = Arc::new({
+            let client = async_client.boxed_clone();
 
             move |entity, run_id, results| {
-                let span = tracing::trace_span!("notify_result", run_id=?run_id, results=?results.len(), queue_server=?queue_results_addr);
-                let _notify_result = span.enter();
+                let run_id = run_id.clone();
+                let client = client.boxed_clone();
+                Box::pin(async move {
+                    let span = tracing::trace_span!("notify_results", run_id=?run_id, results=?results.len(), queue_server=?queue_results_addr);
+                    let _notify_results = span.enter();
 
-                // TODO: error handling
-                let mut stream = client
-                    .connect(queue_results_addr)
-                    .expect("results server not available");
+                    // TODO: error handling
+                    let mut stream = client
+                        .connect(queue_results_addr)
+                        .await
+                        .expect("results server not available");
 
-                let request = net_protocol::queue::Request {
-                    entity,
-                    message: net_protocol::queue::Message::WorkerResult(run_id.clone(), results),
-                };
+                    let request = net_protocol::queue::Request {
+                        entity,
+                        message: net_protocol::queue::Message::WorkerResult(
+                            run_id.clone(),
+                            results,
+                        ),
+                    };
 
-                // TODO: error handling
-                net_protocol::write(&mut stream, request).unwrap();
+                    // TODO: error handling
+                    net_protocol::async_write(&mut stream, &request)
+                        .await
+                        .unwrap();
+                })
             }
         });
 
@@ -317,7 +328,7 @@ impl WorkersNegotiator {
             runner_kind,
             get_next_work,
             get_init_context,
-            notify_result,
+            notify_results,
             run_completed_successfully,
             results_batch_size_hint,
             worker_context,

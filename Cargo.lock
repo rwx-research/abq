@@ -72,6 +72,7 @@ dependencies = [
  "abq_utils",
  "anyhow",
  "clap",
+ "futures",
  "indoc",
  "insta",
  "serde",
@@ -158,6 +159,7 @@ name = "abq_utils"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rustls",
@@ -181,6 +183,7 @@ dependencies = [
  "abq_generic_test_runner",
  "abq_runner_protocol",
  "abq_utils",
+ "futures",
  "parking_lot",
  "procspawn",
  "serde",

@@ -1,6 +1,7 @@
 use std::io::{self, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 mod message_buffer;
+use futures::future::BoxFuture;
 
 pub struct GenericTestRunner;
 
@@ -203,8 +205,10 @@ impl From<ProtocolVersionMessageError> for GenericRunnerError {
     }
 }
 
+pub type SendTestResults = Box<dyn Fn(Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>>;
+
 impl GenericTestRunner {
-    pub fn run<ShouldShutdown, SendManifest, GetInitContext, GetNextWorkBundle, SendTestResult>(
+    pub fn run<ShouldShutdown, SendManifest, GetInitContext, GetNextWorkBundle>(
         worker_entity: EntityId,
         input: NativeTestRunnerParams,
         working_dir: &Path,
@@ -213,7 +217,7 @@ impl GenericTestRunner {
         send_manifest: Option<SendManifest>,
         get_init_context: GetInitContext,
         mut get_next_test_bundle: GetNextWorkBundle,
-        mut send_test_result: SendTestResult,
+        send_test_results: SendTestResults,
         _debug_native_runner: bool,
     ) -> Result<(), GenericRunnerError>
     where
@@ -221,7 +225,6 @@ impl GenericTestRunner {
         SendManifest: FnMut(ManifestResult),
         GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
         GetNextWorkBundle: FnMut() -> NextWorkBundle + std::marker::Send + 'static,
-        SendTestResult: FnMut(Vec<(WorkId, TestResult)>),
     {
         let NativeTestRunnerParams {
             cmd,
@@ -339,6 +342,10 @@ impl GenericTestRunner {
             };
         }
 
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
         let results_batch_size = results_batch_size as usize;
         let mut pending_test_results = Vec::with_capacity(results_batch_size);
 
@@ -366,8 +373,6 @@ impl GenericTestRunner {
                             work_id,
                             test_case,
                             &mut pending_test_results,
-                            results_batch_size,
-                            &mut send_test_result,
                         )?;
 
                         let estimated_runtime = estimated_start.elapsed();
@@ -375,7 +380,7 @@ impl GenericTestRunner {
                         if let Err((work_id, native_error)) = handled_test {
                             handle_native_runner_failure(
                                 worker_entity,
-                                send_test_result,
+                                send_test_results,
                                 &native_runner,
                                 native_runner_handle,
                                 estimated_runtime,
@@ -384,13 +389,19 @@ impl GenericTestRunner {
                             );
                             return Err(native_error.into());
                         }
+
+                        if pending_test_results.len() >= results_batch_size as _ {
+                            let results = std::mem::take(&mut pending_test_results);
+                            pending_test_results.reserve(results_batch_size as _);
+                            rt.block_on(send_test_results(results));
+                        }
                     }
                 }
             }
         }
 
         if !pending_test_results.is_empty() {
-            send_test_result(pending_test_results);
+            rt.block_on(send_test_results(pending_test_results));
         }
 
         drop(our_listener);
@@ -406,17 +417,12 @@ pub enum NativeTestRunnerError {
     Io(#[from] io::Error),
 }
 
-fn handle_one_test<SendTestResult>(
+fn handle_one_test(
     runner_conn: &mut RunnerConnection,
     work_id: WorkId,
     test_case: TestCase,
     pending_test_results: &mut Vec<AssociatedTestResult>,
-    results_batch_size: usize,
-    send_test_result: &mut SendTestResult,
-) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError>
-where
-    SendTestResult: FnMut(Vec<(WorkId, TestResult)>),
-{
+) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError> {
     let test_case_message = TestCaseMessage { test_case };
 
     let opt_test_result_cycle: Result<TestResultMessage, _> =
@@ -426,12 +432,6 @@ where
     match opt_test_result_cycle {
         Ok(TestResultMessage { test_result }) => {
             pending_test_results.push((work_id, test_result));
-
-            if pending_test_results.len() >= results_batch_size as _ {
-                let results = std::mem::take(pending_test_results);
-                pending_test_results.reserve(results_batch_size as _);
-                send_test_result(results);
-            }
 
             Ok(Ok(()))
         }
@@ -469,16 +469,15 @@ fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
 }
 
 #[allow(clippy::format_push_string)] // write! can fail, push can't
-fn handle_native_runner_failure<SendTestResult, I>(
+fn handle_native_runner_failure<I>(
     worker_entity: EntityId,
-    mut send_test_result: SendTestResult,
+    send_test_result: SendTestResults,
     native_runner: &Command,
     mut native_runner_handle: process::Child,
     estimated_time_to_failure: Duration,
     failed_on: WorkId,
     remaining_work: I,
 ) where
-    SendTestResult: FnMut(Vec<(WorkId, TestResult)>),
     I: IntoIterator<Item = NextWork>,
 {
     // Our connection with the native test runner failed, for some
@@ -593,7 +592,7 @@ pub fn execute_wrapped_runner(
     let flat_manifest = Arc::new(Mutex::new(None));
     let mut opt_error_cell = None;
 
-    let mut test_results = vec![];
+    let test_results = Arc::new(Mutex::new(vec![]));
 
     let send_manifest = {
         let flat_manifest = Arc::clone(&flat_manifest);
@@ -653,8 +652,18 @@ pub fn execute_wrapped_runner(
             }
         }
     };
-    let send_test_result =
-        |results: Vec<_>| test_results.extend(results.into_iter().map(|(_, r)| r));
+    let send_test_result: SendTestResults = {
+        let test_results = test_results.clone();
+        Box::new(move |results| {
+            let test_results = test_results.clone();
+            Box::pin(async move {
+                test_results
+                    .lock()
+                    .unwrap()
+                    .extend(results.into_iter().map(|(_id, result)| result))
+            })
+        })
+    };
 
     GenericTestRunner::run(
         EntityId::new(),
@@ -678,7 +687,7 @@ pub fn execute_wrapped_runner(
 
     Ok((
         manifest_message.expect("manifest never received!"),
-        test_results,
+        Arc::try_unwrap(test_results).unwrap().into_inner().unwrap(),
     ))
 }
 
@@ -850,7 +859,7 @@ mod test_validate_protocol_version_message {
 #[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
-    use crate::{execute_wrapped_runner, GenericTestRunner};
+    use crate::{execute_wrapped_runner, GenericTestRunner, SendTestResults};
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::RunAlreadyCompleted;
     use abq_utils::net_protocol::runners::{
@@ -862,6 +871,7 @@ mod test_abq_jest {
     };
 
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     fn npm_jest_project_path() -> PathBuf {
         PathBuf::from(std::env::var("ABQ_WORKSPACE_DIR").unwrap())
@@ -877,7 +887,7 @@ mod test_abq_jest {
         };
 
         let mut manifest = None;
-        let mut test_results = vec![];
+        let test_results = Arc::new(Mutex::new(vec![]));
 
         let send_manifest = |real_manifest| manifest = Some(real_manifest);
         let get_init_context = || {
@@ -886,8 +896,18 @@ mod test_abq_jest {
             })
         };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
-        let send_test_result =
-            |results: Vec<_>| test_results.extend(results.into_iter().map(|(_, r)| r));
+        let send_test_result: SendTestResults = {
+            let test_results = test_results.clone();
+            Box::new(move |results| {
+                let test_results = test_results.clone();
+                Box::pin(async move {
+                    test_results
+                        .lock()
+                        .unwrap()
+                        .push(results.into_iter().map(|(_, result)| result))
+                })
+            })
+        };
 
         GenericTestRunner::run(
             EntityId::new(),
@@ -903,7 +923,7 @@ mod test_abq_jest {
         )
         .unwrap();
 
-        assert!(test_results.is_empty());
+        assert!(test_results.lock().unwrap().is_empty());
 
         let ManifestMessage { mut manifest } = match manifest.unwrap() {
             ManifestResult::Manifest(man) => man,
@@ -962,9 +982,9 @@ mod test_abq_jest {
                 work_id: WorkId("unreachable".to_string()),
             }])
         };
-        let send_test_result = |_| {};
+        let send_test_result: SendTestResults = Box::new(|_| Box::pin(async {}));
 
-        let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _, _, _>(
+        let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _, _>(
             EntityId::new(),
             input,
             &npm_jest_project_path(),
@@ -983,7 +1003,7 @@ mod test_abq_jest {
 
 #[cfg(test)]
 mod test {
-    use crate::{GenericRunnerError, GenericTestRunner};
+    use crate::{GenericRunnerError, GenericTestRunner, SendTestResults};
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::runners::ManifestResult;
     use abq_utils::net_protocol::work_server::InitContext;
@@ -1006,7 +1026,7 @@ mod test {
             })
         };
         let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
-        let send_test_result = |_| {};
+        let send_test_result: SendTestResults = Box::new(|_| Box::pin(async {}));
 
         let runner_result = GenericTestRunner::run(
             EntityId::new(),
