@@ -269,7 +269,7 @@ test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_auto_workers_without_failure (|name, conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
-        let args = &["test", "--reporter", "dot"];
+        let args = &["test", "--reporter", "dot", "--num-workers", "0"];
         let mut args = conf.extend_args_for_in_band_client(args);
         args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
@@ -375,7 +375,9 @@ test_all_network_config_options! {
             "--working-dir",
             &npm_jest_project_path.display().to_string(),
             "--run-id",
-            &run_id
+            &run_id,
+            "--num",
+            "0"
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_worker"), worker_args);
@@ -493,7 +495,9 @@ test_all_network_config_options! {
             "--working-dir",
             &npm_jest_project_path.display().to_string(),
             "--run-id",
-            &run_id
+            &run_id,
+            "--num",
+            "0"
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let CmdOutput {
@@ -517,6 +521,8 @@ test_all_network_config_options! {
             "test",
             "--reporter",
             "dot",
+            "--num-workers",
+            "0"
         ];
         let mut test_args = conf.extend_args_for_in_band_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);
@@ -588,7 +594,9 @@ test_all_network_config_options! {
             "--working-dir",
             &npm_jest_project_path.display().to_string(),
             "--run-id",
-            &run_id
+            &run_id,
+            "--num",
+            "0"
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
@@ -754,7 +762,7 @@ fn work_no_queue_addr_or_api_key() {
         exit_status,
     } = run_abq_forcing_capture(
         "work_no_queue_addr_or_api_key",
-        ["work", "--run-id", "run-id"],
+        ["work", "--run-id", "run-id", "--num", "0"],
     );
 
     assert_eq!(exit_status.code().unwrap(), 2);
