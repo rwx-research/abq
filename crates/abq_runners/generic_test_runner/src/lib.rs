@@ -1,12 +1,13 @@
 use std::io::{self, Read};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
-use std::process::Command;
+use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{net::TcpListener, process};
+
+use tokio::net::{TcpListener, TcpStream};
+use tokio::process::{self, Command};
 
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
@@ -20,8 +21,8 @@ use abq_utils::net_protocol::workers::{
     NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
 };
 use abq_utils::{atomic, flatten_manifest, net_protocol};
-use futures::future::BoxFuture;
-use futures::FutureExt;
+use futures::future::{self, BoxFuture};
+use futures::{Future, FutureExt};
 use indoc::indoc;
 use thiserror::Error;
 use tracing::instrument;
@@ -29,8 +30,6 @@ use tracing::instrument;
 mod message_buffer;
 
 pub struct GenericTestRunner;
-
-static POLL_WAIT_TIME: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub enum ProtocolVersionError {
@@ -57,15 +56,11 @@ type RunnerConnection = TcpStream;
 /// Validates that the connected native runner communicates with a compatible ABQ protocol.
 /// Returns an error if the protocols are incompatible, or the process fails to establish a
 /// connection in a suitable time frame.
-pub fn open_native_runner_connection(
+pub async fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
-    mut is_native_runner_alive: impl FnMut() -> bool,
+    native_runner_died: impl Future<Output = ()>,
 ) -> Result<RunnerConnection, ProtocolVersionMessageError> {
-    use ProtocolVersionMessageError::*;
-
-    listener.set_nonblocking(true).map_err(Io)?;
-
     let start = Instant::now();
     let (
         AbqProtocolVersionMessage {
@@ -74,29 +69,23 @@ pub fn open_native_runner_connection(
             minor,
         },
         runner_conn,
-    ) = loop {
-        if start.elapsed() >= timeout {
+    ) = tokio::select! {
+        _ = tokio::time::sleep(timeout) => {
             tracing::error!(?timeout, elapsed=?start.elapsed(), "timeout");
             return Err(ProtocolVersionError::Timeout.into());
         }
 
-        match listener.accept() {
-            Ok((mut conn, _)) => {
-                let version_message: AbqProtocolVersionMessage =
-                    net_protocol::read(&mut conn).map_err(Io)?;
+        _  = native_runner_died => {
+            return Err(ProtocolVersionError::WorkerQuit.into());
+        }
 
-                break (version_message, conn);
-            }
-            Err(err) => match err.kind() {
-                io::ErrorKind::WouldBlock => {
-                    if !is_native_runner_alive() {
-                        return Err(ProtocolVersionError::WorkerQuit.into());
-                    }
-                    std::thread::sleep(POLL_WAIT_TIME);
-                    continue;
-                }
-                _ => return Err(Io(err)),
-            },
+        opt_conn = listener.accept() => {
+            let (mut conn, _) = opt_conn?;
+
+            let version_message: AbqProtocolVersionMessage =
+                net_protocol::async_read(&mut conn).await?;
+
+            (version_message, conn)
         }
     };
 
@@ -107,8 +96,8 @@ pub fn open_native_runner_connection(
     }
 }
 
-pub fn wait_for_manifest(mut runner_conn: RunnerConnection) -> io::Result<ManifestMessage> {
-    let manifest: ManifestMessage = net_protocol::read(&mut runner_conn)?;
+pub async fn wait_for_manifest(mut runner_conn: RunnerConnection) -> io::Result<ManifestMessage> {
+    let manifest: ManifestMessage = net_protocol::async_read(&mut runner_conn).await?;
 
     Ok(manifest)
 }
@@ -132,7 +121,7 @@ impl From<ProtocolVersionMessageError> for RetrieveManifestError {
 
 /// Retrieves the test manifest from native test runner.
 #[instrument(level = "trace", skip(additional_env, working_dir))]
-fn retrieve_manifest<'a>(
+async fn retrieve_manifest<'a>(
     cmd: &str,
     args: &[String],
     additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
@@ -142,7 +131,7 @@ fn retrieve_manifest<'a>(
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
     let manifest = {
-        let mut our_listener = TcpListener::bind("127.0.0.1:0")?;
+        let mut our_listener = TcpListener::bind("127.0.0.1:0").await?;
         let our_addr = our_listener.local_addr()?;
 
         let mut native_runner = process::Command::new(cmd);
@@ -154,23 +143,26 @@ fn retrieve_manifest<'a>(
         // NB(130): we'd like to surface native runner output today, but tomorrow
         // (with https://github.com/rwx-research/abq/issues/130) this should either
         // be captured or hidden behind a debug flag.
-        native_runner.stdout(process::Stdio::inherit());
-        native_runner.stderr(process::Stdio::inherit());
+        native_runner.stdout(Stdio::inherit());
+        native_runner.stderr(Stdio::inherit());
 
         let mut native_runner_handle = native_runner.spawn()?;
 
-        let is_native_runner_alive = || matches!(native_runner_handle.try_wait(), Ok(None));
+        let native_runner_died = async {
+            let _ = native_runner_handle.wait().await;
+        };
 
         // Wait for and validate the protocol version message, channel must always come first.
         let runner_conn = open_native_runner_connection(
             &mut our_listener,
             protocol_version_timeout,
-            is_native_runner_alive,
-        )?;
+            native_runner_died,
+        )
+        .await?;
 
-        let manifest = wait_for_manifest(runner_conn)?;
+        let manifest = wait_for_manifest(runner_conn).await?;
 
-        let status = native_runner_handle.wait()?;
+        let status = native_runner_handle.wait().await?;
         debug_assert!(status.success());
 
         manifest
@@ -216,202 +208,238 @@ impl GenericTestRunner {
         worker_entity: EntityId,
         input: NativeTestRunnerParams,
         working_dir: &Path,
-        _polling_should_shutdown: ShouldShutdown,
+        polling_should_shutdown: ShouldShutdown,
         results_batch_size: u64,
         send_manifest: Option<SendManifest>,
         get_init_context: GetInitContext,
         get_next_test_bundle: GetNextWorkBundle,
         send_test_results: SendTestResults,
-        _debug_native_runner: bool,
+        debug_native_runner: bool,
     ) -> Result<(), GenericRunnerError>
     where
         ShouldShutdown: Fn() -> bool,
+        // TODO: make both of these async!
         SendManifest: FnMut(ManifestResult),
         GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
     {
-        let NativeTestRunnerParams {
-            cmd,
-            args,
-            extra_env: additional_env,
-        } = input;
-
-        // TODO: get from runner params
-        let protocol_version_timeout = Duration::from_secs(60);
-
-        // If we need to retrieve the manifest, do that first.
-        if let Some(mut send_manifest) = send_manifest {
-            let manifest_or_error = retrieve_manifest(
-                &cmd,
-                &args,
-                &additional_env,
-                working_dir,
-                protocol_version_timeout,
-            );
-
-            match manifest_or_error {
-                Ok(manifest) => {
-                    send_manifest(ManifestResult::Manifest(manifest));
-                }
-                Err(err) => {
-                    send_manifest(ManifestResult::TestRunnerError {
-                        error: err.to_string(),
-                    });
-                    return Err(err.into());
-                }
-            }
-        }
-
-        // Now, start the test runner.
-        //
-        // The interface between us and the runner is described at
-        //   https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-Interface-0959f5a9144741d798ac122566a3d887
-        //
-        // In short: the protocol is
-        //
-        // Queue |                       | Worker (us) |                              | Native runner
-        //       |                       |             | <- recv ProtocolVersion -    |
-        //       | <- send Init-Meta -   |             |                              |
-        //       | - recv Init-Meta ->   |             |                              |
-        //       |                       |             | - send InitMessage    ->     |
-        //       |                       |             | <- recv InitSuccessMessage - |
-        //       | <- send Next-Test -   |             |                              |
-        //       | - recv Next-Test ->   |             |                              |
-        //       |                       |             | - send TestCaseMessage ->    |
-        //       |                       |             | <- recv TestResult -         |
-        //       | <- send Test-Result - |             |                              |
-        //       |                       |             |                              |
-        //       |          ...          |             |          ...                 |
-        //       |                       |             |                              |
-        //       | <- send Next-Test -   |             |                              |
-        //       | -   recv Done    ->   |             |      <close conn>            |
-        // Queue |                       | Worker (us) |                              | Native runner
-        let mut our_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let our_addr = our_listener.local_addr().unwrap();
-
-        let mut native_runner = process::Command::new(cmd);
-        native_runner.args(args);
-        native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
-        native_runner.envs(additional_env);
-        native_runner.current_dir(working_dir);
-        // NB(130): we'd like to surface native runner output today, but tomorrow
-        // (with https://github.com/rwx-research/abq/issues/130) this should either
-        // be captured or hidden behind the `debug_native_runner` flag.
-        native_runner.stdout(process::Stdio::inherit());
-        native_runner.stderr(process::Stdio::inherit());
-
-        // If launching the native runner fails here, it should have failed during manifest
-        // generation as well (unless this is a flakey error in the underlying test runner, channel
-        // we do not attempt to handle gracefully). Since the failure during manifest generation
-        // will have notified the queue, at this point, failures should just result in the worker
-        // exiting silently itself.
-        let mut native_runner_handle = native_runner.spawn()?;
-        let is_native_runner_alive = || matches!(native_runner_handle.try_wait(), Ok(None));
-
-        // First, get and validate the protocol version message.
-        let mut runner_conn = open_native_runner_connection(
-            &mut our_listener,
-            protocol_version_timeout,
-            is_native_runner_alive,
-        )?;
-
-        // Wait for the native runner to initialize, and send it the initialization context.
-        //
-        // If the initialization context informs us that the run is already complete, we can exit
-        // immediately. While this case is possible, it is far more likely that the initialization
-        // context will be material. As such, we want to spawn the native runner before fetching
-        // the initialization context; that way we can pay the price of startup and
-        // context-fetching in parallel.
-        {
-            match get_init_context() {
-                Ok(InitContext { init_meta }) => {
-                    let init_message = net_protocol::runners::InitMessage {
-                        init_meta,
-                        fast_exit: false,
-                    };
-                    net_protocol::write(&mut runner_conn, init_message)?;
-                    let InitSuccessMessage {} = net_protocol::read(&mut runner_conn)?;
-                }
-                Err(RunAlreadyCompleted {}) => {
-                    // There is nothing more for the native runner to do, so we tell it to
-                    // fast-exit and wait for it to terminate.
-                    let init_message = net_protocol::runners::InitMessage {
-                        init_meta: Default::default(),
-                        fast_exit: true,
-                    };
-                    net_protocol::write(&mut runner_conn, init_message)?;
-                    native_runner_handle.wait()?;
-                    return Ok(());
-                }
-            };
-        }
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
+        rt.block_on(run(
+            worker_entity,
+            input,
+            working_dir,
+            polling_should_shutdown,
+            results_batch_size,
+            send_manifest,
+            get_init_context,
+            get_next_test_bundle,
+            send_test_results,
+            debug_native_runner,
+        ))
+    }
+}
 
-        let results_batch_size = results_batch_size as usize;
-        let mut pending_test_results = Vec::with_capacity(results_batch_size);
+async fn run<ShouldShutdown, SendManifest, GetInitContext>(
+    worker_entity: EntityId,
+    input: NativeTestRunnerParams,
+    working_dir: &Path,
+    _polling_should_shutdown: ShouldShutdown,
+    results_batch_size: u64,
+    send_manifest: Option<SendManifest>,
+    get_init_context: GetInitContext,
+    get_next_test_bundle: GetNextWorkBundle<'_>,
+    send_test_results: SendTestResults<'_>,
+    _debug_native_runner: bool,
+) -> Result<(), GenericRunnerError>
+where
+    ShouldShutdown: Fn() -> bool,
+    SendManifest: FnMut(ManifestResult),
+    GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
+{
+    let NativeTestRunnerParams {
+        cmd,
+        args,
+        extra_env: additional_env,
+    } = input;
 
-        // We establish one connection with the native runner and repeatedly send tests until we're
-        // done.
-        'test_all: loop {
-            let NextWorkBundle(test_bundle) = rt.block_on(get_next_test_bundle());
-            let mut test_iter = test_bundle.into_iter();
-            while let Some(next_test) = test_iter.next() {
-                match next_test {
-                    NextWork::EndOfWork => {
-                        drop(runner_conn);
-                        break 'test_all;
-                    }
-                    NextWork::Work {
-                        test_case,
-                        context: _,
-                        run_id: _,
+    // TODO: get from runner params
+    let protocol_version_timeout = Duration::from_secs(60);
+
+    // If we need to retrieve the manifest, do that first.
+    if let Some(mut send_manifest) = send_manifest {
+        let manifest_or_error = retrieve_manifest(
+            &cmd,
+            &args,
+            &additional_env,
+            working_dir,
+            protocol_version_timeout,
+        )
+        .await;
+
+        match manifest_or_error {
+            Ok(manifest) => {
+                send_manifest(ManifestResult::Manifest(manifest));
+            }
+            Err(err) => {
+                send_manifest(ManifestResult::TestRunnerError {
+                    error: err.to_string(),
+                });
+                return Err(err.into());
+            }
+        }
+    }
+
+    // Now, start the test runner.
+    //
+    // The interface between us and the runner is described at
+    //   https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-Interface-0959f5a9144741d798ac122566a3d887
+    //
+    // In short: the protocol is
+    //
+    // Queue |                       | Worker (us) |                              | Native runner
+    //       |                       |             | <- recv ProtocolVersion -    |
+    //       | <- send Init-Meta -   |             |                              |
+    //       | - recv Init-Meta ->   |             |                              |
+    //       |                       |             | - send InitMessage    ->     |
+    //       |                       |             | <- recv InitSuccessMessage - |
+    //       | <- send Next-Test -   |             |                              |
+    //       | - recv Next-Test ->   |             |                              |
+    //       |                       |             | - send TestCaseMessage ->    |
+    //       |                       |             | <- recv TestResult -         |
+    //       | <- send Test-Result - |             |                              |
+    //       |                       |             |                              |
+    //       |          ...          |             |          ...                 |
+    //       |                       |             |                              |
+    //       | <- send Next-Test -   |             |                              |
+    //       | -   recv Done    ->   |             |      <close conn>            |
+    // Queue |                       | Worker (us) |                              | Native runner
+    let mut our_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let our_addr = our_listener.local_addr()?;
+
+    let mut native_runner = process::Command::new(cmd);
+    native_runner.args(args);
+    native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
+    native_runner.envs(additional_env);
+    native_runner.current_dir(working_dir);
+    // NB(130): we'd like to surface native runner output today, but tomorrow
+    // (with https://github.com/rwx-research/abq/issues/130) this should either
+    // be captured or hidden behind the `debug_native_runner` flag.
+    native_runner.stdout(Stdio::inherit());
+    native_runner.stderr(Stdio::inherit());
+
+    // If launching the native runner fails here, it should have failed during manifest
+    // generation as well (unless this is a flakey error in the underlying test runner, channel
+    // we do not attempt to handle gracefully). Since the failure during manifest generation
+    // will have notified the queue, at this point, failures should just result in the worker
+    // exiting silently itself.
+    let mut native_runner_handle = native_runner.spawn()?;
+    let native_runner_died = async {
+        let _ = native_runner_handle.wait().await;
+    };
+
+    // First, get and validate the protocol version message.
+    let mut runner_conn = open_native_runner_connection(
+        &mut our_listener,
+        protocol_version_timeout,
+        native_runner_died,
+    )
+    .await?;
+
+    // Wait for the native runner to initialize, and send it the initialization context.
+    //
+    // If the initialization context informs us that the run is already complete, we can exit
+    // immediately. While this case is possible, it is far more likely that the initialization
+    // context will be material. As such, we want to spawn the native runner before fetching
+    // the initialization context; that way we can pay the price of startup and
+    // context-fetching in parallel.
+    {
+        match get_init_context() {
+            Ok(InitContext { init_meta }) => {
+                let init_message = net_protocol::runners::InitMessage {
+                    init_meta,
+                    fast_exit: false,
+                };
+                net_protocol::async_write(&mut runner_conn, &init_message).await?;
+                let InitSuccessMessage {} = net_protocol::async_read(&mut runner_conn).await?;
+            }
+            Err(RunAlreadyCompleted {}) => {
+                // There is nothing more for the native runner to do, so we tell it to
+                // fast-exit and wait for it to terminate.
+                let init_message = net_protocol::runners::InitMessage {
+                    init_meta: Default::default(),
+                    fast_exit: true,
+                };
+                net_protocol::async_write(&mut runner_conn, &init_message).await?;
+                native_runner_handle.wait().await?;
+                return Ok(());
+            }
+        };
+    }
+
+    let results_batch_size = results_batch_size as usize;
+    let mut pending_test_results = Vec::with_capacity(results_batch_size);
+
+    // We establish one connection with the native runner and repeatedly send tests until we're
+    // done.
+    'test_all: loop {
+        let NextWorkBundle(test_bundle) = get_next_test_bundle().await;
+        let mut test_iter = test_bundle.into_iter();
+        while let Some(next_test) = test_iter.next() {
+            match next_test {
+                NextWork::EndOfWork => {
+                    drop(runner_conn);
+                    break 'test_all;
+                }
+                NextWork::Work {
+                    test_case,
+                    context: _,
+                    run_id: _,
+                    work_id,
+                } => {
+                    let estimated_start = Instant::now();
+
+                    let handled_test = handle_one_test(
+                        &mut runner_conn,
                         work_id,
-                    } => {
-                        let estimated_start = Instant::now();
+                        test_case,
+                        &mut pending_test_results,
+                    )
+                    .await?;
 
-                        let handled_test = handle_one_test(
-                            &mut runner_conn,
+                    let estimated_runtime = estimated_start.elapsed();
+
+                    if let Err((work_id, native_error)) = handled_test {
+                        handle_native_runner_failure(
+                            worker_entity,
+                            send_test_results,
+                            &native_runner,
+                            native_runner_handle,
+                            estimated_runtime,
                             work_id,
-                            test_case,
-                            &mut pending_test_results,
-                        )?;
+                            test_iter,
+                        );
+                        return Err(native_error.into());
+                    }
 
-                        let estimated_runtime = estimated_start.elapsed();
-
-                        if let Err((work_id, native_error)) = handled_test {
-                            handle_native_runner_failure(
-                                worker_entity,
-                                send_test_results,
-                                &native_runner,
-                                native_runner_handle,
-                                estimated_runtime,
-                                work_id,
-                                test_iter,
-                            );
-                            return Err(native_error.into());
-                        }
-
-                        if pending_test_results.len() >= results_batch_size as _ {
-                            let results = std::mem::take(&mut pending_test_results);
-                            pending_test_results.reserve(results_batch_size as _);
-                            rt.block_on(send_test_results(results));
-                        }
+                    if pending_test_results.len() >= results_batch_size as _ {
+                        let results = std::mem::take(&mut pending_test_results);
+                        pending_test_results.reserve(results_batch_size as _);
+                        send_test_results(results).await;
                     }
                 }
             }
         }
-
-        if !pending_test_results.is_empty() {
-            rt.block_on(send_test_results(pending_test_results));
-        }
-
-        drop(our_listener);
-        native_runner_handle.wait()?;
-
-        Ok(())
     }
+
+    if !pending_test_results.is_empty() {
+        send_test_results(pending_test_results).await;
+    }
+
+    drop(our_listener);
+    native_runner_handle.wait().await?;
+
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -420,7 +448,7 @@ pub enum NativeTestRunnerError {
     Io(#[from] io::Error),
 }
 
-fn handle_one_test(
+async fn handle_one_test(
     runner_conn: &mut RunnerConnection,
     work_id: WorkId,
     test_case: TestCase,
@@ -428,9 +456,12 @@ fn handle_one_test(
 ) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError> {
     let test_case_message = TestCaseMessage { test_case };
 
+    use futures::TryFutureExt;
+
     let opt_test_result_cycle: Result<TestResultMessage, _> =
-        net_protocol::write(runner_conn, test_case_message)
-            .and_then(|_| net_protocol::read(runner_conn));
+        future::ready(net_protocol::async_write(runner_conn, &test_case_message).await)
+            .and_then(|_| net_protocol::async_read(runner_conn))
+            .await;
 
     match opt_test_result_cycle {
         Ok(TestResultMessage { test_result }) => {
@@ -486,8 +517,8 @@ fn handle_native_runner_failure<I>(
     // Our connection with the native test runner failed, for some
     // reason. Consider this a fatal error, and report internal errors
     // back to the queue for the remaining test in the batch.
-    let args: Vec<String> = std::iter::once(native_runner.get_program())
-        .chain(native_runner.get_args())
+    let args: Vec<String> = std::iter::once(native_runner.as_std().get_program())
+        .chain(native_runner.as_std().get_args())
         .map(|s| s.to_string_lossy().to_string())
         .collect();
 
@@ -698,10 +729,11 @@ pub fn execute_wrapped_runner(
 
 #[cfg(test)]
 mod test_validate_protocol_version_message {
-    use std::{
+    use std::time::Duration;
+
+    use tokio::{
         net::{TcpListener, TcpStream},
-        thread,
-        time::Duration,
+        time::sleep,
     };
 
     use abq_utils::net_protocol::{
@@ -714,44 +746,57 @@ mod test_validate_protocol_version_message {
 
     use super::{open_native_runner_connection, ProtocolVersionError, ProtocolVersionMessageError};
 
-    #[test]
-    fn recv_and_validate_protocol_version_message() {
-        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    #[tokio::test]
+    async fn recv_and_validate_protocol_version_message() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let mut stream = TcpStream::connect(socket_addr).unwrap();
+
+        let child = async {
+            let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
                 major: ACTIVE_PROTOCOL_VERSION_MAJOR,
                 minor: ACTIVE_PROTOCOL_VERSION_MINOR,
             };
-            net_protocol::write(&mut stream, version_message).unwrap();
-        })
-        .join()
-        .unwrap();
+            net_protocol::async_write(&mut stream, &version_message)
+                .await
+                .unwrap();
+        };
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
+        let parent = open_native_runner_connection(
+            &mut listener,
+            Duration::from_secs(1),
+            sleep(Duration::MAX),
+        );
+
+        let (_, result) = futures::join!(child, parent);
 
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn protocol_version_message_incompatible() {
-        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    #[tokio::test]
+    async fn protocol_version_message_incompatible() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let mut stream = TcpStream::connect(socket_addr).unwrap();
+        let child = async {
+            let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
                 major: 999123123,
                 minor: 12312342,
             };
-            net_protocol::write(&mut stream, version_message).unwrap();
-        })
-        .join()
-        .unwrap();
+            net_protocol::async_write(&mut stream, &version_message)
+                .await
+                .unwrap();
+        };
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
+        let parent = open_native_runner_connection(
+            &mut listener,
+            Duration::from_secs(1),
+            sleep(Duration::MAX),
+        );
+
+        let (_, result) = futures::join!(child, parent);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -761,66 +806,78 @@ mod test_validate_protocol_version_message {
         ));
     }
 
-    #[test]
-    fn protocol_version_message_recv_wrong_message() {
-        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    #[tokio::test]
+    async fn protocol_version_message_recv_wrong_message() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let mut stream = TcpStream::connect(socket_addr).unwrap();
+        let child = async {
+            let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let message = net_protocol::runners::Manifest {
                 members: vec![],
                 init_meta: Default::default(),
             };
-            net_protocol::write(&mut stream, message).unwrap();
-        })
-        .join()
-        .unwrap();
+            net_protocol::async_write(&mut stream, &message)
+                .await
+                .unwrap();
+        };
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
+        let parent = open_native_runner_connection(
+            &mut listener,
+            Duration::from_secs(1),
+            sleep(Duration::MAX),
+        );
+
+        let (_, result) = futures::join!(child, parent);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ProtocolVersionMessageError::Io(_)));
     }
 
-    #[test]
-    fn protocol_version_message_tunnel_dropped() {
-        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    #[tokio::test]
+    async fn protocol_version_message_tunnel_dropped() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            let stream = TcpStream::connect(socket_addr).unwrap();
+        let child = async {
+            let stream = TcpStream::connect(socket_addr).await.unwrap();
             drop(stream);
-        })
-        .join()
-        .unwrap();
+        };
 
-        let result = open_native_runner_connection(&mut listener, Duration::from_secs(1), || true);
+        let parent = open_native_runner_connection(
+            &mut listener,
+            Duration::from_secs(1),
+            sleep(Duration::MAX),
+        );
+
+        let (_, result) = futures::join!(child, parent);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, ProtocolVersionMessageError::Io(_)));
     }
 
-    #[test]
-    fn protocol_version_message_tunnel_timeout() {
-        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    #[tokio::test]
+    async fn protocol_version_message_tunnel_timeout() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
 
         let timeout = Duration::from_millis(0);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(100));
-            let mut stream = TcpStream::connect(socket_addr).unwrap();
+        let child = async {
+            sleep(Duration::from_millis(100)).await;
+            let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
                 major: ACTIVE_PROTOCOL_VERSION_MAJOR,
                 minor: ACTIVE_PROTOCOL_VERSION_MINOR,
             };
-            net_protocol::write(&mut stream, version_message).unwrap();
-        })
-        .join()
-        .unwrap();
+            net_protocol::async_write(&mut stream, &version_message)
+                .await
+                .unwrap();
+        };
 
-        let result = open_native_runner_connection(&mut listener, timeout, || true);
+        let parent = open_native_runner_connection(&mut listener, timeout, sleep(Duration::MAX));
+
+        let (_, result) = futures::join!(child, parent);
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -830,27 +887,28 @@ mod test_validate_protocol_version_message {
         ));
     }
 
-    #[test]
-    fn protocol_version_message_tunnel_connection_dies() {
-        let mut listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    #[tokio::test]
+    async fn protocol_version_message_tunnel_connection_dies() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
 
         let timeout = Duration::from_millis(100);
-        let thread = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            let mut stream = TcpStream::connect(socket_addr).unwrap();
+        let child = async {
+            sleep(Duration::from_millis(100)).await;
+            let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let version_message = AbqProtocolVersionMessage {
                 r#type: AbqProtocolVersionTag::AbqProtocolVersion,
                 major: ACTIVE_PROTOCOL_VERSION_MAJOR,
                 minor: ACTIVE_PROTOCOL_VERSION_MINOR,
             };
-            net_protocol::write(&mut stream, version_message).unwrap();
-        });
+            net_protocol::async_write(&mut stream, &version_message)
+                .await
+                .unwrap();
+        };
 
-        let result = open_native_runner_connection(&mut listener, timeout, || false);
+        let parent = open_native_runner_connection(&mut listener, timeout, sleep(Duration::ZERO));
 
-        // join blocks so we have to call it after we get a result
-        thread.join().unwrap();
+        let (_, result) = futures::join!(child, parent);
 
         assert!(result.is_err());
         let err = result.unwrap_err();

@@ -1,11 +1,7 @@
 //! Binary that can serve as a testing harness of ABQ workers for native runner implementations
 //! wishing to check that their communication protocol is what a ABQ worker expects.
 
-use std::{
-    net::{SocketAddr, TcpListener},
-    path::PathBuf,
-    time::Duration,
-};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand};
 
@@ -87,15 +83,22 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Manifest { server_addr } => {
-            let mut server = TcpListener::bind(server_addr)?;
+            let rt = tokio::runtime::Builder::new_current_thread().build()?;
+            rt.block_on(async {
+                let mut server = tokio::net::TcpListener::bind(server_addr).await?;
 
-            let runner_conn =
-                open_native_runner_connection(&mut server, Duration::from_secs(10), || true)?;
-            let manifest = wait_for_manifest(runner_conn)?;
+                let runner_conn = open_native_runner_connection(
+                    &mut server,
+                    Duration::from_secs(10),
+                    tokio::time::sleep(Duration::MAX),
+                )
+                .await?;
+                let manifest = wait_for_manifest(runner_conn).await?;
 
-            serde_json::to_writer(std::io::stdout(), &manifest)?;
+                serde_json::to_writer(std::io::stdout(), &manifest)?;
 
-            Ok(())
+                Ok(())
+            })
         }
     }
 }

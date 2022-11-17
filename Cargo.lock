@@ -1754,6 +1754,7 @@ dependencies = [
  "mio 0.8.4",
  "num_cpus",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "winapi 0.3.9",
