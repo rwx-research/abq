@@ -10,16 +10,15 @@ use abq_exec_worker as exec;
 use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
-use abq_utils::net_protocol::queue::RunAlreadyCompleted;
+use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     ManifestMessage, ManifestResult, Status, TestId, TestResult,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner};
-use abq_utils::net_protocol::workers::{
-    NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext, WorkId,
-};
+use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext};
 
+use futures::future::BoxFuture;
 use procspawn as proc;
 
 enum MessageFromPool {
@@ -33,8 +32,12 @@ pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
 pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
-pub type NotifyResults =
-    Arc<dyn Fn(EntityId, &RunId, Vec<(WorkId, TestResult)>) + Send + Sync + 'static>;
+pub type NotifyResults = Arc<
+    dyn Fn(EntityId, &RunId, Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>
+        + Send
+        + Sync
+        + 'static,
+>;
 /// Did a given run complete successfully? Returns true if so.
 pub type RunCompletedSuccessfully = Arc<dyn Fn(EntityId) -> bool + Send + Sync + 'static>;
 
@@ -70,7 +73,7 @@ pub struct WorkerPoolConfig {
     /// How should a worker get the next unit of work it needs to run?
     pub get_next_work: GetNextWorkBundle,
     /// How should results be communicated back?
-    pub notify_result: NotifyResults,
+    pub notify_results: NotifyResults,
     /// How many results should be sent back at a time?
     pub results_batch_size_hint: u64,
     /// Query whether the assigned run completed successfully, without any failure.
@@ -162,7 +165,7 @@ impl WorkerPool {
             get_init_context,
             get_next_work,
             results_batch_size_hint: results_batch_size,
-            notify_result,
+            notify_results,
             notify_manifest,
             run_completed_successfully,
             worker_context,
@@ -194,7 +197,7 @@ impl WorkerPool {
             // only it gets the manifest notifier.
             // TODO: consider hiding this behind a macro for code duplication purposes
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
-            let notify_result = Arc::clone(&notify_result);
+            let notify_results = Arc::clone(&notify_results);
             let get_init_context = Arc::clone(&get_init_context);
             let get_next_work = Arc::clone(&get_next_work);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
@@ -205,7 +208,7 @@ impl WorkerPool {
                 get_init_context,
                 get_next_work_bundle: get_next_work,
                 results_batch_size,
-                notify_result,
+                notify_results,
                 context: worker_context.clone(),
                 work_timeout,
                 work_retries,
@@ -220,7 +223,7 @@ impl WorkerPool {
         // Provision the rest of the workers.
         for _id in 1..num_workers {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
-            let notify_result = Arc::clone(&notify_result);
+            let notify_results = Arc::clone(&notify_results);
             let get_init_context = Arc::clone(&get_init_context);
             let get_next_work = Arc::clone(&get_next_work);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
@@ -231,7 +234,7 @@ impl WorkerPool {
                 get_init_context,
                 get_next_work_bundle: get_next_work,
                 results_batch_size,
-                notify_result,
+                notify_results,
                 context: worker_context.clone(),
                 work_timeout,
                 work_retries,
@@ -326,7 +329,7 @@ struct WorkerEnv {
     get_init_context: GetInitContext,
     get_next_work_bundle: GetNextWorkBundle,
     results_batch_size: u64,
-    notify_result: NotifyResults,
+    notify_results: NotifyResults,
     context: WorkerContext,
     work_timeout: Duration,
     work_retries: u8,
@@ -360,7 +363,7 @@ fn start_generic_test_runner(
         get_next_work_bundle,
         run_id,
         get_init_context,
-        notify_result,
+        notify_results,
         notify_manifest,
         results_batch_size,
         context,
@@ -389,7 +392,8 @@ fn start_generic_test_runner(
 
     let get_next_work_bundle = move || get_next_work_bundle();
 
-    let send_test_result = move |results| notify_result(entity, &run_id, results);
+    let send_test_result: abq_generic_test_runner::SendTestResults =
+        Box::new(move |results| notify_results(entity, &run_id, results));
 
     let polling_should_shutdown = || {
         matches!(
@@ -428,7 +432,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         get_init_context,
         run_id,
         results_batch_size: _,
-        notify_result,
+        notify_results,
         context,
         work_timeout,
         work_retries,
@@ -447,6 +451,11 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         Ok(ctx) => ctx,
         Err(RunAlreadyCompleted {}) => return,
     };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     'tests_done: loop {
         // First, check if we have a message from our owner.
@@ -512,7 +521,11 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                             meta: Default::default(),
                         };
 
-                        notify_result(entity, &run_id, vec![(work_id.clone(), result)]);
+                        rt.block_on(notify_results(
+                            entity,
+                            &run_id,
+                            vec![(work_id.clone(), result)],
+                        ));
                         break 'attempts;
                     }
                 }
@@ -681,21 +694,22 @@ mod test {
     fn manifest_collector() -> (ManifestCollector, NotifyManifest) {
         let man: ManifestCollector = Arc::new(Mutex::new(None));
         let man2 = Arc::clone(&man);
-        let notify_result: NotifyManifest = Box::new(move |_, _, man| {
+        let notify_results: NotifyManifest = Box::new(move |_, _, man| {
             let old_manifest = man2.lock().unwrap().replace(man);
             debug_assert!(old_manifest.is_none(), "Overwriting a manifest! This is either a bug in your test, or the worker pool implementation.");
         });
-        (man, notify_result)
+        (man, notify_results)
     }
 
     fn results_collector() -> (ResultsCollector, NotifyResults, RunCompletedSuccessfully) {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
-        let notify_result: NotifyResults = Arc::new(move |_, _, results| {
+        let notify_results: NotifyResults = Arc::new(move |_, _, results| {
             for (work_id, result) in results {
                 let old_result = results2.lock().unwrap().insert(work_id.0, result);
                 debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
             }
+            Box::pin(async {})
         });
         let results3 = Arc::clone(&results);
         let get_completed_status: RunCompletedSuccessfully = Arc::new(move |_| {
@@ -705,7 +719,7 @@ mod test {
                 .iter()
                 .all(|(_, result)| !result.status.is_fail_like())
         });
-        (results, notify_result, get_completed_status)
+        (results, notify_results, get_completed_status)
     }
 
     fn empty_init_context() -> InitContextResult {
@@ -718,7 +732,7 @@ mod test {
         runner_kind: RunnerKind,
         run_id: RunId,
         get_next_work: GetNextWorkBundle,
-        notify_result: NotifyResults,
+        notify_results: NotifyResults,
         run_completed_successfully: RunCompletedSuccessfully,
     ) -> (WorkerPoolConfig, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
@@ -731,7 +745,7 @@ mod test {
             runner_kind,
             run_id,
             notify_manifest: Some(notify_manifest),
-            notify_result,
+            notify_results,
             run_completed_successfully,
             worker_context: WorkerContext::AssumeLocal,
             work_timeout: Duration::from_secs(5),
@@ -805,7 +819,7 @@ mod test {
 
     fn test_echo_n(num_workers: usize, num_echos: usize) {
         let (write_work, get_next_work) = work_writer();
-        let (results, notify_result, run_completed_successfully) = results_collector();
+        let (results, notify_results, run_completed_successfully) = results_collector();
 
         let run_id = RunId::unique();
         let mut expected_results = HashMap::new();
@@ -829,7 +843,7 @@ mod test {
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
             run_id.clone(),
             get_next_work,
-            notify_result,
+            notify_results,
             run_completed_successfully,
         );
 
@@ -897,7 +911,7 @@ mod test {
     #[cfg(feature = "test-test_ids")]
     fn test_timeout() {
         let (write_work, get_next_work) = work_writer();
-        let (results, notify_result) = results_collector();
+        let (results, notify_results) = results_collector();
 
         let run_id = RunId::new();
         let manifest = ManifestMessage {
@@ -909,7 +923,7 @@ mod test {
             run_id,
             manifest,
             get_next_work,
-            notify_result,
+            notify_results,
         );
 
         let timeout = Duration::from_millis(1);
@@ -942,7 +956,7 @@ mod test {
     #[cfg(feature = "test-test_ids")]
     fn test_panic_no_retries() {
         let (write_work, get_next_work) = work_writer();
-        let (results, notify_result) = results_collector();
+        let (results, notify_results) = results_collector();
 
         let run_id = RunId::new();
         let manifest = ManifestMessage {
@@ -954,7 +968,7 @@ mod test {
             run_id,
             manifest,
             get_next_work,
-            notify_result,
+            notify_results,
         );
 
         let config = WorkerPoolConfig {
@@ -984,7 +998,7 @@ mod test {
     #[cfg(feature = "test-test_ids")]
     fn test_panic_succeed_after_retry() {
         let (write_work, get_next_work) = work_writer();
-        let (results, notify_result) = results_collector();
+        let (results, notify_results) = results_collector();
 
         let run_id = RunId::new();
         let manifest = ManifestMessage {
@@ -996,7 +1010,7 @@ mod test {
             run_id,
             manifest,
             get_next_work,
-            notify_result,
+            notify_results,
         );
 
         let config = WorkerPoolConfig {
@@ -1029,7 +1043,7 @@ mod test {
     #[test]
     fn work_in_constant_context() {
         let (write_work, get_next_work) = work_writer();
-        let (results, notify_result, run_completed_successfully) = results_collector();
+        let (results, notify_results, run_completed_successfully) = results_collector();
 
         let working_dir = TempDir::new().unwrap();
         std::fs::write(working_dir.path().join("testfile"), "testcontent").unwrap();
@@ -1050,7 +1064,7 @@ mod test {
             RunnerKind::TestLikeRunner(TestLikeRunner::Exec, manifest),
             run_id.clone(),
             get_next_work,
-            notify_result,
+            notify_results,
             run_completed_successfully,
         );
 
@@ -1129,7 +1143,7 @@ mod test {
     #[test]
     fn exit_with_error_if_worker_errors() {
         let (_write_work, get_next_work) = work_writer();
-        let (_results, notify_result, run_completed_successfully) = results_collector();
+        let (_results, notify_results, run_completed_successfully) = results_collector();
         let (default_config, _manifest_collector) = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
                 // This command should cause the worker to error, since it can't even be executed
@@ -1139,7 +1153,7 @@ mod test {
             }),
             RunId::unique(),
             get_next_work,
-            notify_result,
+            notify_results,
             run_completed_successfully,
         );
 

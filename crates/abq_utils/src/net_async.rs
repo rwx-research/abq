@@ -46,11 +46,12 @@ pub trait ServerStream: std::fmt::Debug + AsyncRead + AsyncWrite + Send + Sync +
 }
 
 #[async_trait]
-pub trait ConfiguredClient {
+pub trait ConfiguredClient: Send + Sync {
     async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn ClientStream>>;
+    fn boxed_clone(&self) -> Box<dyn ConfiguredClient>;
 }
 
-pub trait ClientStream: AsyncRead + AsyncWrite + Unpin {
+pub trait ClientStream: AsyncRead + AsyncWrite + Unpin + Send {
     fn local_addr(&self) -> io::Result<SocketAddr>;
 }
 

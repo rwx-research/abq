@@ -2222,9 +2222,9 @@ mod test {
         build_strategies(UserToken::new_random(), AdminToken::new_random())
     }
 
-    fn fake_workers_config() -> WorkersConfig {
+    fn default_workers_config() -> WorkersConfig {
         WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
+            num_workers: 2.try_into().unwrap(),
             worker_context: WorkerContext::AssumeLocal,
             work_retries: 0,
             work_timeout: Duration::from_secs(1),
@@ -2295,13 +2295,7 @@ mod test {
 
         let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
-        let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
-            work_timeout: Duration::from_secs(1),
-            debug_native_runner: false,
-        };
+        let workers_config = default_workers_config();
 
         let queue_server_addr = queue.server_addr();
 
@@ -2393,13 +2387,7 @@ mod test {
 
         let runner2 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest2);
 
-        let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
-            work_timeout: Duration::from_secs(1),
-            debug_native_runner: false,
-        };
+        let workers_config = default_workers_config();
 
         let queue_server_addr = queue.server_addr();
 
@@ -2519,13 +2507,7 @@ mod test {
 
         let runner1 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest1);
 
-        let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
-            work_timeout: Duration::from_secs(1),
-            debug_native_runner: false,
-        };
+        let workers_config = default_workers_config();
 
         let queue_server_addr = queue.server_addr();
 
@@ -3140,11 +3122,8 @@ mod test {
         // Set up the runner so that it times out, always issuing an error.
         let runner = RunnerKind::TestLikeRunner(TestLikeRunner::InduceTimeout, manifest);
         let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
             work_timeout: Duration::from_secs(0),
-            debug_native_runner: false,
+            ..default_workers_config()
         };
 
         let queue_server_addr = queue.server_addr();
@@ -3220,11 +3199,8 @@ mod test {
             manifest,
         );
         let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
             work_timeout: Duration::from_secs(0),
-            debug_native_runner: false,
+            ..default_workers_config()
         };
 
         let queue_server_addr = queue.server_addr();
@@ -3563,13 +3539,7 @@ mod test {
 
         let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
-        let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
-            work_timeout: Duration::from_secs(1),
-            debug_native_runner: false,
-        };
+        let workers_config = default_workers_config();
 
         let queue_server_addr = queue.server_addr();
 
@@ -3668,13 +3638,7 @@ mod test {
             extra_env: Default::default(),
         });
 
-        let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
-            work_timeout: Duration::from_secs(1),
-            debug_native_runner: false,
-        };
+        let workers_config = default_workers_config();
 
         let queue_server_addr = queue.server_addr();
 
@@ -4183,13 +4147,7 @@ mod test {
 
         let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
 
-        let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
-            work_timeout: Duration::from_secs(1),
-            debug_native_runner: false,
-        };
+        let workers_config = default_workers_config();
 
         let queue_server_addr = queue.server_addr();
 
@@ -4275,13 +4233,7 @@ mod test {
 
         let runner = RunnerKind::TestLikeRunner(TestLikeRunner::EchoInitContext, manifest);
 
-        let workers_config = WorkersConfig {
-            num_workers: 4.try_into().unwrap(),
-            worker_context: WorkerContext::AssumeLocal,
-            work_retries: 0,
-            work_timeout: Duration::from_secs(1),
-            debug_native_runner: false,
-        };
+        let workers_config = default_workers_config();
 
         let queue_server_addr = queue.server_addr();
 
@@ -4649,7 +4601,7 @@ mod test {
 
             thread::spawn(move || {
                 WorkersNegotiator::negotiate_and_start_pool(
-                    fake_workers_config(),
+                    default_workers_config(),
                     negotiator,
                     client_opts,
                     run_id,
@@ -4701,7 +4653,7 @@ mod test {
             });
 
             let mut workers = WorkersNegotiator::negotiate_and_start_pool(
-                fake_workers_config(),
+                default_workers_config(),
                 queue.get_negotiator_handle(),
                 client_opts,
                 run_id,

@@ -197,7 +197,7 @@ impl<Role> ConfiguredClient<Role> {
 #[async_trait]
 impl<Role> super::ConfiguredClient for ConfiguredClient<Role>
 where
-    Role: Send + Sync,
+    Role: Send + Sync + Clone + 'static,
 {
     async fn connect(&self, addr: SocketAddr) -> io::Result<Box<dyn super::ClientStream>> {
         let sock = tokio::net::TcpStream::connect(addr).await?;
@@ -212,5 +212,12 @@ where
         self.auth_strategy.async_send(&mut stream).await?;
 
         Ok(Box::new(stream))
+    }
+
+    fn boxed_clone(&self) -> Box<dyn super::ConfiguredClient> {
+        Box::new(Self {
+            connector: self.connector.clone(),
+            auth_strategy: self.auth_strategy.clone(),
+        })
     }
 }
