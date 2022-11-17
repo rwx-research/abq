@@ -40,10 +40,7 @@ use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
-use crate::{
-    args::{default_num_workers_for_test, Token},
-    health::HealthCheckKind,
-};
+use crate::{args::Token, health::HealthCheckKind};
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
@@ -313,7 +310,20 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), client_tls);
             let queue_negotiator =
                 QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts.clone())?;
-            workers::start_workers_forever(num, working_dir, queue_negotiator, client_opts, run_id)
+            let num_workers = NonZeroUsize::new(if num == 0 {
+                std::cmp::Ord::max(num_cpus::get_physical(), 1)
+            } else {
+                num
+            })
+            .unwrap();
+
+            workers::start_workers_forever(
+                num_workers,
+                working_dir,
+                queue_negotiator,
+                client_opts,
+                run_id,
+            )
         }
         Command::Test {
             args,
@@ -359,6 +369,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 resolved_tls,
             )?;
             let results_timeout = Duration::from_secs(result_timeout_seconds.get());
+
+            let actual_num_workers = NonZeroUsize::new(if num_workers == Some(0) {
+                std::cmp::Ord::max(num_cpus::get_physical() - 1, 1)
+            } else {
+                num_workers.unwrap_or(1)
+            })
+            .unwrap();
+
             run_tests(
                 entity,
                 runner_params,
@@ -368,7 +386,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 color,
                 batch_size,
                 results_timeout,
-                num_workers.unwrap_or_else(default_num_workers_for_test),
+                actual_num_workers,
                 start_in_process_workers,
             )
         }
