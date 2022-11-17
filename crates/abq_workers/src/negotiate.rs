@@ -1,5 +1,6 @@
 //! Module negotiate helps worker pools attach to queues.
 
+use futures::FutureExt;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -242,15 +243,22 @@ impl WorkersNegotiator {
         });
 
         let get_next_work: GetNextWorkBundle = Arc::new({
-            let client = client.boxed_clone();
+            let client = async_client.boxed_clone();
             let run_id = run_id.clone();
 
             move || {
-                let span = tracing::trace_span!("get_next_work", run_id=?run_id, new_work_server=?queue_new_work_addr);
-                let _get_next_work = span.enter();
+                let client = client.boxed_clone();
+                let run_id = run_id.clone();
+                async move {
+                    let span = tracing::trace_span!("get_next_work", run_id=?run_id, new_work_server=?queue_new_work_addr);
+                    let _get_next_work = span.enter();
 
-                // TODO: error handling
-                wait_for_next_work_bundle(&*client, queue_new_work_addr, run_id.clone()).unwrap()
+                    // TODO: error handling
+                    wait_for_next_work_bundle(&*client, queue_new_work_addr, run_id)
+                        .await
+                        .unwrap()
+
+                }.boxed()
             }
         });
 
@@ -428,8 +436,8 @@ fn wait_for_init_context(
 
 /// Asks the work server for the next item of work to run.
 /// Blocks on the result, repeatedly pinging the server until work is available.
-fn wait_for_next_work_bundle(
-    client: &dyn net::ConfiguredClient,
+async fn wait_for_next_work_bundle(
+    client: &dyn net_async::ConfiguredClient,
     work_server_addr: SocketAddr,
     run_id: RunId,
 ) -> Result<NextWorkBundle, io::Error> {
@@ -437,9 +445,9 @@ fn wait_for_next_work_bundle(
 
     let next_test_request = net_protocol::work_server::WorkServerRequest::NextTest { run_id };
 
-    let mut stream = client.connect(work_server_addr)?;
-    net_protocol::write(&mut stream, next_test_request)?;
-    match net_protocol::read(&mut stream)? {
+    let mut stream = client.connect(work_server_addr).await?;
+    net_protocol::async_write(&mut stream, &next_test_request).await?;
+    match net_protocol::async_read(&mut stream).await? {
         NextTestResponse::Bundle(bundle) => Ok(bundle),
     }
 }
