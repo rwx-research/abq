@@ -31,7 +31,10 @@ use abq_utils::{
 };
 use abq_workers::negotiate::QueueNegotiatorHandle;
 
-use args::{Cli, Command};
+use args::{
+    Cli, Command,
+    NumWorkers::{CpuCores, Fixed},
+};
 use clap::Parser;
 
 use instance::AbqInstance;
@@ -312,12 +315,10 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), client_tls);
             let queue_negotiator =
                 QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts.clone())?;
-            let num_workers = NonZeroUsize::new(if num == 0 {
-                std::cmp::Ord::max(num_cpus::get_physical(), 1)
-            } else {
-                num
-            })
-            .unwrap();
+            let num_workers = match num {
+                CpuCores => NonZeroUsize::new(num_cpus::get_physical()).unwrap(),
+                Fixed(num) => num,
+            };
 
             workers::start_workers_forever(
                 num_workers,
@@ -372,12 +373,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             )?;
             let results_timeout = Duration::from_secs(result_timeout_seconds.get());
 
-            let actual_num_workers = NonZeroUsize::new(if num_workers == Some(0) {
-                std::cmp::Ord::max(num_cpus::get_physical() - 1, 1)
-            } else {
-                num_workers.unwrap_or(1)
-            })
-            .unwrap();
+            let actual_num_workers = match num_workers {
+                Some(CpuCores) => {
+                    NonZeroUsize::new(std::cmp::Ord::max(num_cpus::get_physical() - 1, 1)).unwrap()
+                }
+                Some(Fixed(num)) => num,
+                None => NonZeroUsize::new(1).unwrap(),
+            };
 
             run_tests(
                 entity,
