@@ -29,7 +29,8 @@ type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 
-pub type GetNextWorkBundle = Arc<dyn Fn() -> NextWorkBundle + Send + Sync + 'static>;
+pub type GetNextWorkBundle =
+    Arc<dyn Fn() -> BoxFuture<'static, NextWorkBundle> + Send + Sync + 'static>;
 pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResults = Arc<
@@ -390,7 +391,8 @@ fn start_generic_test_runner(
 
     let get_init_context = move || get_init_context();
 
-    let get_next_work_bundle = move || get_next_work_bundle();
+    let get_next_work_bundle: abq_generic_test_runner::GetNextWorkBundle =
+        &move || get_next_work_bundle();
 
     let send_test_result: abq_generic_test_runner::SendTestResults =
         &move |results| notify_results(entity, &run_id, results);
@@ -471,7 +473,7 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                 //
                 // TODO: add a timeout here, in case we get a message from the parent while
                 // blocking on the next test_id from the queue.
-                let NextWorkBundle(bundle) = get_next_work();
+                let NextWorkBundle(bundle) = rt.block_on(get_next_work());
                 bundle
             }
         };
@@ -662,6 +664,7 @@ mod test {
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{flatten_manifest, net_protocol};
+    use futures::FutureExt;
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
@@ -685,7 +688,7 @@ mod test {
         };
         let get_next_work: GetNextWorkBundle = Arc::new(move || loop {
             if let Some(work) = reader.lock().unwrap().pop_front() {
-                return NextWorkBundle(vec![work]);
+                return async { NextWorkBundle(vec![work]) }.boxed();
             }
         });
         (write_work, get_next_work)

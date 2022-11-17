@@ -3,6 +3,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
 use std::process::Command;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{net::TcpListener, process};
@@ -18,13 +19,14 @@ use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
     NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
 };
-use abq_utils::{flatten_manifest, net_protocol};
+use abq_utils::{atomic, flatten_manifest, net_protocol};
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use indoc::indoc;
 use thiserror::Error;
 use tracing::instrument;
 
 mod message_buffer;
-use futures::future::BoxFuture;
 
 pub struct GenericTestRunner;
 
@@ -207,8 +209,10 @@ impl From<ProtocolVersionMessageError> for GenericRunnerError {
 
 pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>;
 
+pub type GetNextWorkBundle<'a> = &'a dyn Fn() -> BoxFuture<'static, NextWorkBundle>;
+
 impl GenericTestRunner {
-    pub fn run<ShouldShutdown, SendManifest, GetInitContext, GetNextWorkBundle>(
+    pub fn run<ShouldShutdown, SendManifest, GetInitContext>(
         worker_entity: EntityId,
         input: NativeTestRunnerParams,
         working_dir: &Path,
@@ -216,7 +220,7 @@ impl GenericTestRunner {
         results_batch_size: u64,
         send_manifest: Option<SendManifest>,
         get_init_context: GetInitContext,
-        mut get_next_test_bundle: GetNextWorkBundle,
+        get_next_test_bundle: GetNextWorkBundle,
         send_test_results: SendTestResults,
         _debug_native_runner: bool,
     ) -> Result<(), GenericRunnerError>
@@ -224,7 +228,6 @@ impl GenericTestRunner {
         ShouldShutdown: Fn() -> bool,
         SendManifest: FnMut(ManifestResult),
         GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
-        GetNextWorkBundle: FnMut() -> NextWorkBundle + std::marker::Send + 'static,
     {
         let NativeTestRunnerParams {
             cmd,
@@ -352,7 +355,7 @@ impl GenericTestRunner {
         // We establish one connection with the native runner and repeatedly send tests until we're
         // done.
         'test_all: loop {
-            let NextWorkBundle(test_bundle) = get_next_test_bundle();
+            let NextWorkBundle(test_bundle) = rt.block_on(get_next_test_bundle());
             let mut test_iter = test_bundle.into_iter();
             while let Some(next_test) = test_iter.next() {
                 match next_test {
@@ -580,8 +583,6 @@ pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
     working_dir: PathBuf,
 ) -> Result<(ManifestMessage, Vec<TestResult>), GenericRunnerError> {
-    let mut test_case_index = 0;
-
     let mut manifest_message = None;
 
     // Currently, an atomic mutex is used here because `send_manifest`, `get_next_test`, and the
@@ -620,14 +621,16 @@ pub fn execute_wrapped_runner(
         })
     };
 
-    let get_next_test = {
+    let test_case_index = AtomicUsize::new(0);
+
+    let get_next_test: GetNextWorkBundle = {
         let manifest = Arc::clone(&flat_manifest);
         let working_dir = working_dir.clone();
-        move || {
+        &move || {
             loop {
                 let manifest_and_data = manifest.lock().unwrap();
                 let next_test = match &(*manifest_and_data) {
-                    Some((manifest, _)) => manifest.get(test_case_index),
+                    Some((manifest, _)) => manifest.get(test_case_index.load(atomic::ORDERING)),
                     None => {
                         // still waiting for the manifest, spin
                         continue;
@@ -635,7 +638,7 @@ pub fn execute_wrapped_runner(
                 };
                 let next = match next_test {
                     Some(test_case) => {
-                        test_case_index += 1;
+                        test_case_index.fetch_add(1, atomic::ORDERING);
 
                         NextWork::Work {
                             test_case: test_case.clone(),
@@ -648,7 +651,7 @@ pub fn execute_wrapped_runner(
                     }
                     None => NextWork::EndOfWork,
                 };
-                return NextWorkBundle(vec![next]);
+                return async { NextWorkBundle(vec![next]) }.boxed();
             }
         }
     };
@@ -871,6 +874,7 @@ mod test_abq_jest {
     use abq_utils::net_protocol::workers::{
         NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId,
     };
+    use futures::FutureExt;
 
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -897,7 +901,7 @@ mod test_abq_jest {
                 init_meta: Default::default(),
             })
         };
-        let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
+        let get_next_test = &|| async { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
         let send_test_result: SendTestResults = {
             let test_results = test_results.clone();
             &move |results| {
@@ -971,22 +975,25 @@ mod test_abq_jest {
         };
 
         let get_init_context = || Err(RunAlreadyCompleted {});
-        let get_next_test = || {
-            NextWorkBundle(vec![NextWork::Work {
-                test_case: TestCase {
-                    id: "unreachable".to_string(),
-                    meta: Default::default(),
-                },
-                context: WorkContext {
-                    working_dir: std::env::current_dir().unwrap(),
-                },
-                run_id: RunId::unique(),
-                work_id: WorkId("unreachable".to_string()),
-            }])
+        let get_next_test = &|| {
+            async {
+                NextWorkBundle(vec![NextWork::Work {
+                    test_case: TestCase {
+                        id: "unreachable".to_string(),
+                        meta: Default::default(),
+                    },
+                    context: WorkContext {
+                        working_dir: std::env::current_dir().unwrap(),
+                    },
+                    run_id: RunId::unique(),
+                    work_id: WorkId("unreachable".to_string()),
+                }])
+            }
+            .boxed()
         };
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
-        let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _, _>(
+        let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _>(
             EntityId::new(),
             input,
             &npm_jest_project_path(),
@@ -1010,6 +1017,7 @@ mod test {
     use abq_utils::net_protocol::runners::ManifestResult;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
+    use futures::FutureExt;
 
     #[test]
     fn invalid_command_yields_error() {
@@ -1027,7 +1035,7 @@ mod test {
                 init_meta: Default::default(),
             })
         };
-        let get_next_test = || NextWorkBundle(vec![NextWork::EndOfWork]);
+        let get_next_test = &|| async { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
         let runner_result = GenericTestRunner::run(
