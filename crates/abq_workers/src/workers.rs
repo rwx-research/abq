@@ -381,7 +381,7 @@ fn start_generic_test_runner(
 
     // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
     // so that they can correlate failures observed in workers with the workers they've launched.
-    eprintln!("Worker starter with id {:?}", entity);
+    eprintln!("Worker started with id {:?}", entity);
 
     let notify_manifest = notify_manifest.map(|notify_manifest| {
         let run_id = run_id.clone();
