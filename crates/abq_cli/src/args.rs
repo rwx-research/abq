@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
 };
 
@@ -13,6 +13,27 @@ use abq_utils::{
 use clap::{ArgGroup, Parser, Subcommand};
 
 use crate::reporting::{ColorPreference, ReporterKind};
+
+#[derive(Clone)]
+pub enum NumWorkers {
+    CpuCores,
+    Fixed(NonZeroUsize),
+}
+
+impl std::str::FromStr for NumWorkers {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "cpu-cores" {
+            Ok(Self::CpuCores)
+        } else {
+            let fixed = s
+                .parse()
+                .map_err(|_| r#"num must be a positive integer, or "cpu-cores""#)?;
+            Ok(Self::Fixed(fixed))
+        }
+    }
+}
 
 /// Always be queueing
 ///
@@ -127,9 +148,9 @@ pub enum Command {
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
-        /// Number of workers to start. 0 implies the number of available (physical) CPUs.
-        #[clap(long, short = 'n', required = false, default_value_t = 1)]
-        num: usize,
+        /// Number of workers to start. set to "cpu-cores" to use as many workers as available (physical) CPU cores.
+        #[clap(long, short = 'n', required = false, default_value = "1")]
+        num: NumWorkers,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
@@ -192,10 +213,10 @@ pub enum Command {
 
         /// Number of workers to start when running in standalone mode.
         /// NOTE: If present, will always launch in standalone mode.
-        /// 0 implies the number of available (physical) CPUs - 1.
+        /// Set to "cpu-cores" to use the number of available (physical) CPUs cores - 1.
         ///
         #[clap(long, short = 'n', required = false)]
-        num_workers: Option<usize>,
+        num_workers: Option<NumWorkers>,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
