@@ -25,7 +25,7 @@ fn version_from_git() -> String {
 
 /// Writes the currently-build ABQ version to $OUT_DIR/abq_version.txt
 fn write_abq_version() {
-    println!("cargo:rerun-if-changed=build_artifact/");
+    println!("cargo:rerun-if-changed=../../build_artifact");
 
     let version = env::var("NIX_ABQ_VERSION").unwrap_or_else(|_| version_from_git());
 
@@ -34,7 +34,15 @@ fn write_abq_version() {
         fs::create_dir(&out_dir).unwrap();
     }
     let dest_path = out_dir.join("abq_version.txt");
-    fs::write(dest_path, version.trim()).unwrap();
+
+    // Avoid rewriting the version if it hasn't changed, to make local rebuilds faster.
+    let should_rewrite = match fs::read_to_string(&dest_path) {
+        Ok(old_version) => old_version.trim() != version.trim(),
+        Err(_) => true,
+    };
+    if should_rewrite {
+        fs::write(dest_path, version.trim()).unwrap();
+    }
 }
 
 fn main() {
