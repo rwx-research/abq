@@ -1,9 +1,6 @@
 use std::{env, fs, path::Path, process::Command};
 
-/// Writes the currently-build ABQ version to $OUT_DIR/abq_version.txt
-fn write_abq_version() {
-    println!("cargo:rerun-if-changed=build_artifact/");
-
+fn version_from_git() -> String {
     let version_output = Command::new("git")
         .args(["describe", "--dirty"])
         .output()
@@ -23,7 +20,14 @@ fn write_abq_version() {
     let commits_since = parts.next().unwrap();
     let short_sha = parts.next().unwrap();
 
-    let version = format!("0.{commits_since}.0+{short_sha}");
+    format!("0.{commits_since}.0+{short_sha}")
+}
+
+/// Writes the currently-build ABQ version to $OUT_DIR/abq_version.txt
+fn write_abq_version() {
+    println!("cargo:rerun-if-changed=build_artifact/");
+
+    let version = env::var("NIX_ABQ_VERSION").unwrap_or_else(|_| version_from_git());
 
     let out_dir = Path::new(&env::var("ABQ_WORKSPACE_DIR").unwrap()).join("build_artifact/");
     if !out_dir.exists() {
