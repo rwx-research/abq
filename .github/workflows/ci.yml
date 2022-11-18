@@ -18,7 +18,7 @@ jobs:
           fetch-depth: 0 # get whole history for versioning
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.64.0
         with:
           components: rustfmt
 
@@ -48,11 +48,11 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ hashFiles('Cargo.lock') }}
+          key: cargo-#{{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-
+            cargo-#{{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.64.0
         with:
           components: clippy
 
@@ -157,9 +157,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ hashFiles('Cargo.lock') }}
+          key: cargo-#{{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-
+            cargo-#{{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
