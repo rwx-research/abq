@@ -5,22 +5,22 @@ use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct ApiKey(String);
+pub struct AccessToken(String);
 
 #[derive(Debug, Error)]
-pub enum ApiKeyError {
-    #[error("invalid api key")]
-    InvalidApiKey,
+pub enum AccessTokenError {
+    #[error("invalid access token")]
+    InvalidAccessToken,
 }
 
-impl fmt::Display for ApiKey {
+impl fmt::Display for AccessToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl FromStr for ApiKey {
-    type Err = ApiKeyError;
+impl FromStr for AccessToken {
+    type Err = AccessTokenError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self(s.to_owned()))

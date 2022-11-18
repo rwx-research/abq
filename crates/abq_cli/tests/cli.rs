@@ -753,15 +753,15 @@ Negotiator at {negotiator_addr}: UNHEALTHY
 
 #[test]
 #[serial]
-fn work_no_queue_addr_or_api_key() {
-    // Spawn worker without a queue addr or api key
+fn work_no_queue_addr_or_access_token() {
+    // Spawn worker without a queue addr or access token
     // abq work --working-dir . run-id
     let CmdOutput {
         stdout,
         stderr,
         exit_status,
     } = run_abq_forcing_capture(
-        "work_no_queue_addr_or_api_key",
+        "work_no_queue_addr_or_access_token",
         ["work", "--run-id", "run-id", "--num", "cpu-cores"],
     );
 
@@ -778,7 +778,7 @@ fn work_user_token_without_admin_token() {
         stderr,
         exit_status,
     } = run_abq_forcing_capture(
-        "work_no_queue_addr_or_api_key",
+        "work_no_queue_addr_or_access_token",
         [
             "start",
             &format!("--user-token={}", UserToken::new_random()),
@@ -798,7 +798,7 @@ fn work_admin_token_without_user_token() {
         stderr,
         exit_status,
     } = run_abq_forcing_capture(
-        "work_no_queue_addr_or_api_key",
+        "work_no_queue_addr_or_access_token",
         [
             "start",
             &format!("--admin-token={}", AdminToken::new_random()),

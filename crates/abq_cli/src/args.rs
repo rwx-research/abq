@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use abq_hosted::ApiKey;
+use abq_hosted::AccessToken;
 use abq_utils::{
     auth::{AdminToken, UserToken},
     net_protocol::workers::RunId,
@@ -124,7 +124,7 @@ pub enum Command {
         ArgGroup::new("execution") // don't allow both queue_addr and num_workers params
             .required(true)
             .multiple(false)
-            .args(["api_key", "queue_addr"]),
+            .args(["access_token", "queue_addr"]),
         ))]
     Work {
         /// Working directory of the workers. Defaults to the current directory.
@@ -136,15 +136,15 @@ pub enum Command {
         #[clap(long, required = false, env("ABQ_RUN_ID"))]
         run_id: Option<RunId>,
 
-        /// The API key to use when fetching queue config information from the ABQ API.
+        /// The access token to use when fetching queue config information from the ABQ API.
         ///
         /// Cannot be used with queue_addr (implies: not using the ABQ API).
-        #[clap(long, required = false, env("ABQ_API_KEY"))]
-        api_key: Option<ApiKey>,
+        #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
+        access_token: Option<AccessToken>,
 
         /// Address of the queue to work from.
         ///
-        /// Cannot be used with api_key (will fetch address from ABQ API).
+        /// Cannot be used with access_token (will fetch address from ABQ API).
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
@@ -155,7 +155,7 @@ pub enum Command {
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
         ///
-        /// If --api-key is specified, the token will be ignored and the token fetched from the ABQ API will be used.
+        /// If --access-token is specified, the token will be ignored and the token fetched from the ABQ API will be used.
         #[clap(long, required = false)]
         token: Option<UserToken>,
 
@@ -164,7 +164,7 @@ pub enum Command {
         ///
         /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
         ///
-        /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
+        /// If --access-token is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
         #[clap(long)]
         tls_cert: Option<PathBuf>,
     },
@@ -179,15 +179,15 @@ pub enum Command {
     ///
     #[clap(verbatim_doc_comment)]
     #[command(group(
-        ArgGroup::new("execution") // don't allow both queue_addr and api_key params
+        ArgGroup::new("execution") // don't allow both queue_addr and access_token params
             .multiple(false)
-            .args(["api_key", "queue_addr"]),
+            .args(["access_token", "queue_addr"]),
         )
     )]
     #[command(group(
         ArgGroup::new("server-key-exclusion") // don't allow server-side cert key if running in non-local mode
             .multiple(false)
-            .args(["api_key", "queue_addr"])
+            .args(["access_token", "queue_addr"])
             .conflicts_with("tls_key"),
         )
     )]
@@ -197,17 +197,17 @@ pub enum Command {
         #[clap(long, required = false, env("ABQ_RUN_ID"))]
         run_id: Option<RunId>,
 
-        /// The API key to use when fetching queue config information from the ABQ API.
+        /// The access token to use when fetching queue config information from the ABQ API.
         ///
         /// Cannot be used with queue_addr (implies: not using the ABQ API) or num_workers (implies: run locally).
-        #[clap(long, required = false, env("ABQ_API_KEY"))]
-        api_key: Option<ApiKey>,
+        #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
+        access_token: Option<AccessToken>,
 
         /// Address of the queue where the test command will be sent.
         ///
         /// Requires that abq workers be started as seperate processes connected to the queue.
         ///
-        /// Cannot be used with api_key (will fetch address from ABQ API) or num_workers (implies: run locally).
+        /// Cannot be used with access_token (will fetch address from ABQ API) or num_workers (implies: run locally).
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
@@ -221,7 +221,7 @@ pub enum Command {
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
         ///
-        /// If --api-key is specified, the token will be ignored and the token fetched from the ABQ API will be used.
+        /// If --access-token is specified, the token will be ignored and the token fetched from the ABQ API will be used.
         #[clap(long, required = false)]
         token: Option<UserToken>,
 
@@ -230,14 +230,14 @@ pub enum Command {
         ///
         /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
         ///
-        /// If --api-key is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
+        /// If --access-token is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
         #[clap(long)]
         tls_cert: Option<PathBuf>,
 
         /// If running in local mode, and if messages should only be sent with TLS,
         /// the path of the TLS cert to anticipate from the communicating queue.
         ///
-        /// Cannot be used with either `--api-key` or `--queue-addr`, both of which anticipate
+        /// Cannot be used with either `--access-token` or `--queue-addr`, both of which anticipate
         /// running in non-local modes. If provided, must provide `--tls-cert` as well.
         #[clap(long, requires("tls_cert"))]
         tls_key: Option<PathBuf>,
