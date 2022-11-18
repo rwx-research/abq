@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use abq_hosted::ApiKey;
+use abq_hosted::AccessToken;
 use abq_output::format_duration;
 use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
 use abq_utils::{
@@ -222,6 +222,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
     let inferred_run_id = get_inferred_run_id(RunIdEnvironment::from_env());
 
+    // todo: drop me once we've upgraded all of our scripts
+    if let (Ok(access_token), Err(_)) = (
+        std::env::var("ABQ_API_KEY"),
+        std::env::var("RWX_ACCESS_TOKEN"),
+    ) {
+        std::env::set_var("RWX_ACCESS_TOKEN", access_token)
+    };
+
     let Cli { command } = Cli::parse();
 
     let entity = EntityId::new();
@@ -274,7 +282,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         Command::Work {
             working_dir,
             run_id,
-            api_key,
+            access_token,
             queue_addr,
             num,
             token,
@@ -297,12 +305,12 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 token,
                 queue_addr,
                 tls_cert,
-            } = resolve_config(token, queue_addr, tls_cert, api_key, &run_id)?;
+            } = resolve_config(token, queue_addr, tls_cert, access_token, &run_id)?;
 
             let queue_addr = queue_addr.unwrap_or_else(|| {
                 let error = cmd.error(
                     ErrorKind::MissingRequiredArgument,
-                    "One of --api-key <API_KEY> or --queue-addr <QUEUE_ADDR> must be provided.",
+                    "One of --access-token <ACCESS_TOKEN> or --queue-addr <QUEUE_ADDR> must be provided.",
                 );
                 clap::Error::exit(&error);
             });
@@ -331,7 +339,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         Command::Test {
             args,
             run_id,
-            api_key,
+            access_token,
             queue_addr,
             num_workers,
             reporter: reporters,
@@ -348,7 +356,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             // Workers are run in-band only if a queue for `abq test` is not going to be
             // provided from an external source.
             let start_in_process_workers =
-                num_workers.is_some() || (api_key.is_none() && queue_addr.is_none());
+                num_workers.is_some() || (access_token.is_none() && queue_addr.is_none());
 
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
@@ -357,7 +365,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
-            } = resolve_config(token, queue_addr, tls_cert, api_key, &run_id)?;
+            } = resolve_config(token, queue_addr, tls_cert, access_token, &run_id)?;
 
             let client_auth = resolved_token.into();
 
@@ -479,12 +487,12 @@ fn resolve_config(
     token_from_cli: Option<UserToken>,
     queue_addr_from_cli: Option<SocketAddr>,
     tls_cert_from_cli: Option<Vec<u8>>,
-    api_key: Option<ApiKey>,
+    access_token: Option<AccessToken>,
     run_id: &RunId,
 ) -> anyhow::Result<ResolvedConfig> {
-    let (queue_addr_from_api, token_from_api, tls_from_api) = match api_key {
-        Some(key) => {
-            let config = get_config_from_api(key, run_id)?;
+    let (queue_addr_from_api, token_from_api, tls_from_api) = match access_token {
+        Some(access_token) => {
+            let config = get_config_from_api(access_token, run_id)?;
             (
                 Some(config.queue_addr),
                 Some(config.token),
@@ -505,7 +513,7 @@ fn resolve_config(
     })
 }
 
-fn get_config_from_api(api_key: ApiKey, run_id: &RunId) -> anyhow::Result<ConfigFromApi> {
+fn get_config_from_api(access_token: AccessToken, run_id: &RunId) -> anyhow::Result<ConfigFromApi> {
     use abq_hosted::{HostedQueueConfig, DEFAULT_RWX_ABQ_API_URL};
 
     let api_url = std::env::var("ABQ_API").unwrap_or_else(|_| DEFAULT_RWX_ABQ_API_URL.to_string());
@@ -515,7 +523,7 @@ fn get_config_from_api(api_key: ApiKey, run_id: &RunId) -> anyhow::Result<Config
         run_id: _,
         auth_token,
         tls_public_certificate,
-    } = HostedQueueConfig::from_api(api_url, api_key, run_id)?;
+    } = HostedQueueConfig::from_api(api_url, access_token, run_id)?;
 
     Ok(ConfigFromApi {
         queue_addr: addr,

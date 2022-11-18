@@ -1,6 +1,6 @@
-mod api_key;
+mod access_token;
 
-pub use api_key::ApiKey;
+pub use access_token::AccessToken;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -64,7 +64,7 @@ struct HostedQueueResponse {
 }
 
 impl HostedQueueConfig {
-    pub fn from_api<U>(api_url: U, api_key: ApiKey, run_id: &RunId) -> Result<Self, Error>
+    pub fn from_api<U>(api_url: U, access_token: AccessToken, run_id: &RunId) -> Result<Self, Error>
     where
         U: AsRef<str>,
     {
@@ -82,7 +82,7 @@ impl HostedQueueConfig {
         let client = reqwest::blocking::Client::new();
         let request = client
             .get(queue_api)
-            .bearer_auth(api_key)
+            .bearer_auth(access_token)
             .query(&[("run_id", run_id.to_string())]);
         let resp: HostedQueueResponse = send_request_with_decay(request)?
             .error_for_status()?
@@ -209,14 +209,14 @@ mod test {
     use abq_utils::{auth::UserToken, net_protocol::workers::RunId};
     use reqwest::StatusCode;
 
-    use crate::{send_request_with_decay_help, ApiKey};
+    use crate::{send_request_with_decay_help, AccessToken};
 
     use super::{Error, HostedQueueConfig};
 
     use mockito::{mock, Matcher};
 
-    fn test_api_key() -> ApiKey {
-        ApiKey::from_str("abqapi_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
+    fn test_access_token() -> AccessToken {
+        AccessToken::from_str("abqapi_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
     }
 
     fn test_auth_token() -> UserToken {
@@ -239,7 +239,7 @@ mod test {
         let _m = mock("GET", "/queue")
             .match_header(
                 "Authorization",
-                format!("Bearer {}", test_api_key()).as_str(),
+                format!("Bearer {}", test_access_token()).as_str(),
             )
             .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
                 "run_id".to_string(),
@@ -259,7 +259,8 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-        } = HostedQueueConfig::from_api(mockito::server_url(), test_api_key(), &in_run_id).unwrap();
+        } = HostedQueueConfig::from_api(mockito::server_url(), test_access_token(), &in_run_id)
+            .unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
@@ -274,7 +275,7 @@ mod test {
         let _m = mock("GET", "/queue")
             .match_header(
                 "Authorization",
-                format!("Bearer {}", test_api_key()).as_str(),
+                format!("Bearer {}", test_access_token()).as_str(),
             )
             .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
                 "run_id".to_string(),
@@ -293,7 +294,8 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-        } = HostedQueueConfig::from_api(mockito::server_url(), test_api_key(), &in_run_id).unwrap();
+        } = HostedQueueConfig::from_api(mockito::server_url(), test_access_token(), &in_run_id)
+            .unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
@@ -310,7 +312,7 @@ mod test {
 
         let err = HostedQueueConfig::from_api(
             mockito::server_url(),
-            test_api_key(),
+            test_access_token(),
             &RunId("".to_owned()),
         )
         .unwrap_err();
@@ -327,7 +329,7 @@ mod test {
 
         let err = HostedQueueConfig::from_api(
             mockito::server_url(),
-            test_api_key(),
+            test_access_token(),
             &RunId("".to_owned()),
         )
         .unwrap_err();
@@ -342,7 +344,7 @@ mod test {
         let _m = mock("GET", "/queue")
             .match_header(
                 "Authorization",
-                format!("Bearer {}", test_api_key()).as_str(),
+                format!("Bearer {}", test_access_token()).as_str(),
             )
             .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
                 "run_id".to_string(),
@@ -353,8 +355,9 @@ mod test {
             .with_body(r#"{"queue_url":"tcp://168.220.85.45:8080"}"#)
             .create();
 
-        let err = HostedQueueConfig::from_api(mockito::server_url(), test_api_key(), &in_run_id)
-            .unwrap_err();
+        let err =
+            HostedQueueConfig::from_api(mockito::server_url(), test_access_token(), &in_run_id)
+                .unwrap_err();
 
         assert!(matches!(err, Error::SchemaError(..)));
     }
@@ -363,7 +366,7 @@ mod test {
     fn get_hosted_queue_config_bad_api_url() {
         let err = HostedQueueConfig::from_api(
             "definitely not a url",
-            test_api_key(),
+            test_access_token(),
             &RunId("".to_owned()),
         )
         .unwrap_err();
