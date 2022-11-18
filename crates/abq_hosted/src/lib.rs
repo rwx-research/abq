@@ -83,6 +83,7 @@ impl HostedQueueConfig {
         let request = client
             .get(queue_api)
             .bearer_auth(access_token)
+            .header("User-Agent", format!("abq/{}", abq_utils::VERSION))
             .query(&[("run_id", run_id.to_string())]);
         let resp: HostedQueueResponse = send_request_with_decay(request)?
             .error_for_status()?
@@ -241,6 +242,7 @@ mod test {
                 "Authorization",
                 format!("Bearer {}", test_access_token()).as_str(),
             )
+            .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
             .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
                 "run_id".to_string(),
                 in_run_id.to_string(),
@@ -277,6 +279,7 @@ mod test {
                 "Authorization",
                 format!("Bearer {}", test_access_token()).as_str(),
             )
+            .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
             .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
                 "run_id".to_string(),
                 in_run_id.to_string(),
@@ -346,6 +349,7 @@ mod test {
                 "Authorization",
                 format!("Bearer {}", test_access_token()).as_str(),
             )
+            .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
             .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
                 "run_id".to_string(),
                 in_run_id.to_string(),
