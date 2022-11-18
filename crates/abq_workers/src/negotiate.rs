@@ -75,6 +75,7 @@ struct ExecutionContext {
     // capabilities (timeout, retries, etc)?
 }
 
+#[allow(clippy::large_enum_variant)] // I believe we can drop this after we upgrade to rust 1.65.0
 #[derive(Serialize, Deserialize)]
 enum MessageFromQueueNegotiator {
     /// The run a worker set is negotiating for has already completed, and the set should

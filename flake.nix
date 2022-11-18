@@ -28,17 +28,19 @@
         buildInputs = if pkgs.stdenv.isDarwin then [ pkgs.libiconv pkgs.darwin.apple_sdk.frameworks.Security ] else [ ];
         nativeBuildInputs = [ pkgs.git ];
 
-        abq = craneLib.buildPackage
-          {
-            cargoToml = ./crates/abq_cli/Cargo.toml;
-            src = nixpkgs.lib.cleanSourceWith {
-              src = ./.;
-              filter = certOrCargo;
+        abq =
+          craneLib.buildPackage
+            {
+              cargoToml = ./crates/abq_cli/Cargo.toml;
+              src = nixpkgs.lib.cleanSourceWith {
+                src = ./.;
+                filter = certOrCargo;
+              };
+              buildInputs = buildInputs;
+              nativeBuildInputs = nativeBuildInputs;
+              doCheck = false;
+              NIX_ABQ_VERSION = "0.${self.lastModifiedDate}.0+g${self.shortRev or "dirty"}";
             };
-            buildInputs = buildInputs;
-            nativeBuildInputs = nativeBuildInputs;
-            doCheck = false;
-          };
       in
       {
         checks = {

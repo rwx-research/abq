@@ -156,8 +156,9 @@ impl<T> BatchedConsumer<T> {
         let mut refill_at = 0;
         let mut processed = 0;
         loop {
-            let Some(msg) = self.msg_rx.recv().await else {
-                return Ok(()); // all done
+            let msg = match self.msg_rx.recv().await {
+                Some(msg) => msg,
+                None => return Ok(()), // all done
             };
 
             let msg = match msg {
