@@ -48,9 +48,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-#{{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-#{{ hashFiles('rust-toolchain.toml')}}-
+            cargo-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.64.0
         with:
@@ -98,7 +98,7 @@ jobs:
       # End setup testdata
 
       - name: Run tests with cargo
-        timeout-minutes: 2
+        timeout-minutes: 10
         if: github.run_attempt == 1
         run: |
           cargo test --all-features

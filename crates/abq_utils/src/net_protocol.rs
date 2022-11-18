@@ -301,6 +301,15 @@ pub mod workers {
         EndOfWork,
     }
 
+    impl NextWork {
+        pub fn into_test(self) -> Option<WorkerTest> {
+            match self {
+                NextWork::Work(test) => Some(test),
+                NextWork::EndOfWork => None,
+            }
+        }
+    }
+
     /// A bundle of work sent to a worker to be run in sequence.
     #[derive(Serialize, Deserialize, Debug)]
     pub struct NextWorkBundle(pub Vec<NextWork>);

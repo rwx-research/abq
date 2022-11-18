@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use message_buffer::{Completed, RefillStrategy};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, Command};
 
@@ -380,64 +381,98 @@ where
     let results_batch_size = results_batch_size as usize;
     let mut pending_test_results = Vec::with_capacity(results_batch_size);
 
-    // We establish one connection with the native runner and repeatedly send tests until we're
-    // done.
-    'test_all: loop {
-        let NextWorkBundle(test_bundle) = get_next_test_bundle().await;
-        let mut test_iter = test_bundle.into_iter();
-        while let Some(next_test) = test_iter.next() {
-            match next_test {
-                NextWork::EndOfWork => {
-                    drop(runner_conn);
-                    break 'test_all;
-                }
-                NextWork::Work(WorkerTest {
-                    test_case,
-                    context: _,
-                    run_id: _,
+    // Assume that the size of the test batches we'll receive from the queue are
+    // roughly the same size as the size of the batches of test results we send back.
+    //
+    // Note that this assumption may change over time, and we may want to tune this figure.
+    // While we likely don't gain much from using a channel of unbounded size, it's important to
+    // take care that we refill the channel at a frequency that avoids blocking execution on the
+    // native test runner.
+    let (tests_tx, mut tests_rx) =
+        message_buffer::channel(results_batch_size, RefillStrategy::HalfConsumed);
+
+    let fetch_tests_task = {
+        let fetch_next_bundle = || async {
+            let NextWorkBundle(bundle) = get_next_test_bundle().await;
+
+            let recv_size = bundle.len();
+
+            // NB: we can get rid of this allocation by returning the filter directly, and a word
+            // for the length of the list after filtering. The allocation doesn't matter though.
+            let filtered_bundle: Vec<_> = bundle
+                .into_iter()
+                .filter_map(|test| test.into_test())
+                .collect();
+
+            // Completed if the bundle contained `EndOfWork` markers, or if there were no tests to
+            // begin with!
+            let completed = filtered_bundle.len() < recv_size || filtered_bundle.is_empty();
+
+            (filtered_bundle, Completed(completed))
+        };
+
+        tests_tx.start(fetch_next_bundle)
+    };
+
+    let run_tests_task = async {
+        while let Some(WorkerTest {
+            test_case,
+            context: _,
+            run_id: _,
+            work_id,
+        }) = tests_rx.recv().await
+        {
+            let estimated_start = Instant::now();
+
+            let handled_test = handle_one_test(
+                &mut runner_conn,
+                work_id,
+                test_case,
+                &mut pending_test_results,
+            )
+            .await?;
+
+            let estimated_runtime = estimated_start.elapsed();
+
+            if let Err((work_id, native_error)) = handled_test {
+                let remaining_tests = tests_rx.flush().await;
+
+                handle_native_runner_failure(
+                    worker_entity,
+                    send_test_results,
+                    &native_runner,
+                    native_runner_handle,
+                    estimated_runtime,
                     work_id,
-                }) => {
-                    let estimated_start = Instant::now();
+                    remaining_tests,
+                );
 
-                    let handled_test = handle_one_test(
-                        &mut runner_conn,
-                        work_id,
-                        test_case,
-                        &mut pending_test_results,
-                    )
-                    .await?;
+                return Err(native_error.into());
+            }
 
-                    let estimated_runtime = estimated_start.elapsed();
+            if pending_test_results.len() >= results_batch_size as _ {
+                let results = std::mem::take(&mut pending_test_results);
+                pending_test_results.reserve(results_batch_size as _);
 
-                    if let Err((work_id, native_error)) = handled_test {
-                        handle_native_runner_failure(
-                            worker_entity,
-                            send_test_results,
-                            &native_runner,
-                            native_runner_handle,
-                            estimated_runtime,
-                            work_id,
-                            test_iter,
-                        );
-                        return Err(native_error.into());
-                    }
-
-                    if pending_test_results.len() >= results_batch_size as _ {
-                        let results = std::mem::take(&mut pending_test_results);
-                        pending_test_results.reserve(results_batch_size as _);
-                        send_test_results(results).await;
-                    }
-                }
+                // TODO: reactive loop for sending test results
+                send_test_results(results).await;
             }
         }
-    }
 
-    if !pending_test_results.is_empty() {
-        send_test_results(pending_test_results).await;
-    }
+        if !pending_test_results.is_empty() {
+            send_test_results(pending_test_results).await;
+        }
 
-    drop(our_listener);
-    native_runner_handle.wait().await?;
+        drop(runner_conn);
+        drop(our_listener);
+        native_runner_handle.wait().await?;
+
+        Result::<(), GenericRunnerError>::Ok(())
+    };
+
+    let ((), run_tests_result) = tokio::join!(fetch_tests_task, run_tests_task);
+
+    run_tests_result?;
 
     Ok(())
 }
@@ -512,7 +547,7 @@ fn handle_native_runner_failure<I>(
     failed_on: WorkId,
     remaining_work: I,
 ) where
-    I: IntoIterator<Item = NextWork>,
+    I: IntoIterator<Item = WorkerTest>,
 {
     // Our connection with the native test runner failed, for some
     // reason. Consider this a fatal error, and report internal errors
@@ -526,10 +561,7 @@ fn handle_native_runner_failure<I>(
 
     let remaining_work = Some(failed_on)
         .into_iter()
-        .chain(remaining_work.into_iter().filter_map(|w| match w {
-            NextWork::Work(WorkerTest { work_id, .. }) => Some(work_id),
-            NextWork::EndOfWork => None,
-        }));
+        .chain(remaining_work.into_iter().map(|test| test.work_id));
 
     let formatted_cmd = args.join(" ");
 
