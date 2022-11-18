@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use buffered_results::BufferedResults;
 use message_buffer::{Completed, RefillStrategy};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, Command};
@@ -26,8 +27,10 @@ use futures::future::{self, BoxFuture};
 use futures::{Future, FutureExt};
 use indoc::indoc;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tracing::instrument;
 
+mod buffered_results;
 mod message_buffer;
 
 pub struct GenericTestRunner;
@@ -241,6 +244,8 @@ impl GenericTestRunner {
     }
 }
 
+type ResultsSender = mpsc::Sender<AssociatedTestResult>;
+
 async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     worker_entity: EntityId,
     input: NativeTestRunnerParams,
@@ -379,7 +384,6 @@ where
     }
 
     let results_batch_size = results_batch_size as usize;
-    let mut pending_test_results = Vec::with_capacity(results_batch_size);
 
     // Assume that the size of the test batches we'll receive from the queue are
     // roughly the same size as the size of the batches of test results we send back.
@@ -414,6 +418,18 @@ where
         tests_tx.start(fetch_next_bundle)
     };
 
+    let (results_tx, mut results_rx) = mpsc::channel(results_batch_size * 2);
+
+    let send_results_task = async {
+        let mut pending_results = BufferedResults::new(results_batch_size, send_test_results);
+
+        while let Some(test_result) = results_rx.recv().await {
+            pending_results.push(test_result).await;
+        }
+
+        pending_results.flush().await;
+    };
+
     let run_tests_task = async {
         while let Some(WorkerTest {
             test_case,
@@ -424,13 +440,8 @@ where
         {
             let estimated_start = Instant::now();
 
-            let handled_test = handle_one_test(
-                &mut runner_conn,
-                work_id,
-                test_case,
-                &mut pending_test_results,
-            )
-            .await?;
+            let handled_test =
+                handle_one_test(&mut runner_conn, work_id, test_case, &results_tx).await?;
 
             let estimated_runtime = estimated_start.elapsed();
 
@@ -449,20 +460,9 @@ where
 
                 return Err(native_error.into());
             }
-
-            if pending_test_results.len() >= results_batch_size as _ {
-                let results = std::mem::take(&mut pending_test_results);
-                pending_test_results.reserve(results_batch_size as _);
-
-                // TODO: reactive loop for sending test results
-                send_test_results(results).await;
-            }
         }
 
-        if !pending_test_results.is_empty() {
-            send_test_results(pending_test_results).await;
-        }
-
+        drop(results_tx);
         drop(runner_conn);
         drop(our_listener);
         native_runner_handle.wait().await?;
@@ -470,7 +470,8 @@ where
         Result::<(), GenericRunnerError>::Ok(())
     };
 
-    let ((), run_tests_result) = tokio::join!(fetch_tests_task, run_tests_task);
+    let ((), run_tests_result, ()) =
+        tokio::join!(fetch_tests_task, run_tests_task, send_results_task);
 
     run_tests_result?;
 
@@ -487,7 +488,7 @@ async fn handle_one_test(
     runner_conn: &mut RunnerConnection,
     work_id: WorkId,
     test_case: TestCase,
-    pending_test_results: &mut Vec<AssociatedTestResult>,
+    results_chan: &ResultsSender,
 ) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError> {
     let test_case_message = TestCaseMessage { test_case };
 
@@ -500,7 +501,16 @@ async fn handle_one_test(
 
     match opt_test_result_cycle {
         Ok(TestResultMessage { test_result }) => {
-            pending_test_results.push((work_id, test_result));
+            let send_to_chan_result = results_chan.send((work_id, test_result)).await;
+
+            if let Err(se) = send_to_chan_result {
+                let (work_id, _) = se.0;
+                tracing::error!(?work_id, "results channel closed prematurely");
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "results channel closed prematurely, likely do to a previous failure to send test results across a network"
+                ).into());
+            }
 
             Ok(Ok(()))
         }
