@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "abq"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "abq_hosted",
  "abq_junit_xml",

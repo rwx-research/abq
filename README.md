@@ -8,7 +8,7 @@ when you run `cargo` in this project.
 Then install cargo-insta for testing
 
 ```
-$ cargo install cargo-insta
+cargo install cargo-insta
 ```
 
 For development in an editor, you'll likely want a version of
@@ -25,3 +25,13 @@ Tips:
   ```json
   "rust-analyzer.checkOnSave.extraArgs": ["--target-dir", "/tmp/rust-analyzer-check"],
   ```
+
+## Releasing a new version
+
+(TODO: automate me)
+
+1. create a new branch
+2. bump the version in crates/abq_cli/Cargo.toml
+3. run `cargo b` to update lockfiles
+4. merge the branch
+5. push a signed tag against the merge commit in master, e.g. `git tag v1.2.3 -s -m "version message"`

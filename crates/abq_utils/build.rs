@@ -1,26 +1,34 @@
 use std::{env, fs, path::Path, process::Command};
 
 fn version_from_git() -> String {
-    let version_output = Command::new("git")
-        .args(["describe", "--dirty"])
-        .output()
-        .unwrap();
+    let version_output = Command::new("git").args(["describe"]).output().unwrap();
 
     let git_described = String::from_utf8(version_output.stdout).unwrap();
+
+    // ensure git describe output is valid
+    assert!(
+        git_described.starts_with("v1"),
+        "tag ({}) should start with v1",
+        git_described.trim()
+    );
 
     // `describe` gives us `tag-revisions since-sha short`
     // Since right now `tag=init`, the initial commit,
     // transform this into `tag.revisions since.0+sha short`
     //
-    // E.g. init-182-ga7a3202 => 0.182.0+ga7a3202
+    // E.g. v1.0.0-1-gb0e5ce5
     //
-    // Panic so that once we have named versions, we know to generate proper names here.
-    let mut parts = git_described.splitn(3, '-');
-    assert_eq!(parts.next().unwrap(), "init", "{git_described}");
-    let commits_since = parts.next().unwrap();
-    let short_sha = parts.next().unwrap();
+    let mut parts = git_described[1..].splitn(4, '-');
+    let latest_version_tag = parts.next().unwrap();
 
-    format!("0.{commits_since}.0+{short_sha}")
+    // there is no describe additional when the current ref is tagged
+    match (parts.next(), parts.next()) {
+        (Some(commits_since), Some(short_sha)) => {
+            // FYI short_sha is prefixed with g
+            format!("{}-{}-{}", latest_version_tag, commits_since, short_sha)
+        }
+        _ => latest_version_tag.to_string(),
+    }
 }
 
 /// Writes the currently-build ABQ version to $OUT_DIR/abq_version.txt

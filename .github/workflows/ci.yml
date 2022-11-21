@@ -14,8 +14,6 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
-        with:
-          fetch-depth: 0 # get whole history for versioning
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.64.0
@@ -31,11 +29,17 @@ jobs:
   test:
     name: Lint, test
     runs-on: ubuntu-latest
+    outputs:
+      abq_version: ${{ steps.abq_version.outputs.abq_version }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
         with:
           fetch-depth: 0 # get whole history for versioning
+
+      # this may not be unecessary when https://github.com/actions/checkout/issues/882 is resolved
+      - name: re-fetch overwritten tag
+        run: git fetch --tags --force
 
       - name: Restore cargo cache
         uses: actions/cache@v3
@@ -114,156 +118,17 @@ jobs:
         env:
           CI: false
 
-  nightly-release:
-    name: Release nightlies
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        include:
-          - os: ubuntu-latest
-            platform: linux_x86-64
-            container: quay.io/pypa/manylinux2014_x86_64
-    runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
-    outputs:
-      abq_version: ${{ steps.abq_version.outputs.abq_version }}
-    if: github.ref == 'refs/heads/main'
-    needs: test
-    env:
-      AWS_DEFAULT_REGION: us-east-2
-      AWS_DEFAULT_OUTPUT: json
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0 # get whole history for versioning
-
-      - name: Mark safe directory
-        run: |
-          # For some reason we need this, even though actions/checkout sets
-          # safe.directory by default?
-          # Perhaps it is because we work in a container?
-          git config --global --add safe.directory $PWD
-          git describe
-
-      - name: Restore cargo cache
-        uses: actions/cache@v3.0.11
-        env:
-          cache-name: ci
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: cargo-#{{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-#{{ hashFiles('rust-toolchain.toml')}}-
-      - name: Install Rust toolchain
-        uses: rwx-research/rust-toolchain@abq
-        with:
-          toolchain: stable
-
-      - name: Install build + deploy deps
-        run: |
-          yum install sudo jq -y
-
-      - name: Build release
-        run: cargo build --release
-
-      - name: Install aws CLI
-        run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
-          sudo ./aws/install
-
-      - name: Prepare release environment
-        run: |
-          ABQ_VERSION="$(cat build_artifact/abq_version.txt)"
-          RELEASE_NAME="abq_${ABQ_VERSION}_${{ matrix.platform }}"
-          RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
-          RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
-          echo "ABQ_VERSION=$ABQ_VERSION" >> $GITHUB_ENV
-          echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
-          echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE" >> $GITHUB_ENV
-          echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT" >> $GITHUB_ENV
-
-      - name: Prepare release
-        run: |
-          mkdir "${RELEASE_NAME}"
-          cp target/release/abq "${RELEASE_NAME}"
-          tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
-
-      - name: Push nightly release to development S3
-        env:
-          RELEASE_BUCKET: abq-releases-development
-        run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_ACCESS_KEY_ID }} --profile development
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_SECRET_ACCESS_KEY }} --profile development
-
-          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile development
-          aws s3api put-object-tagging \
-            --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_S3_OBJECT" \
-            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
-            --profile development
-
-          aws s3 cp \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
-            --profile development
-
-      - name: Push nightly release to staging S3
-        env:
-          RELEASE_BUCKET: abq-releases-staging
-        run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
-
-          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile staging
-          aws s3api put-object-tagging \
-            --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_S3_OBJECT" \
-            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
-            --profile staging
-
-          aws s3 cp \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
-            --profile staging
-      - name: Push nightly release to production S3
-        env:
-          RELEASE_BUCKET: abq-releases
-        run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID }} --profile production
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY }} --profile production
-
-          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile production
-          aws s3api put-object-tagging \
-            --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_S3_OBJECT" \
-            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
-            --profile production
-
-          aws s3 cp \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
-            --profile production
       - name: export abq version
         id: abq_version
         run: |
           echo "abq_version=$ABQ_VERSION" >> $GITHUB_OUTPUT
-  notify-api:
+
+  release_unstable:
     name: Release new abq to API
-    needs: nightly-release
-    uses: ./.github/workflows/release.yml
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/build_and_upload.yml
     with:
-      version: ${{ needs.nightly-release.outputs.abq_version }}
-      release_channel: latest
-    secrets:
-      RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN: ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}
-      RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN: ${{ secrets.RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN }}
-
-
-  # for manual release on the v1 release channel
+      ref: ${{ github.ref }}
+      release_channel: (contains(needs.test.outputs.abq_version, '-') && "latest") || "v1"
+    secrets: inherit
