@@ -130,5 +130,5 @@ jobs:
     uses: ./.github/workflows/build_and_upload.yml
     with:
       ref: ${{ github.ref }}
-      release_channel: (contains(needs.test.outputs.abq_version, '-') && "latest") || "v1"
+      release_channel: latest
     secrets: inherit
