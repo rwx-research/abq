@@ -1,6 +1,21 @@
 name: register ABQ version with api
 
 on:
+  # for manual release
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release'
+        required: true
+        type: string
+      release_channel:
+        description: 'release channel'
+        required: true
+        type: choice
+        options:
+          - "v1"
+          - "latest"
+
   # for automatic release from main on the latest release channel
   workflow_call:
     inputs:
