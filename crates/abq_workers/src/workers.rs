@@ -1,3 +1,4 @@
+use std::io;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicUsize};
@@ -145,6 +146,7 @@ impl LiveWorkers {
     }
 }
 
+#[derive(PartialEq, Eq, Debug)]
 pub enum WorkersExit {
     /// This pool of workers was determined to complete successfully.
     /// Corresponds to all workers for a given [run][RunId] having only work that was
@@ -345,8 +347,7 @@ impl ThreadWorker {
                 start_generic_test_runner(worker_env, params)
             }
             RunnerKind::TestLikeRunner(runner, manifest) => {
-                start_test_like_runner(worker_env, runner, manifest);
-                Ok(())
+                start_test_like_runner(worker_env, runner, manifest)
             }
         });
 
@@ -427,7 +428,11 @@ fn start_generic_test_runner(
     opt_runner_err
 }
 
-fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: ManifestMessage) {
+fn start_test_like_runner(
+    env: WorkerEnv,
+    runner: TestLikeRunner,
+    manifest: ManifestMessage,
+) -> Result<(), GenericRunnerError> {
     let WorkerEnv {
         msg_from_pool_rx,
         get_next_work_bundle: get_next_work,
@@ -445,13 +450,17 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
 
     let entity = EntityId::new();
 
+    if matches!(runner, TestLikeRunner::NeverReturnManifest) {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "will not return manifest").into());
+    }
+
     if let Some(notify_manifest) = notify_manifest {
         notify_manifest(entity, &run_id, ManifestResult::Manifest(manifest));
     }
 
     let init_context = match get_init_context() {
         Ok(ctx) => ctx,
-        Err(RunAlreadyCompleted {}) => return,
+        Err(RunAlreadyCompleted {}) => return Ok(()),
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -465,6 +474,11 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
 
         let bundle = match parent_message {
             Ok(MessageFromPool::Shutdown) => {
+                if matches!(&runner, TestLikeRunner::NeverReturnOnTest(..)) {
+                    return Err(
+                        io::Error::new(io::ErrorKind::Unsupported, "will not return test").into(),
+                    );
+                }
                 break;
             }
             Err(mpsc::TryRecvError::Disconnected) => panic!("Pool died before worker did"),
@@ -490,6 +504,15 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
                     run_id,
                     work_id,
                 }) => {
+                    if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == &test_case.id )
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "will not return test",
+                        )
+                        .into());
+                    }
+
                     // Try the test_id once + how ever many retries were requested.
                     let allowed_attempts = 1 + work_retries;
                     'attempts: for attempt_number in 1.. {
@@ -535,7 +558,9 @@ fn start_test_like_runner(env: WorkerEnv, runner: TestLikeRunner, manifest: Mani
         }
     }
 
-    mark_worker_complete()
+    mark_worker_complete();
+
+    Ok(())
 }
 
 #[inline(always)]
@@ -583,6 +608,8 @@ fn attempt_test_id_for_test_like_runner(
                         "PASS".to_string()
                     }
                 }
+                (R::NeverReturnManifest, _) => unreachable!(),
+                (R::NeverReturnOnTest(..), _) => unreachable!(),
                 #[cfg(feature = "test-test_ids")]
                 (R::EchoOnRetry(succeed_on), s) => {
                     if succeed_on == _attempt {

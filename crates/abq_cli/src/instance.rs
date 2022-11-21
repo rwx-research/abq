@@ -1,3 +1,4 @@
+use abq_queue::timeout::RunTimeoutStrategy;
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
@@ -38,6 +39,7 @@ pub fn start_abq_forever(
         work_port,
         negotiator_port,
         server_options,
+        timeout_strategy: RunTimeoutStrategy::RunBased,
     };
     let mut abq = Abq::start(queue_config);
 

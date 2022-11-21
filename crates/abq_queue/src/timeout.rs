@@ -11,11 +11,10 @@ use std::future::Future;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum RunTimeoutStrategy {
+pub enum RunTimeoutStrategy {
     /// Determine the timeout from the parameters of a test run.
     RunBased,
     /// Constant timeout, for use in testing.
-    #[cfg(test)]
     Constant(Duration),
 }
 
@@ -34,7 +33,6 @@ impl RunTimeoutStrategy {
                 // TODO: eventually get this from the run data
                 Self::DEFAULT_TIMEOUT
             }
-            #[cfg(test)]
             RunTimeoutStrategy::Constant(timeout) => *timeout,
         }
     }
