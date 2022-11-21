@@ -86,6 +86,10 @@ pub async fn open_native_runner_connection(
         opt_conn = listener.accept() => {
             let (mut conn, _) = opt_conn?;
 
+            // Messages sent/received from the runner should be done so ASAP. Since we're on a
+            // local network, we don't care about packet reduction here.
+            conn.set_nodelay(true)?;
+
             let version_message: AbqProtocolVersionMessage =
                 net_protocol::async_read(&mut conn).await?;
 
