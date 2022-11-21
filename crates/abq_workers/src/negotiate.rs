@@ -20,8 +20,7 @@ use crate::workers::{
 };
 use abq_utils::{
     auth::User,
-    net::{self, ConfiguredClient},
-    net_async,
+    net, net_async,
     net_opt::ClientOptions,
     net_protocol::{
         self,
@@ -166,11 +165,34 @@ impl WorkersNegotiator {
         client_options: ClientOptions<User>,
         wanted_run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(Self::negotiate_and_start_pool_on_executor(
+            workers_config,
+            queue_negotiator_handle,
+            client_options,
+            wanted_run_id,
+        ))
+    }
+
+    #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, client_options), fields(
+        num_workers = workers_config.num_workers
+    ))]
+    pub async fn negotiate_and_start_pool_on_executor(
+        workers_config: WorkersConfig,
+        queue_negotiator_handle: QueueNegotiatorHandle,
+        client_options: ClientOptions<User>,
+        wanted_run_id: RunId,
+    ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         let client = client_options.clone().build()?;
         let async_client = client_options.build_async()?;
 
         let execution_decision =
-            wait_for_execution_context(&*client, &wanted_run_id, queue_negotiator_handle.0)?;
+            wait_for_execution_context(&*async_client, &wanted_run_id, queue_negotiator_handle.0)
+                .await?;
 
         let ExecutionContext {
             run_id,
@@ -362,40 +384,37 @@ impl WorkersNegotiator {
 /// Turns Ok(Err(redundant)) if this set of workers would be redundant, and
 /// Ok(Ok(context)) if instead the set of workers should start with the given context.
 #[instrument(level = "debug", skip(client))]
-fn wait_for_execution_context(
-    client: &dyn ConfiguredClient,
+async fn wait_for_execution_context(
+    client: &dyn net_async::ConfiguredClient,
     wanted_run_id: &RunId,
     queue_negotiator_addr: SocketAddr,
 ) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
-    use WorkersNegotiateError::*;
-
     let mut decay = Duration::from_millis(10);
     let max_decay = Duration::from_secs(3);
     loop {
-        let mut conn = client.connect(queue_negotiator_addr)?;
+        let mut conn = client.connect(queue_negotiator_addr).await?;
         let wants_to_attach = MessageToQueueNegotiator::WantsToAttach {
             run: wanted_run_id.clone(),
         };
-        net_protocol::write(&mut conn, wants_to_attach)?;
+        net_protocol::async_write(&mut conn, &wants_to_attach).await?;
 
-        let worker_set_decision =
-            match net_protocol::read(&mut conn).map_err(|_| BadQueueMessage)? {
-                MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
-                MessageFromQueueNegotiator::RunAlreadyCompleted { success } => {
-                    Err(NegotiatedWorkers::Redundant { success })
+        let worker_set_decision = match net_protocol::async_read(&mut conn).await? {
+            MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
+            MessageFromQueueNegotiator::RunAlreadyCompleted { success } => {
+                Err(NegotiatedWorkers::Redundant { success })
+            }
+            MessageFromQueueNegotiator::RunUnknown => {
+                // We are still waiting for this run, sleep on the decay and retry.
+                // TODO: timeout if we go too long without finding the run or its execution context.
+                tokio::time::sleep(decay).await;
+                decay *= 2;
+                if decay >= max_decay {
+                    tracing::info!("hit max decay limit for requesting initialization context");
+                    decay = max_decay;
                 }
-                MessageFromQueueNegotiator::RunUnknown => {
-                    // We are still waiting for this run, sleep on the decay and retry.
-                    // TODO: timeout if we go too long without finding the run or its execution context.
-                    thread::sleep(decay);
-                    decay *= 2;
-                    if decay >= max_decay {
-                        tracing::info!("hit max decay limit for requesting initialization context");
-                        decay = max_decay;
-                    }
-                    continue;
-                }
-            };
+                continue;
+            }
+        };
 
         return Ok(worker_set_decision);
     }

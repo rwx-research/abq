@@ -2,7 +2,7 @@
 
 pub mod invoke;
 pub mod queue;
-mod timeout;
+pub mod timeout;
 
 #[cfg(test)]
 abq_workers::test_support!();

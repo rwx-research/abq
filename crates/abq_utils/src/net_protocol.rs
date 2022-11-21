@@ -244,7 +244,7 @@ pub mod workers {
     #[derive(Serialize, Deserialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
     pub struct WorkId(pub String);
 
-    /// Runners mostly used for testing.
+    /// Runners used only for integration testing.
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum TestLikeRunner {
         /// A worker that echos strings given to it.
@@ -257,6 +257,10 @@ pub mod workers {
         InduceTimeout,
         /// A worker that fails with "INDUCED FAIL" if given a test with the given name.
         FailOnTestName(String),
+        /// A worker that errors before generating a manifest.
+        NeverReturnManifest,
+        /// A worker that errors when a test of a name is received, never returning a result.
+        NeverReturnOnTest(String),
         /// A worker that echos a string given to it after a number of retries.
         #[cfg(feature = "test-actions")]
         EchoOnRetry(u8),

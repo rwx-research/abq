@@ -88,6 +88,13 @@ impl RunCancellationTx {
             .blocking_send(())
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "failed to send cancellation"))
     }
+
+    pub async fn send(&self) -> io::Result<()> {
+        self.0
+            .send(())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "failed to send cancellation"))
+    }
 }
 
 impl RunCancellationRx {
