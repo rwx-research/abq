@@ -139,5 +139,5 @@ jobs:
     uses: ./.github/workflows/build_and_upload.yml
     with:
       ref: ${{ github.ref }}
-      release_channel: latest
+      release_channel: unstable
     secrets: inherit

@@ -14,9 +14,9 @@ on:
         type: choice
         options:
         - "v1"
-        - "latest"
+        - "unstable"
 
-  # for automatic release from main on the latest release channel
+  # for automatic release from main on the unstable release channel
   workflow_call:
     inputs:
       ref:
@@ -130,7 +130,7 @@ jobs:
           cp target/release/abq "${RELEASE_NAME}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
 
-      - name: Push latest release to development S3
+      - name: Push release to development S3
         env:
           RELEASE_BUCKET: abq-releases-development
         run: |
@@ -149,7 +149,7 @@ jobs:
             "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
             --profile development
 
-      - name: Push latest release to staging S3
+      - name: Push release to staging S3
         env:
           RELEASE_BUCKET: abq-releases-staging
         run: |
@@ -167,7 +167,7 @@ jobs:
             "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
             "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
             --profile staging
-      - name: Push latest release to production S3
+      - name: Push release to production S3
         env:
           RELEASE_BUCKET: abq-releases
         run: |
