@@ -1,0 +1,31 @@
+name: register ABQ version with staging API
+
+on:
+  # for automatic release from main on the latest release channel
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to release'
+        required: true
+        type: string
+      release_channel:
+        description: 'release channel'
+        required: false
+        default: ''
+        type: string
+    secrets:
+      RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
+        required: true
+
+jobs:
+  release:
+    name: Release ABQ
+    runs-on: ubuntu-latest
+    steps:
+      - name: Register new release abq api
+        run: |
+          curl -X "POST" "https://staging.abq.build/api/releases" \
+          -H 'Authorization: Bearer ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}' \
+          -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+          --data-urlencode "version=${{inputs.version}}" \
+          `if [ ! -z "${{inputs.release_channel}}" ]; then echo "--data-urlencode 'release_channel=${{inputs.release_channel}}'"; fi`
