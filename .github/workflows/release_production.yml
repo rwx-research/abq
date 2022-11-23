@@ -14,9 +14,9 @@ on:
         type: choice
         options:
           - "v1"
-          - "latest"
+          - "unstable"
 
-  # for automatic release from main on the latest release channel
+  # for automatic release from main on the unstable release channel
   workflow_call:
     inputs:
       version:

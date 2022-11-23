@@ -100,7 +100,7 @@ jobs:
           cp target/release/abq "${RELEASE_NAME}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
 
-      - name: Push latest release to staging S3
+      - name: Push release to staging S3
         env:
           RELEASE_BUCKET: abq-releases-staging
         run: |
