@@ -1,4 +1,4 @@
-name: register ABQ version with api
+name: register ABQ version with staging API
 
 on:
   # for manual release
@@ -28,27 +28,18 @@ on:
         required: true
         type: string
     secrets:
-      RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
-        required: true
       RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
 
 jobs:
   release:
     name: Release ABQ
-    strategy:
-      matrix:
-        include:
-          - api_host: abq.build
-            access_token_name: RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN
-          - api_host: staging.abq.build
-            access_token_name: RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN
     runs-on: ubuntu-latest
     steps:
       - name: Register new release abq api
         run: |
-          curl -X "POST" "https://${{matrix.api_host}}/api/releases" \
-          -H 'Authorization: Bearer ${{ secrets[matrix.access_token_name] }}' \
+          curl -X "POST" "https://abq.build/api/releases" \
+          -H 'Authorization: Bearer ${{ secrets.RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN }}' \
           -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
           --data-urlencode "version=${{inputs.version}}" \
           --data-urlencode "release_channel=${{inputs.release_channel}}"

@@ -1,5 +1,7 @@
 use std::{env, fs, path::Path, process::Command};
 
+const ABQ_DEVELOPMENT_BUILD: &str = "ABQ_DEVELOPMENT_BUILD";
+
 fn version_from_git() -> String {
     let version_output = Command::new("git").args(["describe"]).output().unwrap();
 
@@ -21,11 +23,22 @@ fn version_from_git() -> String {
     let mut parts = git_described[1..].splitn(4, '-');
     let latest_version_tag = parts.next().unwrap();
 
+    let extra_suffix = match std::env::var(ABQ_DEVELOPMENT_BUILD).as_deref() {
+        Ok("1") => "-devel",
+        _ => "",
+    };
+
     // there is no describe additional when the current ref is tagged
     match (parts.next(), parts.next()) {
         (Some(commits_since), Some(short_sha)) => {
             // FYI short_sha is prefixed with g
-            format!("{}-{}-{}", latest_version_tag, commits_since, short_sha)
+            format!(
+                "{}-{}-{}{}",
+                latest_version_tag.trim(),
+                commits_since.trim(),
+                short_sha.trim(),
+                extra_suffix
+            )
         }
         _ => latest_version_tag.to_string(),
     }
@@ -34,6 +47,7 @@ fn version_from_git() -> String {
 /// Writes the currently-build ABQ version to $OUT_DIR/abq_version.txt
 fn write_abq_version() {
     println!("cargo:rerun-if-changed=../../build_artifact");
+    println!("cargo:rerun-if-env-changed=ABQ_DEVELOPMENT_BUILD");
 
     let version = env::var("NIX_ABQ_VERSION").unwrap_or_else(|_| version_from_git());
 

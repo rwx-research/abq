@@ -29,8 +29,6 @@ jobs:
   test:
     name: Lint, test
     runs-on: ubuntu-latest
-    outputs:
-      abq_version: ${{ steps.abq_version.outputs.abq_version }}
     steps:
       - name: Checkout sources
         uses: actions/checkout@v3
@@ -118,10 +116,21 @@ jobs:
         env:
           CI: false
 
-      - name: export abq version
-        id: abq_version
-        run: |
-          echo "abq_version=$ABQ_VERSION" >> $GITHUB_OUTPUT
+  release_development:
+    name: Release new abq to staging API for testing
+    needs: test
+    if: github.ref != 'refs/heads/main'
+    uses: ./.github/workflows/build_and_upload_development.yml
+    with:
+      ref: ${{ github.ref }}
+    secrets: inherit
+
+  extended_testing:
+    needs: release_development
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo abq version
+        run: echo ${{ needs.release_development.outputs.abq_version }}
 
   release_unstable:
     name: Release new abq to API
