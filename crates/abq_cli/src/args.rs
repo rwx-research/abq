@@ -271,7 +271,7 @@ pub enum Command {
         result_timeout_seconds: NonZeroU64,
 
         /// Arguments to the test executable.
-        #[clap(required = true, num_args=1.., allow_hyphen_values = true)]
+        #[clap(required = true, num_args = 1.., allow_hyphen_values = true, last = true)]
         args: Vec<String>,
     },
     /// Checks the health of an abq instance.
