@@ -14,7 +14,8 @@ use tokio::process::{self, Command};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersionMessage, InitSuccessMessage, ManifestMessage, ManifestResult, Status,
+    AbqNativeRunnerSpawnedMessage, AbqNativeRunnerSpawnedMessageCompat,
+    AbqNativeRunnerSpecification, InitSuccessMessage, ManifestMessage, ManifestResult, Status,
     TestCase, TestCaseMessage, TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
     ACTIVE_PROTOCOL_VERSION_MAJOR, ACTIVE_PROTOCOL_VERSION_MINOR,
 };
@@ -64,16 +65,9 @@ pub async fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
     native_runner_died: impl Future<Output = ()>,
-) -> Result<RunnerConnection, ProtocolVersionMessageError> {
+) -> Result<(Option<AbqNativeRunnerSpecification>, RunnerConnection), ProtocolVersionMessageError> {
     let start = Instant::now();
-    let (
-        AbqProtocolVersionMessage {
-            r#type: _,
-            major,
-            minor,
-        },
-        runner_conn,
-    ) = tokio::select! {
+    let (spawn_message, runner_conn) = tokio::select! {
         _ = tokio::time::sleep(timeout) => {
             tracing::error!(?timeout, elapsed=?start.elapsed(), "timeout");
             return Err(ProtocolVersionError::Timeout.into());
@@ -90,17 +84,29 @@ pub async fn open_native_runner_connection(
             // local network, we don't care about packet reduction here.
             conn.set_nodelay(true)?;
 
-            let version_message: AbqProtocolVersionMessage =
-                net_protocol::async_read(&mut conn).await?;
+            // TODO: replace with AbqNativeRunnerSpawnedMessage entirely
+            let spawned_message: AbqNativeRunnerSpawnedMessageCompat = net_protocol::async_read(&mut conn).await?;
 
-            (version_message, conn)
+            (spawned_message, conn)
         }
     };
 
-    if major != ACTIVE_PROTOCOL_VERSION_MAJOR || minor != ACTIVE_PROTOCOL_VERSION_MINOR {
+    let (runner_specification, protocol_version) = match spawn_message {
+        AbqNativeRunnerSpawnedMessageCompat::SpawnedMessage(AbqNativeRunnerSpawnedMessage {
+            protocol_version,
+            runner_specification,
+        }) => (Some(runner_specification), protocol_version),
+        AbqNativeRunnerSpawnedMessageCompat::ProtocolVersion(protocol_version) => {
+            (None, protocol_version)
+        }
+    };
+
+    if protocol_version.major != ACTIVE_PROTOCOL_VERSION_MAJOR
+        || protocol_version.minor != ACTIVE_PROTOCOL_VERSION_MINOR
+    {
         Err(ProtocolVersionError::NotCompatible.into())
     } else {
-        Ok(runner_conn)
+        Ok((runner_specification, runner_conn))
     }
 }
 
@@ -161,7 +167,7 @@ async fn retrieve_manifest<'a>(
         };
 
         // Wait for and validate the protocol version message, channel must always come first.
-        let runner_conn = open_native_runner_connection(
+        let (_specification, runner_conn) = open_native_runner_connection(
             &mut our_listener,
             protocol_version_timeout,
             native_runner_died,
@@ -349,12 +355,16 @@ where
     };
 
     // First, get and validate the protocol version message.
-    let mut runner_conn = open_native_runner_connection(
+    let (runner_spec, mut runner_conn) = open_native_runner_connection(
         &mut our_listener,
         protocol_version_timeout,
         native_runner_died,
     )
     .await?;
+
+    if let Some(runner_spec) = runner_spec {
+        tracing::info!(integration=?runner_spec.name, version=?runner_spec.version, "Launched native test runner");
+    }
 
     // Wait for the native runner to initialize, and send it the initialization context.
     //
@@ -785,26 +795,65 @@ mod test_validate_protocol_version_message {
     use abq_utils::net_protocol::{
         self,
         runners::{
-            AbqProtocolVersionMessage, AbqProtocolVersionTag, ACTIVE_PROTOCOL_VERSION_MAJOR,
-            ACTIVE_PROTOCOL_VERSION_MINOR,
+            AbqNativeRunnerSpawnedMessage, AbqNativeRunnerSpecification, AbqProtocolVersion,
+            ACTIVE_PROTOCOL_VERSION_MAJOR, ACTIVE_PROTOCOL_VERSION_MINOR,
         },
     };
 
     use super::{open_native_runner_connection, ProtocolVersionError, ProtocolVersionMessageError};
 
+    fn legal_spawned_message() -> AbqNativeRunnerSpawnedMessage {
+        let protocol_version = AbqProtocolVersion {
+            major: ACTIVE_PROTOCOL_VERSION_MAJOR,
+            minor: ACTIVE_PROTOCOL_VERSION_MINOR,
+        };
+        let runner_specification = AbqNativeRunnerSpecification {
+            name: "test".to_string(),
+            version: "0.0.0".to_string(),
+        };
+        AbqNativeRunnerSpawnedMessage {
+            protocol_version,
+            runner_specification,
+        }
+    }
+
     #[tokio::test]
-    async fn recv_and_validate_protocol_version_message() {
+    async fn recv_spawn_message_and_validate_protocol_version_message() {
         let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
 
         let child = async {
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let version_message = AbqProtocolVersionMessage {
-                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+            let spawned_message = legal_spawned_message();
+            net_protocol::async_write(&mut stream, &spawned_message)
+                .await
+                .unwrap();
+        };
+
+        let parent = open_native_runner_connection(
+            &mut listener,
+            Duration::from_secs(1),
+            sleep(Duration::MAX),
+        );
+
+        let (_, result) = futures::join!(child, parent);
+
+        assert!(result.is_ok());
+    }
+
+    // TODO: due for removal after SpawnedMessage migration
+    #[tokio::test]
+    async fn recv_version_message_and_validate_protocol_version_message() {
+        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let socket_addr = listener.local_addr().unwrap();
+
+        let child = async {
+            let mut stream = TcpStream::connect(socket_addr).await.unwrap();
+            let protocol_version = AbqProtocolVersion {
                 major: ACTIVE_PROTOCOL_VERSION_MAJOR,
                 minor: ACTIVE_PROTOCOL_VERSION_MINOR,
             };
-            net_protocol::async_write(&mut stream, &version_message)
+            net_protocol::async_write(&mut stream, &protocol_version)
                 .await
                 .unwrap();
         };
@@ -826,12 +875,19 @@ mod test_validate_protocol_version_message {
         let socket_addr = listener.local_addr().unwrap();
         let child = async {
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let version_message = AbqProtocolVersionMessage {
-                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+            let protocol_version = AbqProtocolVersion {
                 major: 999123123,
                 minor: 12312342,
             };
-            net_protocol::async_write(&mut stream, &version_message)
+            let runner_specification = AbqNativeRunnerSpecification {
+                name: "test".to_string(),
+                version: "0.0.0".to_string(),
+            };
+            let spawned_message = AbqNativeRunnerSpawnedMessage {
+                protocol_version,
+                runner_specification,
+            };
+            net_protocol::async_write(&mut stream, &spawned_message)
                 .await
                 .unwrap();
         };
@@ -911,12 +967,8 @@ mod test_validate_protocol_version_message {
         let child = async {
             sleep(Duration::from_millis(100)).await;
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let version_message = AbqProtocolVersionMessage {
-                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
-                major: ACTIVE_PROTOCOL_VERSION_MAJOR,
-                minor: ACTIVE_PROTOCOL_VERSION_MINOR,
-            };
-            net_protocol::async_write(&mut stream, &version_message)
+            let spawned_message = legal_spawned_message();
+            net_protocol::async_write(&mut stream, &spawned_message)
                 .await
                 .unwrap();
         };
@@ -942,12 +994,8 @@ mod test_validate_protocol_version_message {
         let child = async {
             sleep(Duration::from_millis(100)).await;
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let version_message = AbqProtocolVersionMessage {
-                r#type: AbqProtocolVersionTag::AbqProtocolVersion,
-                major: ACTIVE_PROTOCOL_VERSION_MAJOR,
-                minor: ACTIVE_PROTOCOL_VERSION_MINOR,
-            };
-            net_protocol::async_write(&mut stream, &version_message)
+            let spawned_message = legal_spawned_message();
+            net_protocol::async_write(&mut stream, &spawned_message)
                 .await
                 .unwrap();
         };

@@ -171,18 +171,35 @@ pub mod runners {
         pub init_meta: MetadataMap,
     }
 
-    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-    #[serde(rename_all = "snake_case")]
-    pub enum AbqProtocolVersionTag {
-        AbqProtocolVersion,
+    // TODO: to be removed when we switch to `AbqNativeRunnerSpawnedMessage` fully in all runners
+    // and in prod.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[serde(untagged)]
+    pub enum AbqNativeRunnerSpawnedMessageCompat {
+        SpawnedMessage(AbqNativeRunnerSpawnedMessage),
+        ProtocolVersion(AbqProtocolVersion),
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[serde(tag = "type", rename = "abq_native_runner_spawned")]
+    pub struct AbqNativeRunnerSpawnedMessage {
+        pub protocol_version: AbqProtocolVersion,
+        pub runner_specification: AbqNativeRunnerSpecification,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[serde(tag = "type", rename = "abq_native_runner_specification")]
+    pub struct AbqNativeRunnerSpecification {
+        pub name: String,
+        pub version: String,
     }
 
     pub const ACTIVE_PROTOCOL_VERSION_MAJOR: u64 = 0;
     pub const ACTIVE_PROTOCOL_VERSION_MINOR: u64 = 1;
 
     #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-    pub struct AbqProtocolVersionMessage {
-        pub r#type: AbqProtocolVersionTag,
+    #[serde(tag = "type", rename = "abq_protocol_version")]
+    pub struct AbqProtocolVersion {
         pub major: u64,
         pub minor: u64,
     }

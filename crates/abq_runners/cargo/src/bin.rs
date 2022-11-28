@@ -12,16 +12,15 @@ use std::{
 use abq_utils::net_protocol::{
     self,
     runners::{
-        AbqProtocolVersionMessage, AbqProtocolVersionTag, InitMessage, InitSuccessMessage,
-        Manifest, ManifestMessage, Status, Test, TestCase, TestCaseMessage, TestOrGroup,
-        TestResult, TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
-        ACTIVE_PROTOCOL_VERSION_MAJOR, ACTIVE_PROTOCOL_VERSION_MINOR,
+        AbqProtocolVersion, InitMessage, InitSuccessMessage, Manifest, ManifestMessage, Status,
+        Test, TestCase, TestCaseMessage, TestOrGroup, TestResult, TestResultMessage,
+        ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
+        ACTIVE_PROTOCOL_VERSION_MINOR,
     },
 };
 
-fn protocol_version() -> AbqProtocolVersionMessage {
-    AbqProtocolVersionMessage {
-        r#type: AbqProtocolVersionTag::AbqProtocolVersion,
+fn protocol_version() -> AbqProtocolVersion {
+    AbqProtocolVersion {
         major: ACTIVE_PROTOCOL_VERSION_MAJOR,
         minor: ACTIVE_PROTOCOL_VERSION_MINOR,
     }
