@@ -812,6 +812,30 @@ fn work_admin_token_without_user_token() {
 
 #[test]
 #[serial]
+fn invalid_abq_option_before_test_command() {
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = run_abq_forcing_capture(
+        "invalid_abq_option_before_test_command",
+        [
+            "test",
+            "--zzz-not-an-abq-option",
+            "--",
+            "bundle",
+            "exec",
+            "rspec",
+        ],
+    );
+
+    assert_eq!(exit_status.code().unwrap(), 2);
+    assert!(stdout.is_empty());
+    insta::assert_snapshot!(stderr);
+}
+
+#[test]
+#[serial]
 fn test_with_invalid_command() {
     let name = "test_with_invalid_command";
     let conf = CSConfigOptions {
