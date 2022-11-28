@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async {
                 let mut server = tokio::net::TcpListener::bind(server_addr).await?;
 
-                let runner_conn = open_native_runner_connection(
+                let (_spec, runner_conn) = open_native_runner_connection(
                     &mut server,
                     Duration::from_secs(10),
                     tokio::time::sleep(Duration::MAX),
