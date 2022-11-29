@@ -171,15 +171,6 @@ pub mod runners {
         pub init_meta: MetadataMap,
     }
 
-    // TODO: to be removed when we switch to `AbqNativeRunnerSpawnedMessage` fully in all runners
-    // and in prod.
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    #[serde(untagged)]
-    pub enum AbqNativeRunnerSpawnedMessageCompat {
-        SpawnedMessage(AbqNativeRunnerSpawnedMessage),
-        ProtocolVersion(AbqProtocolVersion),
-    }
-
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "type", rename = "abq_native_runner_spawned")]
     pub struct AbqNativeRunnerSpawnedMessage {
