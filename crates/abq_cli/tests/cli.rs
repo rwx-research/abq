@@ -14,14 +14,8 @@ use abq_utils::net_protocol::workers::RunId;
 
 const WORKSPACE: &str = std::env!("ABQ_WORKSPACE_DIR");
 
-const TLS_CERT: &str = std::concat!(
-    std::env!("ABQ_WORKSPACE_DIR"),
-    "crates/abq_utils/data/cert/server.crt"
-);
-const TLS_KEY: &str = std::concat!(
-    std::env!("ABQ_WORKSPACE_DIR"),
-    "crates/abq_utils/data/cert/server.key"
-);
+const TLS_CERT: &str = std::concat!(std::env!("ABQ_WORKSPACE_DIR"), "testdata/certs/server.crt");
+const TLS_KEY: &str = std::concat!(std::env!("ABQ_WORKSPACE_DIR"), "testdata/certs/server.key");
 
 fn var_flag_set(var: &str) -> bool {
     match std::env::var(var) {
