@@ -1,4 +1,4 @@
-use std::io;
+use std::{io, time::Duration};
 
 use abq_utils::net_protocol::runners::{Milliseconds, Status, TestResult};
 use termcolor::{Color, ColorSpec, WriteColor};
@@ -84,8 +84,9 @@ fn format_status(writer: &mut impl WriteColor, status: Status) -> io::Result<()>
     with_color(writer, color, |w| write!(w, "{status}"))
 }
 
+const MILLIS_IN_SECOND: u64 = 1000;
+
 pub fn format_duration(writer: &mut impl io::Write, millis: Milliseconds) -> io::Result<()> {
-    const MILLIS_IN_SECOND: u64 = 1000;
     const MILLIS_IN_MINUTE: u64 = 60 * MILLIS_IN_SECOND;
 
     let millis = millis as u64;
@@ -114,11 +115,20 @@ pub fn format_duration(writer: &mut impl io::Write, millis: Milliseconds) -> io:
     Ok(())
 }
 
+pub fn format_duration_to_partial_seconds(
+    writer: &mut impl io::Write,
+    duration: Duration,
+) -> io::Result<()> {
+    let millis = duration.as_millis() as f64;
+    let seconds = millis / (MILLIS_IN_SECOND as f64);
+    write!(writer, "{seconds:.2} seconds")
+}
+
 #[cfg(test)]
 mod test {
     use abq_utils::net_protocol::runners::{Status, TestResult};
 
-    use crate::format_result_dot;
+    use crate::{format_duration_to_partial_seconds, format_result_dot};
 
     use super::{format_duration, format_result_line, format_result_summary};
     use std::{io, time::Duration};
@@ -317,6 +327,41 @@ mod test {
         Duration::from_millis(35).as_millis() as _,
         @"35 ms"
         @"35 ms"
+    );
+
+    test_format!(
+        format_exact_minutes_partial_seconds, format_duration_to_partial_seconds,
+        Duration::from_secs(360),
+        @"360.00 seconds"
+        @"360.00 seconds"
+    );
+
+    test_format!(
+        format_exact_minutes_leftover_seconds_and_millis_partial_seconds, format_duration_to_partial_seconds,
+        Duration::from_millis(6 * 60 * 1000 + 52 * 1000 + 35),
+        @"412.04 seconds"
+        @"412.04 seconds"
+    );
+
+    test_format!(
+        format_exact_seconds_partial_seconds, format_duration_to_partial_seconds,
+        Duration::from_secs(15),
+        @"15.00 seconds"
+        @"15.00 seconds"
+    );
+
+    test_format!(
+        format_exact_seconds_leftover_millis_partial_seconds, format_duration_to_partial_seconds,
+        Duration::from_millis(15 * 1000 + 35),
+        @"15.04 seconds"
+        @"15.04 seconds"
+    );
+
+    test_format!(
+        format_exact_millis_partial_seconds, format_duration_to_partial_seconds,
+        Duration::from_millis(35),
+        @"0.04 seconds"
+        @"0.04 seconds"
     );
 
     test_format!(
