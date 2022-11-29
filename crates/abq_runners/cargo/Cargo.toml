@@ -22,4 +22,4 @@ anyhow.workspace = true
 test-abq-jest = []
 
 [dev-dependencies]
-insta = "1.21.1"
+insta = "1.21.2"
