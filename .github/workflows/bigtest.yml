@@ -87,11 +87,11 @@ jobs:
       - name: Get associated PR
         uses: 8BitJonny/gh-get-current-pr@2.1.3
         id: pr
-        continue-on-error: true
+        if: github.ref != 'refs/heads/main'
 
       - name: Report bigtest
         uses: thollander/actions-comment-pull-request@v1
-        if: steps.pr.outcome == 'success'
+        if: github.ref != 'refs/heads/main'
         with:
           pr_number: ${{ steps.pr.outputs.number }}
           message: |
