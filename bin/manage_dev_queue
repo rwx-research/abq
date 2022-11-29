@@ -1,0 +1,106 @@
+#!/bin/bash
+
+set -eu
+
+cd $(git rev-parse --show-toplevel)
+
+source bin/dev_queue_state.sh
+
+MANUAL_API='https://staging.abq.build/api/queue/manual'
+AUTH_HEADER="Authorization: Bearer $ABQ_CREATE_MANUAL_ACCESS_TOKEN"
+
+echoerr() { echo "$@" 1>&2; }
+
+fetch_state () {
+  curl 'https://staging.abq.build/api/queue/manual' \
+    -X GET \
+    -H "Authorization: Bearer $ABQ_CREATE_MANUAL_ACCESS_TOKEN" \
+    -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+    --data-urlencode "id=$1" 2> /dev/null
+}
+
+start () {
+  QUEUE_VERSION="$1"
+  if test -d "$STATEDIR"; then
+    echo "Existing dev queue instance $(cat ${INSTANCE_FILE}) already present; please stop it first."
+    exit 1
+  fi
+
+  create_output=$(curl "$MANUAL_API" \
+    -X POST \
+    -H "$AUTH_HEADER" \
+    -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+    --data-urlencode "version=$QUEUE_VERSION" 2> /dev/null)
+
+  if [ "$( jq 'has("error")' <<< $create_output )" == "true" ]; then
+    echoerr $create_output
+    exit 1
+  fi
+
+  instance_id=$(echo "$create_output" | jq -r '.instance_id')
+  echoerr "Waiting for $instance_id to be healthy..."
+  while : ; do
+    data="$(fetch_state $instance_id)"
+    state="$(echo "$data" | jq -r '.state')"
+    if [ "$state" == "healthy" ]; then
+      echo $state
+      break
+    fi
+    echoerr "state=$state..."
+    sleep 1
+  done
+
+  mkdir -p $STATEDIR
+  echo "$instance_id" > $INSTANCE_FILE
+  echo "$data" | jq -r '.tls_public_certificate' > $CERT_FILE
+  echo "$(echo "$data" | jq -r '.public_host'):$(echo "$data" | jq -r '.queue_port')" > $IP_FILE
+  echo "$data" | jq -r '.user_token' > $USER_TOKEN_FILE
+  echo "$QUEUE_VERSION" > $VERSION_FILE
+}
+
+state () {
+  if ! test -d "$STATEDIR"; then
+    echo "No existing dev queue state can be found at $STATEDIR."
+    exit 1
+  fi
+
+  data="$(fetch_state $(cat $INSTANCE_FILE))"
+  echo $data | jq -r '.state'
+}
+
+stop () {
+  if ! test -d "$STATEDIR"; then
+    echo "No existing dev queue state can be found at $STATEDIR."
+    exit 1
+  fi
+
+  curl "$MANUAL_API" \
+    -X DELETE \
+    -H "$AUTH_HEADER" \
+    -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+    --data-urlencode "id=$(cat $INSTANCE_FILE)" 2> /dev/null
+
+  rm -rf $STATEDIR
+}
+
+if [[ $# -gt 0 ]]; then
+  case $1 in
+    start)
+      if [[ $# -gt 1 ]]; then
+        start $2
+        exit 0
+      fi
+      ;;
+    state)
+      state
+      exit 0
+      ;;
+    stop)
+      stop
+      exit 0
+      ;;
+  esac
+fi
+
+echo "Unknown command. Usage: start <version> | stop"
+exit 1

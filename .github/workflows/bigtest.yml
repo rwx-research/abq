@@ -1,0 +1,110 @@
+name: Bigtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'ABQ version to test'
+        required: true
+        type: string
+
+  workflow_call:
+    inputs:
+      version:
+        description: 'ABQ version to test'
+        required: true
+        type: string
+    secrets:
+      ABQ_CREATE_MANUAL_ACCESS_TOKEN:
+        required: true
+      AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
+        required: true
+      AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY:
+        required: true
+
+jobs:
+  bigtest:
+    runs-on: ubuntu-latest
+    env:
+      AWS_DEFAULT_REGION: us-east-2
+      AWS_DEFAULT_OUTPUT: json
+      PLATFORM: linux_x86-64
+
+      RELEASE_BUCKET: abq-releases-staging
+
+      ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - name: Pull down abq binary to test
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
+          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
+
+          ABQ_VERSION="${{ inputs.version }}"
+          RELEASE_NAME="abq_${ABQ_VERSION}_${PLATFORM}"
+          RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
+          RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
+
+          ABQ_BIN="$PWD/abq-bin"
+          mkdir -p "$ABQ_BIN"
+
+          aws s3 cp "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" "$ABQ_BIN/abq.tar.gz" --profile staging
+
+          pushd abq-bin
+          tar -xf abq.tar.gz --strip-components=1
+          popd
+
+          echo "$ABQ_BIN" >> $GITHUB_PATH
+
+      - name: START dev queue
+        run: |
+          bin/manage_dev_queue start ${{ inputs.version }}
+
+      - name: BIGTEST benchmark
+        id: benchmark
+        run: |
+          EXIT=0
+          bigtest/benchmark/test.sh || EXIT=$?
+
+          source bigtest/benchmark/out/exports
+          echo "abq_worker_time=$ABQ_WORKER_TIME" >> $GITHUB_OUTPUT
+          echo "rspec_time=$RSPEC_TIME" >> $GITHUB_OUTPUT
+          echo "abq_worker_overhead=$ABQ_WORKER_OVERHEAD" >> $GITHUB_OUTPUT
+
+          exit $EXIT
+
+      - name: Get status emoji
+        id: status
+        if: always()
+        run: |
+          EMOJI="${{ (steps.benchmark.conclusion == 'success') && ':white_check_mark:' || ':x:' }}"
+          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+
+      - name: Get associated PR
+        uses: 8BitJonny/gh-get-current-pr@2.1.3
+        id: pr
+        continue-on-error: true
+
+      - name: Report bigtest
+        uses: thollander/actions-comment-pull-request@v1
+        if: steps.pr.outcome == 'success'
+        with:
+          pr_number: ${{ steps.pr.outputs.number }}
+          message: |
+            ${{ steps.status.outputs.emoji }} **Bigtest for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
+
+            Benchmarks:
+              - ${{ steps.benchmark.outputs.abq_worker_overhead }}% worker overhead
+                - RSpec time: ${{ steps.benchmark.outputs.rspec_time }} seconds
+                - ABQ worker time: ${{ steps.benchmark.outputs.abq_worker_time }} seconds
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: STOP dev queue
+        if: always()
+        run: |
+          bin/manage_dev_queue stop
