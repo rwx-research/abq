@@ -39,7 +39,8 @@ RE_WORKER_SUMMARY_LINE="Finished in $RE_FLOAT seconds \(files"
 ABQ_WORKER_TIME="$(cat "$ABQ_BENCHMARK_OUT" | grep -Eo "$RE_WORKER_SUMMARY_LINE" | grep -Eo "$RE_FLOAT")"
 RSPEC_TIME="$(cat "$RSPEC_BENCHMARK_OUT" | grep -Eo "$RE_WORKER_SUMMARY_LINE" | grep -Eo "$RE_FLOAT")"
 
-ABQ_WORKER_OVERHEAD="$(echo "scale=4; ($ABQ_WORKER_TIME - $RSPEC_TIME) / $RSPEC_TIME * 100" | bc)"
+# Round decimal percentage to 4 sig figs, then make 100%-scale percentage with 2 sig figs
+ABQ_WORKER_OVERHEAD="$(echo "scale=4; del=($ABQ_WORKER_TIME - $RSPEC_TIME) / $RSPEC_TIME; scale=2; del * 100 / 1" | bc)"
 
 echo "abq workers were $ABQ_WORKER_OVERHEAD% slower; threshold is $ABQ_WORKER_OVERHEAD_THRESHOLD%"
 
