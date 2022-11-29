@@ -119,22 +119,21 @@ jobs:
   release_development:
     name: Release new abq to staging API for testing
     needs: test
-    if: github.ref != 'refs/heads/main'
     uses: ./.github/workflows/build_and_upload_development.yml
     with:
       ref: ${{ github.ref }}
     secrets: inherit
 
-  extended_testing:
+  bigtest:
     needs: release_development
-    runs-on: ubuntu-latest
-    steps:
-      - name: Echo abq version
-        run: echo ${{ needs.release_development.outputs.abq_version }}
+    uses: ./.github/workflows/bigtest.yml
+    secrets: inherit
+    with:
+      version: ${{ needs.release_development.outputs.abq_version }}
 
   release_unstable:
     name: Release new abq to API
-    needs: test
+    needs: bigtest
     if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/build_and_upload.yml
     with:
