@@ -663,7 +663,10 @@ fn run_tests(
         eprintln!("{error}");
     }
 
-    Ok(suite_result.suggested_exit_code)
+    print!("\n\n");
+    suite_result.write_short_summary_lines(&mut io::stdout())?;
+
+    Ok(suite_result.suggested_exit_code())
 }
 
 fn elaborate_invocation_error(

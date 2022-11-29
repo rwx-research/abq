@@ -1,9 +1,18 @@
-use std::{fmt::Display, io, path::PathBuf, str::FromStr};
+use std::{
+    fmt::Display,
+    io,
+    path::PathBuf,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
-use abq_output::{format_result_dot, format_result_line, format_result_summary};
+use abq_output::{
+    format_duration_to_partial_seconds, format_result_dot, format_result_line,
+    format_result_summary,
+};
 use abq_utils::{
     exit,
-    net_protocol::runners::{Status, TestResult},
+    net_protocol::runners::{Milliseconds, Status, TestResult},
 };
 use termcolor::{ColorChoice, StandardStream};
 use thiserror::Error;
@@ -83,7 +92,7 @@ pub enum ReportingError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub(crate) struct ExitCode(i32);
 
 impl ExitCode {
@@ -96,15 +105,46 @@ impl ExitCode {
     }
 }
 
-pub(crate) struct SuiteResult {
-    /// On the whole, did this test suite pass or fail?
-    pub success: bool,
-    /// Exit code suggested for the test suite.
-    pub suggested_exit_code: ExitCode,
+struct SuiteResultBuilder {
+    success: bool,
+    suggested_exit_code: ExitCode,
+    count: u64,
+    count_failed: u64,
+    start_time: Instant,
+    test_time: Milliseconds,
 }
 
-impl SuiteResult {
+impl Default for SuiteResultBuilder {
+    fn default() -> Self {
+        Self {
+            success: true,
+            suggested_exit_code: ExitCode(0),
+            count: 0,
+            count_failed: 0,
+            start_time: Instant::now(),
+            test_time: 0.,
+        }
+    }
+}
+
+pub(crate) struct SuiteResult {
+    /// Exit code suggested for the test suite.
+    suggested_exit_code: ExitCode,
+    /// Total number of tests run.
+    count: u64,
+    count_failed: u64,
+    /// Runtime of the test suite, as accounted between the time the reporter started and the time
+    /// it finished.
+    wall_time: Duration,
+    /// Runtime of the test suite, as accounted for in the actual time in tests.
+    test_time: Milliseconds,
+}
+
+impl SuiteResultBuilder {
     fn account_result(&mut self, test_result: &TestResult) {
+        self.count += 1;
+        self.count_failed += test_result.status.is_fail_like() as u64;
+        self.test_time += test_result.runtime;
         match test_result.status {
             Status::PrivateNativeRunnerError => {
                 self.success = false;
@@ -118,6 +158,40 @@ impl SuiteResult {
             _ => {}
         }
     }
+
+    fn finalize(self) -> SuiteResult {
+        let Self {
+            success: _,
+            suggested_exit_code,
+            count,
+            count_failed,
+            start_time,
+            test_time,
+        } = self;
+
+        SuiteResult {
+            suggested_exit_code,
+            count,
+            count_failed,
+            wall_time: start_time.elapsed(),
+            test_time,
+        }
+    }
+}
+
+impl SuiteResult {
+    pub fn write_short_summary_lines(&self, w: &mut impl io::Write) -> io::Result<()> {
+        write!(w, "Finished in ")?;
+        format_duration_to_partial_seconds(w, self.wall_time)?;
+        write!(w, " (")?;
+        format_duration_to_partial_seconds(w, Duration::from_millis(self.test_time as _))?;
+        writeln!(w, " spent in test code)")?;
+        writeln!(w, "{} tests, {} failures", self.count, self.count_failed)
+    }
+
+    pub fn suggested_exit_code(&self) -> ExitCode {
+        self.suggested_exit_code
+    }
 }
 
 /// A [`Reporter`] defines a way to emit abq test results.
@@ -130,7 +204,7 @@ pub(crate) trait Reporter: Send {
     /// Consume the reporter, and perform any needed finalization steps.
     ///
     /// This method is only called when all test results for a run have been consumed.
-    fn finish(self: Box<Self>, overall_result: &SuiteResult) -> Result<(), ReportingError>;
+    fn finish(self: Box<Self>) -> Result<(), ReportingError>;
 }
 
 fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> {
@@ -175,7 +249,7 @@ impl Reporter for LineReporter {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
+    fn finish(mut self: Box<Self>) -> Result<(), ReportingError> {
         write_summary_results(&mut self.buffer, self.delayed_failure_reports)?;
 
         self.buffer
@@ -226,7 +300,7 @@ impl Reporter for DotReporter {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
+    fn finish(mut self: Box<Self>) -> Result<(), ReportingError> {
         if !self.delayed_failure_reports.is_empty()
             && self.num_results % DOT_REPORTER_LINE_LIMIT != 0
         {
@@ -257,7 +331,7 @@ impl Reporter for JUnitXmlReporter {
         Ok(())
     }
 
-    fn finish(self: Box<Self>, _overall_result: &SuiteResult) -> Result<(), ReportingError> {
+    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -311,7 +385,7 @@ fn reporter_from_kind(
 
 pub(crate) struct SuiteReporters {
     reporters: Vec<Box<dyn Reporter>>,
-    overall_result: SuiteResult,
+    overall_result: SuiteResultBuilder,
 }
 
 impl SuiteReporters {
@@ -325,10 +399,7 @@ impl SuiteReporters {
                 .into_iter()
                 .map(|kind| reporter_from_kind(kind, color_preference, test_suite_name))
                 .collect(),
-            overall_result: SuiteResult {
-                success: true,
-                suggested_exit_code: ExitCode(0),
-            },
+            overall_result: SuiteResultBuilder::default(),
         }
     }
 
@@ -354,9 +425,11 @@ impl SuiteReporters {
             overall_result,
         } = self;
 
+        let overall_result = overall_result.finalize();
+
         let errors: Vec<_> = reporters
             .into_iter()
-            .filter_map(|reporter| reporter.finish(&overall_result).err())
+            .filter_map(|reporter| reporter.finish().err())
             .collect();
 
         (overall_result, errors)
@@ -457,7 +530,7 @@ impl termcolor::WriteColor for &mut MockWriter {
 }
 
 #[cfg(test)]
-impl io::Write for &mut MockWriter {
+impl io::Write for MockWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.buffer.extend(buf);
         self.num_writes += 1;
@@ -484,26 +557,8 @@ fn default_result() -> TestResult {
 }
 
 #[cfg(test)]
-fn suite_failure() -> SuiteResult {
-    SuiteResult {
-        success: false,
-        suggested_exit_code: ExitCode(1),
-    }
-}
-
-#[cfg(test)]
-fn suite_success() -> SuiteResult {
-    SuiteResult {
-        success: true,
-        suggested_exit_code: ExitCode(0),
-    }
-}
-
-#[cfg(test)]
 mod test_line_reporter {
     use abq_utils::net_protocol::runners::{Status, TestResult};
-
-    use crate::reporting::{suite_failure, suite_success};
 
     use super::{default_result, LineReporter, MockWriter, Reporter};
 
@@ -547,7 +602,7 @@ mod test_line_reporter {
             buffer,
             num_writes,
             num_flushes,
-        } = with_reporter(|reporter| reporter.finish(&suite_success()).unwrap());
+        } = with_reporter(|reporter| reporter.finish().unwrap());
 
         assert!(buffer.is_empty());
         assert_eq!(num_writes, 0);
@@ -602,7 +657,7 @@ mod test_line_reporter {
                     ..default_result()
                 })
                 .unwrap();
-            reporter.finish(&suite_failure()).unwrap();
+            reporter.finish().unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -628,7 +683,7 @@ mod test_line_reporter {
 mod test_dot_reporter {
     use abq_utils::net_protocol::runners::{Status, TestResult};
 
-    use crate::reporting::{suite_failure, suite_success, DOT_REPORTER_LINE_LIMIT};
+    use crate::reporting::DOT_REPORTER_LINE_LIMIT;
 
     use super::{default_result, DotReporter, MockWriter, Reporter};
 
@@ -673,7 +728,7 @@ mod test_dot_reporter {
             buffer,
             num_writes,
             num_flushes,
-        } = with_reporter(|reporter| reporter.finish(&suite_success()).unwrap());
+        } = with_reporter(|reporter| reporter.finish().unwrap());
 
         assert!(buffer.is_empty());
         assert_eq!(num_writes, 0);
@@ -728,7 +783,7 @@ mod test_dot_reporter {
                     ..default_result()
                 })
                 .unwrap();
-            reporter.finish(&suite_failure()).unwrap();
+            reporter.finish().unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -769,7 +824,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish(&suite_success()).unwrap();
+            reporter.finish().unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -790,7 +845,7 @@ mod test_dot_reporter {
                 reporter.push_result(&default_result()).unwrap();
             }
 
-            reporter.finish(&suite_success()).unwrap();
+            reporter.finish().unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -821,7 +876,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish(&suite_failure()).unwrap();
+            reporter.finish().unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -858,7 +913,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish(&suite_failure()).unwrap();
+            reporter.finish().unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -875,6 +930,8 @@ mod test_dot_reporter {
 
 #[cfg(test)]
 mod suite {
+    use std::time::Duration;
+
     use abq_utils::{
         exit,
         net_protocol::runners::{Status, TestResult},
@@ -882,7 +939,7 @@ mod suite {
 
     use crate::reporting::ExitCode;
 
-    use super::{default_result, ColorPreference, SuiteReporters, SuiteResult};
+    use super::{default_result, ColorPreference, MockWriter, SuiteReporters, SuiteResult};
 
     fn get_overall_result<'a>(results: impl IntoIterator<Item = &'a TestResult>) -> SuiteResult {
         let mut suite = SuiteReporters::new([], ColorPreference::Auto, "test");
@@ -894,7 +951,7 @@ mod suite {
     }
 
     macro_rules! test_status {
-        ($($test_name:ident, $status_order:expr, $expect_success:expr, $expect_exit:expr)*) => {$(
+        ($($test_name:ident, $status_order:expr, $expect_exit:expr, $count:expr)*) => {$(
             #[test]
             fn $test_name() {
                 use Status::*;
@@ -905,26 +962,62 @@ mod suite {
                 }).collect::<Vec<_>>();
 
                 let SuiteResult {
-                    success, suggested_exit_code
+                    suggested_exit_code, count, ..
                 } = get_overall_result(&results);
 
-                assert_eq!(success, $expect_success);
                 assert_eq!(suggested_exit_code, $expect_exit);
+                assert_eq!(count, $count);
             }
         )*};
     }
 
     test_status! {
-        success_if_no_errors, [Success, Pending, Skipped], true, ExitCode(0)
-        fail_if_success_then_error, [Success, Error], false, ExitCode(1)
-        fail_if_error_then_success, [Error, Success], false, ExitCode(1)
-        fail_if_success_then_failure, [Success, Failure], false, ExitCode(1)
-        fail_if_failure_then_success, [Failure, Success], false, ExitCode(1)
-        error_if_success_then_internal_error, [Success, PrivateNativeRunnerError], false, ExitCode(exit::CODE_ERROR)
-        error_if_internal_error_then_success, [PrivateNativeRunnerError, Success], false, ExitCode(exit::CODE_ERROR)
-        error_if_error_then_internal_error, [Error, PrivateNativeRunnerError], false, ExitCode(exit::CODE_ERROR)
-        error_if_internal_error_then_error, [PrivateNativeRunnerError, Error], false, ExitCode(exit::CODE_ERROR)
-        error_if_failure_then_internal_error, [Failure, PrivateNativeRunnerError], false, ExitCode(exit::CODE_ERROR)
-        error_if_internal_error_then_failure, [PrivateNativeRunnerError, Failure], false, ExitCode(exit::CODE_ERROR)
+        success_if_no_errors, [Success, Pending, Skipped], ExitCode(0), 3
+        fail_if_success_then_error, [Success, Error], ExitCode(1), 2
+        fail_if_error_then_success, [Error, Success], ExitCode(1), 2
+        fail_if_success_then_failure, [Success, Failure], ExitCode(1), 2
+        fail_if_failure_then_success, [Failure, Success], ExitCode(1), 2
+        error_if_success_then_internal_error, [Success, PrivateNativeRunnerError], ExitCode(exit::CODE_ERROR), 2
+        error_if_internal_error_then_success, [PrivateNativeRunnerError, Success], ExitCode(exit::CODE_ERROR), 2
+        error_if_error_then_internal_error, [Error, PrivateNativeRunnerError], ExitCode(exit::CODE_ERROR), 2
+        error_if_internal_error_then_error, [PrivateNativeRunnerError, Error], ExitCode(exit::CODE_ERROR), 2
+        error_if_failure_then_internal_error, [Failure, PrivateNativeRunnerError], ExitCode(exit::CODE_ERROR), 2
+        error_if_internal_error_then_failure, [PrivateNativeRunnerError, Failure], ExitCode(exit::CODE_ERROR), 2
+    }
+
+    fn get_short_summary_lines(summary: SuiteResult) -> String {
+        let mut mock_writer = MockWriter::default();
+        summary.write_short_summary_lines(&mut mock_writer).unwrap();
+        String::from_utf8(mock_writer.buffer).unwrap()
+    }
+
+    #[test]
+    fn summary_when_no_tests_fail() {
+        let summary = SuiteResult {
+            suggested_exit_code: ExitCode(0),
+            count: 10,
+            count_failed: 0,
+            wall_time: Duration::from_secs(78),
+            test_time: 70200.,
+        };
+        insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
+        Finished in 78.00 seconds (70.20 seconds spent in test code)
+        10 tests, 0 failures
+        "###);
+    }
+
+    #[test]
+    fn summary_when_some_tests_fail() {
+        let summary = SuiteResult {
+            suggested_exit_code: ExitCode(0),
+            count: 10,
+            count_failed: 5,
+            wall_time: Duration::from_secs(78),
+            test_time: 70200.,
+        };
+        insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
+        Finished in 78.00 seconds (70.20 seconds spent in test code)
+        10 tests, 5 failures
+        "###);
     }
 }
