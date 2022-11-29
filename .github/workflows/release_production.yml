@@ -1,4 +1,4 @@
-name: register ABQ version with staging API
+name: register ABQ version with production API
 
 on:
   # for manual release
