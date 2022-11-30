@@ -11,6 +11,7 @@ dependencies = [
  "abq_output",
  "abq_queue",
  "abq_runner_protocol",
+ "abq_rwx_v1_json",
  "abq_utils",
  "abq_workers",
  "anyhow",
@@ -145,6 +146,17 @@ name = "abq_runner_protocol"
 version = "0.1.0"
 dependencies = [
  "abq_utils",
+]
+
+[[package]]
+name = "abq_rwx_v1_json"
+version = "0.1.0"
+dependencies = [
+ "abq_utils",
+ "insta",
+ "serde",
+ "serde_derive",
+ "serde_json",
 ]
 
 [[package]]

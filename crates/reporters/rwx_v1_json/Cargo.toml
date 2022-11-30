@@ -1,0 +1,14 @@
+[package]
+edition = "2021"
+name = "abq_rwx_v1_json"
+version = "0.1.0"
+
+[dependencies]
+abq_utils = { path = "../../abq_utils" }
+
+serde.workspace = true
+serde_derive.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+insta = "1.21.2"
