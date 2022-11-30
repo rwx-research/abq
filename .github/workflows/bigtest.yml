@@ -58,7 +58,7 @@ jobs:
           tar -xf abq.tar.gz --strip-components=1
           popd
 
-          echo "$ABQ_BIN" >> $GITHUB_PATH
+          echo "$ABQ_BIN" >> "$GITHUB_PATH"
 
       - name: START dev queue
         run: |
@@ -71,9 +71,11 @@ jobs:
           bigtest/benchmark/test.sh || EXIT=$?
 
           source bigtest/benchmark/out/exports
-          echo "abq_worker_time=$ABQ_WORKER_TIME" >> $GITHUB_OUTPUT
-          echo "rspec_time=$RSPEC_TIME" >> $GITHUB_OUTPUT
-          echo "abq_worker_overhead=$ABQ_WORKER_OVERHEAD" >> $GITHUB_OUTPUT
+          {
+          echo "abq_worker_time=$ABQ_WORKER_TIME"
+          echo "rspec_time=$RSPEC_TIME"
+          echo "abq_worker_overhead=$ABQ_WORKER_OVERHEAD"
+          } >> "$GITHUB_OUTPUT"
 
           exit $EXIT
 
@@ -82,7 +84,7 @@ jobs:
         if: always()
         run: |
           EMOJI="${{ (steps.benchmark.conclusion == 'success') && ':white_check_mark:' || ':x:' }}"
-          echo "emoji=$EMOJI" >> $GITHUB_OUTPUT
+          echo "emoji=$EMOJI" >> "$GITHUB_OUTPUT"
 
       - name: Get associated PR
         uses: 8BitJonny/gh-get-current-pr@2.1.3
