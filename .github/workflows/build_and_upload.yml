@@ -92,9 +92,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
@@ -105,7 +105,7 @@ jobs:
           yum install sudo jq -y
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release --all-features
 
       - name: Install aws CLI
         run: |

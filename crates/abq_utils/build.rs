@@ -46,8 +46,10 @@ fn version_from_git() -> String {
 
 /// Writes the currently-build ABQ version to $OUT_DIR/abq_version.txt
 fn write_abq_version() {
-    println!("cargo:rerun-if-changed=../../build_artifact");
-    println!("cargo:rerun-if-env-changed=ABQ_DEVELOPMENT_BUILD");
+    if !matches!(std::env::var("ABQ_NO_REBUILD").as_deref(), Ok("true")) {
+        println!("cargo:rerun-if-changed=../../build_artifact");
+        println!("cargo:rerun-if-env-changed=ABQ_DEVELOPMENT_BUILD");
+    }
 
     let version = env::var("NIX_ABQ_VERSION").unwrap_or_else(|_| version_from_git());
 

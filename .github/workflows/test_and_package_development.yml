@@ -1,7 +1,6 @@
-name: Build and Upload (development versions)
+name: Test and package development builds
 
 on:
-  # for automatic builds into staging from feature branches
   workflow_call:
     inputs:
       ref:
@@ -13,6 +12,8 @@ on:
         description: "Released ABQ version"
         value: ${{ jobs.release.outputs.abq_version }}
     secrets:
+      SSH_KEY_ABQ_JEST:
+        required: true
       RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
       AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
@@ -33,6 +34,7 @@ jobs:
       AWS_DEFAULT_OUTPUT: json
       PLATFORM: linux_x86-64
       ABQ_DEVELOPMENT_BUILD: 1
+      ABQ_NO_REBUILD: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -51,6 +53,10 @@ jobs:
       - name: re-fetch overwritten tag
         run: git fetch --tags --force
 
+      - name: Install build + deploy deps
+        run: |
+          yum install sudo jq openssh-clients openssh-server -y
+
       - name: Restore cargo cache
         uses: actions/cache@v3.0.11
         env:
@@ -62,20 +68,87 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-${{ hashFiles('rust-toolchain.toml')}}-
+
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
           toolchain: stable
+          components: clippy
 
-      - name: Install build + deploy deps
+      - name: Run lints
+        uses: actions-rs/cargo@v1.0.3
+        with:
+          command: clippy
+          args: --workspace --tests --release -- --deny warnings
+
+      # setup testdata
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '14'
+          cache: 'npm'
+          cache-dependency-path: 'testdata/**/package-lock.json'
+
+      - name: Install Yarn
+        run: npm install -g yarn
+
+      - name: Pull native test runners
         run: |
-          yum install sudo jq -y
+          set -x
 
-      - name: Build release
-        run: cargo build --release
+          mkdir -p /root/.ssh
+          touch /root/.ssh/known_hosts
+          ssh-keyscan -t rsa github.com >> /root/.ssh/known_hosts
+
+          eval `ssh-agent -s`
+
+          echo "${{secrets.SSH_KEY_ABQ_JEST}}" | ssh-add -
+          git submodule update --init -- native-runners/abq-jest
+
+          eval `ssh-agent -k`
+
+      - name: Get yarn cache directory path
+        id: yarn-cache-dir-path
+        run: echo "::set-output name=dir::$(yarn config get cacheFolder)"
+        shell: bash
+        working-directory: native-runners/abq-jest
+
+      - name: Restore yarn cache
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
+          key: yarn-cache-folder-${{ hashFiles('native-runners/abq-jest/yarn.lock', '.yarnrc.yml') }}
+          restore-keys: |
+            yarn-cache-folder-
+
+      - name: Load test dependencies
+        run: |
+          scripts/init_testdata
+
+      # End setup testdata
+      
+      - name: Build release with tests
+        run: |
+          cargo build --tests --release --all-features
+
+      - name: Run tests with cargo
+        timeout-minutes: 4
+        if: github.run_attempt == 1
+        run: |
+          cargo test --release --all-features
+        env:
+          CI: false
+
+      - name: Run retried tests with cargo, including debug output
+        timeout-minutes: 5
+        if: github.run_attempt > 1
+        run: |
+          export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
+          cargo test --release --all-features -- --nocapture
+        env:
+          CI: false
 
       - name: Install aws CLI
         run: |
