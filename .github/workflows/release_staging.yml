@@ -24,8 +24,10 @@ jobs:
     steps:
       - name: Register new release abq api
         run: |
+          # the release channel data should be expanded into an array, so we disable the check
+          # shellcheck disable=SC2046
           curl -X "POST" "https://staging.abq.build/api/releases" \
           -H 'Authorization: Bearer ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}' \
           -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
           --data-urlencode "version=${{inputs.version}}" \
-          `if [ ! -z "${{inputs.release_channel}}" ]; then echo "--data-urlencode 'release_channel=${{inputs.release_channel}}'"; fi`
+          $(if [ -n "${{inputs.release_channel}}" ]; then echo "--data-urlencode 'release_channel=${{inputs.release_channel}}'"; fi)

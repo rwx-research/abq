@@ -32,7 +32,7 @@ abq test \
 
 bundle exec rspec bigtest/benchmark/benchmark_spec.rb | tee $RSPEC_BENCHMARK_OUT
 
-RE_FLOAT="[0-9]+.[0-9]+"
+RE_FLOAT="[0-9]+(\.[0-9]+)?"
 RE_WORKER_SUMMARY_LINE="Finished in $RE_FLOAT seconds \(files"
 
 # TODO: we should check the `abq test` wall time here as well.

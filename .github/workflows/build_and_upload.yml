@@ -74,7 +74,7 @@ jobs:
           # For some reason we need this, even though actions/checkout sets
           # safe.directory by default?
           # Perhaps it is because we work in a container?
-          git config --global --add safe.directory $PWD
+          git config --global --add safe.directory "$PWD"
           git describe
 
       # this may not be unecessary when https://github.com/actions/checkout/issues/882 is resolved
@@ -119,10 +119,12 @@ jobs:
           RELEASE_NAME="abq_${ABQ_VERSION}_${{ matrix.platform }}"
           RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
           RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
-          echo "ABQ_VERSION=$ABQ_VERSION" >> $GITHUB_ENV
-          echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
-          echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE" >> $GITHUB_ENV
-          echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT" >> $GITHUB_ENV
+          {
+          echo "ABQ_VERSION=$ABQ_VERSION"
+          echo "RELEASE_NAME=$RELEASE_NAME"
+          echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE"
+          echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT"
+          } >> "$GITHUB_ENV"
 
       - name: Prepare release
         run: |
@@ -188,7 +190,7 @@ jobs:
       - name: export abq version
         id: abq_version
         run: |
-          echo "abq_version=$ABQ_VERSION" >> $GITHUB_OUTPUT
+          echo "abq_version=$ABQ_VERSION" >> "$GITHUB_OUTPUT"
 
   notify-staging-api:
     name: Release new abq to staging API
