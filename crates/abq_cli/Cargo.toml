@@ -11,6 +11,7 @@ abq_workers = { path = "../abq_workers" }
 abq_utils = { path = "../abq_utils" }
 abq_hosted = { path = "../abq_hosted" }
 abq_junit_xml = { path = "../reporters/junit_xml" }
+abq_rwx_v1_json = { path = "../reporters/rwx_v1_json" }
 
 anyhow.workspace = true
 signal-hook.workspace = true

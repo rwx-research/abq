@@ -362,10 +362,12 @@ impl Reporter for JUnitXmlReporter {
 /// Writes test results as JUnit XML to a path.
 struct RwxV1JsonReporter {
     path: PathBuf,
+    collector: abq_rwx_v1_json::Collector,
 }
 
 impl Reporter for RwxV1JsonReporter {
-    fn push_result(&mut self, _test_result: &TestResult) -> Result<(), ReportingError> {
+    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
+        self.collector.push_result(test_result);
         Ok(())
     }
 
@@ -374,11 +376,15 @@ impl Reporter for RwxV1JsonReporter {
             std::fs::create_dir_all(dir)?;
         }
 
-        std::fs::OpenOptions::new()
+        let fd = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .open(self.path)?;
+
+        self.collector
+            .write_json(fd)
+            .map_err(|_| ReportingError::FailedToFormat)?;
 
         Ok(())
     }
@@ -415,7 +421,10 @@ fn reporter_from_kind(
             path,
             collector: abq_junit_xml::Collector::new(test_suite_name),
         }),
-        ReporterKind::RwxV1Json(path) => Box::new(RwxV1JsonReporter { path }),
+        ReporterKind::RwxV1Json(path) => Box::new(RwxV1JsonReporter {
+            path,
+            collector: abq_rwx_v1_json::Collector::default(),
+        }),
     }
 }
 
