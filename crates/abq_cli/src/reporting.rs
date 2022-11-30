@@ -17,7 +17,8 @@ use abq_utils::{
 use termcolor::{ColorChoice, StandardStream};
 use thiserror::Error;
 
-static DEFAULT_JUNIT_XML_PATH: &str = "abq-test-results.xml";
+static DEFAULT_XML_PATH: &str = "abq-test-results.xml";
+static DEFAULT_JSON_PATH: &str = "abq-test-results.json";
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum ReporterKind {
@@ -27,6 +28,8 @@ pub enum ReporterKind {
     Dot,
     /// Writes JUnit XML to a file
     JUnitXml(PathBuf),
+    /// Writes RWX Test Results (https://github.com/rwx-research/test-results-schema/blob/main/v1.json) to a file
+    RwxV1Json(PathBuf),
 }
 
 impl Display for ReporterKind {
@@ -35,6 +38,7 @@ impl Display for ReporterKind {
             ReporterKind::Line => write!(f, "line"),
             ReporterKind::Dot => write!(f, "dot"),
             ReporterKind::JUnitXml(path) => write!(f, "junit-xml={}", path.display()),
+            ReporterKind::RwxV1Json(path) => write!(f, "rwx-v1-json={}", path.display()),
         }
     }
 }
@@ -47,17 +51,23 @@ impl FromStr for ReporterKind {
             "line" => Ok(Self::Line),
             "dot" => Ok(Self::Dot),
             other => {
-                if other.starts_with("junit-xml") {
-                    let mut splits = other.split("junit-xml=");
-                    splits.next(); // eat junit-xml=;
-                    let path = splits
-                        .next()
-                        .filter(|path| !path.trim().is_empty())
-                        .unwrap_or(DEFAULT_JUNIT_XML_PATH);
-                    let path = PathBuf::from_str(path).map_err(|e| e.to_string())?;
-                    Ok(ReporterKind::JUnitXml(path))
-                } else {
-                    Err(format!("Unknown reporter {}", other))
+                let mut splits = other.split('=');
+                let reporter = splits.next().filter(|reporter| !reporter.trim().is_empty());
+                let path = splits.next().filter(|path| !path.trim().is_empty());
+
+                match reporter {
+                    Some("junit-xml") => {
+                        let path = PathBuf::from_str(path.unwrap_or(DEFAULT_XML_PATH))
+                            .map_err(|e| e.to_string())?;
+                        Ok(ReporterKind::JUnitXml(path))
+                    }
+                    Some("rwx-v1-json") => {
+                        let path = PathBuf::from_str(path.unwrap_or(DEFAULT_JSON_PATH))
+                            .map_err(|e| e.to_string())?;
+                        Ok(ReporterKind::RwxV1Json(path))
+                    }
+                    Some(other) => Err(format!("Unknown reporter {}", other)),
+                    None => Err(format!("Reporter not specified in '{}'", other)),
                 }
             }
         }
@@ -349,6 +359,31 @@ impl Reporter for JUnitXmlReporter {
     }
 }
 
+/// Writes test results as JUnit XML to a path.
+struct RwxV1JsonReporter {
+    path: PathBuf,
+}
+
+impl Reporter for RwxV1JsonReporter {
+    fn push_result(&mut self, _test_result: &TestResult) -> Result<(), ReportingError> {
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(self.path)?;
+
+        Ok(())
+    }
+}
+
 fn reporter_from_kind(
     kind: ReporterKind,
     color_preference: ColorPreference,
@@ -380,6 +415,7 @@ fn reporter_from_kind(
             path,
             collector: abq_junit_xml::Collector::new(test_suite_name),
         }),
+        ReporterKind::RwxV1Json(path) => Box::new(RwxV1JsonReporter { path }),
     }
 }
 
@@ -438,7 +474,7 @@ impl SuiteReporters {
 
 #[cfg(test)]
 mod test_reporter_kind {
-    use super::{ReporterKind, DEFAULT_JUNIT_XML_PATH};
+    use super::{ReporterKind, DEFAULT_JSON_PATH, DEFAULT_XML_PATH};
     use std::{path::PathBuf, str::FromStr};
 
     #[test]
@@ -446,6 +482,22 @@ mod test_reporter_kind {
         assert_eq!(
             ReporterKind::from_str("not-a-reporter"),
             Err("Unknown reporter not-a-reporter".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_only_reporter_path() {
+        assert_eq!(
+            ReporterKind::from_str("=the/path"),
+            Err("Reporter not specified in '=the/path'".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_empty_reporter() {
+        assert_eq!(
+            ReporterKind::from_str(""),
+            Err("Reporter not specified in ''".to_string())
         );
     }
 
@@ -463,9 +515,7 @@ mod test_reporter_kind {
     fn parse_junit_reporter_no_eq_to_default() {
         assert_eq!(
             ReporterKind::from_str("junit-xml"),
-            Ok(ReporterKind::JUnitXml(PathBuf::from(
-                DEFAULT_JUNIT_XML_PATH
-            )))
+            Ok(ReporterKind::JUnitXml(PathBuf::from(DEFAULT_XML_PATH)))
         );
     }
 
@@ -473,9 +523,7 @@ mod test_reporter_kind {
     fn parse_junit_reporter_eq_no_suffix_to_default() {
         assert_eq!(
             ReporterKind::from_str("junit-xml="),
-            Ok(ReporterKind::JUnitXml(PathBuf::from(
-                DEFAULT_JUNIT_XML_PATH
-            )))
+            Ok(ReporterKind::JUnitXml(PathBuf::from(DEFAULT_XML_PATH)))
         );
     }
 
@@ -483,9 +531,7 @@ mod test_reporter_kind {
     fn parse_junit_reporter_eq_no_suffix_with_spaces_to_default() {
         assert_eq!(
             ReporterKind::from_str("junit-xml=     "),
-            Ok(ReporterKind::JUnitXml(PathBuf::from(
-                DEFAULT_JUNIT_XML_PATH
-            )))
+            Ok(ReporterKind::JUnitXml(PathBuf::from(DEFAULT_XML_PATH)))
         );
     }
 
@@ -502,6 +548,46 @@ mod test_reporter_kind {
         assert_eq!(
             ReporterKind::from_str("junit-xml=my/test.xml"),
             Ok(ReporterKind::JUnitXml(PathBuf::from("my/test.xml")))
+        );
+    }
+
+    #[test]
+    fn parse_rwx_v1_json_reporter_no_eq_to_default() {
+        assert_eq!(
+            ReporterKind::from_str("rwx-v1-json"),
+            Ok(ReporterKind::RwxV1Json(PathBuf::from(DEFAULT_JSON_PATH)))
+        );
+    }
+
+    #[test]
+    fn parse_rwx_v1_json_reporter_eq_no_suffix_to_default() {
+        assert_eq!(
+            ReporterKind::from_str("rwx-v1-json="),
+            Ok(ReporterKind::RwxV1Json(PathBuf::from(DEFAULT_JSON_PATH)))
+        );
+    }
+
+    #[test]
+    fn parse_rwx_v1_json_reporter_eq_no_suffix_with_spaces_to_default() {
+        assert_eq!(
+            ReporterKind::from_str("rwx-v1-json=     "),
+            Ok(ReporterKind::RwxV1Json(PathBuf::from(DEFAULT_JSON_PATH)))
+        );
+    }
+
+    #[test]
+    fn parse_rwx_v1_json_reporter_eq_with_suffix_to_absolute_path() {
+        assert_eq!(
+            ReporterKind::from_str("rwx-v1-json=/my/test.xml"),
+            Ok(ReporterKind::RwxV1Json(PathBuf::from("/my/test.xml")))
+        );
+    }
+
+    #[test]
+    fn parse_rwx_v1_json_reporter_eq_with_suffix_to_relative_path() {
+        assert_eq!(
+            ReporterKind::from_str("rwx-v1-json=my/test.xml"),
+            Ok(ReporterKind::RwxV1Json(PathBuf::from("my/test.xml")))
         );
     }
 }
