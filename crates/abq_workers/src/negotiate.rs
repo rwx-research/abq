@@ -248,6 +248,8 @@ impl WorkersNegotiator {
                     net_protocol::async_write(&mut stream, &request)
                         .await
                         .unwrap();
+                    let net_protocol::queue::AckTestResults {} =
+                        net_protocol::async_read(&mut stream).await.unwrap();
                 })
             }
         });
@@ -308,7 +310,7 @@ impl WorkersNegotiator {
 
                     // TODO: error handling
                     net_protocol::write(&mut stream, message).unwrap();
-                    let net_protocol::workers::AckManifest =
+                    let net_protocol::queue::AckManifest {} =
                         net_protocol::read(&mut stream).unwrap();
                 }
             }))
@@ -906,6 +908,8 @@ mod test {
             let request: net_protocol::queue::Request = net_protocol::read(&mut client).unwrap();
             match request.message {
                 net_protocol::queue::Message::WorkerResult(_, results) => {
+                    net_protocol::write(&mut client, net_protocol::queue::AckTestResults {})
+                        .unwrap();
                     for (_, result) in results {
                         msgs2.lock().unwrap().push(result);
                     }
@@ -920,7 +924,7 @@ mod test {
                         old_manifest.is_none(),
                         "replacing existing manifest! This is a bug in our tests."
                     );
-                    net_protocol::write(&mut client, net_protocol::workers::AckManifest).unwrap();
+                    net_protocol::write(&mut client, net_protocol::queue::AckManifest {}).unwrap();
                 }
                 net_protocol::queue::Message::RequestTotalRunResult(_) => {
                     let succeeded = msgs2

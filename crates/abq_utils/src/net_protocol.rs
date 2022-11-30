@@ -325,10 +325,6 @@ pub mod workers {
     /// A bundle of work sent to a worker to be run in sequence.
     #[derive(Serialize, Deserialize, Debug)]
     pub struct NextWorkBundle(pub Vec<NextWork>);
-
-    /// An acknowledgement from the queue that it received a manifest message.
-    #[derive(Serialize, Deserialize)]
-    pub struct AckManifest;
 }
 
 pub mod queue {
@@ -423,6 +419,17 @@ pub mod queue {
         pub entity: EntityId,
         pub message: Message,
     }
+
+    /// An acknowledgement from the queue that it received a manifest message.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub struct AckManifest {}
+
+    /// An acknowledgement of receiving a bundle of test result from a worker.
+    /// Sent by the queue.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub struct AckTestResults {}
 
     /// **ADMIN RESPONSE**
     /// The queue acknowledges retirement.

@@ -1251,8 +1251,12 @@ impl QueueServer {
                 // client connection on that; recall that the worker side of the connection will
                 // move on to the next test as soon as it sends a test result back.
                 //
-                // So, we have no use for the connection as soon as we've parsed the test result out,
-                // and we'd prefer to close it immediately.
+                // So, we have no use for the connection as soon as we've parsed the test results out.
+                // The worker will have been waiting for us to notify them once the parsing is
+                // complete (XREF https://github.com/rwx-research/abq/issues/281), so notify them
+                // now and close out our side of the connection.
+                net_protocol::async_write(&mut stream, &net_protocol::queue::AckTestResults {})
+                    .await?;
                 drop(stream);
 
                 // Record the test results and notify the test client out-of-band.
@@ -1562,7 +1566,7 @@ impl QueueServer {
 
         queues.add_manifest(run_id, flat_manifest, init_metadata);
 
-        net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
+        net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {}).await?;
 
         Ok(())
     }
@@ -1596,7 +1600,7 @@ impl QueueServer {
         {
             // Immediately ACK to the worker responsible for the manifest, so they can relinquish
             // blocking and exit.
-            net_protocol::async_write(&mut stream, &net_protocol::workers::AckManifest).await?;
+            net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {}).await?;
             drop(stream);
         }
 
