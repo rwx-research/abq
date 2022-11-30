@@ -7,7 +7,7 @@ when you run `cargo` in this project.
 
 Then install cargo-insta for testing
 
-```
+```bash
 cargo install cargo-insta
 ```
 
@@ -39,8 +39,15 @@ To get started, you need to have permission to create queues manually on Captain
 staging. This script expects `ABQ_CREATE_MANUAL_ACCESS_TOKEN` to be available in
 your environment with the access token, which you can get via
 
-```
+```bash
+aws sso login --profile staging
 aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN --with-decryption --profile staging
+```
+
+or if you're using direnv, write ABQ_CREATE_MANUAL_ACCESS to your .envrc
+
+```bash
+aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN --with-decryption --profile staging --output json | jq .Parameter.Value | xargs -n 1 -I {} echo "ABQ_CREATE_MANUAL_ACCESS_TOKEN={}" > .envrc
 ```
 
 - `bin/manage_dev_queue start <version>` - start the dev queue instance. If no
@@ -70,7 +77,7 @@ client at runtime.
 
 An example of how to create such a certificate follows:
 
-```
+```bash
 openssl \
   req -x509 -newkey rsa:4096 \
   -keyout server.key -out ssl_certs/server.crt \
