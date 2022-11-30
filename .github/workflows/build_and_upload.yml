@@ -51,11 +51,19 @@ jobs:
     strategy:
       # in the future we'll want to release against different architectures
       matrix:
-        os: [ubuntu-latest]
         include:
           - os: ubuntu-latest
             platform: linux_x86-64
             container: quay.io/pypa/manylinux2014_x86_64
+            cross-target: ''
+          - os: macos-10.15 # use an older version for broader osx support
+            platform: darwin_x86-64
+            container: ''
+            cross-target: ''
+          - os: macos-11 # first OS X to support arm64 -- so the first os for cross compilation
+            platform: darwin_aarch64
+            container: ''
+            cross-target: 'aarch64-apple-darwin'
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     outputs:
@@ -92,22 +100,36 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-release-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-${{ matrix.platform }}-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-${{ matrix.platform }}-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
-          toolchain: stable
+          toolchain: "1.64.0"
+          # this is really only for arm64 apple (for now)
+          target: ${{ matrix.cross-target }}
+          default: true
 
+      # jq is already in the default mac image
+      # https://github.com/actions/runner-images/blob/main/images/macos/macos-10.15-Readme.md
       - name: Install build + deploy deps
+        if: contains(matrix.platform, 'linux')
         run: |
           yum install sudo jq -y
 
       - name: Build release
+        if: '!matrix.cross-target'
         run: cargo build --release --all-features
 
+      - name: Build release
+        if: matrix.cross-target
+        run: cargo build --release --all-features --target="${{ matrix.cross-target }}"
+
+      # aws cli is already in the default mac image
+      # https://github.com/actions/runner-images/blob/main/images/macos/macos-10.15-Readme.md
       - name: Install aws CLI
+        if: contains(matrix.platform, 'linux') # done via homebrew on mac
         run: |
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip
@@ -129,7 +151,11 @@ jobs:
       - name: Prepare release
         run: |
           mkdir "${RELEASE_NAME}"
-          cp target/release/abq "${RELEASE_NAME}"
+          if [ -z "${{ matrix.cross-target }}" ]; then
+            cp target/release/abq "${RELEASE_NAME}/"
+          else
+            cp target/${{ matrix.cross-target }}/release/abq "${RELEASE_NAME}/"
+          fi
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
 
       - name: Push release to development S3

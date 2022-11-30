@@ -68,10 +68,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-release-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-linux_x86-64-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ hashFiles('rust-toolchain.toml')}}-
-
+            cargo-release-linux_x86-64-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
