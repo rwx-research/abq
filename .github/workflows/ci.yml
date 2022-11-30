@@ -26,110 +26,19 @@ jobs:
           command: fmt
           args: -- --check
 
-  test:
-    name: Lint, test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0 # get whole history for versioning
-
-      # this may not be unecessary when https://github.com/actions/checkout/issues/882 is resolved
-      - name: re-fetch overwritten tag
-        run: git fetch --tags --force
-
-      - name: Restore cargo cache
-        uses: actions/cache@v3
-        env:
-          cache-name: ci
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: cargo-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ hashFiles('rust-toolchain.toml')}}-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.64.0
-        with:
-          components: clippy
-
-      - name: Run lints
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: clippy
-          args: --workspace --tests --release -- --deny warnings
-
-      # setup testdata
-      - uses: actions/setup-node@v3
-        with:
-          node-version: '14'
-          cache: 'npm'
-          cache-dependency-path: 'testdata/**/package-lock.json'
-
-      - name: Pull native test runners
-        run: |
-          eval `ssh-agent -s`
-
-          echo "${{secrets.SSH_KEY_ABQ_JEST}}" | ssh-add -
-          git submodule update --init -- native-runners/abq-jest
-
-          eval `ssh-agent -k`
-
-      - name: Get yarn cache directory path
-        id: yarn-cache-dir-path
-        run: echo "::set-output name=dir::$(yarn config get cacheFolder)"
-        shell: bash
-        working-directory: native-runners/abq-jest
-      - name: Restore yarn cache
-        uses: actions/cache@v3
-        with:
-          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
-          key: yarn-cache-folder-${{ hashFiles('native-runners/abq-jest/yarn.lock', '.yarnrc.yml') }}
-          restore-keys: |
-            yarn-cache-folder-
-
-      - name: Load test dependencies
-        run: |
-          scripts/init_testdata
-
-      # End setup testdata
-
-      - name: Run tests with cargo
-        timeout-minutes: 10
-        if: github.run_attempt == 1
-        run: |
-          cargo test --all-features
-        env:
-          CI: false
-
-      - name: Run retried tests with cargo, including debug output
-        timeout-minutes: 5
-        if: github.run_attempt > 1
-        run: |
-          export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --all-features -- --nocapture
-        env:
-          CI: false
-
-  release_development:
-    name: Release new abq to staging API for testing
-    needs: test
-    uses: ./.github/workflows/build_and_upload_development.yml
+  test_and_package_development:
+    name: Test and package development build
+    uses: ./.github/workflows/test_and_package_development.yml
     with:
       ref: ${{ github.ref }}
     secrets: inherit
 
   bigtest:
-    needs: release_development
+    needs: test_and_package_development
     uses: ./.github/workflows/bigtest.yml
     secrets: inherit
     with:
-      version: ${{ needs.release_development.outputs.abq_version }}
+      version: ${{ needs.test_and_package_development.outputs.abq_version }}
 
   release_unstable:
     name: Release new abq to API
