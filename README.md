@@ -26,6 +26,30 @@ Tips:
   "rust-analyzer.checkOnSave.extraArgs": ["--target-dir", "/tmp/rust-analyzer-check"],
   ```
 
+### Dev queues
+
+[Automated tests](.github/workflows/bigtest.yml) are run against remote instances of
+feature-branch queues when you submit a PR. These feature-branch queues are
+called "dev queues" and have `-devel` version suffixes, e.g. `1.0.0-15-gd923df5-devel`.
+
+Sometimes, you may want to perform local manual testing against a remote dev
+queue. To aid this, use `bin/manage_dev_queue`.
+
+To get started, you need to have permission to create queues manually on Captain
+staging. This script expects `ABQ_CREATE_MANUAL_ACCESS_TOKEN` to be available in
+your environment with the access token, which you can get via
+
+```
+aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN --with-decryption --profile staging
+```
+
+- `bin/manage_dev_queue start <version>` - start the dev queue instance. If no
+  version is provided, the head commit version will be used. You should make
+  sure that the version has been [built and published](.github/workflows/test_and_package_development.yml)
+  to Captain/ABQ staging for this to work.
+  - Only one dev queue can be active at a time.
+- `bin/manage_dev_queue stop` - stops the active dev queue instance, if any.
+
 ## Operations
 
 ### Releasing a new version
