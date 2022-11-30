@@ -1,8 +1,6 @@
 //! Persisted connections between the queue and workers.
 
-#![cfg(test)] // TODO #281
-
-use std::{collections::HashMap, future::Future, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use abq_utils::net_protocol::workers::RunId;
 use parking_lot::Mutex;
@@ -10,16 +8,19 @@ use tokio::{sync::oneshot, task::JoinSet};
 
 use crate::prelude::{AnyError, OpaqueResult};
 
-#[derive(Default)]
+#[derive(Clone)]
 pub(crate) struct ConnectedWorkers {
-    map: Mutex<
-        //
-        HashMap<RunId, PersistedConnectionSet>,
+    timeout: Duration,
+    map: Arc<
+        Mutex<
+            //
+            HashMap<RunId, PersistedConnectionSet>,
+        >,
     >,
 }
 
+#[derive(Default)]
 struct PersistedConnectionSet {
-    timeout: Duration,
     // NB: we do not care about the ordering of launched tasks, so we prefer
     // provided collections here over ordered ones.
     all_tasks: JoinSet<OpaqueResult<()>>,
@@ -28,46 +29,37 @@ struct PersistedConnectionSet {
 
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-impl ConnectedWorkers {
-    /// Create a set of connected workers associated to a run.
-    ///
-    /// # Invariants
-    ///
-    /// - This must be called before [insert][Self::insert] of any associated worker connection.
-    /// - No other association for the same test run already exists.
-    ///
-    /// These invariants should be guaranteed by the state machine the queue moves test runs
-    /// through.
-    ///
-    /// Panics if any invariant is broken.
-    pub fn create(&self, run_id: RunId) {
-        self.create_with_timeout(run_id, DEFAULT_STOP_TIMEOUT)
+impl Default for ConnectedWorkers {
+    fn default() -> Self {
+        Self::new(DEFAULT_STOP_TIMEOUT)
     }
+}
 
-    fn create_with_timeout(&self, run_id: RunId, timeout: Duration) {
-        let mut map = self.map.lock();
-        assert!(
-            !map.contains_key(&run_id),
-            "existing worker connection pool for {run_id:?}"
-        );
-        map.insert(
-            run_id,
-            PersistedConnectionSet {
-                timeout,
-                all_tasks: JoinSet::new(),
-                all_tx_stop: Vec::new(),
-            },
-        );
+pub(crate) enum StopResult {
+    /// The run ID was not associated in the connection set.
+    RunNotAssociated,
+    /// Stopped worker connection tasks for a run ID. Returns errors seen during stopping, if any.
+    Stopped(Vec<AnyError>),
+}
+
+impl ConnectedWorkers {
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            map: Default::default(),
+        }
     }
 
     /// Launches a task responsible for communicating with a persisted worker connection for a run.
     /// This method will call `spawn` itself; you should not do so yourself.
     ///
+    /// If there is not already an association for the run ID, a new one will be created. This is
+    /// to avoid locking of the state machine of test runs for associating a test run ID.
+    ///
     /// # Invariants
     ///
     /// - Must be called in an async (tokio) runtime
-    /// - This must be called only after an association for a run has been [created][Self::create].
-    pub fn insert<F, Fut>(&self, run_id: &RunId, create_task: F)
+    pub fn insert<F, Fut>(&self, run_id: RunId, create_task: F)
     where
         F: FnOnce(/* on stop */ oneshot::Receiver<()>) -> Fut,
         Fut: Future<Output = OpaqueResult<()>> + Send + 'static,
@@ -76,9 +68,7 @@ impl ConnectedWorkers {
         let task = create_task(rx_stop);
         {
             let mut map = self.map.lock();
-            let conn_set = map.get_mut(run_id).unwrap_or_else(|| {
-                panic!("worker connection pool for {run_id:?} must be present before insertion")
-            });
+            let conn_set = map.entry(run_id).or_default();
 
             // We manage task cancellation via channels, so no need for the forcable abort handles.
             let _abort_handle = conn_set.all_tasks.spawn(task);
@@ -92,20 +82,16 @@ impl ConnectedWorkers {
     /// Resolves only once all worker connections are stopped, or the timeout for
     /// stopping is reached. If the timeout for stopping is reached, the tasks are
     /// forcably aborted.
-    ///
-    /// Returns errors discovered when stopping the tasks, if any.
-    ///
-    /// # Invariants
-    ///
-    /// - The test run association must already exist.
-    pub async fn stop(&self, run_id: &RunId) -> Vec<AnyError> {
+    pub async fn stop(&self, run_id: &RunId) -> StopResult {
+        // NB: take exclusive access over the map only for as long as removal, not shutdown, takes.
+        let removed_set = { self.map.lock().remove(run_id) };
         let PersistedConnectionSet {
-            timeout,
             mut all_tasks,
             all_tx_stop,
-        } = self.map.lock().remove(run_id).unwrap_or_else(|| {
-            panic!("worker connection pool for {run_id:?} must be present before stopping")
-        });
+        } = match removed_set {
+            Some(set) => set,
+            None => return StopResult::RunNotAssociated,
+        };
 
         for tx_stop in all_tx_stop {
             // The task can exit of its own volition prior to receiving the stop signal.
@@ -126,14 +112,21 @@ impl ConnectedWorkers {
 
         tokio::select! {
             result = wait_for_all_tasks => {
-                result
+                StopResult::Stopped(result)
             }
-            _ = tokio::time::sleep(timeout) => {
-                tracing::error!(?run_id, ?timeout, "forcing abort for worker connections failing to exit");
+            _ = tokio::time::sleep(self.timeout) => {
+                tracing::error!(?run_id, timeout=?self.timeout, "forcing abort for worker connections failing to exit");
                 all_tasks.shutdown().await;
-                vec!["Forced abort for worker connections".into()]
+                StopResult::Stopped(
+                    vec!["Forced abort for worker connections".into()]
+                )
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn has_tasks_for(&self, run_id: &RunId) -> bool {
+        self.map.lock().contains_key(run_id)
     }
 }
 
@@ -144,7 +137,7 @@ mod test {
     use abq_utils::net_protocol::workers::RunId;
     use tokio::sync::Mutex;
 
-    use crate::prelude::AnyError;
+    use crate::{connections::StopResult, prelude::AnyError};
 
     use super::ConnectedWorkers;
 
@@ -160,15 +153,12 @@ mod test {
     ) where
         Fut: Future<Output = ()>,
     {
-        let workers = ConnectedWorkers::default();
+        let workers = ConnectedWorkers::new(timeout);
 
         let run_ids: Vec<_> = (0..MULTIPLE_RUN_IDS).map(|_| RunId::unique()).collect();
         let mut launched_by_id: Vec<_> = (0..MULTIPLE_RUN_IDS).map(|_| IdVec::default()).collect();
         let mut stopped_by_id: Vec<_> = (0..MULTIPLE_RUN_IDS).map(|_| IdVec::default()).collect();
 
-        for run_id in run_ids.iter().cloned() {
-            workers.create_with_timeout(run_id, timeout);
-        }
         for i in 0..MULTIPLE_RUN_IDS {
             let run_id = run_ids[i].clone();
             let launched = launched_by_id[i].clone();
@@ -184,7 +174,10 @@ mod test {
             let run_id = run_ids[i].clone();
             let workers = &workers;
             let fut = async move {
-                let errors = workers.stop(&run_id).await;
+                let errors = match workers.stop(&run_id).await {
+                    StopResult::Stopped(errors) => errors,
+                    _ => unreachable!(),
+                };
                 check(errors, launched, stopped).await;
             };
             all_test_futs.push(fut);
@@ -194,12 +187,11 @@ mod test {
     }
 
     #[tokio::test]
-    async fn create_and_stop_empty() {
+    async fn create_and_stop_nothing_created() {
         let workers = ConnectedWorkers::default();
         let run_id = RunId::unique();
-        workers.create(run_id.clone());
-        let errors = workers.stop(&run_id).await;
-        assert!(errors.is_empty());
+        let stopped = workers.stop(&run_id).await;
+        assert!(matches!(stopped, StopResult::RunNotAssociated));
     }
 
     #[tokio::test]
@@ -207,7 +199,7 @@ mod test {
         with_many_runs(
             |workers, run_id, launched, stopped| {
                 for i in 0..MULTIPLE_WORKERS {
-                    workers.insert(&run_id, |rx_stop| {
+                    workers.insert(run_id.clone(), |rx_stop| {
                         let launched = launched.clone();
                         let stopped = stopped.clone();
                         async move {
@@ -237,7 +229,7 @@ mod test {
     async fn stopped_before_rx_stop() {
         with_many_runs(
             |workers, run_id, launched, _stopped| {
-                workers.insert(&run_id, |_rx_stop| {
+                workers.insert(run_id, |_rx_stop| {
                     let launched = launched.clone();
                     async move {
                         launched.lock().await.push(1);
@@ -261,7 +253,7 @@ mod test {
         with_many_runs(
             |workers, run_id, launched, _stopped| {
                 for i in 0..MULTIPLE_WORKERS {
-                    workers.insert(&run_id, |rx_stop| {
+                    workers.insert(run_id.clone(), |rx_stop| {
                         let launched = launched.clone();
                         async move {
                             launched.lock().await.push(i);
@@ -296,7 +288,7 @@ mod test {
     async fn stopped_with_error_before_rx_stop() {
         with_many_runs(
             |workers, run_id, launched, _stopped| {
-                workers.insert(&run_id, |_rx_stop| {
+                workers.insert(run_id, |_rx_stop| {
                     let launched = launched.clone();
                     async move {
                         launched.lock().await.push(1);
@@ -321,7 +313,7 @@ mod test {
         with_many_runs(
             |workers, run_id, _launched, _stopped| {
                 for _ in 0..MULTIPLE_WORKERS {
-                    workers.insert(&run_id, |_rx_stop| async move {
+                    workers.insert(run_id.clone(), |_rx_stop| async move {
                         tokio::time::sleep(Duration::MAX).await;
                         Ok(())
                     });

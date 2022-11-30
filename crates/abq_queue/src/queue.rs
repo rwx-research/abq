@@ -34,7 +34,8 @@ use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tracing::instrument;
 
-use crate::prelude::AnyError;
+use crate::connections::{self, ConnectedWorkers};
+use crate::prelude::{AnyError, OpaqueResult};
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun};
 
 // TODO: we probably want something more sophisticated here, in particular a concurrent
@@ -192,6 +193,7 @@ impl AllRuns {
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
     ) -> Result<(), NewQueueError> {
+        // Take an exclusive lock over the run state for the entirety of the update.
         let mut runs = self.runs.write();
 
         if let Some(state) = runs.get(&run_id) {
@@ -1071,6 +1073,11 @@ struct QueueServerCtx {
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 
+    /// Connected worker tasks. A task is spawned when a worker opens a persistent connection with
+    /// the queue to incrementally stream test results, and the task simply listens for new test
+    /// result messages until the worker notifies completion.
+    worker_results_tasks: ConnectedWorkers,
+
     /// Holds state on whether the queue is retired, and records retirement if the queue is asked
     /// to retire by a priveleged process.
     retirement: RetirementCell,
@@ -1114,6 +1121,8 @@ impl QueueServer {
                 state_cache: Default::default(),
                 public_negotiator_addr,
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
+
+                worker_results_tasks: Default::default(),
 
                 retirement: shutdown.get_retirement_cell(),
             };
@@ -1263,9 +1272,20 @@ impl QueueServer {
                     ctx.queues,
                     ctx.active_runs,
                     ctx.state_cache,
+                    ctx.worker_results_tasks,
                     entity,
                     run_id,
                     results,
+                )
+                .await
+            }
+
+            Message::PersistentWorkerResultsConnection(run_id) => {
+                Self::handle_new_persistent_worker_results_connection(
+                    ctx.worker_results_tasks,
+                    run_id,
+                    entity,
+                    stream,
                 )
                 .await
             }
@@ -1657,11 +1677,15 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
+    #[instrument(
+        level = "trace",
+        skip(queues, active_runs, state_cache, worker_results_tasks)
+    )]
     async fn handle_worker_results(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunResultStateCache,
+        worker_results_tasks: ConnectedWorkers,
         entity: EntityId,
         run_id: RunId,
         results: Vec<AssociatedTestResult>,
@@ -1715,77 +1739,103 @@ impl QueueServer {
             (run_state.work_left == 0, run_state.is_successful)
         };
 
-        if no_more_work {
-            let run_complete_span = tracing::info_span!("run completion", ?run_id, ?entity);
-            let _run_complete_enter = run_complete_span.enter();
-
-            // Now, we have to take both the active runs, and the map of work left, to mark
-            // the work for the current run as complete in both cases. It's okay for this to
-            // be slow(er), since it happens only once per test run.
-            //
-            // Note however that this does block requests indexing into the maps for other `abq
-            // test` runs.
-            // We may want to use concurrent hashmaps that index into partitioned buckets for that
-            // use case (e.g. DashMap).
-            let responder = active_runs.write().await.remove(&run_id).unwrap();
-            let mut responder = responder.into_inner();
-
-            responder.flush_results().await;
-
-            match responder {
-                ClientResponder::DirectStream { mut stream, buffer } => {
-                    assert!(
-                        buffer.is_empty(),
-                        "no results should be buffered after drainage"
-                    );
-
-                    net_protocol::async_write(&mut stream, &InvokerTestResult::EndOfResults)
-                        .await?;
-
-                    // To avoid a race between the total test result observed by a supervisor vs.
-                    // the total test result observed by a worker, require the supervisor to
-                    // provide an ACK of the test ending before marking the test result as complete
-                    // here.
-                    //
-                    // Consider the case where we are streaming this last test result back to the
-                    // supervisor, but during the send, the supervisor issues a cancellation.
-                    // Without checking for an ACK, we would now record the test run as `Done`,
-                    // before later receiving the cancellation from the client. This delta
-                    // exposes a temporal race in how workers observe the final test result.
-                    //
-                    // Since the supervisor always blocks, achieving an ACK here means that the
-                    // client will have seen a proper completion as well. Otherwise, in the
-                    // presence of a cancellation, the stream will break before the ACK, and this
-                    // request will be dropped while the cancellation will be fulfilled.
-                    let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
-
-                    drop(stream);
-
-                    tracing::info!(?run_id, "closed connected results responder");
-                }
-                ClientResponder::Disconnected {
-                    results,
-                    buffer_size: _,
-                } => {
-                    tracing::warn!(?run_id, "dropping disconnected results responder");
-
-                    // Unfortunately, since we still don't have an active connection to the abq
-                    // client, we can't send any buffered test results or end-of-tests anywhere.
-                    // To avoid leaking memory we assume the client is dead and drop the results.
-                    //
-                    // TODO: rather than dropping any pending results, consider attaching any
-                    // pending results back to the queue. If the client re-connects, send them all
-                    // back at that point. The queue can run a weep to cleanup any uncolleted
-                    // results on some time interval.
-                    let _ = results;
-                }
-            }
-
-            state_cache.lock().remove(&run_id);
-            queues.mark_complete(&run_id, is_successful);
+        if !no_more_work {
+            return Ok(());
         }
 
-        Ok(())
+        // Now, we need to notify the end of the test run and handle resource cleanup.
+
+        let run_complete_span = tracing::info_span!("run completion", ?run_id, ?entity);
+        let _run_complete_enter = run_complete_span.enter();
+
+        // Now, we have to take both the active runs, and the map of work left, to mark
+        // the work for the current run as complete in both cases. It's okay for this to
+        // be slow(er), since it happens only once per test run.
+        //
+        // Note however that this does block requests indexing into the maps for other `abq
+        // test` runs.
+        // We may want to use concurrent hashmaps that index into partitioned buckets for that
+        // use case (e.g. DashMap).
+        let responder = active_runs.write().await.remove(&run_id).unwrap();
+        let mut responder = responder.into_inner();
+
+        responder.flush_results().await;
+
+        match responder {
+            ClientResponder::DirectStream { mut stream, buffer } => {
+                assert!(
+                    buffer.is_empty(),
+                    "no results should be buffered after drainage"
+                );
+
+                net_protocol::async_write(&mut stream, &InvokerTestResult::EndOfResults).await?;
+
+                // To avoid a race between the total test result observed by a supervisor vs.
+                // the total test result observed by a worker, require the supervisor to
+                // provide an ACK of the test ending before marking the test result as complete
+                // here.
+                //
+                // Consider the case where we are streaming this last test result back to the
+                // supervisor, but during the send, the supervisor issues a cancellation.
+                // Without checking for an ACK, we would now record the test run as `Done`,
+                // before later receiving the cancellation from the client. This delta
+                // exposes a temporal race in how workers observe the final test result.
+                //
+                // Since the supervisor always blocks, achieving an ACK here means that the
+                // client will have seen a proper completion as well. Otherwise, in the
+                // presence of a cancellation, the stream will break before the ACK, and this
+                // request will be dropped while the cancellation will be fulfilled.
+                //
+                // TODO: if, on the other hand, reading here fails due to a network error (or
+                // writing above does), we will leak memory and connections as the state is not
+                // updated to mark end-of-run until after the client acknowledges success.
+                //   In practice this degraded state is unlikely to materially affect the runtime
+                // of the queue, but we should avoid needless leaks here.
+                let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
+
+                drop(stream);
+
+                tracing::info!(?run_id, "closed connected results responder");
+            }
+            ClientResponder::Disconnected {
+                results,
+                buffer_size: _,
+            } => {
+                tracing::warn!(?run_id, "dropping disconnected results responder");
+
+                // Unfortunately, since we still don't have an active connection to the abq
+                // client, we can't send any buffered test results or end-of-tests anywhere.
+                // To avoid leaking memory we assume the client is dead and drop the results.
+                //
+                // TODO: rather than dropping any pending results, consider attaching any
+                // pending results back to the queue. If the client re-connects, send them all
+                // back at that point. The queue can run a weep to cleanup any uncolleted
+                // results on some time interval.
+                let _ = results;
+            }
+        }
+
+        state_cache.lock().remove(&run_id);
+        queues.mark_complete(&run_id, is_successful);
+
+        match worker_results_tasks.stop(&run_id).await {
+            connections::StopResult::RunNotAssociated => {
+                // TODO: if we hit this state, it should be an error once we migrate to
+                // persisted connections!
+                Ok(())
+            }
+            connections::StopResult::Stopped(errors) if errors.is_empty() => Ok(()),
+            connections::StopResult::Stopped(mut errors) => {
+                for error in errors.iter() {
+                    tracing::error!(
+                        ?error,
+                        ?run_id,
+                        "failed to successfully stop worker results connection task"
+                    );
+                }
+                Err(errors.remove(0))
+            }
+        }
     }
 
     /// Handles fired timeouts for test results, instuted by a [RunTimeoutManager].
@@ -1885,6 +1935,20 @@ impl QueueServer {
         state_cache.lock().remove(&run_id);
 
         let _ = locked_active_runs; // make sure the lock isn't dropped before here
+
+        Ok(())
+    }
+
+    async fn handle_new_persistent_worker_results_connection(
+        worker_results_tasks: ConnectedWorkers,
+        run_id: RunId,
+        _entity: EntityId,
+        _stream: Box<dyn net_async::ServerStream>,
+    ) -> OpaqueResult<()> {
+        worker_results_tasks.insert(run_id, |rx_stop| async move {
+            rx_stop.await?;
+            Ok(())
+        });
 
         Ok(())
     }
@@ -2110,6 +2174,7 @@ mod test {
 
     use super::{RunResultState, RunResultStateCache};
     use crate::{
+        connections::ConnectedWorkers,
         invoke::{run_cancellation_pair, Client, DEFAULT_CLIENT_POLL_TIMEOUT},
         queue::{
             ActiveRunResponders, BufferedResults, CancelReason, ClientReconnectionError,
@@ -2351,6 +2416,7 @@ mod test {
         let active_runs = ActiveRunResponders::default();
         let run_queues = SharedRuns::default();
         let run_state = RunResultStateCache::default();
+        let worker_results_tasks = ConnectedWorkers::default();
 
         let client_entity = EntityId::new();
 
@@ -2401,6 +2467,7 @@ mod test {
                 run_queues.clone(),
                 Arc::clone(&active_runs),
                 Arc::clone(&run_state),
+                worker_results_tasks.clone(),
                 EntityId::new(),
                 run_id.clone(),
                 vec![(buffered_work_id.clone(), fake_test_result())],
@@ -2461,6 +2528,7 @@ mod test {
                 run_queues,
                 Arc::clone(&active_runs),
                 run_state,
+                worker_results_tasks.clone(),
                 EntityId::new(),
                 run_id,
                 vec![(second_work_id.clone(), fake_test_result())],
@@ -2994,6 +3062,7 @@ mod test {
             );
             Arc::new(pl::Mutex::new(cache))
         };
+        let worker_results_tasks = ConnectedWorkers::default();
 
         let entity = EntityId::new();
 
@@ -3001,6 +3070,7 @@ mod test {
             queues.clone(),
             Arc::clone(&active_runs),
             Arc::clone(&state_cache),
+            worker_results_tasks.clone(),
             entity,
             run_id.clone(),
             vec![(WorkId("work".into()), fake_test_result())],
@@ -3027,6 +3097,7 @@ mod test {
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
         assert!(!state_cache.lock().contains_key(&run_id));
+        assert!(!worker_results_tasks.has_tasks_for(&run_id));
     }
 
     #[test]

@@ -464,6 +464,10 @@ pub mod queue {
         /// cleanly, or fail.
         RequestTotalRunResult(RunId),
 
+        /// A worker is connecting with the intent to hold a persistent connection over which test
+        /// results will be communicated back.
+        PersistentWorkerResultsConnection(RunId),
+
         /// **ADMIN REQUEST**
         /// Asks the queue to retire, rejecting any new test run requests.
         Retire,
