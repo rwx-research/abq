@@ -34,6 +34,7 @@ use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tracing::instrument;
 
+use crate::prelude::AnyError;
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun};
 
 // TODO: we probably want something more sophisticated here, in particular a concurrent
@@ -1032,8 +1033,6 @@ enum ClientReconnectionError {
     #[error("{0} was never used to invoke work on the queue")]
     NeverInvoked(RunId),
 }
-
-type AnyError = Box<dyn Error + Send + Sync>;
 
 #[derive(Debug)]
 struct EntityfulError {
