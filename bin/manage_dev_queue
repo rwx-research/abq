@@ -11,6 +11,15 @@ AUTH_HEADER="Authorization: Bearer $ABQ_CREATE_MANUAL_ACCESS_TOKEN"
 
 echoerr() { echo "$@" 1>&2; }
 
+infer_queue_version () {
+  cargo build -p abq_utils > /dev/null
+  VERSION="$(cat build_artifact/abq_version.txt)"
+  if [[ "$VERSION" != *-devel ]]; then
+    VERSION="$VERSION-devel"
+  fi
+  echo $VERSION
+}
+
 fetch_state () {
   curl 'https://staging.abq.build/api/queue/manual' \
     -X GET \
@@ -88,8 +97,12 @@ if [[ $# -gt 0 ]]; then
     start)
       if [[ $# -gt 1 ]]; then
         start $2
-        exit 0
+      else
+        version="$(infer_queue_version)"
+        echoerr "Starting inferred $version"
+        start $version
       fi
+        exit 0
       ;;
     state)
       state
@@ -102,5 +115,5 @@ if [[ $# -gt 0 ]]; then
   esac
 fi
 
-echo "Unknown command. Usage: start <version> | stop"
+echo "Unknown command. Usage: start <version> | state | stop"
 exit 1

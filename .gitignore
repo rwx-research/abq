@@ -17,6 +17,9 @@ build_artifact/
 .direnv
 result
 
+# Put your env vars in here
+.envrc
+
 # Dev queue
 .dev_queue_state
 bigtest/*/out
