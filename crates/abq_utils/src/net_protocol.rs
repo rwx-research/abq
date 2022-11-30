@@ -493,6 +493,10 @@ pub mod work_server {
         NextTest {
             run_id: RunId,
         },
+
+        /// A worker is connecting with the intent to hold a persistent connection
+        /// over which it will request next tests to run.
+        PersistentWorkerNextTestsConnection(RunId),
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]

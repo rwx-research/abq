@@ -721,12 +721,21 @@ fn start_queue(config: QueueConfig) -> Abq {
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
     let timeout_manager = RunTimeoutManager::default();
+    let worker_next_tests_tasks = ConnectedWorkers::default();
 
     let server_shutdown_rx = shutdown_manager.add_receiver();
     let server_handle = thread::spawn({
         let queue_server = QueueServer::new(queues.clone(), public_negotiator_addr);
         let timeout_manager = timeout_manager.clone();
-        move || queue_server.start_on(server_listener, timeout_manager, server_shutdown_rx)
+        let worker_next_tests_tasks = worker_next_tests_tasks.clone();
+        move || {
+            queue_server.start_on(
+                server_listener,
+                timeout_manager,
+                server_shutdown_rx,
+                worker_next_tests_tasks,
+            )
+        }
     });
 
     let new_work_server = server_options.bind((bind_ip, work_port)).unwrap();
@@ -743,6 +752,7 @@ fn start_queue(config: QueueConfig) -> Abq {
                 timeout_manager,
                 timeout_strategy,
                 work_scheduler_shutdown_rx,
+                worker_next_tests_tasks,
             )
         }
     });
@@ -1073,10 +1083,18 @@ struct QueueServerCtx {
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 
-    /// Connected worker tasks. A task is spawned when a worker opens a persistent connection with
-    /// the queue to incrementally stream test results, and the task simply listens for new test
-    /// result messages until the worker notifies completion.
+    /// Persisted worker connections yielding test results.
+    /// A task is spawned when a worker opens a persistent connection with the
+    /// queue to incrementally stream test results, and the task simply listens
+    /// for new test result messages until the worker notifies completion.
     worker_results_tasks: ConnectedWorkers,
+
+    /// Persisted worker connections that fetch new tests to run.
+    /// These connections are only created on request to the [WorkScheduler],
+    /// and are only [shutdown][ConnectedWorkers::stop] when a test run completes.
+    /// As such, we maintain a pointer so we can stop all remaining tasks when we receive a final
+    /// test result.
+    worker_next_tests_tasks: ConnectedWorkers,
 
     /// Holds state on whether the queue is retired, and records retirement if the queue is asked
     /// to retire by a priveleged process.
@@ -1096,6 +1114,7 @@ impl QueueServer {
         server_listener: Box<dyn net::ServerListener>,
         timeouts: RunTimeoutManager,
         mut shutdown: ShutdownReceiver,
+        worker_next_tests_tasks: ConnectedWorkers,
     ) -> Result<(), QueueServerError> {
         // Create a new tokio runtime solely for handling requests that come into the queue server.
         //
@@ -1123,6 +1142,7 @@ impl QueueServer {
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
 
                 worker_results_tasks: Default::default(),
+                worker_next_tests_tasks,
 
                 retirement: shutdown.get_retirement_cell(),
             };
@@ -1273,6 +1293,7 @@ impl QueueServer {
                     ctx.active_runs,
                     ctx.state_cache,
                     ctx.worker_results_tasks,
+                    ctx.worker_next_tests_tasks,
                     entity,
                     run_id,
                     results,
@@ -1679,13 +1700,20 @@ impl QueueServer {
 
     #[instrument(
         level = "trace",
-        skip(queues, active_runs, state_cache, worker_results_tasks)
+        skip(
+            queues,
+            active_runs,
+            state_cache,
+            worker_results_tasks,
+            worker_next_tests_tasks
+        )
     )]
     async fn handle_worker_results(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunResultStateCache,
         worker_results_tasks: ConnectedWorkers,
+        worker_next_tests_tasks: ConnectedWorkers,
         entity: EntityId,
         run_id: RunId,
         results: Vec<AssociatedTestResult>,
@@ -1817,8 +1845,29 @@ impl QueueServer {
 
         state_cache.lock().remove(&run_id);
         queues.mark_complete(&run_id, is_successful);
+        let opt_worker_results_tasks_err = Self::shutdown_persisted_worker_connection_tasks(
+            worker_results_tasks,
+            &run_id,
+            "failed to successfully stop worker results connection task",
+        )
+        .await;
+        let opt_worker_next_tests_tasks_err = Self::shutdown_persisted_worker_connection_tasks(
+            worker_next_tests_tasks,
+            &run_id,
+            "failed to successfully stop worker next tests connection task",
+        )
+        .await;
 
-        match worker_results_tasks.stop(&run_id).await {
+        opt_worker_results_tasks_err.or(opt_worker_next_tests_tasks_err)
+    }
+
+    #[instrument(level = "trace", skip(tasks, fail_msg))]
+    async fn shutdown_persisted_worker_connection_tasks(
+        tasks: ConnectedWorkers,
+        run_id: &RunId,
+        fail_msg: &str,
+    ) -> OpaqueResult<()> {
+        match tasks.stop(run_id).await {
             connections::StopResult::RunNotAssociated => {
                 // TODO: if we hit this state, it should be an error once we migrate to
                 // persisted connections!
@@ -1827,11 +1876,7 @@ impl QueueServer {
             connections::StopResult::Stopped(errors) if errors.is_empty() => Ok(()),
             connections::StopResult::Stopped(mut errors) => {
                 for error in errors.iter() {
-                    tracing::error!(
-                        ?error,
-                        ?run_id,
-                        "failed to successfully stop worker results connection task"
-                    );
+                    tracing::error!(?error, ?run_id, "{}", fail_msg);
                 }
                 Err(errors.remove(0))
             }
@@ -2042,6 +2087,12 @@ struct SchedulerCtx {
     timeouts: RunTimeoutManager,
     timeout_strategy: RunTimeoutStrategy,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
+
+    /// Persisted worker connections yielding requests for new tests to run.
+    /// A task is spawned when a worker opens a persistent connection with the
+    /// work server to incrementally stream test results, and the task listens
+    /// and responds to new messages until work has been exhausted.
+    worker_next_tests_tasks: ConnectedWorkers,
 }
 
 impl WorkScheduler {
@@ -2051,6 +2102,7 @@ impl WorkScheduler {
         timeouts: RunTimeoutManager,
         timeout_strategy: RunTimeoutStrategy,
         mut shutdown: ShutdownReceiver,
+        worker_next_tests_tasks: ConnectedWorkers,
     ) -> Result<(), WorkSchedulerError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2065,6 +2117,8 @@ impl WorkScheduler {
                 timeouts,
                 timeout_strategy,
                 handshake_ctx: Arc::new(listener.handshake_ctx()),
+
+                worker_next_tests_tasks,
             };
 
             loop {
@@ -2131,6 +2185,14 @@ impl WorkScheduler {
                 };
 
                 net_protocol::async_write(&mut stream, &response).await?;
+            }
+            WorkServerRequest::PersistentWorkerNextTestsConnection(run_id) => {
+                ctx.worker_next_tests_tasks
+                    .insert(run_id, |rx_stop| async move {
+                        // TODO actually handle task
+                        rx_stop.await?;
+                        Ok(())
+                    });
             }
             WorkServerRequest::NextTest { run_id } => {
                 // Pull the next bundle of work.
@@ -2273,7 +2335,12 @@ mod test {
         };
         let server_thread = thread::spawn(|| {
             queue_server
-                .start_on(server, RunTimeoutManager::default(), shutdown_rx)
+                .start_on(
+                    server,
+                    RunTimeoutManager::default(),
+                    shutdown_rx,
+                    ConnectedWorkers::default(),
+                )
                 .unwrap();
         });
 
@@ -2296,7 +2363,12 @@ mod test {
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server
-                .start_on(listener, RunTimeoutManager::default(), shutdown_rx)
+                .start_on(
+                    listener,
+                    RunTimeoutManager::default(),
+                    shutdown_rx,
+                    ConnectedWorkers::default(),
+                )
                 .unwrap();
         });
 
@@ -2417,6 +2489,7 @@ mod test {
         let run_queues = SharedRuns::default();
         let run_state = RunResultStateCache::default();
         let worker_results_tasks = ConnectedWorkers::default();
+        let worker_next_tests_tasks = ConnectedWorkers::default();
 
         let client_entity = EntityId::new();
 
@@ -2468,6 +2541,7 @@ mod test {
                 Arc::clone(&active_runs),
                 Arc::clone(&run_state),
                 worker_results_tasks.clone(),
+                worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id.clone(),
                 vec![(buffered_work_id.clone(), fake_test_result())],
@@ -2529,6 +2603,7 @@ mod test {
                 Arc::clone(&active_runs),
                 run_state,
                 worker_results_tasks.clone(),
+                worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id,
                 vec![(second_work_id.clone(), fake_test_result())],
@@ -2559,7 +2634,12 @@ mod test {
         };
         let queue_handle = thread::spawn(|| {
             queue_server
-                .start_on(server, RunTimeoutManager::default(), server_shutdown_rx)
+                .start_on(
+                    server,
+                    RunTimeoutManager::default(),
+                    server_shutdown_rx,
+                    ConnectedWorkers::default(),
+                )
                 .unwrap();
         });
 
@@ -2604,6 +2684,7 @@ mod test {
                     RunTimeoutManager::default(),
                     RunTimeoutStrategy::default(),
                     server_shutdown_rx,
+                    ConnectedWorkers::default(),
                 )
                 .unwrap();
         });
@@ -2645,6 +2726,7 @@ mod test {
                     RunTimeoutManager::default(),
                     RunTimeoutStrategy::default(),
                     shutdown_rx,
+                    ConnectedWorkers::default(),
                 )
                 .unwrap();
         });
@@ -2675,7 +2757,12 @@ mod test {
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server
-                .start_on(listener, RunTimeoutManager::default(), shutdown_rx)
+                .start_on(
+                    listener,
+                    RunTimeoutManager::default(),
+                    shutdown_rx,
+                    ConnectedWorkers::default(),
+                )
                 .unwrap();
         });
 
@@ -2714,7 +2801,12 @@ mod test {
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
             server
-                .start_on(listener, RunTimeoutManager::default(), shutdown_rx)
+                .start_on(
+                    listener,
+                    RunTimeoutManager::default(),
+                    shutdown_rx,
+                    ConnectedWorkers::default(),
+                )
                 .unwrap();
         });
 
@@ -2756,6 +2848,7 @@ mod test {
                     RunTimeoutManager::default(),
                     RunTimeoutStrategy::default(),
                     shutdown_rx,
+                    ConnectedWorkers::default(),
                 )
                 .unwrap();
         });
@@ -2798,6 +2891,7 @@ mod test {
                     RunTimeoutManager::default(),
                     RunTimeoutStrategy::default(),
                     shutdown_rx,
+                    ConnectedWorkers::default(),
                 )
                 .unwrap();
         });
@@ -3063,6 +3157,7 @@ mod test {
             Arc::new(pl::Mutex::new(cache))
         };
         let worker_results_tasks = ConnectedWorkers::default();
+        let worker_next_tests_tasks = ConnectedWorkers::default();
 
         let entity = EntityId::new();
 
@@ -3071,6 +3166,7 @@ mod test {
             Arc::clone(&active_runs),
             Arc::clone(&state_cache),
             worker_results_tasks.clone(),
+            worker_next_tests_tasks.clone(),
             entity,
             run_id.clone(),
             vec![(WorkId("work".into()), fake_test_result())],
@@ -3098,6 +3194,7 @@ mod test {
         assert!(!active_runs.read().await.contains_key(&run_id));
         assert!(!state_cache.lock().contains_key(&run_id));
         assert!(!worker_results_tasks.has_tasks_for(&run_id));
+        assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
 
     #[test]
