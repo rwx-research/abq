@@ -61,13 +61,12 @@ aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN
 
 ### Releasing a new version
 
-(TODO: automate me)
-
 1. create a new branch
 2. bump the version in crates/abq_cli/Cargo.toml
 3. run `cargo b` to update lockfiles
-4. merge the branch
-5. push a signed tag against the merge commit in master, e.g. `git tag v1.2.3 -s -m "version message"`
+4. merge the branch. MERGE BEFORE YOU TAG! (squash commit will leave any pre-merge tag on a branch dangling!)
+5. push a signed tag against the merge commit in master, e.g. `git tag v1.2.3 -s -m "version message" && git push --tags`
+6. [run the build and upload workflow](https://github.com/rwx-research/abq/actions/workflows/build_and_upload.yml) with your new tag as the ref
 
 ### SSL Certificates
 
