@@ -161,6 +161,8 @@ pub struct Test {
 // otherErrors are not exposed to the reporters right now
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TestResults {
+    #[serde(rename = "$schema")]
+    schema: String,
     framework: Framework,
     summary: Summary,
     tests: Vec<Test>,
@@ -260,6 +262,9 @@ impl Collector {
 
     fn test_results(self) -> TestResults {
         TestResults {
+            schema:
+                "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json"
+                    .to_string(),
             framework: Framework {
                 kind: "other".to_string(),
                 language: "other".to_string(),
