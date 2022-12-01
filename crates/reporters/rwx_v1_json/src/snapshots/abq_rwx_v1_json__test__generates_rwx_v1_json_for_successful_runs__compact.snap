@@ -2,4 +2,4 @@
 source: crates/reporters/rwx_v1_json/src/lib.rs
 expression: json
 ---
-{"framework":{"kind":"other","language":"other"},"summary":{"status":{"kind":"successful"},"tests":1,"otherErrors":0,"retries":0,"canceled":0,"failed":0,"pended":0,"quarantined":0,"skipped":0,"successful":1,"timedOut":0,"todo":0},"tests":[{"name":"app::module::test1","attempt":{"durationInNanoseconds":11000000,"meta":{},"status":{"kind":"successful"}}}]}
+{"$schema":"https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json","framework":{"kind":"other","language":"other"},"summary":{"status":{"kind":"successful"},"tests":1,"otherErrors":0,"retries":0,"canceled":0,"failed":0,"pended":0,"quarantined":0,"skipped":0,"successful":1,"timedOut":0,"todo":0},"tests":[{"name":"app::module::test1","attempt":{"durationInNanoseconds":11000000,"meta":{},"status":{"kind":"successful"}}}]}
