@@ -14,9 +14,10 @@ use tokio::process::{self, Command};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    AbqNativeRunnerSpawnedMessage, AbqNativeRunnerSpecification, FastExit, InitSuccessMessage,
-    ManifestMessage, ProtocolWitness, Status, TestCase, TestCaseMessage, TestResult,
-    TestResultMessage, TestResultSpec, TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
+    NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage, Status, TestCase,
+    TestCaseMessage, TestResult, TestResultMessage, TestResultSpec, TestRuntime,
+    ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -59,7 +60,7 @@ type RunnerConnection = TcpStream;
 #[derive(Debug)]
 pub struct NativeRunnerInfo {
     protocol: ProtocolWitness,
-    specification: AbqNativeRunnerSpecification,
+    specification: NativeRunnerSpecification,
 }
 
 /// Opens a connection with native test runner on the given listener.
@@ -74,7 +75,7 @@ pub async fn open_native_runner_connection(
 ) -> Result<(NativeRunnerInfo, RunnerConnection), ProtocolVersionMessageError> {
     let start = Instant::now();
     let (
-        AbqNativeRunnerSpawnedMessage {
+        NativeRunnerSpawnedMessage {
             protocol_version,
             runner_specification,
         },
@@ -96,7 +97,8 @@ pub async fn open_native_runner_connection(
             // local network, we don't care about packet reduction here.
             conn.set_nodelay(true)?;
 
-            let spawned_message = net_protocol::async_read(&mut conn).await?;
+            let concrete_spawned_message: RawNativeRunnerSpawnedMessage = net_protocol::async_read(&mut conn).await?;
+            let spawned_message = concrete_spawned_message.into();
 
             (spawned_message, conn)
         }
@@ -809,16 +811,16 @@ mod test_validate_protocol_version_message {
     use abq_utils::net_protocol::{
         self,
         runners::{
-            AbqNativeRunnerSpawnedMessage, AbqNativeRunnerSpecification, AbqProtocolVersion,
-            Manifest,
+            AbqProtocolVersion, Manifest, NativeRunnerSpecification, ProtocolWitness,
+            RawNativeRunnerSpawnedMessage,
         },
     };
 
     use super::{open_native_runner_connection, ProtocolVersionError, ProtocolVersionMessageError};
 
-    fn legal_spawned_message() -> AbqNativeRunnerSpawnedMessage {
+    fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessage {
         let protocol_version = AbqProtocolVersion::V0_1;
-        let runner_specification = AbqNativeRunnerSpecification {
+        let runner_specification = NativeRunnerSpecification {
             name: "test".to_string(),
             version: "0.0.0".to_string(),
             test_framework: Some("rspec".to_owned()),
@@ -829,20 +831,18 @@ mod test_validate_protocol_version_message {
                 "ruby 3.1.2p20 (2022-04-12 revision 4491bb740a) [x86_64-darwin21]".to_owned(),
             ),
         };
-        AbqNativeRunnerSpawnedMessage {
-            protocol_version,
-            runner_specification,
-        }
+        RawNativeRunnerSpawnedMessage::new(proto, protocol_version, runner_specification)
     }
 
     #[tokio::test]
+    #[with_protocol_version]
     async fn recv_and_validate_protocol_version_message() {
         let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
 
         let child = async {
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let spawned_message = legal_spawned_message();
+            let spawned_message = legal_spawned_message(proto);
             net_protocol::async_write(&mut stream, &spawned_message)
                 .await
                 .unwrap();
@@ -860,6 +860,7 @@ mod test_validate_protocol_version_message {
     }
 
     #[tokio::test]
+    #[with_protocol_version]
     async fn protocol_version_message_incompatible() {
         let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
@@ -869,7 +870,7 @@ mod test_validate_protocol_version_message {
                 major: 999123123,
                 minor: 12312342,
             };
-            let runner_specification = AbqNativeRunnerSpecification {
+            let runner_specification = NativeRunnerSpecification {
                 name: "test".to_string(),
                 version: "0.0.0".to_string(),
                 test_framework: None,
@@ -878,10 +879,8 @@ mod test_validate_protocol_version_message {
                 language_version: None,
                 host: None,
             };
-            let spawned_message = AbqNativeRunnerSpawnedMessage {
-                protocol_version,
-                runner_specification,
-            };
+            let spawned_message =
+                RawNativeRunnerSpawnedMessage::new(proto, protocol_version, runner_specification);
             net_protocol::async_write(&mut stream, &spawned_message)
                 .await
                 .unwrap();
@@ -952,6 +951,7 @@ mod test_validate_protocol_version_message {
     }
 
     #[tokio::test]
+    #[with_protocol_version]
     async fn protocol_version_message_tunnel_timeout() {
         let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
@@ -960,7 +960,7 @@ mod test_validate_protocol_version_message {
         let child = async {
             sleep(Duration::from_millis(100)).await;
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let spawned_message = legal_spawned_message();
+            let spawned_message = legal_spawned_message(proto);
             net_protocol::async_write(&mut stream, &spawned_message)
                 .await
                 .unwrap();
@@ -979,6 +979,7 @@ mod test_validate_protocol_version_message {
     }
 
     #[tokio::test]
+    #[with_protocol_version]
     async fn protocol_version_message_tunnel_connection_dies() {
         let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
@@ -987,7 +988,7 @@ mod test_validate_protocol_version_message {
         let child = async {
             sleep(Duration::from_millis(100)).await;
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let spawned_message = legal_spawned_message();
+            let spawned_message = legal_spawned_message(proto);
             net_protocol::async_write(&mut stream, &spawned_message)
                 .await
                 .unwrap();

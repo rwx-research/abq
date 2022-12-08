@@ -30,25 +30,6 @@ pub static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
 
 mod v0_1;
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename = "abq_native_runner_spawned")]
-pub struct AbqNativeRunnerSpawnedMessage {
-    pub protocol_version: AbqProtocolVersion,
-    pub runner_specification: AbqNativeRunnerSpecification,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type", rename = "abq_native_runner_specification")]
-pub struct AbqNativeRunnerSpecification {
-    pub name: String,
-    pub version: String,
-    pub test_framework: Option<String>,
-    pub test_framework_version: Option<String>,
-    pub language: Option<String>,
-    pub language_version: Option<String>,
-    pub host: Option<String>,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(tag = "type", rename = "abq_protocol_version")]
 pub struct AbqProtocolVersion {
@@ -93,6 +74,105 @@ impl ProtocolWitness {
         use PrivProtocolWitness::*;
 
         [Self(V0_1)].into_iter()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NativeRunnerSpecification {
+    pub name: String,
+    pub version: String,
+    pub test_framework: Option<String>,
+    pub test_framework_version: Option<String>,
+    pub language: Option<String>,
+    pub language_version: Option<String>,
+    pub host: Option<String>,
+}
+
+impl From<v0_1::AbqNativeRunnerSpecification> for NativeRunnerSpecification {
+    fn from(spec: v0_1::AbqNativeRunnerSpecification) -> Self {
+        let v0_1::AbqNativeRunnerSpecification {
+            name,
+            version,
+            test_framework,
+            test_framework_version,
+            language,
+            language_version,
+            host,
+        } = spec;
+        Self {
+            name,
+            version,
+            test_framework,
+            test_framework_version,
+            language,
+            language_version,
+            host,
+        }
+    }
+}
+
+#[cfg(feature = "expose-native-protocols")]
+impl From<NativeRunnerSpecification> for v0_1::AbqNativeRunnerSpecification {
+    fn from(spec: NativeRunnerSpecification) -> v0_1::AbqNativeRunnerSpecification {
+        let NativeRunnerSpecification {
+            name,
+            version,
+            test_framework,
+            test_framework_version,
+            language,
+            language_version,
+            host,
+        } = spec;
+        v0_1::AbqNativeRunnerSpecification {
+            name,
+            version,
+            test_framework,
+            test_framework_version,
+            language,
+            language_version,
+            host,
+        }
+    }
+}
+
+/// Normalized spawn message.
+pub struct NativeRunnerSpawnedMessage {
+    pub protocol_version: AbqProtocolVersion,
+    pub runner_specification: NativeRunnerSpecification,
+}
+
+impl From<RawNativeRunnerSpawnedMessage> for NativeRunnerSpawnedMessage {
+    fn from(msg: RawNativeRunnerSpawnedMessage) -> Self {
+        let v0_1::AbqNativeRunnerSpawnedMessage {
+            protocol_version,
+            runner_specification,
+        } = msg.0;
+        Self {
+            protocol_version,
+            runner_specification: runner_specification.into(),
+        }
+    }
+}
+
+/// Spawn message received from a native runner.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RawNativeRunnerSpawnedMessage(PrivAbqNativeRunnerSpawnedMessage);
+type PrivAbqNativeRunnerSpawnedMessage = v0_1::AbqNativeRunnerSpawnedMessage;
+
+impl RawNativeRunnerSpawnedMessage {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(
+        protocol: ProtocolWitness,
+        protocol_version: AbqProtocolVersion,
+        spec: NativeRunnerSpecification,
+    ) -> Self {
+        use PrivProtocolWitness::*;
+        match protocol.0 {
+            V0_1 => Self(v0_1::AbqNativeRunnerSpawnedMessage {
+                protocol_version,
+                runner_specification: spec.into(),
+            }),
+        }
     }
 }
 
