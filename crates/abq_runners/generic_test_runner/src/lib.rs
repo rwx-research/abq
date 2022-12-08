@@ -14,14 +14,15 @@ use tokio::process::{self, Command};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    AbqNativeRunnerSpawnedMessage, AbqNativeRunnerSpecification, InitSuccessMessage,
-    ManifestMessage, ManifestResult, Status, TestCase, TestCaseMessage, TestResult,
+    AbqNativeRunnerSpawnedMessage, AbqNativeRunnerSpecification, AbqProtocolVersion,
+    InitSuccessMessage, ManifestMessage, Status, TestCase, TestCaseMessage, TestResult,
     TestResultMessage, ABQ_GENERATE_MANIFEST, ABQ_SOCKET, ACTIVE_PROTOCOL_VERSION_MAJOR,
     ACTIVE_PROTOCOL_VERSION_MINOR,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
-    NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId, WorkerTest,
+    ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, RunId,
+    WorkContext, WorkId, WorkerTest,
 };
 use abq_utils::{atomic, flatten_manifest, net_protocol};
 use futures::future::{self, BoxFuture};
@@ -65,7 +66,14 @@ pub async fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
     native_runner_died: impl Future<Output = ()>,
-) -> Result<(AbqNativeRunnerSpecification, RunnerConnection), ProtocolVersionMessageError> {
+) -> Result<
+    (
+        AbqProtocolVersion,
+        AbqNativeRunnerSpecification,
+        RunnerConnection,
+    ),
+    ProtocolVersionMessageError,
+> {
     let start = Instant::now();
     let (
         AbqNativeRunnerSpawnedMessage {
@@ -101,7 +109,7 @@ pub async fn open_native_runner_connection(
     {
         Err(ProtocolVersionError::NotCompatible.into())
     } else {
-        Ok((runner_specification, runner_conn))
+        Ok((protocol_version, runner_specification, runner_conn))
     }
 }
 
@@ -136,10 +144,10 @@ async fn retrieve_manifest<'a>(
     additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
     working_dir: &Path,
     protocol_version_timeout: Duration,
-) -> Result<ManifestMessage, RetrieveManifestError> {
+) -> Result<ReportedManifest, RetrieveManifestError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
-    let manifest = {
+    let (protocol_version, specification, manifest) = {
         let mut our_listener = TcpListener::bind("127.0.0.1:0").await?;
         let our_addr = our_listener.local_addr()?;
 
@@ -162,22 +170,26 @@ async fn retrieve_manifest<'a>(
         };
 
         // Wait for and validate the protocol version message, channel must always come first.
-        let (_specification, runner_conn) = open_native_runner_connection(
+        let (protocol_version, specification, runner_conn) = open_native_runner_connection(
             &mut our_listener,
             protocol_version_timeout,
             native_runner_died,
         )
         .await?;
 
-        let manifest = wait_for_manifest(runner_conn).await?;
+        let ManifestMessage { manifest } = wait_for_manifest(runner_conn).await?;
 
         let status = native_runner_handle.wait().await?;
         debug_assert!(status.success());
 
-        manifest
+        (protocol_version, specification, manifest)
     };
 
-    Ok(manifest)
+    Ok(ReportedManifest {
+        manifest,
+        native_runner_protocol: protocol_version,
+        native_runner_specification: specification,
+    })
 }
 
 #[derive(Debug, Error)]
@@ -350,7 +362,7 @@ where
     };
 
     // First, get and validate the protocol version message.
-    let (runner_spec, mut runner_conn) = open_native_runner_connection(
+    let (_protocol_version, runner_spec, mut runner_conn) = open_native_runner_connection(
         &mut our_listener,
         protocol_version_timeout,
         native_runner_died,
@@ -662,7 +674,7 @@ fn handle_native_runner_failure<I>(
 pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
     working_dir: PathBuf,
-) -> Result<(ManifestMessage, Vec<TestResult>), GenericRunnerError> {
+) -> Result<(ReportedManifest, Vec<TestResult>), GenericRunnerError> {
     let mut manifest_message = None;
 
     // Currently, an atomic mutex is used here because `send_manifest`, `get_next_test`, and the
@@ -985,11 +997,12 @@ mod test_abq_jest {
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::RunAlreadyCompleted;
     use abq_utils::net_protocol::runners::{
-        ManifestMessage, ManifestResult, Status, TestCase, TestOrGroup,
+        Status, TestCase, TestOrGroup, ACTIVE_ABQ_PROTOCOL_VERSION,
     };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        NativeTestRunnerParams, NextWork, NextWorkBundle, RunId, WorkContext, WorkId, WorkerTest,
+        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, RunId,
+        WorkContext, WorkId, WorkerTest,
     };
     use futures::FutureExt;
 
@@ -1048,10 +1061,17 @@ mod test_abq_jest {
 
         assert!(test_results.lock().unwrap().is_empty());
 
-        let ManifestMessage { mut manifest } = match manifest.unwrap() {
+        let ReportedManifest {
+            mut manifest,
+            native_runner_protocol,
+            native_runner_specification,
+        } = match manifest.unwrap() {
             ManifestResult::Manifest(man) => man,
             ManifestResult::TestRunnerError { .. } => unreachable!(),
         };
+
+        assert_eq!(native_runner_protocol, ACTIVE_ABQ_PROTOCOL_VERSION);
+        assert_eq!(native_runner_specification.name, "abq-jest");
 
         manifest.members.sort_by_key(|member| match member {
             TestOrGroup::Test(test) => test.id.clone(),
@@ -1131,9 +1151,10 @@ mod test_abq_jest {
 mod test {
     use crate::{GenericRunnerError, GenericTestRunner, SendTestResults};
     use abq_utils::net_protocol::entity::EntityId;
-    use abq_utils::net_protocol::runners::ManifestResult;
     use abq_utils::net_protocol::work_server::InitContext;
-    use abq_utils::net_protocol::workers::{NativeTestRunnerParams, NextWork, NextWorkBundle};
+    use abq_utils::net_protocol::workers::{
+        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle,
+    };
     use futures::FutureExt;
 
     #[test]

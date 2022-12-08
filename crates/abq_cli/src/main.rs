@@ -17,7 +17,7 @@ use std::{
 
 use abq_hosted::AccessToken;
 use abq_output::format_duration;
-use abq_queue::invoke::{self, Client, InvocationError, TestResultError};
+use abq_queue::invoke::{self, Client, CompletedSummary, InvocationError, TestResultError};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     net_opt::{ClientOptions, ServerOptions},
@@ -750,7 +750,7 @@ fn start_test_result_reporter(
     batch_size: NonZeroU64,
     results_timeout: Duration,
     on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
-) -> io::Result<JoinHandle<Result<(), InvocationError>>> {
+) -> io::Result<JoinHandle<Result<CompletedSummary, InvocationError>>> {
     let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
 
     let mut term_signals = Signals::new(TERM_SIGNALS)?;
@@ -778,8 +778,9 @@ fn start_test_result_reporter(
                 run_cancellation_rx,
             )
             .await?;
-            abq_test_client.stream_results(on_result).await?;
-            Ok(())
+
+            let completed_summary = abq_test_client.stream_results(on_result).await?;
+            Ok(completed_summary)
         });
 
         // No matter how we exited, now close the thread responsible for capturing termination
