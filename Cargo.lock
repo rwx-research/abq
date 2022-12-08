@@ -56,6 +56,7 @@ version = "0.1.0"
 dependencies = [
  "abq_runner_protocol",
  "abq_utils",
+ "abq_with_protocol_version",
  "anyhow",
  "clap",
  "futures",
@@ -111,6 +112,7 @@ dependencies = [
  "abq_exec_worker",
  "abq_runner_protocol",
  "abq_utils",
+ "abq_with_protocol_version",
  "abq_workers",
  "anyhow",
  "futures",
@@ -168,6 +170,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "abq_with_protocol_version"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "abq_workers"
 version = "0.1.0"
 dependencies = [
@@ -176,6 +186,7 @@ dependencies = [
  "abq_generic_test_runner",
  "abq_runner_protocol",
  "abq_utils",
+ "abq_with_protocol_version",
  "futures",
  "parking_lot",
  "procspawn",

@@ -1,0 +1,11 @@
+[package]
+name = "abq_with_protocol_version"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "1.0.81", features = ["full", "extra-traits"] }
+quote = "1.0.10"
