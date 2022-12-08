@@ -129,18 +129,6 @@ pub mod runners {
         pub manifest: Manifest,
     }
 
-    /// The result of a worker attempting to retrieve a manifest for a test command.
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    pub enum ManifestResult {
-        /// The manifest was successfully retrieved.
-        Manifest(ManifestMessage),
-        /// The worker failed to start the underlying test runner.
-        TestRunnerError {
-            /// Opaque error message from the failing test runner.
-            error: String,
-        },
-    }
-
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "type")]
     pub enum TestOrGroup {
@@ -188,7 +176,12 @@ pub mod runners {
     pub const ACTIVE_PROTOCOL_VERSION_MAJOR: u64 = 0;
     pub const ACTIVE_PROTOCOL_VERSION_MINOR: u64 = 1;
 
-    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+    pub const ACTIVE_ABQ_PROTOCOL_VERSION: AbqProtocolVersion = AbqProtocolVersion {
+        major: ACTIVE_PROTOCOL_VERSION_MAJOR,
+        minor: ACTIVE_PROTOCOL_VERSION_MINOR,
+    };
+
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
     #[serde(tag = "type", rename = "abq_protocol_version")]
     pub struct AbqProtocolVersion {
         pub major: u64,
@@ -197,7 +190,9 @@ pub mod runners {
 }
 
 pub mod workers {
-    use super::runners::{ManifestMessage, TestCase};
+    use super::runners::{
+        AbqNativeRunnerSpecification, AbqProtocolVersion, Manifest, ManifestMessage, TestCase,
+    };
     use serde_derive::{Deserialize, Serialize};
     use std::{
         collections::HashMap,
@@ -325,6 +320,28 @@ pub mod workers {
     /// A bundle of work sent to a worker to be run in sequence.
     #[derive(Serialize, Deserialize, Debug)]
     pub struct NextWorkBundle(pub Vec<NextWork>);
+
+    /// Manifest reported to from a worker to the queue, including
+    /// - test manifest
+    /// - native test runner metadata
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct ReportedManifest {
+        pub manifest: Manifest,
+        pub native_runner_protocol: AbqProtocolVersion,
+        pub native_runner_specification: AbqNativeRunnerSpecification,
+    }
+
+    /// The result of a worker attempting to retrieve a manifest for a test command.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub enum ManifestResult {
+        /// The manifest was successfully retrieved.
+        Manifest(ReportedManifest),
+        /// The worker failed to start the underlying test runner.
+        TestRunnerError {
+            /// Opaque error message from the failing test runner.
+            error: String,
+        },
+    }
 }
 
 pub mod queue {
@@ -334,8 +351,8 @@ pub mod queue {
 
     use super::{
         entity::EntityId,
-        runners::{ManifestResult, TestResult},
-        workers::{RunId, RunnerKind, WorkId},
+        runners::{AbqNativeRunnerSpecification, AbqProtocolVersion, TestResult},
+        workers::{ManifestResult, RunId, RunnerKind, WorkId},
     };
 
     /// A marker that a test run has already completed.
@@ -374,9 +391,9 @@ pub mod queue {
     /// A test result associated with an individual unit of work.
     pub type AssociatedTestResult = (WorkId, TestResult);
 
-    /// An incremental test result sent back to an invoker.
+    /// An incremental unit of information about the state of a test suite, or its test result.
     #[derive(Serialize, Deserialize, Debug)]
-    pub enum InvokerTestResult {
+    pub enum InvokerTestData {
         /// A batch of test results.
         Results(Vec<AssociatedTestResult>),
         /// No more results are known.
@@ -394,6 +411,19 @@ pub mod queue {
             /// Opaque error message related to the failure of the test command.
             error: String,
         },
+        /// Information about the native test runner being used for the current test suite.
+        /// This message is sent exaclty once per test run, and usually received at the start of a
+        /// test run.
+        /// Receipt of this message by the supervisor intentionally does not block
+        /// - the start of workers for a test run, or
+        /// - the consumption of test results by the supervisor
+        NativeRunnerInfo(NativeRunnerInfo),
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct NativeRunnerInfo {
+        pub protocol_version: AbqProtocolVersion,
+        pub specification: AbqNativeRunnerSpecification,
     }
 
     /// A response regarding the final result of a given test run, after all tests in the run are
@@ -525,7 +555,7 @@ pub mod client {
 
     /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
     #[derive(Serialize, Deserialize)]
-    pub struct AckTestResult {}
+    pub struct AckTestData {}
 
     /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
     #[derive(Serialize, Deserialize)]

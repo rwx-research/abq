@@ -13,10 +13,13 @@ use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    ManifestMessage, ManifestResult, Status, TestId, TestResult,
+    AbqNativeRunnerSpecification, ManifestMessage, Status, TestId, TestResult,
+    ACTIVE_ABQ_PROTOCOL_VERSION,
 };
 use abq_utils::net_protocol::work_server::InitContext;
-use abq_utils::net_protocol::workers::{NativeTestRunnerParams, TestLikeRunner, WorkerTest};
+use abq_utils::net_protocol::workers::{
+    ManifestResult, NativeTestRunnerParams, ReportedManifest, TestLikeRunner, WorkerTest,
+};
 use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext};
 
 use futures::future::BoxFuture;
@@ -428,6 +431,22 @@ fn start_generic_test_runner(
     opt_runner_err
 }
 
+fn build_test_like_runner_reported_manifest(manifest_message: ManifestMessage) -> ReportedManifest {
+    let ManifestMessage { manifest } = manifest_message;
+
+    let native_runner_protocol = ACTIVE_ABQ_PROTOCOL_VERSION;
+    let native_runner_specification = AbqNativeRunnerSpecification {
+        name: "unknown-test-like-runner".to_string(),
+        version: "0.0.1".to_owned(),
+    };
+
+    ReportedManifest {
+        manifest,
+        native_runner_protocol,
+        native_runner_specification,
+    }
+}
+
 fn start_test_like_runner(
     env: WorkerEnv,
     runner: TestLikeRunner,
@@ -455,7 +474,8 @@ fn start_test_like_runner(
     }
 
     if let Some(notify_manifest) = notify_manifest {
-        notify_manifest(entity, &run_id, ManifestResult::Manifest(manifest));
+        let reported_manifest = build_test_like_runner_reported_manifest(manifest);
+        notify_manifest(entity, &run_id, ManifestResult::Manifest(reported_manifest));
     }
 
     let init_context = match get_init_context() {
@@ -682,11 +702,12 @@ mod test {
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::runners::{
-        Manifest, ManifestMessage, ManifestResult, Status, Test, TestCase, TestOrGroup, TestResult,
+        Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner, WorkerTest,
+        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
+        WorkerTest,
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};

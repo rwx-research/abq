@@ -774,14 +774,14 @@ mod test {
     };
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::runners::{
-        Manifest, ManifestMessage, ManifestResult, Status, Test, TestOrGroup, TestResult,
+        Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::{
         InitContext, InitContextResponse, NextTestResponse, WorkServerRequest,
     };
     use abq_utils::net_protocol::workers::{
-        NextWork, NextWorkBundle, RunId, RunnerKind, TestLikeRunner, WorkContext, WorkId,
-        WorkerTest,
+        ManifestResult, NextWork, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
+        TestLikeRunner, WorkContext, WorkId, WorkerTest,
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
@@ -798,7 +798,7 @@ mod test {
     }
 
     type Messages = Arc<Mutex<Vec<TestResult>>>;
-    type ManifestCollector = Arc<Mutex<Option<ManifestMessage>>>;
+    type ManifestCollector = Arc<Mutex<Option<ReportedManifest>>>;
 
     type QueueNextWork = (SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
     type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);

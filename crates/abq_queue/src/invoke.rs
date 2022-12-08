@@ -20,7 +20,7 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::EntityId,
-        queue::{self, InvokeWork, InvokerTestResult, Message},
+        queue::{self, InvokeWork, InvokerTestData, Message, NativeRunnerInfo},
         runners::TestResult,
         workers::{RunId, RunnerKind, WorkId},
     },
@@ -103,9 +103,22 @@ impl RunCancellationRx {
     }
 }
 
+pub(crate) enum IncrementalTestData {
+    Results(Vec<(WorkId, TestResult)>),
+    Finished,
+    NativeRunnerInfo(NativeRunnerInfo),
+}
+
 pub fn run_cancellation_pair() -> (RunCancellationTx, RunCancellationRx) {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     (RunCancellationTx(tx), RunCancellationRx(rx))
+}
+
+#[must_use]
+#[derive(Debug)]
+pub struct CompletedSummary {
+    /// The native test runner that was in use for this test run.
+    pub native_runner_info: NativeRunnerInfo,
 }
 
 impl Client {
@@ -197,7 +210,7 @@ impl Client {
 
     /// Yields the next test result, as it streams in.
     /// Returns [None] when there are no more test results.
-    pub async fn next(&mut self) -> Result<Option<Vec<(WorkId, TestResult)>>, TestResultError> {
+    pub(crate) async fn next(&mut self) -> Result<IncrementalTestData, TestResultError> {
         loop {
             let read_result = tokio::select! {
                 read = net_protocol::async_read(&mut self.stream) => {
@@ -215,20 +228,20 @@ impl Client {
             };
 
             match read_result {
-                Ok(InvokerTestResult::Results(results)) => {
+                Ok(InvokerTestData::Results(results)) => {
                     // Send an acknowledgement of the result to the server. If it fails, attempt to reconnect once.
                     let ack_result = net_protocol::async_write(
                         &mut self.stream,
-                        &net_protocol::client::AckTestResult {},
+                        &net_protocol::client::AckTestData {},
                     )
                     .await;
                     if ack_result.is_err() {
                         self.reconnect().await?;
                     }
 
-                    return Ok(Some(results));
+                    return Ok(IncrementalTestData::Results(results));
                 }
-                Ok(InvokerTestResult::EndOfResults) => {
+                Ok(InvokerTestData::EndOfResults) => {
                     // Send a final ACK of the test results, so that cancellation signals do not
                     // interfere with us here.
                     net_protocol::async_write(
@@ -237,12 +250,12 @@ impl Client {
                     )
                     .await?;
 
-                    return Ok(None);
+                    return Ok(IncrementalTestData::Finished);
                 }
-                Ok(InvokerTestResult::TestCommandError { error }) => {
+                Ok(InvokerTestData::TestCommandError { error }) => {
                     return Err(TestResultError::TestCommandError(error))
                 }
-                Ok(InvokerTestResult::TimedOut { after }) => {
+                Ok(InvokerTestData::TimedOut { after }) => {
                     // Send a final ACK of the test results, so that cancellation signals do not
                     // interfere with us here.
                     net_protocol::async_write(
@@ -252,6 +265,18 @@ impl Client {
                     .await?;
 
                     return Err(TestResultError::TimedOut(after));
+                }
+                Ok(InvokerTestData::NativeRunnerInfo(native_runner_info)) => {
+                    let ack_result = net_protocol::async_write(
+                        &mut self.stream,
+                        &net_protocol::client::AckTestData {},
+                    )
+                    .await;
+                    if ack_result.is_err() {
+                        self.reconnect().await?;
+                    }
+
+                    return Ok(IncrementalTestData::NativeRunnerInfo(native_runner_info));
                 }
                 Err(err) => {
                     // Attempt to reconnect once. If it's successful, just re-read the next message.
@@ -271,12 +296,35 @@ impl Client {
     pub async fn stream_results(
         mut self,
         mut on_result: impl FnMut(WorkId, TestResult),
-    ) -> Result<(), TestResultError> {
-        while let Some(results) = self.next().await? {
-            for (work_id, test_result) in results {
-                on_result(work_id, test_result);
+    ) -> Result<CompletedSummary, TestResultError> {
+        use IncrementalTestData::*;
+
+        let mut native_runner_info = None;
+
+        loop {
+            match self.next().await? {
+                Finished => {
+                    break;
+                }
+                Results(results) => {
+                    for (work_id, test_result) in results {
+                        on_result(work_id, test_result);
+                    }
+                }
+                NativeRunnerInfo(runner_info) => {
+                    assert!(
+                        native_runner_info.is_none(),
+                        "illegal run state - native runner info received more than once"
+                    );
+
+                    native_runner_info = Some(runner_info);
+                }
             }
         }
-        Ok(())
+
+        let native_runner_info = native_runner_info
+            .expect("illegal run state - run completed succesfully but runner info never received");
+
+        Ok(CompletedSummary { native_runner_info })
     }
 }

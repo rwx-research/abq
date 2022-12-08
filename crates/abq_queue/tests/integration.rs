@@ -9,8 +9,8 @@ use std::{
 
 use abq_queue::{
     invoke::{
-        run_cancellation_pair, Client, InvocationError, RunCancellationTx, TestResultError,
-        DEFAULT_CLIENT_POLL_TIMEOUT,
+        run_cancellation_pair, Client, CompletedSummary, InvocationError, RunCancellationTx,
+        TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT,
     },
     queue::{Abq, QueueConfig},
     timeout::RunTimeoutStrategy,
@@ -22,7 +22,11 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::EntityId,
-        runners::{Manifest, ManifestMessage, MetadataMap, Test, TestOrGroup, TestResult},
+        queue::NativeRunnerInfo,
+        runners::{
+            Manifest, ManifestMessage, MetadataMap, Test, TestOrGroup, TestResult,
+            ACTIVE_ABQ_PROTOCOL_VERSION,
+        },
         work_server::{InitContext, InitContextResponse},
         workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
     },
@@ -171,7 +175,10 @@ enum Action {
 enum Assert<'a> {
     CheckSupervisor(Sid, &'a dyn Fn(&Result<Client, InvocationError>) -> bool),
 
-    TestExit(Sid, &'a dyn Fn(&Result<(), TestResultError>) -> bool),
+    TestExit(
+        Sid,
+        &'a dyn Fn(&Result<CompletedSummary, TestResultError>) -> bool,
+    ),
     TestExitWithoutErr(Sid),
     TestResults(Sid, &'a dyn Fn(&[(WorkId, TestResult)]) -> bool),
 
@@ -219,7 +226,8 @@ type Supervisors = Arc<Mutex<HashMap<Sid, Result<Client, InvocationError>>>>;
 type SupervisorData = Arc<
     tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, Arc<Mutex<Vec<(WorkId, TestResult)>>>)>>,
 >;
-type SupervisorResults = Arc<tokio::sync::Mutex<HashMap<Sid, Result<(), TestResultError>>>>;
+type SupervisorResults =
+    Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedSummary, TestResultError>>>>;
 
 type Workers = Arc<Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
@@ -449,6 +457,12 @@ fn run_test(servers: Servers, steps: Steps) {
                         let results = supervisor_results.lock().await;
                         let exit = results.get(&n).expect("supervisor exit not found");
                         assert!(exit.is_ok());
+                        let CompletedSummary { native_runner_info } = exit.as_ref().unwrap();
+                        let NativeRunnerInfo {
+                            protocol_version,
+                            specification: _,
+                        } = native_runner_info;
+                        assert_eq!(protocol_version, &ACTIVE_ABQ_PROTOCOL_VERSION);
                     }
 
                     TestResults(n, check) => {

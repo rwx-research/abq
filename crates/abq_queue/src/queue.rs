@@ -13,10 +13,14 @@ use abq_utils::net;
 use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
-use abq_utils::net_protocol::queue::{AssociatedTestResult, InvokerTestResult, Request};
-use abq_utils::net_protocol::runners::{ManifestResult, MetadataMap, TestCase};
+use abq_utils::net_protocol::queue::{
+    AssociatedTestResult, InvokerTestData, NativeRunnerInfo, Request,
+};
+use abq_utils::net_protocol::runners::{MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
-use abq_utils::net_protocol::workers::{NextWorkBundle, RunnerKind, WorkContext, WorkerTest};
+use abq_utils::net_protocol::workers::{
+    ManifestResult, NextWorkBundle, ReportedManifest, RunnerKind, WorkContext, WorkerTest,
+};
 use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, Message},
@@ -30,6 +34,7 @@ use abq_workers::negotiate::{
     AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
 };
 
+use futures::{future, TryFutureExt};
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tracing::instrument;
@@ -302,13 +307,13 @@ impl AllRuns {
 
     pub fn add_manifest(
         &self,
-        run_id: RunId,
+        run_id: &RunId,
         flat_manifest: Vec<TestCase>,
         init_metadata: MetadataMap,
     ) {
         let runs = self.runs.read();
 
-        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+        let mut run = runs.get(run_id).expect("no run recorded").lock();
 
         match run.state {
             RunState::WaitingForManifest => {
@@ -853,6 +858,7 @@ enum ClientResponder {
     /// This state may be reached during the time a client is disconnected.
     Disconnected {
         results: Vec<AssociatedTestResult>,
+        pending_runner_info: Option<NativeRunnerInfo>,
         /// Size of the [buffer][BufferedResults] we should create when moving back into connected
         /// mode.
         buffer_size: usize,
@@ -872,9 +878,9 @@ impl ClientResponder {
         buffer: &mut BufferedResults,
         results: Vec<AssociatedTestResult>,
     ) -> Result<(), Self> {
-        use net_protocol::client::AckTestResult;
+        use net_protocol::client::AckTestData;
 
-        let batch_msg = InvokerTestResult::Results(results);
+        let batch_msg = InvokerTestData::Results(results);
 
         // Send the test results and wait for an ack. If either fails, suppose the client is
         // disconnected.
@@ -885,7 +891,7 @@ impl ClientResponder {
                 let ack = net_protocol::async_read(stream).await;
                 match ack {
                     Err(_) => true,
-                    Ok(AckTestResult {}) => false,
+                    Ok(AckTestData {}) => false,
                 }
             }
         };
@@ -893,7 +899,7 @@ impl ClientResponder {
         if client_disconnected {
             // Demote ourselves to the disconnected state until reconnection happens.
             let results = match batch_msg {
-                InvokerTestResult::Results(results) => results,
+                InvokerTestData::Results(results) => results,
                 _ => unreachable!(),
             };
 
@@ -902,6 +908,7 @@ impl ClientResponder {
             return Err(Self::Disconnected {
                 results,
                 buffer_size: buffer.max_size,
+                pending_runner_info: None,
             });
         }
 
@@ -927,6 +934,7 @@ impl ClientResponder {
             ClientResponder::Disconnected {
                 results,
                 buffer_size: _,
+                pending_runner_info: _,
             } => {
                 results.extend(test_results);
             }
@@ -959,6 +967,46 @@ impl ClientResponder {
         }
     }
 
+    async fn send_native_runner_info(&mut self, runner_info: NativeRunnerInfo) {
+        match self {
+            ClientResponder::DirectStream { stream, buffer } => {
+                let runner_info_message = InvokerTestData::NativeRunnerInfo(runner_info);
+
+                let send_recv_result =
+                    future::ready(net_protocol::async_write(stream, &runner_info_message).await)
+                        .and_then(|_| net_protocol::async_read(stream))
+                        .await;
+
+                let client_disconnected = match send_recv_result {
+                    Ok(net_protocol::client::AckTestData {}) => false,
+                    Err(_) => true,
+                };
+
+                if client_disconnected {
+                    // Demote ourselves to the disconnected state until reconnection happens.
+                    tracing::info!(peer_addr=?stream.peer_addr(), "failed to send runner specification; demoting to supervisor to disconnected state");
+
+                    let runner_info = match runner_info_message {
+                        InvokerTestData::NativeRunnerInfo(info) => info,
+                        _ => unreachable!(),
+                    };
+
+                    *self = Self::Disconnected {
+                        results: buffer.drain_all(),
+                        buffer_size: buffer.max_size,
+                        pending_runner_info: Some(runner_info),
+                    };
+                }
+            }
+            ClientResponder::Disconnected {
+                pending_runner_info,
+                ..
+            } => {
+                *pending_runner_info = Some(runner_info);
+            }
+        }
+    }
+
     /// Updates the responder with a new connection. If there are any pending test results that
     /// failed to be sent from a previous connections, they are streamed to the new connection
     /// before the future returned from this function completes.
@@ -987,7 +1035,15 @@ impl ClientResponder {
         };
 
         match old_conn {
-            ClientResponder::Disconnected { results, .. } => {
+            ClientResponder::Disconnected {
+                results,
+                pending_runner_info,
+                ..
+            } => {
+                if let Some(runner_info) = pending_runner_info {
+                    self.send_native_runner_info(runner_info).await;
+                }
+
                 self.send_test_results(results).await;
             }
             ClientResponder::DirectStream { .. } => {
@@ -1541,19 +1597,32 @@ impl QueueServer {
         stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), AnyError> {
         match manifest_result {
-            ManifestResult::Manifest(manifest) => {
+            ManifestResult::Manifest(reported_manifest) => {
+                let ReportedManifest {
+                    manifest,
+                    native_runner_protocol,
+                    native_runner_specification,
+                } = reported_manifest;
+
                 // Record the manifest for this run in its appropriate queue.
                 // TODO: actually record the manifest metadata
-                let (flat_manifest, metadata) = flatten_manifest(manifest.manifest);
+                let (flat_manifest, metadata) = flatten_manifest(manifest);
+
+                let native_runner_info = NativeRunnerInfo {
+                    protocol_version: native_runner_protocol,
+                    specification: native_runner_specification,
+                };
 
                 if !flat_manifest.is_empty() {
                     Self::handle_manifest_success(
                         queues,
+                        active_runs,
                         state_cache,
                         entity,
                         run_id,
                         flat_manifest,
                         metadata,
+                        native_runner_info,
                         stream,
                     )
                     .await
@@ -1564,7 +1633,7 @@ impl QueueServer {
                         state_cache,
                         entity,
                         run_id,
-                        Ok(()),
+                        Ok(native_runner_info),
                         stream,
                     )
                     .await
@@ -1588,11 +1657,13 @@ impl QueueServer {
     #[instrument(level = "trace", skip(queues, state_cache, flat_manifest))]
     async fn handle_manifest_success(
         queues: SharedRuns,
+        active_runs: ActiveRunResponders,
         state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
         flat_manifest: Vec<TestCase>,
         init_metadata: MetadataMap,
+        native_runner_info: NativeRunnerInfo,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), AnyError> {
         tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
@@ -1604,9 +1675,22 @@ impl QueueServer {
 
         state_cache.lock().insert(run_id.clone(), run_state);
 
-        queues.add_manifest(run_id, flat_manifest, init_metadata);
+        queues.add_manifest(&run_id, flat_manifest, init_metadata);
 
         net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {}).await?;
+
+        // Since the supervisor doesn't need to know about the native runner that'll be running the
+        // current test suite as soon as the test run starts, only let it know about the runner
+        // after we've unblocked the workers.
+        {
+            let active_runs = active_runs.read().await;
+            let mut responder = active_runs
+                .get(&run_id)
+                .expect("impossible state - supervisor responder must be available")
+                .lock()
+                .await;
+            responder.send_native_runner_info(native_runner_info).await;
+        }
 
         Ok(())
     }
@@ -1618,7 +1702,10 @@ impl QueueServer {
         state_cache: RunResultStateCache,
         entity: EntityId,
         run_id: RunId,
-        manifest_result: Result<() /* empty */, String /* error */>,
+        manifest_result: Result<
+            NativeRunnerInfo, /* empty manifest */
+            String,           /* error manifest */
+        >,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), AnyError> {
         // If a worker failed to generate a manifest, or the manifest is empty,
@@ -1650,7 +1737,7 @@ impl QueueServer {
             debug_assert!(!state_cache.lock().contains_key(&run_id));
         }
 
-        let responder = {
+        let mut responder = {
             // Remove and take over the responder; since the manifest is not known, we should be the
             // only task that ever communicates with the client.
             let responder = active_runs.write().await.remove(&run_id).unwrap();
@@ -1659,24 +1746,31 @@ impl QueueServer {
 
         // Tell the client that the tests are done or that the test runners have failed, as
         // appropriate.
+        let final_message = match manifest_result {
+            Ok(native_runner_info) => {
+                // The native runner info must arrive before any notification that the supervisor
+                // should close.
+                responder.send_native_runner_info(native_runner_info).await;
+
+                InvokerTestData::EndOfResults
+            }
+            Err(opaque_manifest_generation_error) => InvokerTestData::TestCommandError {
+                error: opaque_manifest_generation_error,
+            },
+        };
+
         match responder {
             ClientResponder::DirectStream { mut stream, buffer } => {
                 debug_assert!(buffer.is_empty(), "messages before manifest received");
 
-                let test_result_msg = match manifest_result {
-                    Ok(()) => InvokerTestResult::EndOfResults,
-                    Err(opaque_manifest_generation_error) => InvokerTestResult::TestCommandError {
-                        error: opaque_manifest_generation_error,
-                    },
-                };
-
-                net_protocol::async_write(&mut stream, &test_result_msg).await?;
+                net_protocol::async_write(&mut stream, &final_message).await?;
 
                 drop(stream);
             }
             ClientResponder::Disconnected {
                 results,
                 buffer_size: _,
+                pending_runner_info: _,
             } => {
                 // Unfortunately, since we still don't have an active connection to the abq
                 // client, we can't do anything here.
@@ -1796,7 +1890,7 @@ impl QueueServer {
                     "no results should be buffered after drainage"
                 );
 
-                net_protocol::async_write(&mut stream, &InvokerTestResult::EndOfResults).await?;
+                net_protocol::async_write(&mut stream, &InvokerTestData::EndOfResults).await?;
 
                 // To avoid a race between the total test result observed by a supervisor vs.
                 // the total test result observed by a worker, require the supervisor to
@@ -1828,6 +1922,7 @@ impl QueueServer {
             ClientResponder::Disconnected {
                 results,
                 buffer_size: _,
+                pending_runner_info: _,
             } => {
                 tracing::warn!(?run_id, "dropping disconnected results responder");
 
@@ -1946,7 +2041,7 @@ impl QueueServer {
                     "no results should be buffered after drainage"
                 );
 
-                net_protocol::async_write(&mut stream, &InvokerTestResult::TimedOut { after })
+                net_protocol::async_write(&mut stream, &InvokerTestData::TimedOut { after })
                     .await?;
 
                 // To avoid a race between perceived cancellation by the supervisor and perceived
@@ -1962,6 +2057,7 @@ impl QueueServer {
             ClientResponder::Disconnected {
                 results: _,
                 buffer_size: _,
+                pending_runner_info: _,
             } => {
                 tracing::error!(
                     ?run_id,
@@ -2237,7 +2333,7 @@ mod test {
     use super::{RunResultState, RunResultStateCache};
     use crate::{
         connections::ConnectedWorkers,
-        invoke::{run_cancellation_pair, Client, DEFAULT_CLIENT_POLL_TIMEOUT},
+        invoke::{run_cancellation_pair, Client, IncrementalTestData, DEFAULT_CLIENT_POLL_TIMEOUT},
         queue::{
             ActiveRunResponders, BufferedResults, CancelReason, ClientReconnectionError,
             ClientResponder, QueueServer, RunLive, SharedRuns, WorkScheduler,
@@ -2588,7 +2684,10 @@ mod test {
                 run_id.clone(),
             ));
 
-            let (work_id, _) = client.next().await.unwrap().unwrap().pop().unwrap();
+            let (work_id, _) = match client.next().await.unwrap() {
+                IncrementalTestData::Results(mut results) => results.pop().unwrap(),
+                _ => panic!(),
+            };
             assert_eq!(work_id, buffered_work_id);
 
             let reconnection_result = reconnection_future.await.unwrap();
@@ -2609,7 +2708,10 @@ mod test {
                 vec![(second_work_id.clone(), fake_test_result())],
             ));
 
-            let (work_id, _) = client.next().await.unwrap().unwrap().pop().unwrap();
+            let (work_id, _) = match client.next().await.unwrap() {
+                IncrementalTestData::Results(mut results) => results.pop().unwrap(),
+                _ => panic!(),
+            };
             assert_eq!(work_id, second_work_id);
 
             worker_result_future.await.unwrap().unwrap();
@@ -2966,7 +3068,7 @@ mod test {
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
-        queues.add_manifest(run_id, vec![], Default::default());
+        queues.add_manifest(&run_id, vec![], Default::default());
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
     }
@@ -2986,7 +3088,7 @@ mod test {
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
-        queues.add_manifest(run_id.clone(), vec![], Default::default());
+        queues.add_manifest(&run_id, vec![], Default::default());
         queues.mark_complete(&run_id, true);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
@@ -3015,7 +3117,7 @@ mod test {
         }
 
         for run_id in [&run_id1, &run_id2, &run_id4] {
-            queues.add_manifest(run_id.clone(), vec![], Default::default());
+            queues.add_manifest(run_id, vec![], Default::default());
         }
 
         for run_id in [run_id1, run_id2] {
@@ -3091,7 +3193,7 @@ mod test {
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
-        queues.add_manifest(run_id.clone(), vec![], Default::default());
+        queues.add_manifest(&run_id, vec![], Default::default());
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
@@ -3134,7 +3236,7 @@ mod test {
                 )
                 .unwrap();
             queues.get_run_for_worker(&run_id);
-            queues.add_manifest(run_id.clone(), vec![], Default::default());
+            queues.add_manifest(&run_id, vec![], Default::default());
             queues
         };
         let active_runs: ActiveRunResponders = {
