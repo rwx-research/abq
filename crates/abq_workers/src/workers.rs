@@ -13,7 +13,7 @@ use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    AbqNativeRunnerSpecification, AbqProtocolVersion, ManifestMessage, Status, TestId, TestResult,
+    AbqProtocolVersion, ManifestMessage, NativeRunnerSpecification, Status, TestId, TestResult,
     TestResultSpec, TestRuntime,
 };
 use abq_utils::net_protocol::work_server::InitContext;
@@ -434,7 +434,7 @@ fn build_test_like_runner_reported_manifest(manifest_message: ManifestMessage) -
     let manifest = manifest_message.into_manifest();
 
     let native_runner_protocol = AbqProtocolVersion::V0_1;
-    let native_runner_specification = AbqNativeRunnerSpecification {
+    let native_runner_specification = NativeRunnerSpecification {
         name: "unknown-test-like-runner".to_string(),
         version: "0.0.1".to_owned(),
         test_framework: Some("rspec".to_owned()),

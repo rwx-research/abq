@@ -4,7 +4,26 @@
 
 use serde_derive::{Deserialize, Serialize};
 
-use super::MetadataMap;
+use super::{AbqProtocolVersion, MetadataMap};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename = "abq_native_runner_spawned")]
+pub struct AbqNativeRunnerSpawnedMessage {
+    pub protocol_version: AbqProtocolVersion,
+    pub runner_specification: AbqNativeRunnerSpecification,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename = "abq_native_runner_specification")]
+pub struct AbqNativeRunnerSpecification {
+    pub name: String,
+    pub version: String,
+    pub test_framework: Option<String>,
+    pub test_framework_version: Option<String>,
+    pub language: Option<String>,
+    pub language_version: Option<String>,
+    pub host: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InitMessage {

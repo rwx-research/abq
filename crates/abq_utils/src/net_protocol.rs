@@ -51,7 +51,7 @@ pub mod entity {
 
 pub mod workers {
     use super::runners::{
-        AbqNativeRunnerSpecification, AbqProtocolVersion, Manifest, ManifestMessage, TestCase,
+        AbqProtocolVersion, Manifest, ManifestMessage, NativeRunnerSpecification, TestCase,
     };
     use serde_derive::{Deserialize, Serialize};
     use std::{
@@ -189,7 +189,7 @@ pub mod workers {
         pub manifest: Manifest,
         pub native_runner_protocol: AbqProtocolVersion,
         // Boxed to decrease total size on the stack
-        pub native_runner_specification: Box<AbqNativeRunnerSpecification>,
+        pub native_runner_specification: Box<NativeRunnerSpecification>,
     }
 
     static_assertions::assert_eq_size!(ManifestResult, [u8; 80]);
@@ -216,7 +216,7 @@ pub mod queue {
 
     use super::{
         entity::EntityId,
-        runners::{AbqNativeRunnerSpecification, AbqProtocolVersion, TestResult},
+        runners::{AbqProtocolVersion, NativeRunnerSpecification, TestResult},
         workers::{ManifestResult, RunId, RunnerKind, WorkId},
     };
 
@@ -288,7 +288,7 @@ pub mod queue {
     #[derive(Serialize, Deserialize, Debug)]
     pub struct NativeRunnerInfo {
         pub protocol_version: AbqProtocolVersion,
-        pub specification: AbqNativeRunnerSpecification,
+        pub specification: NativeRunnerSpecification,
     }
 
     /// A response regarding the final result of a given test run, after all tests in the run are
