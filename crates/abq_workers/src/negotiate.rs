@@ -1,6 +1,5 @@
 //! Module negotiate helps worker pools attach to queues.
 
-use futures::FutureExt;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -15,8 +14,9 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::workers::{
-    GetInitContext, GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResults,
-    RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
+    GetInitContext, GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest,
+    NotifyResults, RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkerPoolConfig,
+    WorkersExit,
 };
 use abq_utils::{
     auth::User,
@@ -27,7 +27,7 @@ use abq_utils::{
         entity::EntityId,
         publicize_addr,
         queue::RunAlreadyCompleted,
-        workers::{NextWorkBundle, RunId, RunnerKind},
+        workers::{RunId, RunnerKind},
     },
     shutdown::ShutdownReceiver,
 };
@@ -61,7 +61,7 @@ struct ExecutionContext {
     /// The work run we are connecting to.
     run_id: RunId,
     /// Where workers should receive messages from.
-    queue_new_work_addr: SocketAddr,
+    work_server_addr: SocketAddr,
     /// Where workers should send results to.
     queue_results_addr: SocketAddr,
     /// The kind of native runner workers should start.
@@ -196,7 +196,7 @@ impl WorkersNegotiator {
 
         let ExecutionContext {
             run_id,
-            queue_new_work_addr,
+            work_server_addr,
             queue_results_addr,
             runner_kind,
             worker_should_generate_manifest,
@@ -208,7 +208,7 @@ impl WorkersNegotiator {
 
         tracing::debug!(
             "Recieved execution message. New work addr: {:?}, results addr: {:?}",
-            queue_new_work_addr,
+            work_server_addr,
             queue_results_addr
         );
 
@@ -259,33 +259,26 @@ impl WorkersNegotiator {
             let run_id = run_id.clone();
 
             move || {
-                let span = tracing::trace_span!("get_init_context", run_id=?run_id, new_work_server=?queue_new_work_addr);
+                let span = tracing::trace_span!("get_init_context", run_id=?run_id, new_work_server=?work_server_addr);
                 let _get_next_work = span.enter();
 
                 // TODO: error handling
-                wait_for_init_context(&*client, queue_new_work_addr, run_id.clone()).unwrap()
+                wait_for_init_context(&*client, work_server_addr, run_id.clone()).unwrap()
             }
         });
 
-        let get_next_work: GetNextWorkBundle = Arc::new({
-            let client = async_client.boxed_clone();
+        // A function to generate a [GetNextTests] closure.
+        let get_next_tests_generator: GetNextTestsGenerator = {
+            let async_client = async_client.boxed_clone();
             let run_id = run_id.clone();
-
-            move || {
-                let client = client.boxed_clone();
-                let run_id = run_id.clone();
-                async move {
-                    let span = tracing::trace_span!("get_next_work", run_id=?run_id, new_work_server=?queue_new_work_addr);
-                    let _get_next_work = span.enter();
-
-                    // TODO: error handling
-                    wait_for_next_work_bundle(&*client, queue_new_work_addr, run_id)
-                        .await
-                        .unwrap()
-
-                }.boxed()
+            &move || {
+                persistent_next_tests_connection::start(
+                    work_server_addr,
+                    async_client.boxed_clone(),
+                    run_id.clone(),
+                )
             }
-        });
+        };
 
         let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
             Some(Box::new({
@@ -359,7 +352,7 @@ impl WorkersNegotiator {
         let pool_config = WorkerPoolConfig {
             size: num_workers,
             runner_kind,
-            get_next_work,
+            get_next_tests_generator,
             get_init_context,
             notify_results,
             run_completed_successfully,
@@ -456,21 +449,134 @@ fn wait_for_init_context(
     }
 }
 
-/// Asks the work server for the next item of work to run.
-/// Blocks on the result, repeatedly pinging the server until work is available.
-async fn wait_for_next_work_bundle(
-    client: &dyn net_async::ConfiguredClient,
-    work_server_addr: SocketAddr,
-    run_id: RunId,
-) -> Result<NextWorkBundle, io::Error> {
-    use net_protocol::work_server::NextTestResponse;
+mod persistent_next_tests_connection {
+    use std::{io, net::SocketAddr, sync::Arc};
 
-    let next_test_request = net_protocol::work_server::WorkServerRequest::NextTest { run_id };
+    use abq_utils::{
+        net_async::{ClientStream, ConfiguredClient},
+        net_protocol::{
+            self,
+            workers::{NextWorkBundle, RunId},
+        },
+    };
+    use futures::FutureExt;
+    use tokio::sync::{Mutex, MutexGuard};
 
-    let mut stream = client.connect(work_server_addr).await?;
-    net_protocol::async_write(&mut stream, &next_test_request).await?;
-    match net_protocol::async_read(&mut stream).await? {
-        NextTestResponse::Bundle(bundle) => Ok(bundle),
+    use super::GetNextTests;
+
+    // TODO: technically speaking we don't *need* an `Arc<Mutex>` here, because the semantics of
+    // `GetNextTests` in practice is such that it is only ever called in sequence, so any
+    // references a `PersistedConnection`s are exclusive. That means we should be able to get away
+    // with `Rc<Cell>`.
+    // However I don't want to mess with unsafe code right so, so let's revisit this later. Since
+    // there is zero contention of the mutex, its use should not be onerous to us.
+    type PersistedConnection = Arc<Mutex<Option<Box<dyn ClientStream>>>>;
+
+    /// Returns a [GetNextTests] closure which operates by keeping a persistent connection to fetch
+    /// next tests open with the work server.
+    pub fn start(
+        work_server_addr: SocketAddr,
+        client: Box<dyn ConfiguredClient>,
+        run_id: RunId,
+    ) -> GetNextTests {
+        let persistent_conn: PersistedConnection = Default::default();
+
+        Box::new(move || {
+            let client = client.boxed_clone();
+            let run_id = run_id.clone();
+            let conn = persistent_conn.clone();
+
+            async move {
+                let span = tracing::trace_span!("get_next_work", run_id=?run_id, work_server=?work_server_addr);
+                let _get_next_work = span.enter();
+
+                // TODO: propagate errors here upwards rather than panicking
+                wait_for_next_work_bundle(&*client, run_id, conn, work_server_addr)
+                    .await
+                    .unwrap()
+            }.boxed()
+        })
+    }
+
+    const MAX_TRIES_FOR_ONE_CYCLE: usize = 3;
+
+    /// Asks the work server for the next item of work to run.
+    ///
+    /// If the connection is noted to have been dropped, we re-try at most twice.
+    async fn wait_for_next_work_bundle(
+        client: &dyn ConfiguredClient,
+        run_id: RunId,
+        persistent_conn: PersistedConnection,
+        work_server_addr: SocketAddr,
+    ) -> io::Result<NextWorkBundle> {
+        // As mentioned above (see PersistedConnection), the lock here is mostly ceremonious.
+        // Take it for the entirety of the fetch to avoid needless contention with ourselves.
+        let mut conn = persistent_conn.lock().await;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match try_request(&mut conn, client, run_id.clone(), work_server_addr).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if attempt < MAX_TRIES_FOR_ONE_CYCLE {
+                        tracing::warn!(?attempt, ?run_id, "Retrying fetch of work bundle");
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    async fn try_request(
+        conn: &mut MutexGuard<'_, Option<Box<dyn ClientStream>>>,
+        client: &dyn ConfiguredClient,
+        run_id: RunId,
+        work_server_addr: SocketAddr,
+    ) -> Result<NextWorkBundle, io::Error> {
+        use net_protocol::work_server::NextTestResponse;
+
+        // Make sure that if our connection is closed, we re-open it.
+        ensure_persistent_conn(conn, client, run_id, work_server_addr).await?;
+        let conn = conn
+            .as_mut()
+            .expect("The connection was just ensured above");
+
+        let next_test_request = net_protocol::work_server::NextTestRequest {};
+        net_protocol::async_write(&mut *conn, &next_test_request).await?;
+        match net_protocol::async_read(&mut *conn).await? {
+            NextTestResponse::Bundle(bundle) => Ok(bundle),
+        }
+    }
+
+    // TODO: it would be nice to return a mut ref to the ensured connection here, but doing so
+    // presently (1.64) hits some fun compiler limits:
+    //
+    // error: higher-ranked lifetime error
+    //   ...
+    //     = note: could not prove `for<'r, 's, 't0> Pin<Box<impl for<'r, 's> futures::Future<Output = NextWorkBundle>>>: CoerceUnsized<Pin<Box<(dyn futures::Future<Output = NextWorkBundle> + std::marker::Send + 't0)>>>`
+    //
+    // XREF https://github.com/rust-lang/rust/issues/102211
+    async fn ensure_persistent_conn<'a>(
+        persistent_conn: &mut MutexGuard<'a, Option<Box<dyn ClientStream>>>,
+        client: &dyn ConfiguredClient,
+        run_id: RunId,
+        work_server_addr: SocketAddr,
+    ) -> io::Result<()> {
+        use net_protocol::work_server::WorkServerRequest;
+
+        if persistent_conn.is_none() {
+            let mut conn = client.connect(work_server_addr).await?;
+            net_protocol::async_write(
+                &mut conn,
+                &WorkServerRequest::PersistentWorkerNextTestsConnection(run_id),
+            )
+            .await?;
+
+            **persistent_conn = Some(conn);
+        }
+
+        Ok(())
     }
 }
 
@@ -708,7 +814,7 @@ impl QueueNegotiator {
                         );
 
                         MessageFromQueueNegotiator::ExecutionContext(ExecutionContext {
-                            queue_new_work_addr: ctx.advertised_queue_work_scheduler_addr,
+                            work_server_addr: ctx.advertised_queue_work_scheduler_addr,
                             queue_results_addr: ctx.advertised_queue_results_addr,
                             results_batch_size_hint,
                             runner_kind,
@@ -777,7 +883,7 @@ mod test {
         Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::{
-        InitContext, InitContextResponse, NextTestResponse, WorkServerRequest,
+        InitContext, InitContextResponse, NextTestRequest, NextTestResponse, WorkServerRequest,
     };
     use abq_utils::net_protocol::workers::{
         ManifestResult, NextWork, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
@@ -852,12 +958,21 @@ mod test {
                             )
                             .unwrap();
                         } else {
-                            let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
-                            let work_bundle = NextWorkBundle(vec![work]);
+                            let _connect_msg: WorkServerRequest =
+                                net_protocol::read(&mut worker).unwrap();
+                            let mut all_done = false;
+                            while !all_done {
+                                let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
+                                all_done = matches!(work, NextWork::EndOfWork);
+                                let work_bundle = NextWorkBundle(vec![work]);
 
-                            let _msg: WorkServerRequest = net_protocol::read(&mut worker).unwrap();
-                            let response = NextTestResponse::Bundle(work_bundle);
-                            net_protocol::write(&mut worker, response).unwrap();
+                                let NextTestRequest {} = match net_protocol::read(&mut worker) {
+                                    Ok(r) => r,
+                                    _ => break, // worker disconnected
+                                };
+                                let response = NextTestResponse::Bundle(work_bundle);
+                                net_protocol::write(&mut worker, response).unwrap();
+                            }
                         }
                     }
 

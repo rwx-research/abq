@@ -37,6 +37,7 @@ use abq_workers::negotiate::{
 use futures::{future, TryFutureExt};
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tracing::instrument;
 
 use crate::connections::{self, ConnectedWorkers};
@@ -187,6 +188,29 @@ enum InitMetadata {
     Metadata(MetadataMap),
     WaitingForManifest,
     RunAlreadyCompleted,
+}
+
+/// What is the state of the queue of tests for a run after some bundle of tests have been pulled?
+#[derive(Clone, Copy)]
+enum PulledTestsStatus {
+    /// There are additional tests remaining.
+    MoreTestsRemaining,
+    /// The bundle of tests just pulled have exhausted the queue of tests.
+    /// The last test to be handed out is in this bundle.
+    PulledLastTest,
+    /// The queue was already empty when tests were pulled.
+    QueueWasEmpty,
+}
+
+impl PulledTestsStatus {
+    fn reached_end_of_tests(&self) -> bool {
+        match self {
+            PulledTestsStatus::MoreTestsRemaining => false,
+
+            PulledTestsStatus::PulledLastTest => true,
+            PulledTestsStatus::QueueWasEmpty => true,
+        }
+    }
 }
 
 impl AllRuns {
@@ -371,8 +395,7 @@ impl AllRuns {
         }
     }
 
-    /// Returns (next_work, pulled_last_test)
-    pub fn next_work(&self, run_id: RunId) -> (NextWorkBundle, bool) {
+    pub fn next_work(&self, run_id: RunId) -> (NextWorkBundle, PulledTestsStatus) {
         let runs = self.runs.read();
 
         let mut run = runs.get(&run_id).expect("no run recorded").lock();
@@ -391,22 +414,29 @@ impl AllRuns {
                 let mut bundle = Vec::with_capacity(batch_size.get() as _);
                 bundle.extend(queue.get_work(batch_size));
 
-                let pulled_last_test = queue.is_empty() && !bundle.is_empty();
+                let pulled_tests_status = if queue.is_empty() {
+                    if !bundle.is_empty() {
+                        // We pulled the last test just now.
+                        PulledTestsStatus::PulledLastTest
+                    } else {
+                        PulledTestsStatus::QueueWasEmpty
+                    }
+                } else {
+                    PulledTestsStatus::MoreTestsRemaining
+                };
 
-                if bundle.len() < batch_size.get() as _ {
-                    // We've hit the end of the manifest but have space for more tests to send in
-                    // this batch. Let the worker know this is the end, so they don't have to
-                    // round-trip.
+                if pulled_tests_status.reached_end_of_tests() {
+                    // Let the worker know this is the end, so they don't ask again.
                     bundle.push(NextWork::EndOfWork);
                 }
 
                 (
-                    NextWorkBundle(bundle), pulled_last_test
+                    NextWorkBundle(bundle), pulled_tests_status
                 )
             }
             RunState::Done { .. } | RunState::Cancelled {..} => {
                 (
-                    NextWorkBundle(vec![NextWork::EndOfWork]), false
+                    NextWorkBundle(vec![NextWork::EndOfWork]), PulledTestsStatus::QueueWasEmpty
                 )
             }
             RunState::WaitingForFirstWorker |
@@ -2284,38 +2314,80 @@ impl WorkScheduler {
             }
             WorkServerRequest::PersistentWorkerNextTestsConnection(run_id) => {
                 ctx.worker_next_tests_tasks
-                    .insert(run_id, |rx_stop| async move {
-                        // TODO actually handle task
-                        rx_stop.await?;
-                        Ok(())
+                    .insert(run_id.clone(), move |rx_stop| {
+                        Self::start_persistent_next_tests_requests_task(
+                            ctx.queues,
+                            ctx.timeouts,
+                            ctx.timeout_strategy,
+                            run_id,
+                            stream,
+                            rx_stop,
+                        )
                     });
-            }
-            WorkServerRequest::NextTest { run_id } => {
-                // Pull the next bundle of work.
-                let (bundle, pulled_last_test) = { ctx.queues.next_work(run_id.clone()) };
-
-                use net_protocol::work_server::NextTestResponse;
-                let response = NextTestResponse::Bundle(bundle);
-
-                net_protocol::async_write(&mut stream, &response).await?;
-
-                if pulled_last_test {
-                    // This was the last test, so start a timeout for the whole test run to
-                    // complete - if it doesn't, we'll fire and timeout the run.
-                    let timeout = ctx.timeout_strategy.timeout();
-
-                    tracing::info!(
-                        ?run_id,
-                        ?timeout,
-                        "issued last test in the manifest to a worker"
-                    );
-
-                    ctx.timeouts.insert_run(run_id, timeout).await;
-                }
             }
         }
 
         Ok(())
+    }
+
+    async fn start_persistent_next_tests_requests_task(
+        queues: SharedRuns,
+        timeouts: RunTimeoutManager,
+        timeout_strategy: RunTimeoutStrategy,
+        run_id: RunId,
+        mut conn: Box<dyn net_async::ServerStream>,
+        mut rx_stop: oneshot::Receiver<()>,
+    ) -> OpaqueResult<()> {
+        use net_protocol::work_server::{NextTestRequest, NextTestResponse};
+
+        loop {
+            tokio::select! {
+                _ = &mut rx_stop => {
+                    tracing::warn!(?run_id, "Stopping next-tests requests task before connection naturally expired");
+                    return Ok(())
+                }
+                opt_read_error = net_protocol::async_read(&mut conn) => {
+                    // If we fail to read or write, simply fall out of the task -
+                    // the worker will re-connect as necessary.
+                    //
+                    // TODO: if we fail to write tests out, we have lost tests to be run in the
+                    // manifest. Currently this does not cause runs to hang, as we will end up
+                    // timing out the test run when the last test in the queue is handed out.
+                    // However, the behavior could still be made better, in particular by
+                    // re-enqueuing dropped tests.
+                    // See https://github.com/rwx-research/abq/issues/185.
+                    let NextTestRequest {} = opt_read_error?;
+
+                    // Pull the next bundle of work.
+                    let (bundle,pulled_tests_status) = { queues.next_work(run_id.clone()) };
+
+                    let response = NextTestResponse::Bundle(bundle);
+
+                    net_protocol::async_write(&mut conn, &response).await?;
+
+                    if matches!(pulled_tests_status, PulledTestsStatus::PulledLastTest) {
+                        // This was the last test, so start a timeout for the whole test run to
+                        // complete - if it doesn't, we'll fire and timeout the run.
+                        let timeout = timeout_strategy.timeout();
+
+                        tracing::info!(
+                            ?run_id,
+                            ?timeout,
+                            "issued last test in the manifest to a worker"
+                        );
+
+                        timeouts.insert_run(run_id, timeout).await;
+
+                        return Ok(())
+                    }
+
+                    if pulled_tests_status.reached_end_of_tests() {
+                        // Exit, since the worker should not ask us for tests again.
+                        return Ok(())
+                    }
+                }
+            }
+        }
     }
 }
 

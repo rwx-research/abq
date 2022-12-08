@@ -51,7 +51,7 @@ pub trait ConfiguredClient: Send + Sync {
     fn boxed_clone(&self) -> Box<dyn ConfiguredClient>;
 }
 
-pub trait ClientStream: AsyncRead + AsyncWrite + Unpin + Send {
+pub trait ClientStream: AsyncRead + AsyncWrite + Unpin + Send + Sync {
     fn local_addr(&self) -> io::Result<SocketAddr>;
 }
 

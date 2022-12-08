@@ -30,3 +30,4 @@ ntest.workspace = true
 procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile.workspace = true
 tracing-test.workspace = true
+tracing-subscriber.workspace = true

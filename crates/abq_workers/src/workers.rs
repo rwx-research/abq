@@ -33,8 +33,9 @@ type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 
-pub type GetNextWorkBundle =
-    Arc<dyn Fn() -> BoxFuture<'static, NextWorkBundle> + Send + Sync + 'static>;
+pub type GetNextTests = Box<dyn Fn() -> BoxFuture<'static, NextWorkBundle> + Send + 'static>;
+pub type GetNextTestsGenerator<'a> = &'a dyn Fn() -> GetNextTests;
+
 pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResults = Arc<
@@ -63,7 +64,7 @@ pub enum WorkerContext {
 }
 
 /// Configuration for a [WorkerPool].
-pub struct WorkerPoolConfig {
+pub struct WorkerPoolConfig<'a> {
     /// Number of workers.
     pub size: NonZeroUsize,
     /// The kind of runners the workers should start.
@@ -76,7 +77,7 @@ pub struct WorkerPoolConfig {
     /// How should workers initialize their native test runners?
     pub get_init_context: GetInitContext,
     /// How should a worker get the next unit of work it needs to run?
-    pub get_next_work: GetNextWorkBundle,
+    pub get_next_tests_generator: GetNextTestsGenerator<'a>,
     /// How should results be communicated back?
     pub notify_results: NotifyResults,
     /// How many results should be sent back at a time?
@@ -169,7 +170,7 @@ impl WorkerPool {
             runner_kind,
             run_id,
             get_init_context,
-            get_next_work,
+            get_next_tests_generator,
             results_batch_size_hint: results_batch_size,
             notify_results,
             notify_manifest,
@@ -205,14 +206,13 @@ impl WorkerPool {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let notify_results = Arc::clone(&notify_results);
             let get_init_context = Arc::clone(&get_init_context);
-            let get_next_work = Arc::clone(&get_next_work);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                get_next_work_bundle: get_next_work,
+                get_next_tests: get_next_tests_generator(),
                 results_batch_size,
                 notify_results,
                 context: worker_context.clone(),
@@ -231,14 +231,13 @@ impl WorkerPool {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let notify_results = Arc::clone(&notify_results);
             let get_init_context = Arc::clone(&get_init_context);
-            let get_next_work = Arc::clone(&get_next_work);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                get_next_work_bundle: get_next_work,
+                get_next_tests: get_next_tests_generator(),
                 results_batch_size,
                 notify_results,
                 context: worker_context.clone(),
@@ -333,7 +332,7 @@ struct WorkerEnv {
     run_id: RunId,
     notify_manifest: Option<NotifyManifest>,
     get_init_context: GetInitContext,
-    get_next_work_bundle: GetNextWorkBundle,
+    get_next_tests: GetNextTests,
     results_batch_size: u64,
     notify_results: NotifyResults,
     context: WorkerContext,
@@ -365,7 +364,7 @@ fn start_generic_test_runner(
     native_runner_params: NativeTestRunnerParams,
 ) -> Result<(), GenericRunnerError> {
     let WorkerEnv {
-        get_next_work_bundle,
+        get_next_tests: get_next_tests_bundle,
         run_id,
         get_init_context,
         notify_results,
@@ -395,8 +394,8 @@ fn start_generic_test_runner(
 
     let get_init_context = move || get_init_context();
 
-    let get_next_work_bundle: abq_generic_test_runner::GetNextWorkBundle =
-        &move || get_next_work_bundle();
+    let get_next_tests_bundle: abq_generic_test_runner::GetNextTests =
+        &move || get_next_tests_bundle();
 
     let send_test_result: abq_generic_test_runner::SendTestResults =
         &move |results| notify_results(entity, &run_id, results);
@@ -421,7 +420,7 @@ fn start_generic_test_runner(
         results_batch_size,
         notify_manifest,
         get_init_context,
-        get_next_work_bundle,
+        get_next_tests_bundle,
         send_test_result,
         debug_native_runner,
     );
@@ -454,7 +453,7 @@ fn start_test_like_runner(
 ) -> Result<(), GenericRunnerError> {
     let WorkerEnv {
         msg_from_pool_rx,
-        get_next_work_bundle: get_next_work,
+        get_next_tests,
         get_init_context,
         run_id,
         results_batch_size: _,
@@ -507,7 +506,7 @@ fn start_test_like_runner(
                 //
                 // TODO: add a timeout here, in case we get a message from the parent while
                 // blocking on the next test_id from the queue.
-                let NextWorkBundle(bundle) = rt.block_on(get_next_work());
+                let NextWorkBundle(bundle) = rt.block_on(get_next_tests());
                 bundle
             }
         };
@@ -718,7 +717,7 @@ mod test {
     use tracing_test::traced_test;
 
     use super::{
-        GetNextWorkBundle, InitContextResult, NotifyManifest, NotifyResults,
+        GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest, NotifyResults,
         RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkersExit,
     };
     use crate::negotiate::QueueNegotiator;
@@ -728,18 +727,22 @@ mod test {
     type ResultsCollector = Arc<Mutex<HashMap<String, TestResult>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestResult>>>;
 
-    fn work_writer() -> (impl Fn(NextWork), GetNextWorkBundle) {
+    fn work_writer() -> (impl Fn(NextWork), impl Fn() -> GetNextTests) {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
         let reader = Arc::clone(&writer);
         let write_work = move |work| {
             writer.lock().unwrap().push_back(work);
         };
-        let get_next_work: GetNextWorkBundle = Arc::new(move || loop {
-            if let Some(work) = reader.lock().unwrap().pop_front() {
-                return async { NextWorkBundle(vec![work]) }.boxed();
-            }
-        });
-        (write_work, get_next_work)
+        let get_next_tests = move || {
+            let reader = reader.clone();
+            let get_next_tests: GetNextTests = Box::new(move || loop {
+                if let Some(work) = reader.lock().unwrap().pop_front() {
+                    return async { NextWorkBundle(vec![work]) }.boxed();
+                }
+            });
+            get_next_tests
+        };
+        (write_work, get_next_tests)
     }
 
     fn manifest_collector() -> (ManifestCollector, NotifyManifest) {
@@ -782,7 +785,7 @@ mod test {
     fn setup_pool(
         runner_kind: RunnerKind,
         run_id: RunId,
-        get_next_work: GetNextWorkBundle,
+        get_next_tests_generator: GetNextTestsGenerator,
         notify_results: NotifyResults,
         run_completed_successfully: RunCompletedSuccessfully,
     ) -> (WorkerPoolConfig, ManifestCollector) {
@@ -790,7 +793,7 @@ mod test {
 
         let config = WorkerPoolConfig {
             size: NonZeroUsize::new(1).unwrap(),
-            get_next_work,
+            get_next_tests_generator,
             get_init_context: Arc::new(empty_init_context),
             results_batch_size_hint: 5,
             runner_kind,
@@ -869,7 +872,7 @@ mod test {
     }
 
     fn test_echo_n(num_workers: usize, num_echos: usize) {
-        let (write_work, get_next_work) = work_writer();
+        let (write_work, get_next_tests) = work_writer();
         let (results, notify_results, run_completed_successfully) = results_collector();
 
         let run_id = RunId::unique();
@@ -893,7 +896,7 @@ mod test {
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
             run_id.clone(),
-            get_next_work,
+            &get_next_tests,
             notify_results,
             run_completed_successfully,
         );
@@ -961,7 +964,7 @@ mod test {
     #[test]
     #[cfg(feature = "test-test_ids")]
     fn test_timeout() {
-        let (write_work, get_next_work) = work_writer();
+        let (write_work, get_next_tests) = work_writer();
         let (results, notify_results) = results_collector();
 
         let run_id = RunId::new();
@@ -973,7 +976,7 @@ mod test {
             TestLikeRunner::InduceTimeout,
             run_id,
             manifest,
-            get_next_work,
+            get_next_tests,
             notify_results,
         );
 
@@ -1006,7 +1009,7 @@ mod test {
     #[test]
     #[cfg(feature = "test-test_ids")]
     fn test_panic_no_retries() {
-        let (write_work, get_next_work) = work_writer();
+        let (write_work, get_next_tests) = work_writer();
         let (results, notify_results) = results_collector();
 
         let run_id = RunId::new();
@@ -1018,7 +1021,7 @@ mod test {
             TestLikeRunner::EchoOnRetry(10),
             run_id,
             manifest,
-            get_next_work,
+            get_next_tests,
             notify_results,
         );
 
@@ -1048,7 +1051,7 @@ mod test {
     #[test]
     #[cfg(feature = "test-test_ids")]
     fn test_panic_succeed_after_retry() {
-        let (write_work, get_next_work) = work_writer();
+        let (write_work, get_next_tests) = work_writer();
         let (results, notify_results) = results_collector();
 
         let run_id = RunId::new();
@@ -1060,7 +1063,7 @@ mod test {
             TestLikeRunner::EchoOnRetry(2),
             run_id,
             manifest,
-            get_next_work,
+            get_next_tests,
             notify_results,
         );
 
@@ -1093,7 +1096,7 @@ mod test {
 
     #[test]
     fn work_in_constant_context() {
-        let (write_work, get_next_work) = work_writer();
+        let (write_work, get_next_tests) = work_writer();
         let (results, notify_results, run_completed_successfully) = results_collector();
 
         let working_dir = TempDir::new().unwrap();
@@ -1114,7 +1117,7 @@ mod test {
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Exec, manifest),
             run_id.clone(),
-            get_next_work,
+            &get_next_tests,
             notify_results,
             run_completed_successfully,
         );
@@ -1193,7 +1196,7 @@ mod test {
 
     #[test]
     fn exit_with_error_if_worker_errors() {
-        let (_write_work, get_next_work) = work_writer();
+        let (_write_work, get_next_tests) = work_writer();
         let (_results, notify_results, run_completed_successfully) = results_collector();
         let (default_config, _manifest_collector) = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
@@ -1203,7 +1206,7 @@ mod test {
                 extra_env: Default::default(),
             }),
             RunId::unique(),
-            get_next_work,
+            &get_next_tests,
             notify_results,
             run_completed_successfully,
         );
