@@ -24,6 +24,8 @@ uuid.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 
+static_assertions.workspace = true
+
 [features]
 default = []
 test-actions = []

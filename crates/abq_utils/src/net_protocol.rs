@@ -171,6 +171,11 @@ pub mod runners {
     pub struct AbqNativeRunnerSpecification {
         pub name: String,
         pub version: String,
+        pub test_framework: Option<String>,
+        pub test_framework_version: Option<String>,
+        pub language: Option<String>,
+        pub language_version: Option<String>,
+        pub host: Option<String>,
     }
 
     pub const ACTIVE_PROTOCOL_VERSION_MAJOR: u64 = 0;
@@ -328,8 +333,11 @@ pub mod workers {
     pub struct ReportedManifest {
         pub manifest: Manifest,
         pub native_runner_protocol: AbqProtocolVersion,
-        pub native_runner_specification: AbqNativeRunnerSpecification,
+        // Boxed to decrease total size on the stack
+        pub native_runner_specification: Box<AbqNativeRunnerSpecification>,
     }
+
+    static_assertions::assert_eq_size!(ManifestResult, [u8; 80]);
 
     /// The result of a worker attempting to retrieve a manifest for a test command.
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -342,6 +350,8 @@ pub mod workers {
             error: String,
         },
     }
+
+    static_assertions::assert_eq_size!(ManifestResult, [u8; 80]);
 }
 
 pub mod queue {

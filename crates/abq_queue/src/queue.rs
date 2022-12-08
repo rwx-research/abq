@@ -1640,7 +1640,7 @@ impl QueueServer {
 
                 let native_runner_info = NativeRunnerInfo {
                     protocol_version: native_runner_protocol,
-                    specification: native_runner_specification,
+                    specification: *native_runner_specification,
                 };
 
                 if !flat_manifest.is_empty() {
