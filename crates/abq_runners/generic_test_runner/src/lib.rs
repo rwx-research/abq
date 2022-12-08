@@ -188,7 +188,7 @@ async fn retrieve_manifest<'a>(
     Ok(ReportedManifest {
         manifest,
         native_runner_protocol: protocol_version,
-        native_runner_specification: specification,
+        native_runner_specification: Box::new(specification),
     })
 }
 
@@ -815,6 +815,13 @@ mod test_validate_protocol_version_message {
         let runner_specification = AbqNativeRunnerSpecification {
             name: "test".to_string(),
             version: "0.0.0".to_string(),
+            test_framework: Some("rspec".to_owned()),
+            test_framework_version: Some("3.12.0".to_owned()),
+            language: Some("ruby".to_owned()),
+            language_version: Some("3.1.2p20".to_owned()),
+            host: Some(
+                "ruby 3.1.2p20 (2022-04-12 revision 4491bb740a) [x86_64-darwin21]".to_owned(),
+            ),
         };
         AbqNativeRunnerSpawnedMessage {
             protocol_version,
@@ -859,6 +866,11 @@ mod test_validate_protocol_version_message {
             let runner_specification = AbqNativeRunnerSpecification {
                 name: "test".to_string(),
                 version: "0.0.0".to_string(),
+                test_framework: None,
+                test_framework_version: None,
+                language: None,
+                language_version: None,
+                host: None,
             };
             let spawned_message = AbqNativeRunnerSpawnedMessage {
                 protocol_version,

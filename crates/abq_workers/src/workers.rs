@@ -437,12 +437,17 @@ fn build_test_like_runner_reported_manifest(manifest_message: ManifestMessage) -
     let native_runner_specification = AbqNativeRunnerSpecification {
         name: "unknown-test-like-runner".to_string(),
         version: "0.0.1".to_owned(),
+        test_framework: Some("rspec".to_owned()),
+        test_framework_version: Some("3.12.0".to_owned()),
+        language: Some("ruby".to_owned()),
+        language_version: Some("3.1.2p20".to_owned()),
+        host: Some("ruby 3.1.2p20 (2022-04-12 revision 4491bb740a) [x86_64-darwin21]".to_owned()),
     };
 
     ReportedManifest {
         manifest,
         native_runner_protocol,
-        native_runner_specification,
+        native_runner_specification: Box::new(native_runner_specification),
     }
 }
 
