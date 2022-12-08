@@ -222,7 +222,7 @@ impl From<ProtocolVersionMessageError> for GenericRunnerError {
 
 pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>;
 
-pub type GetNextWorkBundle<'a> = &'a dyn Fn() -> BoxFuture<'static, NextWorkBundle>;
+pub type GetNextTests<'a> = &'a dyn Fn() -> BoxFuture<'static, NextWorkBundle>;
 
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetInitContext>(
@@ -233,7 +233,7 @@ impl GenericTestRunner {
         results_batch_size: u64,
         send_manifest: Option<SendManifest>,
         get_init_context: GetInitContext,
-        get_next_test_bundle: GetNextWorkBundle,
+        get_next_test_bundle: GetNextTests,
         send_test_results: SendTestResults,
         debug_native_runner: bool,
     ) -> Result<(), GenericRunnerError>
@@ -271,7 +271,7 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     results_batch_size: u64,
     send_manifest: Option<SendManifest>,
     get_init_context: GetInitContext,
-    get_next_test_bundle: GetNextWorkBundle<'_>,
+    get_next_test_bundle: GetNextTests<'_>,
     send_test_results: SendTestResults<'_>,
     _debug_native_runner: bool,
 ) -> Result<(), GenericRunnerError>
@@ -715,7 +715,7 @@ pub fn execute_wrapped_runner(
 
     let test_case_index = AtomicUsize::new(0);
 
-    let get_next_test: GetNextWorkBundle = {
+    let get_next_test: GetNextTests = {
         let manifest = Arc::clone(&flat_manifest);
         let working_dir = working_dir.clone();
         &move || {

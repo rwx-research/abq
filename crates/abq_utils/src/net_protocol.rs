@@ -519,10 +519,6 @@ pub mod work_server {
         InitContext {
             run_id: RunId,
         },
-        /// An ask to get the next test for a particular run for the queue.
-        NextTest {
-            run_id: RunId,
-        },
 
         /// A worker is connecting with the intent to hold a persistent connection
         /// over which it will request next tests to run.
@@ -542,6 +538,12 @@ pub mod work_server {
         /// The run is already done, the worker can exit.
         RunAlreadyCompleted,
     }
+
+    /// An ask to get the next test for a particular run from the queue.
+    /// This should be requested from a [persistent connection][WorkServerRequest::PersistentWorkerNextTestsConnection].
+    #[derive(Serialize, Deserialize, Debug)]
+    #[serde(tag = "type")]
+    pub struct NextTestRequest {}
 
     #[derive(Serialize, Deserialize, Debug)]
     pub enum NextTestResponse {
