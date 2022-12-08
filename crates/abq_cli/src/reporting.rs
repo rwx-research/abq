@@ -12,7 +12,7 @@ use abq_output::{
 };
 use abq_utils::{
     exit,
-    net_protocol::runners::{Milliseconds, Status, TestResult},
+    net_protocol::runners::{Status, TestResult, TestRuntime},
 };
 use termcolor::{ColorChoice, StandardStream};
 use thiserror::Error;
@@ -121,7 +121,7 @@ struct SuiteResultBuilder {
     count: u64,
     count_failed: u64,
     start_time: Instant,
-    test_time: Milliseconds,
+    test_time: TestRuntime,
 }
 
 impl Default for SuiteResultBuilder {
@@ -132,7 +132,7 @@ impl Default for SuiteResultBuilder {
             count: 0,
             count_failed: 0,
             start_time: Instant::now(),
-            test_time: 0.,
+            test_time: TestRuntime::ZERO,
         }
     }
 }
@@ -147,7 +147,7 @@ pub(crate) struct SuiteResult {
     /// it finished.
     wall_time: Duration,
     /// Runtime of the test suite, as accounted for in the actual time in tests.
-    test_time: Milliseconds,
+    test_time: TestRuntime,
 }
 
 impl SuiteResultBuilder {
@@ -194,7 +194,8 @@ impl SuiteResult {
         write!(w, "Finished in ")?;
         format_duration_to_partial_seconds(w, self.wall_time)?;
         write!(w, " (")?;
-        format_duration_to_partial_seconds(w, Duration::from_millis(self.test_time as _))?;
+        let TestRuntime::Milliseconds(test_time_millis) = self.test_time;
+        format_duration_to_partial_seconds(w, Duration::from_millis(test_time_millis as _))?;
         writeln!(w, " spent in test code)")?;
         writeln!(w, "{} tests, {} failures", self.count, self.count_failed)
     }
@@ -639,21 +640,24 @@ impl io::Write for MockWriter {
 }
 
 #[cfg(test)]
+use abq_utils::net_protocol::runners::TestResultSpec;
+
+#[cfg(test)]
 #[allow(clippy::identity_op)]
-fn default_result() -> TestResult {
-    TestResult {
+fn default_result() -> TestResultSpec {
+    TestResultSpec {
         status: Status::Success,
         id: "default id".to_owned(),
         display_name: "default name".to_owned(),
         output: Some("default output".to_owned()),
-        runtime: (1 * 60 * 1000 + 15 * 1000 + 3) as _,
+        runtime: TestRuntime::Milliseconds((1 * 60 * 1000 + 15 * 1000 + 3) as _),
         meta: Default::default(),
     }
 }
 
 #[cfg(test)]
 mod test_line_reporter {
-    use abq_utils::net_protocol::runners::{Status, TestResult};
+    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec};
 
     use super::{default_result, LineReporter, MockWriter, Reporter};
 
@@ -682,8 +686,12 @@ mod test_line_reporter {
             num_writes,
             num_flushes,
         } = with_reporter(|mut reporter| {
-            reporter.push_result(&default_result()).unwrap();
-            reporter.push_result(&default_result()).unwrap();
+            reporter
+                .push_result(&TestResult::new(default_result()))
+                .unwrap();
+            reporter
+                .push_result(&TestResult::new(default_result()))
+                .unwrap();
         });
 
         assert!(!buffer.is_empty());
@@ -712,45 +720,45 @@ mod test_line_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Success,
                     display_name: "abq/test1".to_string(),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Failure,
                     display_name: "abq/test2".to_string(),
                     output: Some("Assertion failed: 1 != 2".to_string()),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Skipped,
                     display_name: "abq/test3".to_string(),
                     output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Error,
                     display_name: "abq/test4".to_string(),
                     output: Some("Process 28821 terminated early via SIGTERM".to_string()),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Pending,
                     display_name: "abq/test5".to_string(),
                     output: Some(
                         r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
                     ),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter.finish().unwrap();
         });
@@ -776,7 +784,7 @@ mod test_line_reporter {
 
 #[cfg(test)]
 mod test_dot_reporter {
-    use abq_utils::net_protocol::runners::{Status, TestResult};
+    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec};
 
     use crate::reporting::DOT_REPORTER_LINE_LIMIT;
 
@@ -808,8 +816,12 @@ mod test_dot_reporter {
             num_writes,
             num_flushes,
         } = with_reporter(|mut reporter| {
-            reporter.push_result(&default_result()).unwrap();
-            reporter.push_result(&default_result()).unwrap();
+            reporter
+                .push_result(&TestResult::new(default_result()))
+                .unwrap();
+            reporter
+                .push_result(&TestResult::new(default_result()))
+                .unwrap();
         });
 
         assert!(!buffer.is_empty());
@@ -838,45 +850,45 @@ mod test_dot_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Success,
                     display_name: "abq/test1".to_string(),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Failure,
                     display_name: "abq/test2".to_string(),
                     output: Some("Assertion failed: 1 != 2".to_string()),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Skipped,
                     display_name: "abq/test3".to_string(),
                     output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Error,
                     display_name: "abq/test4".to_string(),
                     output: Some("Process 28821 terminated early via SIGTERM".to_string()),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter
-                .push_result(&TestResult {
+                .push_result(&TestResult::new(TestResultSpec {
                     status: Status::Pending,
                     display_name: "abq/test5".to_string(),
                     output: Some(
                         r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
                     ),
                     ..default_result()
-                })
+                }))
                 .unwrap();
             reporter.finish().unwrap();
         });
@@ -912,10 +924,10 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult {
+                    .push_result(&TestResult::new(TestResultSpec {
                         status,
                         ..default_result()
-                    })
+                    }))
                     .unwrap();
             }
 
@@ -937,7 +949,9 @@ mod test_dot_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             for _ in 0..DOT_REPORTER_LINE_LIMIT {
-                reporter.push_result(&default_result()).unwrap();
+                reporter
+                    .push_result(&TestResult::new(default_result()))
+                    .unwrap();
             }
 
             reporter.finish().unwrap();
@@ -964,10 +978,10 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult {
+                    .push_result(&TestResult::new(TestResultSpec {
                         status,
                         ..default_result()
-                    })
+                    }))
                     .unwrap();
             }
 
@@ -1001,10 +1015,10 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult {
+                    .push_result(&TestResult::new(TestResultSpec {
                         status,
                         ..default_result()
-                    })
+                    }))
                     .unwrap();
             }
 
@@ -1029,7 +1043,7 @@ mod suite {
 
     use abq_utils::{
         exit,
-        net_protocol::runners::{Status, TestResult},
+        net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime},
     };
 
     use crate::reporting::ExitCode;
@@ -1051,10 +1065,10 @@ mod suite {
             fn $test_name() {
                 use Status::*;
 
-                let results = $status_order.into_iter().map(|status| TestResult {
+                let results = $status_order.into_iter().map(|status| TestResult::new(TestResultSpec {
                     status,
                     ..default_result()
-                }).collect::<Vec<_>>();
+                })).collect::<Vec<_>>();
 
                 let SuiteResult {
                     suggested_exit_code, count, ..
@@ -1093,7 +1107,7 @@ mod suite {
             count: 10,
             count_failed: 0,
             wall_time: Duration::from_secs(78),
-            test_time: 70200.,
+            test_time: TestRuntime::Milliseconds(70200.),
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         Finished in 78.00 seconds (70.20 seconds spent in test code)
@@ -1108,7 +1122,7 @@ mod suite {
             count: 10,
             count_failed: 5,
             wall_time: Duration::from_secs(78),
-            test_time: 70200.,
+            test_time: TestRuntime::Milliseconds(70200.),
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         Finished in 78.00 seconds (70.20 seconds spent in test code)

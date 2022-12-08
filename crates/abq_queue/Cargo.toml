@@ -24,6 +24,8 @@ tokio.workspace = true
 futures.workspace = true
 
 [dev-dependencies]
+abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
+
 ntest.workspace = true
 # Needed for testing abq_workers.
 # TODO: figure out a better way to implement abq_workers::test_support to avoid this!

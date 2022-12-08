@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use abq_utils::atomic;
 use abq_utils::auth::ServerAuthStrategy;
 use abq_utils::net;
 use abq_utils::net_async::{self, UnverifiedServerStream};
@@ -29,7 +30,6 @@ use abq_utils::net_protocol::{
 use abq_utils::net_protocol::{client, publicize_addr};
 use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
-use abq_utils::{atomic, flatten_manifest};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
 };
@@ -1636,7 +1636,7 @@ impl QueueServer {
 
                 // Record the manifest for this run in its appropriate queue.
                 // TODO: actually record the manifest metadata
-                let (flat_manifest, metadata) = flatten_manifest(manifest);
+                let (flat_manifest, metadata) = manifest.flatten();
 
                 let native_runner_info = NativeRunnerInfo {
                     protocol_version: native_runner_protocol,
@@ -2423,7 +2423,7 @@ mod test {
             self,
             entity::EntityId,
             queue::InvokeWork,
-            runners::{Manifest, ManifestMessage, Status, TestResult},
+            runners::{v0_1, ManifestMessage, Status, TestResult, TestResultSpec, TestRuntime},
             workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
         },
         shutdown::ShutdownManager,
@@ -2437,14 +2437,14 @@ mod test {
     use tracing_test::{internal::logs_with_scope_contain, traced_test};
 
     fn fake_test_result() -> TestResult {
-        TestResult {
+        TestResult::new(TestResultSpec {
             status: Status::Success,
             id: "".to_string(),
             display_name: "".to_string(),
             output: None,
-            runtime: 0.,
+            runtime: TestRuntime::Milliseconds(0.),
             meta: Default::default(),
-        }
+        })
     }
 
     fn one_nonzero() -> NonZeroU64 {
@@ -2459,17 +2459,14 @@ mod test {
         Ok((stream, addr))
     }
 
-    fn empty_manifest() -> Manifest {
-        Manifest {
-            members: vec![],
-            init_meta: Default::default(),
-        }
-    }
-
     fn empty_manifest_msg() -> ManifestMessage {
-        ManifestMessage {
-            manifest: empty_manifest(),
+        v0_1::ManifestMessage {
+            manifest: v0_1::Manifest {
+                members: vec![],
+                init_meta: Default::default(),
+            },
         }
+        .into()
     }
 
     fn faux_invoke_work() -> InvokeWork {

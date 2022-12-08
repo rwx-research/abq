@@ -1,6 +1,6 @@
-use std::{io, time::Duration};
+use std::{io, ops::Deref, time::Duration};
 
-use abq_utils::net_protocol::runners::{Milliseconds, Status, TestResult};
+use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime};
 use termcolor::{Color, ColorSpec, WriteColor};
 
 /// Formats a test result on a single line.
@@ -28,14 +28,14 @@ pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) 
     // {output}
     // (completed in {runtime})
 
-    let TestResult {
+    let TestResultSpec {
         status,
         id: _,
         display_name,
         output,
         runtime,
         meta: _,
-    } = result;
+    } = result.deref();
 
     let output = output.as_deref().unwrap_or("<no output>");
 
@@ -86,10 +86,12 @@ fn format_status(writer: &mut impl WriteColor, status: Status) -> io::Result<()>
 
 const MILLIS_IN_SECOND: u64 = 1000;
 
-pub fn format_duration(writer: &mut impl io::Write, millis: Milliseconds) -> io::Result<()> {
+pub fn format_duration(writer: &mut impl io::Write, duration: TestRuntime) -> io::Result<()> {
     const MILLIS_IN_MINUTE: u64 = 60 * MILLIS_IN_SECOND;
 
-    let millis = millis as u64;
+    let millis = match duration {
+        TestRuntime::Milliseconds(ms) => ms as u64,
+    };
     let (minutes, millis) = (millis / MILLIS_IN_MINUTE, millis % MILLIS_IN_MINUTE);
     let (seconds, millis) = (millis / MILLIS_IN_SECOND, millis % MILLIS_IN_SECOND);
 
@@ -126,7 +128,7 @@ pub fn format_duration_to_partial_seconds(
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::runners::{Status, TestResult};
+    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime};
 
     use crate::{format_duration_to_partial_seconds, format_result_dot};
 
@@ -134,13 +136,13 @@ mod test {
     use std::{io, time::Duration};
 
     #[allow(clippy::identity_op)]
-    fn default_result() -> TestResult {
-        TestResult {
+    fn default_result() -> TestResultSpec {
+        TestResultSpec {
             status: Status::Success,
             id: "default id".to_owned(),
             display_name: "default name".to_owned(),
             output: Some("default output".to_owned()),
-            runtime: (1 * 60 * 1000 + 15 * 1000 + 3) as _,
+            runtime: TestRuntime::Milliseconds((1 * 60 * 1000 + 15 * 1000 + 3) as _),
             meta: Default::default(),
         }
     }
@@ -216,7 +218,7 @@ mod test {
 
     test_format!(
         format_line_success, format_result_line,
-        &TestResult {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
         @"abq/test: ok"
         @r###"
     abq/test: <green>ok<reset>
@@ -225,7 +227,7 @@ mod test {
 
     test_format!(
         format_line_failure, format_result_line,
-        &TestResult {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() }),
         @"abq/test: FAILED"
         @r###"
     abq/test: <red>FAILED<reset>
@@ -234,7 +236,7 @@ mod test {
 
     test_format!(
         format_line_error, format_result_line,
-        &TestResult {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() }),
         @"abq/test: ERRORED"
         @r###"
     abq/test: <red>ERRORED<reset>
@@ -243,7 +245,7 @@ mod test {
 
     test_format!(
         format_line_pending, format_result_line,
-        &TestResult {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
         @"abq/test: pending"
         @r###"
     abq/test: <yellow>pending<reset>
@@ -252,7 +254,7 @@ mod test {
 
     test_format!(
         format_line_skipped, format_result_line,
-        &TestResult {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         @"abq/test: skipped"
         @r###"
     abq/test: <yellow>skipped<reset>
@@ -261,70 +263,70 @@ mod test {
 
     test_format!(
         format_dot_success, format_result_dot,
-        &TestResult {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
         @"."
         @"<green>.<reset>"
     );
 
     test_format!(
         format_dot_failure, format_result_dot,
-        &TestResult {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() }),
         @"F"
         @"<red>F<reset>"
     );
 
     test_format!(
         format_dot_error, format_result_dot,
-        &TestResult {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() }),
         @"E"
         @"<red>E<reset>"
     );
 
     test_format!(
         format_dot_pending, format_result_dot,
-        &TestResult {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
         @"P"
         @"<yellow>P<reset>"
     );
 
     test_format!(
         format_dot_skipped, format_result_dot,
-        &TestResult {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         @"S"
         @"<yellow>S<reset>"
     );
 
     test_format!(
         format_exact_minutes, format_duration,
-        Duration::from_secs(360).as_millis() as _,
+        TestRuntime::Milliseconds(Duration::from_secs(360).as_millis() as _),
         @"6 m"
         @"6 m"
     );
 
     test_format!(
         format_exact_minutes_leftover_seconds_and_millis, format_duration,
-        Duration::from_millis(6 * 60 * 1000 + 52 * 1000 + 35).as_millis() as _,
+        TestRuntime::Milliseconds(Duration::from_millis(6 * 60 * 1000 + 52 * 1000 + 35).as_millis() as _),
         @"6 m, 52 s, 35 ms"
         @"6 m, 52 s, 35 ms"
     );
 
     test_format!(
         format_exact_seconds, format_duration,
-        Duration::from_secs(15).as_millis() as _,
+        TestRuntime::Milliseconds(Duration::from_secs(15).as_millis() as _),
         @"15 s"
         @"15 s"
     );
 
     test_format!(
         format_exact_seconds_leftover_millis, format_duration,
-        Duration::from_millis(15 * 1000 + 35).as_millis() as _,
+        TestRuntime::Milliseconds(Duration::from_millis(15 * 1000 + 35).as_millis() as _),
         @"15 s, 35 ms"
         @"15 s, 35 ms"
     );
 
     test_format!(
         format_exact_millis, format_duration,
-        Duration::from_millis(35).as_millis() as _,
+        TestRuntime::Milliseconds(Duration::from_millis(35).as_millis() as _),
         @"35 ms"
         @"35 ms"
     );
@@ -366,7 +368,7 @@ mod test {
 
     test_format!(
         format_summary_success, format_result_summary,
-        &TestResult {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
         @r###"
     --- abq/test: ok ---
     Test passed!
@@ -381,7 +383,7 @@ mod test {
 
     test_format!(
         format_summary_failure, format_result_summary,
-        &TestResult {status: Status::Failure, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Failure, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: FAILED ---
     Assertion failed: 1 != 2
@@ -396,7 +398,7 @@ mod test {
 
     test_format!(
         format_summary_error, format_result_summary,
-        &TestResult {status: Status::Error, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Error, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
         @r###"
     --- abq/test: ERRORED ---
     Process at pid 72818 exited early with SIGTERM
@@ -411,7 +413,7 @@ mod test {
 
     test_format!(
         format_summary_pending, format_result_summary,
-        &TestResult {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: pending ---
     Test not implemented yet for reason: "need to implement feature A"
@@ -426,7 +428,7 @@ mod test {
 
     test_format!(
         format_summary_skipped, format_result_summary,
-        &TestResult {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: skipped ---
     Test skipped for reason: "only enabled on summer Fridays"
@@ -441,7 +443,7 @@ mod test {
 
     test_format!(
         format_summary_multiline, format_result_summary,
-        &TestResult {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
         @r###"
     --- abq/test: ok ---
     Test passed!
@@ -462,7 +464,7 @@ mod test {
 
     test_format!(
         format_summary_no_output, format_result_summary,
-        &TestResult {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() },
+        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
         @r###"
     --- abq/test: ok ---
     <no output>

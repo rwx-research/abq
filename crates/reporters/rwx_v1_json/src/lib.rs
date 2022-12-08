@@ -1,7 +1,7 @@
 use serde_derive::{Deserialize, Serialize};
 use std::io::Write;
 
-use abq_utils::net_protocol::runners::{Status, TestResult};
+use abq_utils::net_protocol::runners::{Status, TestResult, TestRuntime};
 
 // Note: this is intentionally permissive right now for `kind` and `language` until we have
 // implemented native runner support for specifying language and framework. Once we do that,
@@ -190,13 +190,17 @@ impl Collector {
             Status::Success => AttemptStatus::Successful,
         };
 
+        let duration = match test_result.runtime {
+            TestRuntime::Milliseconds(runtime) => (runtime * 1000000.0).round() as Nanoseconds,
+        };
+
         let test = Test {
             id: None,
             name: test_result.display_name.clone(),
             lineage: None,
             location: None,
             attempt: Attempt {
-                duration: (test_result.runtime * 1000000.0).round() as Nanoseconds,
+                duration,
                 meta: Some(test_result.meta.clone()),
                 status,
                 stderr: None,
@@ -279,7 +283,7 @@ impl Collector {
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::runners::{Status, TestResult};
+    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime};
 
     use crate::Collector;
 
@@ -292,46 +296,46 @@ mod test {
             serde_json::Value::String("value".to_string()),
         );
 
-        collector.push_result(&TestResult {
+        collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Success,
             id: "id1".to_string(),
             display_name: "app::module::test1".to_string(),
             output: Some("Test 1 passed".to_string()),
-            runtime: 11.0,
+            runtime: TestRuntime::Milliseconds(11.0),
             meta,
-        });
-        collector.push_result(&TestResult {
+        }));
+        collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Failure,
             id: "id2".to_string(),
             display_name: "app::module::test2".to_string(),
             output: Some("Test 2 failed".to_string()),
-            runtime: 22.0,
+            runtime: TestRuntime::Milliseconds(22.0),
             meta: Default::default(),
-        });
-        collector.push_result(&TestResult {
+        }));
+        collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Error,
             id: "id3".to_string(),
             display_name: "app::module::test3".to_string(),
             output: None,
-            runtime: 33.0,
+            runtime: TestRuntime::Milliseconds(33.0),
             meta: Default::default(),
-        });
-        collector.push_result(&TestResult {
+        }));
+        collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Pending,
             id: "id4".to_string(),
             display_name: "app::module::test4".to_string(),
             output: Some("Test 4 pending".to_string()),
-            runtime: 44.0,
+            runtime: TestRuntime::Milliseconds(44.0),
             meta: Default::default(),
-        });
-        collector.push_result(&TestResult {
+        }));
+        collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Skipped,
             id: "id5".to_string(),
             display_name: "app::module::test5".to_string(),
             output: None,
-            runtime: 55.0,
+            runtime: TestRuntime::Milliseconds(55.0),
             meta: Default::default(),
-        });
+        }));
 
         {
             let mut buf = vec![];
@@ -358,14 +362,14 @@ mod test {
     fn generates_rwx_v1_json_for_successful_runs() {
         let mut collector = Collector::default();
 
-        collector.push_result(&TestResult {
+        collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Success,
             id: "id1".to_string(),
             display_name: "app::module::test1".to_string(),
             output: Some("Test 1 passed".to_string()),
-            runtime: 11.0,
+            runtime: TestRuntime::Milliseconds(11.0),
             meta: Default::default(),
-        });
+        }));
 
         {
             let mut buf = vec![];

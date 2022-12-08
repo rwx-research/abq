@@ -879,9 +879,7 @@ mod test {
         UserToken,
     };
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
-    use abq_utils::net_protocol::runners::{
-        Manifest, ManifestMessage, Status, Test, TestOrGroup, TestResult,
-    };
+    use abq_utils::net_protocol::runners::{v0_1, Status, TestResult};
     use abq_utils::net_protocol::work_server::{
         InitContext, InitContextResponse, NextTestRequest, NextTestResponse, WorkServerRequest,
     };
@@ -891,7 +889,7 @@ mod test {
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
-    use abq_utils::{flatten_manifest, net, net_protocol};
+    use abq_utils::{net, net_protocol};
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
@@ -921,7 +919,9 @@ mod test {
             let mut work_to_write = loop {
                 match manifest_collector.lock().unwrap().take() {
                     Some(man) => {
-                        let work: Vec<_> = flatten_manifest(man.manifest)
+                        let work: Vec<_> = man
+                            .manifest
+                            .flatten()
                             .0
                             .into_iter()
                             .enumerate()
@@ -1089,8 +1089,8 @@ mod test {
         }
     }
 
-    fn echo_test(echo_msg: String) -> TestOrGroup {
-        TestOrGroup::Test(Test {
+    fn echo_test(echo_msg: String) -> v0_1::TestOrGroup {
+        v0_1::TestOrGroup::Test(v0_1::Test {
             id: echo_msg,
             tags: Default::default(),
             meta: Default::default(),
@@ -1108,12 +1108,13 @@ mod test {
         let run_id = RunId::unique();
 
         let get_assigned_run = |run_id: &RunId| {
-            let manifest = ManifestMessage {
-                manifest: Manifest {
+            let manifest = v0_1::ManifestMessage {
+                manifest: v0_1::Manifest {
                     members: vec![echo_test("hello".to_string())],
                     init_meta: Default::default(),
                 },
-            };
+            }
+            .into();
             AssignedRunStatus::Run(AssignedRun {
                 run_id: run_id.clone(),
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
@@ -1188,12 +1189,13 @@ mod test {
                     run_id: RunId::unique(),
                     runner_kind: RunnerKind::TestLikeRunner(
                         TestLikeRunner::Echo,
-                        ManifestMessage {
-                            manifest: Manifest {
+                        v0_1::ManifestMessage {
+                            manifest: v0_1::Manifest {
                                 members: vec![],
                                 init_meta: Default::default(),
                             },
-                        },
+                        }
+                        .into(),
                     ),
                     should_generate_manifest: true,
                     results_batch_size_hint: 2,

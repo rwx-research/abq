@@ -24,7 +24,7 @@ use abq_utils::{
     net_protocol::{
         entity::EntityId,
         health::Health,
-        runners::TestResult,
+        runners::{TestResult, TestRuntime},
         workers::{NativeTestRunnerParams, RunId, RunnerKind, WorkId},
     },
     tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -714,7 +714,7 @@ fn elaborate_invocation_error(
             }
             TestResultError::TimedOut(after) => {
                 let mut s = Vec::new();
-                format_duration(&mut s, after.as_millis() as _)
+                format_duration(&mut s, TestRuntime::Milliseconds(after.as_millis() as _))
                     .expect("formatting duration to vec is infallible");
                 let timeout_s = String::from_utf8_lossy(&s);
 
