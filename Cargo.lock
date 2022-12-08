@@ -35,20 +35,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "abq_cargo"
-version = "0.1.0"
-dependencies = [
- "abq_utils",
- "anyhow",
- "clap",
- "insta",
- "serde",
- "serde_derive",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "abq_echo_worker"
 version = "0.1.0"
 dependencies = [
