@@ -706,7 +706,9 @@ mod test {
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol;
-    use abq_utils::net_protocol::runners::{v0_1, Status, TestCase, TestResult};
+    use abq_utils::net_protocol::runners::{
+        Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestCase, TestOrGroup, TestResult,
+    };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
@@ -714,6 +716,7 @@ mod test {
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
+    use abq_with_protocol_version::with_protocol_version;
     use futures::FutureExt;
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
@@ -824,25 +827,23 @@ mod test {
         })
     }
 
-    pub fn echo_test(echo_msg: String) -> v0_1::TestOrGroup {
-        v0_1::TestOrGroup::Test(v0_1::Test {
-            id: echo_msg,
-            tags: Default::default(),
-            meta: Default::default(),
-        })
+    pub fn echo_test(protocol: ProtocolWitness, echo_msg: String) -> TestOrGroup {
+        TestOrGroup::test(
+            protocol,
+            Test::new(protocol, echo_msg, [], Default::default()),
+        )
     }
 
-    pub fn exec_test(cmd: &str, args: &[&str]) -> v0_1::TestOrGroup {
+    pub fn exec_test(protocol: ProtocolWitness, cmd: &str, args: &[&str]) -> TestOrGroup {
         let exec_str = std::iter::once(cmd)
             .chain(args.iter().copied())
             .collect::<Vec<_>>()
             .join(" ");
 
-        v0_1::TestOrGroup::Test(v0_1::Test {
-            id: exec_str,
-            tags: Default::default(),
-            meta: Default::default(),
-        })
+        TestOrGroup::test(
+            protocol,
+            Test::new(protocol, exec_str, [], Default::default()),
+        )
     }
 
     fn await_manifest_test_cases(manifest: ManifestCollector) -> Vec<TestCase> {
@@ -872,28 +873,20 @@ mod test {
         }
     }
 
-    fn test_echo_n(num_workers: usize, num_echos: usize) {
+    fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
         let (write_work, get_next_tests) = work_writer();
         let (results, notify_results, run_completed_successfully) = results_collector();
 
         let run_id = RunId::unique();
         let mut expected_results = HashMap::new();
-        let tests = (0..num_echos)
-            .into_iter()
-            .map(|i| {
-                let echo_string = format!("echo {}", i);
-                expected_results.insert(i.to_string(), echo_string.clone());
+        let tests = (0..num_echos).into_iter().map(|i| {
+            let echo_string = format!("echo {}", i);
+            expected_results.insert(i.to_string(), echo_string.clone());
 
-                echo_test(echo_string)
-            })
-            .collect();
-        let manifest = v0_1::ManifestMessage {
-            manifest: v0_1::Manifest {
-                members: tests,
-                init_meta: Default::default(),
-            },
-        }
-        .into();
+            echo_test(protocol, echo_string)
+        });
+        let manifest =
+            ManifestMessage::new(protocol, Manifest::new(protocol, tests, Default::default()));
 
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
@@ -939,28 +932,33 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn test_1_worker_1_echo() {
-        test_echo_n(1, 1);
+        test_echo_n(proto, 1, 1);
     }
 
     #[test]
+    #[with_protocol_version]
     fn test_2_workers_1_echo() {
-        test_echo_n(2, 1);
+        test_echo_n(proto, 2, 1);
     }
 
     #[test]
+    #[with_protocol_version]
     fn test_1_worker_2_echos() {
-        test_echo_n(1, 2);
+        test_echo_n(proto, 1, 2);
     }
 
     #[test]
+    #[with_protocol_version]
     fn test_2_workers_2_echos() {
-        test_echo_n(2, 2);
+        test_echo_n(proto, 2, 2);
     }
 
     #[test]
+    #[with_protocol_version]
     fn test_2_workers_8_echos() {
-        test_echo_n(2, 8);
+        test_echo_n(proto, 2, 8);
     }
 
     #[test]
@@ -1097,6 +1095,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn work_in_constant_context() {
         let (write_work, get_next_tests) = work_writer();
         let (results, notify_results, run_completed_successfully) = results_collector();
@@ -1109,13 +1108,14 @@ mod test {
         };
 
         let run_id = RunId::unique();
-        let manifest = v0_1::ManifestMessage {
-            manifest: v0_1::Manifest {
-                members: vec![exec_test("cat", &["testfile"])],
-                init_meta: Default::default(),
-            },
-        }
-        .into();
+        let manifest = ManifestMessage::new(
+            proto,
+            Manifest::new(
+                proto,
+                [exec_test(proto, "cat", &["testfile"])],
+                Default::default(),
+            ),
+        );
 
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Exec, manifest),

@@ -28,10 +28,7 @@ use serde_derive::{Deserialize, Serialize};
 pub static ABQ_SOCKET: &str = "ABQ_SOCKET";
 pub static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
 
-#[cfg(not(feature = "expose-native-protocols"))]
 mod v0_1;
-#[cfg(feature = "expose-native-protocols")]
-pub mod v0_1;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename = "abq_native_runner_spawned")]
@@ -85,11 +82,17 @@ enum PrivProtocolWitness {
 pub struct ProtocolWitness(PrivProtocolWitness);
 
 impl ProtocolWitness {
-    pub fn get_version(&self) -> AbqProtocolVersion {
+    pub const fn get_version(&self) -> AbqProtocolVersion {
         use PrivProtocolWitness::*;
         match self.0 {
             V0_1 => AbqProtocolVersion::V0_1,
         }
+    }
+
+    pub fn iter_all() -> impl Iterator<Item = ProtocolWitness> {
+        use PrivProtocolWitness::*;
+
+        [Self(V0_1)].into_iter()
     }
 }
 
@@ -100,6 +103,17 @@ pub struct TestCase(PrivTestCase);
 impl TestCase {
     pub fn id(&self) -> &TestId {
         &self.0.id
+    }
+
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(protocol: ProtocolWitness, id: impl Into<TestId>, meta: MetadataMap) -> Self {
+        use PrivProtocolWitness::*;
+        match protocol.0 {
+            V0_1 => Self(v0_1::TestCase {
+                id: id.into(),
+                meta,
+            }),
+        }
     }
 }
 
@@ -119,6 +133,43 @@ impl TestCaseMessage {
             test_case: test_case.0,
         };
         Self(v0_1_message)
+    }
+}
+
+pub struct TestOrGroup(PrivTestOrGroup);
+type PrivTestOrGroup = v0_1::TestOrGroup;
+
+impl TestOrGroup {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn test(protocol: ProtocolWitness, test: Test) -> Self {
+        use PrivProtocolWitness::*;
+
+        match protocol.0 {
+            V0_1 => Self(v0_1::TestOrGroup::Test(test.0)),
+        }
+    }
+}
+
+pub struct Test(PrivTest);
+type PrivTest = v0_1::Test;
+
+impl Test {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(
+        protocol: ProtocolWitness,
+        id: impl Into<TestId>,
+        tags: impl Into<Vec<String>>,
+        meta: MetadataMap,
+    ) -> Self {
+        use PrivProtocolWitness::*;
+
+        match protocol.0 {
+            V0_1 => Self(v0_1::Test {
+                id: id.into(),
+                tags: tags.into(),
+                meta,
+            }),
+        }
     }
 }
 
@@ -161,6 +212,22 @@ impl Manifest {
             TestOrGroup::Group(group) => group.name.clone(),
         });
     }
+
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(
+        protocol: ProtocolWitness,
+        members: impl IntoIterator<Item = TestOrGroup>,
+        init_meta: MetadataMap,
+    ) -> Self {
+        use PrivProtocolWitness::*;
+
+        match protocol.0 {
+            V0_1 => {
+                let members = members.into_iter().map(|tg| tg.0).collect();
+                Self(v0_1::Manifest { members, init_meta })
+            }
+        }
+    }
 }
 
 impl From<v0_1::Manifest> for Manifest {
@@ -177,6 +244,17 @@ impl ManifestMessage {
     /// Extract the [manifest][Manifest] from the manifest message.
     pub fn into_manifest(self) -> Manifest {
         self.0.manifest.into()
+    }
+
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(protocol: ProtocolWitness, manifest: Manifest) -> Self {
+        use PrivProtocolWitness::*;
+
+        match protocol.0 {
+            V0_1 => Self(v0_1::ManifestMessage {
+                manifest: manifest.0,
+            }),
+        }
     }
 }
 

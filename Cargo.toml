@@ -11,6 +11,8 @@ members = [
   "crates/abq_runners/exec",
   "crates/abq_runners/generic_test_runner",
   "crates/reporters/junit_xml",
+
+  "crates/abq_test_support/with_protocol_version",
 ]
 
 [workspace.dependencies]

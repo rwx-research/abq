@@ -25,6 +25,7 @@ futures.workspace = true
 
 [dev-dependencies]
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
+abq_with_protocol_version = { path = "../abq_test_support/with_protocol_version" }
 
 ntest.workspace = true
 # Needed for testing abq_workers.

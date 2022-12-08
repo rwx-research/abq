@@ -879,7 +879,9 @@ mod test {
         UserToken,
     };
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
-    use abq_utils::net_protocol::runners::{v0_1, Status, TestResult};
+    use abq_utils::net_protocol::runners::{
+        Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
+    };
     use abq_utils::net_protocol::work_server::{
         InitContext, InitContextResponse, NextTestRequest, NextTestResponse, WorkServerRequest,
     };
@@ -890,6 +892,7 @@ mod test {
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{net, net_protocol};
+    use abq_with_protocol_version::with_protocol_version;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
@@ -1089,15 +1092,15 @@ mod test {
         }
     }
 
-    fn echo_test(echo_msg: String) -> v0_1::TestOrGroup {
-        v0_1::TestOrGroup::Test(v0_1::Test {
-            id: echo_msg,
-            tags: Default::default(),
-            meta: Default::default(),
-        })
+    fn echo_test(protocol: ProtocolWitness, echo_msg: String) -> TestOrGroup {
+        TestOrGroup::test(
+            protocol,
+            Test::new(protocol, echo_msg, [], Default::default()),
+        )
     }
 
     #[test]
+    #[with_protocol_version]
     fn queue_and_workers_lifecycle() {
         let manifest_collector = ManifestCollector::default();
         let (next_work_addr, shutdown_next_work_server, next_work_handle) =
@@ -1107,14 +1110,15 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let get_assigned_run = |run_id: &RunId| {
-            let manifest = v0_1::ManifestMessage {
-                manifest: v0_1::Manifest {
-                    members: vec![echo_test("hello".to_string())],
-                    init_meta: Default::default(),
-                },
-            }
-            .into();
+        let get_assigned_run = move |run_id: &RunId| {
+            let manifest = ManifestMessage::new(
+                proto,
+                Manifest::new(
+                    proto,
+                    [echo_test(proto, "hello".to_string())],
+                    Default::default(),
+                ),
+            );
             AssignedRunStatus::Run(AssignedRun {
                 run_id: run_id.clone(),
                 runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
@@ -1174,7 +1178,10 @@ mod test {
         );
     }
 
-    fn test_negotiator(server: Box<dyn net::ServerListener>) -> (QueueNegotiator, ShutdownManager) {
+    fn test_negotiator(
+        protocol: ProtocolWitness,
+        server: Box<dyn net::ServerListener>,
+    ) -> (QueueNegotiator, ShutdownManager) {
         let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
 
         let negotiator = QueueNegotiator::new(
@@ -1184,18 +1191,15 @@ mod test {
             // Below parameters are faux because they are unnecessary for healthchecks.
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
-            |_| {
+            move |_| {
                 AssignedRunStatus::Run(AssignedRun {
                     run_id: RunId::unique(),
                     runner_kind: RunnerKind::TestLikeRunner(
                         TestLikeRunner::Echo,
-                        v0_1::ManifestMessage {
-                            manifest: v0_1::Manifest {
-                                members: vec![],
-                                init_meta: Default::default(),
-                            },
-                        }
-                        .into(),
+                        ManifestMessage::new(
+                            protocol,
+                            Manifest::new(protocol, [], Default::default()),
+                        ),
                     ),
                     should_generate_manifest: true,
                     results_batch_size_hint: 2,
@@ -1208,13 +1212,14 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn queue_negotiator_healthcheck() {
         let server = ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
             .bind("0.0.0.0:0")
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(proto, server);
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()
@@ -1231,6 +1236,7 @@ mod test {
 
     #[test]
     #[traced_test]
+    #[with_protocol_version]
     fn queue_negotiator_with_auth_okay() {
         let (server_auth, client_auth, _) = build_random_strategies();
 
@@ -1239,7 +1245,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(proto, server);
 
         let client = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
             .build()
@@ -1258,6 +1264,7 @@ mod test {
 
     #[test]
     #[traced_test]
+    #[with_protocol_version]
     fn queue_negotiator_connect_with_no_auth_fails() {
         let (server_auth, _, _) = build_random_strategies();
 
@@ -1266,7 +1273,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(proto, server);
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()

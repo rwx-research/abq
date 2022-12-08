@@ -2423,12 +2423,16 @@ mod test {
             self,
             entity::EntityId,
             queue::InvokeWork,
-            runners::{v0_1, ManifestMessage, Status, TestResult, TestResultSpec, TestRuntime},
+            runners::{
+                Manifest, ManifestMessage, ProtocolWitness, Status, TestResult, TestResultSpec,
+                TestRuntime,
+            },
             workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
         },
         shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
+    use abq_with_protocol_version::with_protocol_version;
     use parking_lot as pl;
     use tokio::{
         io::AsyncWriteExt,
@@ -2459,20 +2463,14 @@ mod test {
         Ok((stream, addr))
     }
 
-    fn empty_manifest_msg() -> ManifestMessage {
-        v0_1::ManifestMessage {
-            manifest: v0_1::Manifest {
-                members: vec![],
-                init_meta: Default::default(),
-            },
-        }
-        .into()
+    fn empty_manifest_msg(proto: ProtocolWitness) -> ManifestMessage {
+        ManifestMessage::new(proto, Manifest::new(proto, [], Default::default()))
     }
 
-    fn faux_invoke_work() -> InvokeWork {
+    fn faux_invoke_work(proto: ProtocolWitness) -> InvokeWork {
         InvokeWork {
             run_id: RunId::unique(),
-            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
             batch_size_hint: one_nonzero(),
         }
     }
@@ -3089,13 +3087,14 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn active_runs_when_some_waiting_on_workers() {
         let queues = SharedRuns::default();
 
         queues
             .create_queue(
                 RunId::unique(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                 one_nonzero(),
             )
             .unwrap();
@@ -3104,6 +3103,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn active_runs_when_some_waiting_on_manifest() {
         let queues = SharedRuns::default();
 
@@ -3112,7 +3112,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                 one_nonzero(),
             )
             .unwrap();
@@ -3123,6 +3123,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn active_runs_when_running() {
         let queues = SharedRuns::default();
 
@@ -3131,7 +3132,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                 one_nonzero(),
             )
             .unwrap();
@@ -3143,6 +3144,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn active_runs_when_all_done() {
         let queues = SharedRuns::default();
 
@@ -3151,7 +3153,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                 one_nonzero(),
             )
             .unwrap();
@@ -3164,6 +3166,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn active_runs_multiple_in_various_states() {
         let queues = SharedRuns::default();
 
@@ -3177,7 +3180,7 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                     one_nonzero(),
                 )
                 .unwrap();
@@ -3197,6 +3200,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn mark_cancellation_when_waiting_on_workers() {
         let queues = SharedRuns::default();
         let run_id = RunId::unique();
@@ -3204,7 +3208,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                 one_nonzero(),
             )
             .unwrap();
@@ -3221,6 +3225,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn mark_cancellation_when_some_waiting_on_manifest() {
         let queues = SharedRuns::default();
 
@@ -3229,7 +3234,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                 one_nonzero(),
             )
             .unwrap();
@@ -3248,6 +3253,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn mark_cancellation_when_running() {
         let queues = SharedRuns::default();
 
@@ -3256,7 +3262,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                 one_nonzero(),
             )
             .unwrap();
@@ -3276,6 +3282,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[with_protocol_version]
     async fn receiving_cancellation_during_last_test_results_is_cancellation() {
         let server_opts =
             ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
@@ -3300,7 +3307,7 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
                     one_nonzero(),
                 )
                 .unwrap();
@@ -3369,6 +3376,7 @@ mod test {
     }
 
     #[test]
+    #[with_protocol_version]
     fn accept_retirement_request() {
         use net_protocol::queue;
 
@@ -3407,7 +3415,7 @@ mod test {
                 &mut conn,
                 queue::Request {
                     entity: EntityId::new(),
-                    message: queue::Message::InvokeWork(faux_invoke_work()),
+                    message: queue::Message::InvokeWork(faux_invoke_work(proto)),
                 },
             )
             .unwrap();

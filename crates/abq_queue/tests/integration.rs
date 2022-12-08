@@ -23,13 +23,17 @@ use abq_utils::{
         self,
         entity::EntityId,
         queue::NativeRunnerInfo,
-        runners::{v0_1, AbqProtocolVersion, ManifestMessage, MetadataMap, TestResult},
+        runners::{
+            AbqProtocolVersion, Manifest, ManifestMessage, MetadataMap, ProtocolWitness, Test,
+            TestOrGroup, TestResult,
+        },
         work_server::{InitContext, InitContextResponse},
         workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
     },
     tls::ClientTlsStrategy,
 };
 
+use abq_with_protocol_version::with_protocol_version;
 use abq_workers::{
     negotiate::{NegotiatedWorkers, WorkersConfig, WorkersNegotiator},
     workers::{WorkerContext, WorkersExit},
@@ -86,22 +90,12 @@ fn one_nonzero_usize() -> NonZeroUsize {
     1.try_into().unwrap()
 }
 
-fn echo_test(echo_msg: String) -> v0_1::TestOrGroup {
-    v0_1::TestOrGroup::Test(v0_1::Test {
-        id: echo_msg,
-        tags: Default::default(),
-        meta: Default::default(),
-    })
+fn echo_test(proto: ProtocolWitness, echo_msg: String) -> TestOrGroup {
+    TestOrGroup::test(proto, Test::new(proto, echo_msg, [], Default::default()))
 }
 
-fn empty_manifest_msg() -> ManifestMessage {
-    v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![],
-            init_meta: Default::default(),
-        },
-    }
-    .into()
+fn empty_manifest_msg(proto: ProtocolWitness) -> ManifestMessage {
+    ManifestMessage::new(proto, Manifest::new(proto, [], Default::default()))
 }
 
 fn default_workers_config() -> WorkersConfig {
@@ -490,18 +484,20 @@ fn run_test(servers: Servers, steps: Steps) {
 }
 
 #[test]
+#[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn multiple_jobs_complete() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![
-                echo_test("echo1".to_string()),
-                echo_test("echo2".to_string()),
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [
+                echo_test(proto, "echo1".to_string()),
+                echo_test(proto, "echo2".to_string()),
             ],
-            ..Default::default()
-        },
-    }
-    .into();
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
@@ -528,33 +524,38 @@ fn multiple_jobs_complete() {
 }
 
 #[test]
+#[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn multiple_invokers() {
     let runner1 = {
-        let manifest = v0_1::ManifestMessage {
-            manifest: v0_1::Manifest {
-                members: vec![
-                    echo_test("echo1".to_string()),
-                    echo_test("echo2".to_string()),
+        let manifest = ManifestMessage::new(
+            proto,
+            Manifest::new(
+                proto,
+                [
+                    echo_test(proto, "echo1".to_string()),
+                    echo_test(proto, "echo2".to_string()),
                 ],
-                ..Default::default()
-            },
-        };
-        RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest.into())
+                Default::default(),
+            ),
+        );
+        RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest)
     };
 
     let runner2 = {
-        let manifest = v0_1::ManifestMessage {
-            manifest: v0_1::Manifest {
-                members: vec![
-                    echo_test("echo3".to_string()),
-                    echo_test("echo4".to_string()),
-                    echo_test("echo5".to_string()),
+        let manifest = ManifestMessage::new(
+            proto,
+            Manifest::new(
+                proto,
+                [
+                    echo_test(proto, "echo3".to_string()),
+                    echo_test(proto, "echo4".to_string()),
+                    echo_test(proto, "echo5".to_string()),
                 ],
-                ..Default::default()
-            },
-        };
-        RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest.into())
+                Default::default(),
+            ),
+        );
+        RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest)
     };
 
     TestBuilder::default()
@@ -594,21 +595,24 @@ fn multiple_invokers() {
 
 // TODO write some tests that smoke over # of workers and batch sizes
 #[test]
+#[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn batch_two_requests_at_a_time() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![
-                echo_test("echo1".to_string()),
-                echo_test("echo2".to_string()),
-                echo_test("echo3".to_string()),
-                echo_test("echo4".to_string()),
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [
+                echo_test(proto, "echo1".to_string()),
+                echo_test(proto, "echo2".to_string()),
+                echo_test(proto, "echo3".to_string()),
+                echo_test(proto, "echo4".to_string()),
             ],
-            ..Default::default()
-        },
-    };
+            Default::default(),
+        ),
+    );
 
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest.into());
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
     TestBuilder::default()
         .step(
@@ -637,15 +641,17 @@ fn batch_two_requests_at_a_time() {
 }
 
 #[test]
+#[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn worker_exits_with_failure_if_test_fails() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo".to_string())],
+            Default::default(),
+        ),
+    );
 
     // Set up the runner so that it times out, always issuing an error.
     let runner =
@@ -672,25 +678,27 @@ fn worker_exits_with_failure_if_test_fails() {
 }
 
 #[test]
+#[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
     // NOTE: we set up two workers and unleash them on the following manifest, setting both
     // workers to fail only on the `echo_fail` case. That way, no matter which one picks it up,
     // we should observe a failure for both workers sets.
 
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![
-                echo_test("echo1".to_string()),
-                echo_test("echo2".to_string()),
-                echo_test("echo_fail".to_string()),
-                echo_test("echo3".to_string()),
-                echo_test("echo4".to_string()),
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [
+                echo_test(proto, "echo1".to_string()),
+                echo_test(proto, "echo2".to_string()),
+                echo_test(proto, "echo_fail".to_string()),
+                echo_test(proto, "echo3".to_string()),
+                echo_test(proto, "echo4".to_string()),
             ],
-            init_meta: Default::default(),
-        },
-    }
-    .into();
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(
         TestLikeRunner::FailOnTestName("echo_fail".to_string()),
@@ -729,15 +737,17 @@ fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
 }
 
 #[test]
+#[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn invoke_work_with_duplicate_id_is_an_error() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
@@ -762,15 +772,17 @@ fn invoke_work_with_duplicate_id_is_an_error() {
 }
 
 #[test]
+#[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
@@ -798,8 +810,9 @@ fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
 }
 
 #[test]
+#[with_protocol_version]
 fn empty_manifest_exits_gracefully() {
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto));
 
     TestBuilder::default()
         .step(
@@ -821,14 +834,16 @@ fn empty_manifest_exits_gracefully() {
 
 #[test]
 #[traced_test]
+#[with_protocol_version]
 fn get_init_context_from_work_server_waiting_for_first_worker() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
@@ -854,14 +869,16 @@ fn get_init_context_from_work_server_waiting_for_first_worker() {
 }
 
 #[test]
+#[with_protocol_version]
 fn get_init_context_from_work_server_waiting_for_manifest() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::NeverReturnManifest, manifest);
 
@@ -890,6 +907,7 @@ fn get_init_context_from_work_server_waiting_for_manifest() {
 }
 
 #[test]
+#[with_protocol_version]
 fn get_init_context_from_work_server_active() {
     let expected_init_meta = {
         let mut meta = MetadataMap::default();
@@ -898,13 +916,14 @@ fn get_init_context_from_work_server_active() {
         meta
     };
 
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            init_meta: expected_init_meta.clone(),
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            expected_init_meta.clone(),
+        ),
+    );
 
     // Set up the runner to return the manifest, but not run any test.
     let runner = RunnerKind::TestLikeRunner(
@@ -956,14 +975,16 @@ fn get_init_context_from_work_server_active() {
 }
 
 #[test]
+#[with_protocol_version]
 fn get_init_context_after_run_already_completed() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
@@ -998,17 +1019,19 @@ fn get_init_context_after_run_already_completed() {
 }
 
 #[test]
+#[with_protocol_version]
 fn getting_run_after_work_is_complete_returns_nothing() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![
-                echo_test("echo1".to_string()),
-                echo_test("echo2".to_string()),
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [
+                echo_test(proto, "echo1".to_string()),
+                echo_test(proto, "echo2".to_string()),
             ],
-            init_meta: Default::default(),
-        },
-    }
-    .into();
+            Default::default(),
+        ),
+    );
 
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest);
 
@@ -1046,14 +1069,16 @@ fn getting_run_after_work_is_complete_returns_nothing() {
 }
 
 #[test]
+#[with_protocol_version]
 fn test_cancellation_drops_remaining_work() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ),
+    );
     let runner = RunnerKind::TestLikeRunner(
         TestLikeRunner::NeverReturnOnTest("echo1".to_owned()),
         manifest,
@@ -1106,14 +1131,16 @@ fn failure_to_run_worker_command_exits_gracefully() {
 }
 
 #[test]
+#[with_protocol_version]
 fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
-    let manifest = v0_1::ManifestMessage {
-        manifest: v0_1::Manifest {
-            members: vec![echo_test("echo1".to_string())],
-            ..Default::default()
-        },
-    }
-    .into();
+    let manifest = ManifestMessage::new(
+        proto,
+        Manifest::new(
+            proto,
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ),
+    );
     let runner = RunnerKind::TestLikeRunner(
         TestLikeRunner::NeverReturnOnTest("echo1".to_owned()),
         manifest,
@@ -1143,6 +1170,7 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
 }
 
 #[test]
+#[with_protocol_version]
 fn pending_worker_attachment_does_not_block_other_attachers() {
     TestBuilder::default()
         // Start a set of workers that will never find their execution context, and just
@@ -1154,7 +1182,8 @@ fn pending_worker_attachment_does_not_block_other_attachers() {
         // In the meantime, start and execute a run that should complete successfully.
         .step(
             {
-                let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
+                let runner =
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto));
                 [
                     RunTest(Run(2), Sid(2), SupervisorConfig::new(runner)),
                     StartWorkers(Run(2), Wid(2), default_workers_config()),

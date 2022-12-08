@@ -800,6 +800,7 @@ pub fn execute_wrapped_runner(
 mod test_validate_protocol_version_message {
     use std::time::Duration;
 
+    use abq_with_protocol_version::with_protocol_version;
     use tokio::{
         net::{TcpListener, TcpStream},
         time::sleep,
@@ -809,6 +810,7 @@ mod test_validate_protocol_version_message {
         self,
         runners::{
             AbqNativeRunnerSpawnedMessage, AbqNativeRunnerSpecification, AbqProtocolVersion,
+            Manifest,
         },
     };
 
@@ -902,15 +904,13 @@ mod test_validate_protocol_version_message {
     }
 
     #[tokio::test]
+    #[with_protocol_version]
     async fn protocol_version_message_recv_wrong_message() {
         let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let socket_addr = listener.local_addr().unwrap();
         let child = async {
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let message = net_protocol::runners::v0_1::Manifest {
-                members: vec![],
-                init_meta: Default::default(),
-            };
+            let message = Manifest::new(proto, vec![], Default::default());
             net_protocol::async_write(&mut stream, &message)
                 .await
                 .unwrap();
@@ -1012,12 +1012,13 @@ mod test_abq_jest {
     use crate::{execute_wrapped_runner, GenericTestRunner, SendTestResults};
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::RunAlreadyCompleted;
-    use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestResultSpec};
+    use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, RunId,
         WorkContext, WorkId, WorkerTest,
     };
+    use abq_with_protocol_version::with_protocol_version;
     use futures::FutureExt;
 
     use std::path::PathBuf;
@@ -1117,9 +1118,8 @@ mod test_abq_jest {
     }
 
     #[test]
+    #[with_protocol_version]
     fn quick_exit_if_init_context_says_run_is_complete() {
-        use abq_utils::net_protocol::runners::v0_1;
-
         let input = NativeTestRunnerParams {
             cmd: "npm".to_string(),
             args: vec!["test".to_string()],
@@ -1127,14 +1127,10 @@ mod test_abq_jest {
         };
 
         let get_init_context = || Err(RunAlreadyCompleted {});
-        let get_next_test = &|| {
-            async {
+        let get_next_test = &move || {
+            async move {
                 NextWorkBundle(vec![NextWork::Work(WorkerTest {
-                    test_case: v0_1::TestCase {
-                        id: "unreachable".to_string(),
-                        meta: Default::default(),
-                    }
-                    .into(),
+                    test_case: TestCase::new(proto, "unreachable", Default::default()),
                     context: WorkContext {
                         working_dir: std::env::current_dir().unwrap(),
                     },
