@@ -539,7 +539,7 @@ test_all_network_config_options! {
         // this prints more than needed because we don't capture worker stdout/stderr
         // assert_eq!(stdout_lines.next().unwrap(), "F");
         // assert!(stderr.is_empty(), "{:?}", stderr);
-        assert!(stdout_lines.into_iter().any(|line| line.contains( "F")));
+        assert!(stdout_lines.into_iter().any(|line| line.contains('F')));
     })
 }
 

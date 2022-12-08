@@ -13,8 +13,8 @@ use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    AbqNativeRunnerSpecification, ManifestMessage, Status, TestId, TestResult,
-    ACTIVE_ABQ_PROTOCOL_VERSION,
+    AbqNativeRunnerSpecification, AbqProtocolVersion, ManifestMessage, Status, TestId, TestResult,
+    TestResultSpec, TestRuntime,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -431,9 +431,9 @@ fn start_generic_test_runner(
 }
 
 fn build_test_like_runner_reported_manifest(manifest_message: ManifestMessage) -> ReportedManifest {
-    let ManifestMessage { manifest } = manifest_message;
+    let manifest = manifest_message.into_manifest();
 
-    let native_runner_protocol = ACTIVE_ABQ_PROTOCOL_VERSION;
+    let native_runner_protocol = AbqProtocolVersion::V0_1;
     let native_runner_specification = AbqNativeRunnerSpecification {
         name: "unknown-test-like-runner".to_string(),
         version: "0.0.1".to_owned(),
@@ -528,7 +528,7 @@ fn start_test_like_runner(
                     run_id,
                     work_id,
                 }) => {
-                    if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == &test_case.id )
+                    if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == test_case.id() )
                     {
                         return Err(io::Error::new(
                             io::ErrorKind::Unsupported,
@@ -544,7 +544,7 @@ fn start_test_like_runner(
                         let attempt_result = attempt_test_id_for_test_like_runner(
                             &context,
                             runner.clone(),
-                            test_case.id.clone(),
+                            test_case.id().clone(),
                             init_context.clone(),
                             &work_context,
                             work_timeout,
@@ -561,14 +561,14 @@ fn start_test_like_runner(
                                 (Status::Error, format!("Timeout: {}ms", time.as_millis()))
                             }
                         };
-                        let result = TestResult {
+                        let result = TestResult::new(TestResultSpec {
                             status,
-                            id: test_case.id.clone(),
-                            display_name: test_case.id.clone(),
+                            id: test_case.id().clone(),
+                            display_name: test_case.id().clone(),
                             output: Some(output),
-                            runtime,
+                            runtime: TestRuntime::Milliseconds(runtime),
                             meta: Default::default(),
-                        };
+                        });
 
                         rt.block_on(notify_results(
                             entity,
@@ -705,9 +705,8 @@ mod test {
 
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
-    use abq_utils::net_protocol::runners::{
-        Manifest, ManifestMessage, Status, Test, TestCase, TestOrGroup, TestResult,
-    };
+    use abq_utils::net_protocol;
+    use abq_utils::net_protocol::runners::{v0_1, Status, TestCase, TestResult};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
@@ -715,7 +714,6 @@ mod test {
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
-    use abq_utils::{flatten_manifest, net_protocol};
     use futures::FutureExt;
     use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
@@ -826,21 +824,21 @@ mod test {
         })
     }
 
-    pub fn echo_test(echo_msg: String) -> TestOrGroup {
-        TestOrGroup::Test(Test {
+    pub fn echo_test(echo_msg: String) -> v0_1::TestOrGroup {
+        v0_1::TestOrGroup::Test(v0_1::Test {
             id: echo_msg,
             tags: Default::default(),
             meta: Default::default(),
         })
     }
 
-    pub fn exec_test(cmd: &str, args: &[&str]) -> TestOrGroup {
+    pub fn exec_test(cmd: &str, args: &[&str]) -> v0_1::TestOrGroup {
         let exec_str = std::iter::once(cmd)
             .chain(args.iter().copied())
             .collect::<Vec<_>>()
             .join(" ");
 
-        TestOrGroup::Test(Test {
+        v0_1::TestOrGroup::Test(v0_1::Test {
             id: exec_str,
             tags: Default::default(),
             meta: Default::default(),
@@ -850,9 +848,7 @@ mod test {
     fn await_manifest_test_cases(manifest: ManifestCollector) -> Vec<TestCase> {
         loop {
             match manifest.lock().unwrap().take() {
-                Some(ManifestResult::Manifest(manifest)) => {
-                    return flatten_manifest(manifest.manifest).0
-                }
+                Some(ManifestResult::Manifest(manifest)) => return manifest.manifest.flatten().0,
                 Some(ManifestResult::TestRunnerError { .. }) => unreachable!(),
                 None => continue,
             }
@@ -891,12 +887,13 @@ mod test {
                 echo_test(echo_string)
             })
             .collect();
-        let manifest = ManifestMessage {
-            manifest: Manifest {
+        let manifest = v0_1::ManifestMessage {
+            manifest: v0_1::Manifest {
                 members: tests,
                 init_meta: Default::default(),
             },
-        };
+        }
+        .into();
 
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
@@ -931,7 +928,7 @@ mod test {
                 .unwrap()
                 .clone()
                 .into_iter()
-                .map(|(k, v)| (k, v.output.unwrap()))
+                .map(|(k, v)| (k, v.into_spec().output.unwrap()))
                 .collect();
 
             results == expected_results
@@ -1112,12 +1109,13 @@ mod test {
         };
 
         let run_id = RunId::unique();
-        let manifest = ManifestMessage {
-            manifest: Manifest {
+        let manifest = v0_1::ManifestMessage {
+            manifest: v0_1::Manifest {
                 members: vec![exec_test("cat", &["testfile"])],
                 init_meta: Default::default(),
             },
-        };
+        }
+        .into();
 
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Exec, manifest),

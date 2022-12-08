@@ -32,3 +32,4 @@ test-abq-jest = []
 
 [dev-dependencies]
 insta.workspace = true
+abq_utils = { path = "../../abq_utils", features = ["expose-native-protocols"] }

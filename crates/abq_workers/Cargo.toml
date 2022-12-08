@@ -26,6 +26,7 @@ tracing.workspace = true
 procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile.workspace = true
 tracing-test.workspace = true
+abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 
 [features]
 default = []
