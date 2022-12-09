@@ -24,15 +24,15 @@ on:
 jobs:
   release:
     name: Build, Upload, Release ABQ
-    # We only need x86-64 AL2-compatible binaries for development testing.
+    # We only need x86-64 statically-linked binaries for development testing.
     runs-on: ubuntu-latest
-    container: quay.io/pypa/manylinux2014_x86_64
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
       PLATFORM: linux_x86-64
+      RUST_TARGET: x86_64-unknown-linux-musl
       ABQ_DEVELOPMENT_BUILD: 1
       ABQ_NO_REBUILD: true
     steps:
@@ -53,9 +53,9 @@ jobs:
       - name: re-fetch overwritten tag
         run: git fetch --tags --force
 
-      - name: Install build + deploy deps
+      - name: Install musl libc tools
         run: |
-          yum install sudo jq openssh-clients openssh-server -y
+          sudo apt-get install -y musl-tools
 
       - name: Restore cargo cache
         uses: actions/cache@v3.0.11
@@ -68,20 +68,22 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-release-linux_x86-64-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-linux_x86-64-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
-          toolchain: stable
+          toolchain: 1.64.0
+          target: ${{ env.RUST_TARGET }}
+          default: true
           components: clippy
 
       - name: Run lints
         uses: actions-rs/cargo@v1.0.3
         with:
           command: clippy
-          args: --workspace --tests --release -- --deny warnings
+          args: --workspace --tests --release --all-features --target=${{ env.RUST_TARGET }} -- --deny warnings
 
       - name: Lint github workflows
         run: |
@@ -103,10 +105,6 @@ jobs:
       - name: Pull native test runners
         run: |
           set -x
-
-          mkdir -p /root/.ssh
-          touch /root/.ssh/known_hosts
-          ssh-keyscan -t rsa github.com >> /root/.ssh/known_hosts
 
           eval "$(ssh-agent -s)"
 
@@ -137,13 +135,13 @@ jobs:
 
       - name: Build release with tests
         run: |
-          cargo build --tests --release --all-features
+          cargo build --tests --release --all-features --target="$RUST_TARGET"
 
       - name: Run tests with cargo
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          cargo test --release --all-features
+          cargo test --release --all-features --target="$RUST_TARGET"
         env:
           CI: false
 
@@ -152,20 +150,14 @@ jobs:
         if: github.run_attempt > 1
         run: |
           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --release --all-features -- --nocapture
+          cargo test --release --all-features --target="$RUST_TARGET" -- --nocapture
         env:
           CI: false
-
-      - name: Install aws CLI
-        run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
-          sudo ./aws/install
 
       - name: Prepare release environment
         run: |
           ABQ_VERSION="$(cat build_artifact/abq_version.txt)"
-          RELEASE_NAME="abq_${ABQ_VERSION}_${PLATFORM}"
+          RELEASE_NAME="abq_${ABQ_VERSION}_linux_x86-64"
           RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
           RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
           {
@@ -178,7 +170,7 @@ jobs:
       - name: Prepare release
         run: |
           mkdir "${RELEASE_NAME}"
-          cp target/release/abq "${RELEASE_NAME}"
+          cp "target/$RUST_TARGET/release/abq" "${RELEASE_NAME}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
 
       - name: Push release to staging S3

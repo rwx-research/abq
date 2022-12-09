@@ -37,7 +37,10 @@ fn debug_log_for_ci() -> bool {
 }
 
 fn abq_binary() -> PathBuf {
-    if cfg!(debug_assertions) {
+    if cfg!(all(target_arch = "x86_64", target_env = "musl")) {
+        // GHA is using a musl target
+        PathBuf::from(WORKSPACE).join("target/x86_64-unknown-linux-musl/release/abq")
+    } else if cfg!(debug_assertions) {
         PathBuf::from(WORKSPACE).join("target/debug/abq")
     } else {
         PathBuf::from(WORKSPACE).join("target/release/abq")
@@ -131,7 +134,8 @@ where
         cmd.env("ABQ_LOG", "abq=debug");
     }
 
-    cmd.spawn().expect("abq cli failed to spawn")
+    cmd.spawn()
+        .unwrap_or_else(|_| panic!("{} cli failed to spawn", abq_binary().display()))
 }
 
 fn find_free_port() -> u16 {

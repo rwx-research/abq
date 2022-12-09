@@ -27,8 +27,6 @@ pub fn start_abq_forever(
     negotiator_port: u16,
     server_options: ServerOptions,
 ) -> ! {
-    abq_queue::queue::init();
-
     // Public IP defaults to the binding IP.
     let public_ip = public_ip.unwrap_or(bind_ip);
 
@@ -146,8 +144,6 @@ impl AbqInstance {
         client_tls: ClientTlsStrategy,
     ) -> Self {
         tracing::debug!("Creating an ephemeral queue");
-
-        abq_queue::queue::init();
 
         let server_auth = match opt_user_token {
             Some(user_token) => {

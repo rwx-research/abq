@@ -11,7 +11,6 @@ abq_exec_worker = { path = "../abq_runners/exec" }
 abq_utils = { path = "../abq_utils" }
 
 thiserror.workspace = true
-procspawn.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
@@ -23,7 +22,6 @@ futures.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile.workspace = true
 tracing-test.workspace = true
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }

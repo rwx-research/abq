@@ -23,7 +23,6 @@ use abq_utils::net_protocol::workers::{
 use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext};
 
 use futures::future::BoxFuture;
-use procspawn as proc;
 
 enum MessageFromPool {
     Shutdown,
@@ -100,20 +99,11 @@ pub struct WorkerPoolConfig<'a> {
     pub debug_native_runner: bool,
 }
 
-/// Executes an initialization sequence that must be performed before any worker pool can be created.
-/// Do not use this in tests. The initialization sequence for test is done in the [crate root][crate].
-#[cfg(not(test))]
-pub fn init() {
-    // Must initialize the process pool state.
-    proc::init();
-}
-
 /// Manages a pool of threads and processes upon which work is run and reported back.
 ///
 /// A pool of size N has N worker threads that listen to incoming work (given by
 /// [WorkerPool::send_work]). Each thread is given access to a pool of N processes where
-/// they execute a given piece of work. Each process in the pool is partially loaded and
-/// forked when new work is sent; this is managed by the [procspawn] library.
+/// they execute a given piece of work.
 ///
 /// Work execution is done in the process pool so that the managing worker threads can easily
 /// terminate the process if needed, and panics in the process pool don't induce a panic in the
@@ -604,69 +594,81 @@ fn attempt_test_id_for_test_like_runner(
 
     let init_context = serde_json::to_string(&init_context).unwrap();
 
-    let result_handle = proc::spawn!(
-        (runner, test_id, working_dir, attempt, init_context) || {
-            std::env::set_current_dir(working_dir).unwrap();
-            let _attempt = attempt;
-            match (runner, test_id) {
-                (R::Echo, s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
-                (R::EchoInitContext, _) => echo::EchoWorker::run(echo::EchoWork {
-                    message: init_context,
-                }),
-                (R::Exec, cmd_and_args) => {
-                    let mut args = cmd_and_args
-                        .split(' ')
-                        .map(ToOwned::to_owned)
-                        .collect::<Vec<String>>();
-                    let cmd = args.remove(0);
-                    exec::ExecWorker::run(exec::Work { cmd, args })
-                }
-                (R::InduceTimeout, _) => {
-                    thread::sleep(Duration::MAX);
-                    unreachable!()
-                }
-                (R::FailOnTestName(fail_name), test) => {
-                    if test == fail_name {
-                        panic!("INDUCED FAIL")
-                    } else {
-                        "PASS".to_string()
-                    }
-                }
-                (R::NeverReturnManifest, _) => unreachable!(),
-                (R::NeverReturnOnTest(..), _) => unreachable!(),
-                #[cfg(feature = "test-test_ids")]
-                (R::EchoOnRetry(succeed_on), s) => {
-                    if succeed_on == _attempt {
-                        echo::EchoWorker::run(echo::EchoWork { message: s })
-                    } else {
-                        panic!("Failed to echo!");
-                    }
-                }
-                #[cfg(feature = "test-actions")]
-                (runner, test_id) => unreachable!(
-                    "Invalid runner/test_id combination: {:?} and {:?}",
-                    runner, test_id
-                ),
-            }
-        }
-    );
+    let (send_shutdown, recv_shutdown) = std::sync::mpsc::channel();
 
-    let result = result_handle.join_timeout(timeout);
+    let started = Instant::now();
+    let result_handle = thread::spawn(move || {
+        std::env::set_current_dir(working_dir).unwrap();
+        let _attempt = attempt;
+        match (runner, test_id) {
+            (R::Echo, s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
+            (R::EchoInitContext, _) => echo::EchoWorker::run(echo::EchoWork {
+                message: init_context,
+            }),
+            (R::Exec, cmd_and_args) => {
+                let mut args = cmd_and_args
+                    .split(' ')
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<String>>();
+                let cmd = args.remove(0);
+                exec::ExecWorker::run(exec::Work { cmd, args })
+            }
+            (R::InduceTimeout, _) => {
+                // Sleep until we get the shutdown signal.
+                recv_shutdown.recv().unwrap();
+                unreachable!()
+            }
+            (R::FailOnTestName(fail_name), test) => {
+                if test == fail_name {
+                    panic!("INDUCED FAIL")
+                } else {
+                    "PASS".to_string()
+                }
+            }
+            (R::NeverReturnManifest, _) => unreachable!(),
+            (R::NeverReturnOnTest(..), _) => unreachable!(),
+            #[cfg(feature = "test-test_ids")]
+            (R::EchoOnRetry(succeed_on), s) => {
+                if succeed_on == _attempt {
+                    echo::EchoWorker::run(echo::EchoWork { message: s })
+                } else {
+                    panic!("Failed to echo!");
+                }
+            }
+            #[cfg(feature = "test-actions")]
+            (runner, test_id) => unreachable!(
+                "Invalid runner/test_id combination: {:?} and {:?}",
+                runner, test_id
+            ),
+        }
+    });
+
+    let mut timed_out = false;
+    while !result_handle.is_finished() {
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            send_shutdown.send(()).unwrap();
+            break;
+        }
+
+        thread::sleep(Duration::from_micros(100));
+    }
+    let result = result_handle.join();
     match result {
         Ok(output) => Ok(output),
         Err(e) => {
             if attempt < allowed_attempts {
                 Err(AttemptError::ShouldRetry)
-            } else if let Some(info) = e.panic_info() {
-                Err(AttemptError::Panic(info.to_string()))
-            } else if e.is_timeout() {
+            } else if timed_out {
                 Err(AttemptError::Timeout(timeout))
-            } else if e.is_cancellation() {
-                panic!("Never cancelled the job, but error is cancellation");
-            } else if e.is_remote_close() {
-                panic!("Process in the pool closed our channel before exit");
             } else {
-                panic!("Unknown error {e:?}");
+                let msg = if let Some(msg) = e.downcast_ref::<&'static str>() {
+                    msg.to_string()
+                } else {
+                    format!("???unknown panic {:?}", e)
+                };
+
+                Err(AttemptError::Panic(msg))
             }
         }
     }
