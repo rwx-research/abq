@@ -54,18 +54,14 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux_x86-64
-            container: quay.io/pypa/manylinux2014_x86_64
             cross-target: 'x86_64-unknown-linux-musl'
           - os: macos-10.15 # use an older version for broader osx support
             platform: darwin_x86-64
-            container: ''
             cross-target: ''
           - os: macos-11 # first OS X to support arm64 -- so the first os for cross compilation
             platform: darwin_aarch64
-            container: ''
             cross-target: 'aarch64-apple-darwin'
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
     env:
