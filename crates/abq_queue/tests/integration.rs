@@ -46,12 +46,6 @@ use Action::*;
 use Assert::*;
 use Servers::*;
 
-// ===
-// === INITIALIZATION MANDATORY FOR TESTS
-// ===
-abq_workers::test_support!();
-// ===
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Run(usize);
 

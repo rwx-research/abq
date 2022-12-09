@@ -45,6 +45,10 @@ use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
 use crate::{args::Token, health::HealthCheckKind};
 
+#[cfg(all(target_arch = "x86_64", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
     std::process::exit(exit_code.get());

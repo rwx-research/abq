@@ -55,7 +55,7 @@ jobs:
           - os: ubuntu-latest
             platform: linux_x86-64
             container: quay.io/pypa/manylinux2014_x86_64
-            cross-target: ''
+            cross-target: 'x86_64-unknown-linux-musl'
           - os: macos-10.15 # use an older version for broader osx support
             platform: darwin_x86-64
             container: ''
@@ -106,17 +106,15 @@ jobs:
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
-          toolchain: "1.64.0"
-          # this is really only for arm64 apple (for now)
+          toolchain: 1.64.0
           target: ${{ matrix.cross-target }}
           default: true
 
-      # jq is already in the default mac image
-      # https://github.com/actions/runner-images/blob/main/images/macos/macos-10.15-Readme.md
-      - name: Install build + deploy deps
+      # We don't build a musl ABQ on MacOS
+      - name: Install musl libc tools
         if: contains(matrix.platform, 'linux')
         run: |
-          yum install sudo jq -y
+          sudo apt-get install -y musl-tools
 
       - name: Build release
         if: '!matrix.cross-target'
@@ -125,15 +123,6 @@ jobs:
       - name: Build release
         if: matrix.cross-target
         run: cargo build --release --all-features --target="${{ matrix.cross-target }}"
-
-      # aws cli is already in the default mac image
-      # https://github.com/actions/runner-images/blob/main/images/macos/macos-10.15-Readme.md
-      - name: Install aws CLI
-        if: contains(matrix.platform, 'linux') # done via homebrew on mac
-        run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip
-          sudo ./aws/install
 
       - name: Prepare release environment
         run: |

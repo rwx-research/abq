@@ -21,8 +21,6 @@ pub fn start_workers(
     client_opts: ClientOptions,
     run_id: RunId,
 ) -> anyhow::Result<NegotiatedWorkers> {
-    abq_workers::workers::init();
-
     let context = WorkerContext::AlwaysWorkIn { working_dir };
 
     // TODO: make this configurable

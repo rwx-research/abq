@@ -6,6 +6,3 @@ mod connections;
 pub mod invoke;
 pub mod queue;
 pub mod timeout;
-
-#[cfg(test)]
-abq_workers::test_support!();

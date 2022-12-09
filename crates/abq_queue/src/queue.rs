@@ -575,16 +575,6 @@ impl AllRuns {
     }
 }
 
-/// Executes an initialization sequence that must be performed before any queue can be created.
-/// [init] only needs to be run once in a process, even if multiple [Abq] instances are crated, but
-/// it must be run before any instance is created.
-/// Do not use this in tests. The initialization sequence for test is done in the [crate root][crate].
-#[cfg(not(test))]
-pub fn init() {
-    // We must initialize the workers, in particular what's needed for the process pool.
-    abq_workers::workers::init();
-}
-
 pub struct Abq {
     shutdown_manager: ShutdownManager,
 
