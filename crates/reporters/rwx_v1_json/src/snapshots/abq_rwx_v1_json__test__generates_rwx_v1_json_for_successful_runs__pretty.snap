@@ -26,7 +26,6 @@ expression: json
   },
   "tests": [
     {
-      "id": "id1",
       "name": "app::module::test1",
       "attempt": {
         "durationInNanoseconds": 11000000,

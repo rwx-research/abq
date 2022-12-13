@@ -6,20 +6,20 @@ use termcolor::{Color, ColorSpec, WriteColor};
 /// Formats a test result on a single line.
 pub fn format_result_line(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
     write!(writer, "{}: ", &result.display_name)?;
-    format_status(writer, &result.status)?;
+    format_status(writer, result.status)?;
     writeln!(writer)
 }
 
 /// Formats a test result as a single dot.
 pub fn format_result_dot(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
     let dot = match result.status {
-        Status::Failure { .. } | Status::TimedOut => "F",
+        Status::Failure => "F",
         Status::Success => ".",
-        Status::Error { .. } | Status::PrivateNativeRunnerError => "E",
+        Status::Error | Status::PrivateNativeRunnerError => "E",
         Status::Pending => "P",
-        Status::Skipped | Status::Todo => "S",
+        Status::Skipped => "S",
     };
-    with_color(writer, status_color(&result.status), |w| write!(w, "{dot}"))
+    with_color(writer, status_color(result.status), |w| write!(w, "{dot}"))
 }
 
 /// Formats a test result as a summary, possibly across multiple lines.
@@ -35,21 +35,12 @@ pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) 
         output,
         runtime,
         meta: _,
-        // TODO
-        location: _,
-        started_at: _,
-        finished_at: _,
-        lineage: _,
-        past_attempts: _,
-        other_errors: _,
-        stderr: _,
-        stdout: _,
     } = result.deref();
 
     let output = output.as_deref().unwrap_or("<no output>");
 
     write!(writer, "--- {display_name}: ")?;
-    format_status(writer, status)?;
+    format_status(writer, *status)?;
     writeln!(writer, " ---")?;
     writeln!(writer, "{output}")?;
     write!(writer, "(completed in ")?;
@@ -57,14 +48,12 @@ pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) 
     writeln!(writer, ")")
 }
 
-fn status_color(status: &Status) -> Color {
+fn status_color(status: Status) -> Color {
     match status {
-        Status::Success { .. } => Color::Green,
-        Status::Failure { .. }
-        | Status::Error { .. }
-        | Status::TimedOut
-        | Status::PrivateNativeRunnerError => Color::Red,
-        Status::Pending | Status::Todo => Color::Yellow,
+        Status::Success => Color::Green,
+        Status::Failure => Color::Red,
+        Status::Error | Status::PrivateNativeRunnerError => Color::Red,
+        Status::Pending => Color::Yellow,
         Status::Skipped => Color::Yellow,
     }
 }
@@ -82,15 +71,13 @@ where
     writer.reset()
 }
 
-fn format_status(writer: &mut impl WriteColor, status: &Status) -> io::Result<()> {
+fn format_status(writer: &mut impl WriteColor, status: Status) -> io::Result<()> {
     let color = status_color(status);
     let status = match status {
-        Status::Failure { .. } => "FAILED",
+        Status::Failure => "FAILED",
         Status::Success => "ok",
-        Status::Error { .. } | Status::PrivateNativeRunnerError => "ERRORED",
-        Status::TimedOut => "TIMED OUT",
+        Status::Error | Status::PrivateNativeRunnerError => "ERRORED",
         Status::Pending => "pending",
-        Status::Todo => "todo",
         Status::Skipped => "skipped",
     };
 
@@ -104,7 +91,6 @@ pub fn format_duration(writer: &mut impl io::Write, duration: TestRuntime) -> io
 
     let millis = match duration {
         TestRuntime::Milliseconds(ms) => ms as u64,
-        TestRuntime::Nanoseconds(ns) => ns * 1_000_000,
     };
     let (minutes, millis) = (millis / MILLIS_IN_MINUTE, millis % MILLIS_IN_MINUTE);
     let (seconds, millis) = (millis / MILLIS_IN_SECOND, millis % MILLIS_IN_SECOND);
@@ -158,7 +144,6 @@ mod test {
             output: Some("default output".to_owned()),
             runtime: TestRuntime::Milliseconds((1 * 60 * 1000 + 15 * 1000 + 3) as _),
             meta: Default::default(),
-            ..TestResultSpec::fake()
         }
     }
 
@@ -242,7 +227,7 @@ mod test {
 
     test_format!(
         format_line_failure, format_result_line,
-        &TestResult::new(TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(TestResultSpec {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() }),
         @"abq/test: FAILED"
         @r###"
     abq/test: <red>FAILED<reset>
@@ -251,7 +236,7 @@ mod test {
 
     test_format!(
         format_line_error, format_result_line,
-        &TestResult::new(TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(TestResultSpec {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() }),
         @"abq/test: ERRORED"
         @r###"
     abq/test: <red>ERRORED<reset>
@@ -285,14 +270,14 @@ mod test {
 
     test_format!(
         format_dot_failure, format_result_dot,
-        &TestResult::new(TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(TestResultSpec {status: Status::Failure, display_name: "abq/test".to_string(), ..default_result() }),
         @"F"
         @"<red>F<reset>"
     );
 
     test_format!(
         format_dot_error, format_result_dot,
-        &TestResult::new(TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(TestResultSpec {status: Status::Error, display_name: "abq/test".to_string(), ..default_result() }),
         @"E"
         @"<red>E<reset>"
     );
@@ -398,7 +383,7 @@ mod test {
 
     test_format!(
         format_summary_failure, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        &TestResult::new(TestResultSpec {status: Status::Failure, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: FAILED ---
     Assertion failed: 1 != 2
@@ -413,7 +398,7 @@ mod test {
 
     test_format!(
         format_summary_error, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
+        &TestResult::new(TestResultSpec {status: Status::Error, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
         @r###"
     --- abq/test: ERRORED ---
     Process at pid 72818 exited early with SIGTERM

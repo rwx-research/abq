@@ -1,10 +1,10 @@
 //! Native runner protocol version 0.1
 //!
-//! https://www.notion.so/rwx/Native-Runner-Protocol-0-1-b16c33b82f854a799b0aca53891a7f5a
+//! https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-IPC-Interface-0959f5a9144741d798ac122566a3d887#9226eb8d416d4ed7ab0fc567eef5b1a2
 
 use serde_derive::{Deserialize, Serialize};
 
-use super::{v0_2, AbqProtocolVersion, MetadataMap};
+use super::{AbqProtocolVersion, MetadataMap};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename = "abq_native_runner_spawned")]
@@ -23,29 +23,6 @@ pub struct AbqNativeRunnerSpecification {
     pub language: Option<String>,
     pub language_version: Option<String>,
     pub host: Option<String>,
-}
-
-impl From<v0_2::AbqNativeRunnerSpecification> for AbqNativeRunnerSpecification {
-    fn from(spec: v0_2::AbqNativeRunnerSpecification) -> Self {
-        let v0_2::AbqNativeRunnerSpecification {
-            name,
-            version,
-            test_framework,
-            test_framework_version,
-            language,
-            language_version,
-            host,
-        } = spec;
-        Self {
-            name,
-            version,
-            test_framework: Some(test_framework),
-            test_framework_version: Some(test_framework_version),
-            language: Some(language),
-            language_version: Some(language_version),
-            host: Some(host),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

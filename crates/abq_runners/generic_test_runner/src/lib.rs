@@ -15,9 +15,9 @@ use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
-    NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
-    RawTestResultMessage, Status, TestCase, TestCaseMessage, TestResult, TestResultSpec,
-    TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage, Status, TestCase,
+    TestCaseMessage, TestResult, TestResultMessage, TestResultSpec, TestRuntime,
+    ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -521,7 +521,7 @@ async fn handle_one_test(
 
     use futures::TryFutureExt;
 
-    let opt_test_result_cycle: Result<RawTestResultMessage, _> =
+    let opt_test_result_cycle: Result<TestResultMessage, _> =
         future::ready(net_protocol::async_write(runner_conn, &test_case_message).await)
             .and_then(|_| net_protocol::async_read(runner_conn))
             .await;
@@ -671,7 +671,6 @@ fn handle_native_runner_failure<I>(
             output: Some(error_message.clone()),
             runtime: TestRuntime::Milliseconds(estimated_time_to_failure.as_millis() as _),
             meta: Default::default(),
-            ..TestResultSpec::fake()
         });
 
         final_results.push((work_id, error_result));
@@ -820,7 +819,7 @@ mod test_validate_protocol_version_message {
     use super::{open_native_runner_connection, ProtocolVersionError, ProtocolVersionMessageError};
 
     fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessage {
-        let protocol_version = proto.get_version();
+        let protocol_version = AbqProtocolVersion::V0_1;
         let runner_specification = NativeRunnerSpecification {
             name: "test".to_string(),
             version: "0.0.0".to_string(),
@@ -910,7 +909,7 @@ mod test_validate_protocol_version_message {
         let socket_addr = listener.local_addr().unwrap();
         let child = async {
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let message = Manifest::new(vec![], Default::default());
+            let message = Manifest::new(proto, vec![], Default::default());
             net_protocol::async_write(&mut stream, &message)
                 .await
                 .unwrap();

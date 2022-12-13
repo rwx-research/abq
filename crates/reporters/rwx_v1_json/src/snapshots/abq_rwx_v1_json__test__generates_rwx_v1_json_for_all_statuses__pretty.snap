@@ -26,7 +26,6 @@ expression: json
   },
   "tests": [
     {
-      "id": "id1",
       "name": "app::module::test1",
       "attempt": {
         "durationInNanoseconds": 11000000,
@@ -39,24 +38,17 @@ expression: json
       }
     },
     {
-      "id": "id2",
       "name": "app::module::test2",
       "attempt": {
         "durationInNanoseconds": 22000000,
         "meta": {},
         "status": {
           "kind": "failed",
-          "exception": "test-exception",
-          "message": "Test 2 failed",
-          "backtrace": [
-            "file1.cpp:10",
-            "file2.cpp:20"
-          ]
+          "message": "Test 2 failed"
         }
       }
     },
     {
-      "id": "id3",
       "name": "app::module::test3",
       "attempt": {
         "durationInNanoseconds": 33000000,
@@ -67,19 +59,16 @@ expression: json
       }
     },
     {
-      "id": "id4",
       "name": "app::module::test4",
       "attempt": {
         "durationInNanoseconds": 44000000,
         "meta": {},
         "status": {
-          "kind": "pended",
-          "message": "Test 4 pending"
+          "kind": "pended"
         }
       }
     },
     {
-      "id": "id5",
       "name": "app::module::test5",
       "attempt": {
         "durationInNanoseconds": 55000000,

@@ -77,13 +77,7 @@ jobs:
           toolchain: 1.64.0
           target: ${{ env.RUST_TARGET }}
           default: true
-          components: clippy, rustfmt
-
-      - name: Check formatting
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: fmt
-          args: -- --check
+          components: clippy
 
       - name: Run lints
         uses: actions-rs/cargo@v1.0.3

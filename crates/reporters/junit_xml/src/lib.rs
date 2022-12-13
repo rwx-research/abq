@@ -32,21 +32,11 @@ impl Collector {
             display_name,
             output,
             runtime,
-            // TODO: use all this
             meta: _,
-            location: _,
-            started_at: _,
-            finished_at: _,
-            lineage: _,
-            past_attempts: _,
-            other_errors: _,
-            stderr: _,
-            stdout: _,
         } = test_result.deref();
 
         let duration = match runtime {
             TestRuntime::Milliseconds(ms) => junit::Duration::milliseconds(*ms as _),
-            TestRuntime::Nanoseconds(ns) => junit::Duration::nanoseconds(*ns as _),
         };
 
         let raw_output = output.to_owned().unwrap_or_default();
@@ -63,21 +53,14 @@ impl Collector {
         };
 
         let test_case = match status {
-            Status::Failure {
-                exception: _, // TODO
-                backtrace: _,
-            } => {
+            Status::Failure => {
                 // TODO: expose optional failure type on `TestResult`?
                 let failure_type = "failure";
 
                 junit::TestCase::failure(display_name, duration, failure_type, &cleaned_output)
             }
             Status::Success => junit::TestCase::success(display_name, duration),
-            Status::Error {
-                exception: _, // TODO
-                backtrace: _,
-            }
-            | Status::PrivateNativeRunnerError => {
+            Status::Error | Status::PrivateNativeRunnerError => {
                 // TODO: expose optional error type on `TestResult`?
                 let error_type = "error";
 
@@ -85,12 +68,6 @@ impl Collector {
             }
             Status::Pending => junit::TestCase::skipped(display_name),
             Status::Skipped => junit::TestCase::skipped(display_name),
-            Status::Todo => junit::TestCase::skipped(display_name),
-            Status::TimedOut => {
-                let error_type = "timed out";
-
-                junit::TestCase::error(display_name, duration, error_type, &cleaned_output)
-            }
         };
 
         self.test_suite.add_testcase(test_case);
@@ -132,31 +109,22 @@ mod test {
                 output: Some("Test 1 passed".to_string()),
                 runtime: Milliseconds(11.0),
                 meta: Default::default(),
-                ..TestResultSpec::fake()
             }),
             TestResult::new(TestResultSpec {
-                status: Status::Failure {
-                    exception: Some("test-exception".to_string()),
-                    backtrace: Some(vec!["file1.cpp:10".to_string(), "file2.cpp:20".to_string()]),
-                },
+                status: Status::Failure,
                 id: "id2".to_string(),
                 display_name: "app::module::test2".to_string(),
                 output: Some("Test 2 failed".to_string()),
                 runtime: Milliseconds(22.0),
                 meta: Default::default(),
-                ..TestResultSpec::fake()
             }),
             TestResult::new(TestResultSpec {
-                status: Status::Error {
-                    exception: None,
-                    backtrace: None,
-                },
+                status: Status::Error,
                 id: "id3".to_string(),
                 display_name: "app::module::test3".to_string(),
                 output: Some("Test 3 errored".to_string()),
                 runtime: Milliseconds(33.0),
                 meta: Default::default(),
-                ..TestResultSpec::fake()
             }),
             TestResult::new(TestResultSpec {
                 status: Status::Pending,
@@ -165,7 +133,6 @@ mod test {
                 output: Some("Test 4 pending".to_string()),
                 runtime: Milliseconds(44.0),
                 meta: Default::default(),
-                ..TestResultSpec::fake()
             }),
             TestResult::new(TestResultSpec {
                 status: Status::Skipped,
@@ -174,7 +141,6 @@ mod test {
                 output: Some("Test 5 skipped".to_string()),
                 runtime: Milliseconds(55.0),
                 meta: Default::default(),
-                ..TestResultSpec::fake()
             }),
         ]);
 
@@ -217,20 +183,15 @@ mod test {
             output: Some("Test 1 passed".to_string()),
             runtime: Milliseconds(11.0),
             meta: Default::default(),
-            ..TestResultSpec::fake()
         })]);
 
         collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Failure {
-                exception: None,
-                backtrace: None,
-            },
+            status: Status::Failure,
             id: "id2".to_string(),
             display_name: "app::module::test2".to_string(),
             output: Some("Test 2 failed".to_string()),
             runtime: Milliseconds(22.0),
             meta: Default::default(),
-            ..TestResultSpec::fake()
         })]);
 
         let mut buf = vec![];
@@ -257,16 +218,12 @@ mod test {
     fn failure_with_empty_output_prints_empty_output() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Failure {
-                exception: None,
-                backtrace: None,
-            },
+            status: Status::Failure,
             id: "id1".to_string(),
             display_name: "app::module::test1".to_string(),
             output: None,
             runtime: Milliseconds(11.0),
             meta: Default::default(),
-            ..TestResultSpec::fake()
         })]);
 
         let mut buf = vec![];
@@ -292,16 +249,12 @@ mod test {
     fn error_with_empty_output_prints_empty_output() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Error {
-                exception: None,
-                backtrace: None,
-            },
+            status: Status::Error,
             id: "id1".to_string(),
             display_name: "app::module::test1".to_string(),
             output: None,
             runtime: Milliseconds(11.0),
             meta: Default::default(),
-            ..TestResultSpec::fake()
         })]);
 
         let mut buf = vec![];
@@ -327,16 +280,12 @@ mod test {
     fn strip_ansi_escape_codes() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Error {
-                exception: None,
-                backtrace: None,
-            },
+            status: Status::Error,
             id: "id1".to_string(),
             display_name: "app::module::test1".to_string(),
             output: Some(String::from_utf8(b"\x1b[32mRESULT\x1b[m of test".to_vec()).unwrap()),
             runtime: Milliseconds(11.0),
             meta: Default::default(),
-            ..TestResultSpec::fake()
         })]);
 
         let mut buf = vec![];
