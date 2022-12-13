@@ -144,7 +144,7 @@ pub mod workers {
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum RunnerKind {
         GenericNativeTestRunner(NativeTestRunnerParams),
-        TestLikeRunner(TestLikeRunner, ManifestMessage),
+        TestLikeRunner(TestLikeRunner, Box<ManifestMessage>),
     }
 
     /// Context for a unit of work.
@@ -192,7 +192,7 @@ pub mod workers {
         pub native_runner_specification: Box<NativeRunnerSpecification>,
     }
 
-    static_assertions::assert_eq_size!(ManifestResult, [u8; 80]);
+    static_assertions::assert_eq_size!(ReportedManifest, [u8; 72]);
 
     /// The result of a worker attempting to retrieve a manifest for a test command.
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -206,6 +206,7 @@ pub mod workers {
         },
     }
 
+    // TODO 0.2: size should go down when manifest exposed flatly
     static_assertions::assert_eq_size!(ManifestResult, [u8; 80]);
 }
 
