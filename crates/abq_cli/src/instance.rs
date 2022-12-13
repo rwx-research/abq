@@ -43,15 +43,15 @@ pub fn start_abq_forever(
 
     tracing::debug!("Queue active at {}", abq.server_addr());
 
-    println!("Run the following to start workers and attach to the queue:");
-    println!(
-        "\tabq work --queue-addr={}",
-        publicize_addr(abq.server_addr(), public_ip)
-    );
     println!("Run the following to invoke a test run:");
     println!(
-        "\tabq test --queue-addr={} -- <your test args here>",
+        "\tabq test --queue-addr={} --run-id <a-unique-run-id> -- <your test args here>",
         publicize_addr(abq.server_addr(), public_ip),
+    );
+    println!("Run the following to start one or more workers for that test run:");
+    println!(
+        "\tabq work --queue-addr={} --run-id <the-same-run-id>",
+        publicize_addr(abq.server_addr(), public_ip)
     );
 
     // Register signal handlers, so we know to shutdown (or kill) the queue if
