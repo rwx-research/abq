@@ -314,7 +314,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start workers") {
+                if line.contains("Run the following to start") {
                     break;
                 }
             }
@@ -359,7 +359,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start workers") {
+                if line.contains("Run the following to start") {
                     break;
                 }
             }
@@ -444,7 +444,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start workers") {
+                if line.contains("Run the following to start") {
                     break;
                 }
             }
@@ -578,7 +578,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start workers") {
+                if line.contains("Run the following to start") {
                     break;
                 }
             }
@@ -664,7 +664,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start workers") {
+                if line.contains("Run the following to start one or more workers") {
                     break;
                 }
             }
@@ -870,7 +870,7 @@ fn test_with_invalid_command() {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start workers") {
+            if line.contains("Run the following to start") {
                 break;
             }
         }
