@@ -74,7 +74,7 @@ jobs:
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
-          toolchain: 1.64.0
+          toolchain: 1.65.0
           target: ${{ env.RUST_TARGET }}
           default: true
           components: clippy

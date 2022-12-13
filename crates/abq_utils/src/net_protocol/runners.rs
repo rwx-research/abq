@@ -420,6 +420,7 @@ pub struct TestResultSpec {
 pub struct NativeTestResult(PrivNativeTestResult);
 type PrivNativeTestResult = v0_1::TestResult;
 
+static_assertions::assert_eq_size!(NativeTestResult, [u8; 112]);
 impl From<v0_1::TestResult> for NativeTestResult {
     fn from(result: v0_1::TestResult) -> Self {
         Self(result)
@@ -475,6 +476,7 @@ type PrivTestResultMessage = v0_1::TestResultMessage;
 #[derive(Serialize, Deserialize)]
 pub struct TestResultMessage(PrivTestResultMessage);
 
+static_assertions::assert_eq_size!(TestResultMessage, [u8; 112]);
 impl TestResultMessage {
     /// Extract the [test result][TestResult] from the message.
     pub fn into_test_result(self) -> TestResult {
