@@ -1,7 +1,7 @@
 use serde_derive::{Deserialize, Serialize};
-use std::io::Write;
+use std::{io::Write, ops::Deref};
 
-use abq_utils::net_protocol::runners::{Status, TestResult, TestRuntime};
+use abq_utils::net_protocol::runners::{self, Status, TestResult, TestResultSpec, TestRuntime};
 
 // Note: this is intentionally permissive right now for `kind` and `language` until we have
 // implemented native runner support for specifying language and framework. Once we do that,
@@ -80,6 +80,16 @@ pub struct Location {
     column: Option<u64>,
 }
 
+impl From<&runners::Location> for Location {
+    fn from(l: &runners::Location) -> Self {
+        Self {
+            file: l.file.clone(),
+            line: l.line,
+            column: l.column,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "kind")]
 pub enum AttemptStatus {
@@ -141,6 +151,69 @@ pub struct Attempt {
     finished_at: Option<String>,
 }
 
+impl From<&TestResult> for Attempt {
+    fn from(test_result: &TestResult) -> Self {
+        let TestResultSpec {
+            status,
+            output,
+            runtime,
+            meta,
+            started_at,
+            finished_at,
+            other_errors: _, // TODO
+            stderr,
+            stdout,
+            ..
+        } = &test_result.deref();
+
+        let status = match status {
+            Status::Success => AttemptStatus::Successful,
+            Status::Failure {
+                exception,
+                backtrace,
+            }
+            | Status::Error {
+                exception,
+                backtrace,
+            } => AttemptStatus::Failed {
+                exception: exception.clone(),
+                message: output.clone(),
+                backtrace: backtrace.clone(),
+            },
+            Status::PrivateNativeRunnerError => AttemptStatus::Failed {
+                exception: None,
+                message: output.clone(),
+                backtrace: None,
+            },
+            Status::Pending => AttemptStatus::Pended {
+                message: output.clone(),
+            },
+            Status::Skipped => AttemptStatus::Skipped {
+                message: output.clone(),
+            },
+            Status::Todo => AttemptStatus::Todo {
+                message: output.clone(),
+            },
+            Status::TimedOut => AttemptStatus::TimedOut,
+        };
+
+        let duration = match runtime {
+            TestRuntime::Milliseconds(runtime) => (runtime * 1000000.0).round() as Nanoseconds,
+            TestRuntime::Nanoseconds(nanos) => *nanos,
+        };
+
+        Attempt {
+            duration,
+            meta: Some(meta.clone()),
+            status,
+            stderr: stderr.clone(),
+            stdout: stdout.clone(),
+            started_at: started_at.as_ref().map(|t| t.0.clone()),
+            finished_at: finished_at.as_ref().map(|t| t.0.clone()),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Test {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -154,6 +227,33 @@ pub struct Test {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "pastAttempts")]
     past_attempts: Option<Vec<Attempt>>,
+}
+
+impl From<&TestResult> for Test {
+    fn from(test_result: &TestResult) -> Self {
+        let TestResultSpec {
+            id,
+            display_name,
+            location,
+            lineage,
+            past_attempts,
+            ..
+        } = &test_result.deref();
+
+        let attempt = test_result.into();
+        let past_attempts = past_attempts
+            .as_ref()
+            .map(|attempts| attempts.iter().map(Into::into).collect());
+
+        Test {
+            id: Some(id.to_owned()),
+            name: display_name.clone(),
+            lineage: lineage.clone(),
+            location: location.as_ref().map(Into::into),
+            attempt,
+            past_attempts,
+        }
+    }
 }
 
 // Note: this does not currently implement support for otherErrors nor derivedFrom
@@ -177,39 +277,7 @@ pub struct Collector {
 impl Collector {
     #[inline(always)]
     pub fn push_result(&mut self, test_result: &TestResult) {
-        let status = match test_result.status {
-            Status::Error | Status::Failure | Status::PrivateNativeRunnerError => {
-                AttemptStatus::Failed {
-                    exception: None,
-                    message: test_result.output.clone(),
-                    backtrace: None,
-                }
-            }
-            Status::Pending => AttemptStatus::Pended { message: None },
-            Status::Skipped => AttemptStatus::Skipped { message: None },
-            Status::Success => AttemptStatus::Successful,
-        };
-
-        let duration = match test_result.runtime {
-            TestRuntime::Milliseconds(runtime) => (runtime * 1000000.0).round() as Nanoseconds,
-        };
-
-        let test = Test {
-            id: None,
-            name: test_result.display_name.clone(),
-            lineage: None,
-            location: None,
-            attempt: Attempt {
-                duration,
-                meta: Some(test_result.meta.clone()),
-                status,
-                stderr: None,
-                stdout: None,
-                started_at: None,
-                finished_at: None,
-            },
-            past_attempts: None,
-        };
+        let test: Test = test_result.into();
 
         self.summary.tests += 1;
 
@@ -253,7 +321,7 @@ impl Collector {
             }
         }
 
-        self.tests.push(test)
+        self.tests.push(test);
     }
 
     pub fn write_json(self, writer: impl Write) -> Result<(), String> {
@@ -303,22 +371,31 @@ mod test {
             output: Some("Test 1 passed".to_string()),
             runtime: TestRuntime::Milliseconds(11.0),
             meta,
+            ..TestResultSpec::fake() // TODO
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Failure,
+            status: Status::Failure {
+                exception: Some("test-exception".to_string()),
+                backtrace: Some(vec!["file1.cpp:10".to_string(), "file2.cpp:20".to_string()]),
+            },
             id: "id2".to_string(),
             display_name: "app::module::test2".to_string(),
             output: Some("Test 2 failed".to_string()),
             runtime: TestRuntime::Milliseconds(22.0),
             meta: Default::default(),
+            ..TestResultSpec::fake() // TODO
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Error,
+            status: Status::Error {
+                exception: None,
+                backtrace: None,
+            },
             id: "id3".to_string(),
             display_name: "app::module::test3".to_string(),
             output: None,
             runtime: TestRuntime::Milliseconds(33.0),
             meta: Default::default(),
+            ..TestResultSpec::fake() // TODO
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Pending,
@@ -327,6 +404,7 @@ mod test {
             output: Some("Test 4 pending".to_string()),
             runtime: TestRuntime::Milliseconds(44.0),
             meta: Default::default(),
+            ..TestResultSpec::fake() // TODO
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Skipped,
@@ -335,6 +413,7 @@ mod test {
             output: None,
             runtime: TestRuntime::Milliseconds(55.0),
             meta: Default::default(),
+            ..TestResultSpec::fake() // TODO
         }));
 
         {
@@ -369,6 +448,7 @@ mod test {
             output: Some("Test 1 passed".to_string()),
             runtime: TestRuntime::Milliseconds(11.0),
             meta: Default::default(),
+            ..TestResultSpec::fake() // TODO
         }));
 
         {
