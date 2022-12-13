@@ -1093,7 +1093,10 @@ mod test {
     }
 
     fn echo_test(protocol: ProtocolWitness, echo_msg: String) -> TestOrGroup {
-        TestOrGroup::test(Test::new(protocol, echo_msg, [], Default::default()))
+        TestOrGroup::test(
+            protocol,
+            Test::new(protocol, echo_msg, [], Default::default()),
+        )
     }
 
     #[test]
@@ -1108,13 +1111,17 @@ mod test {
         let run_id = RunId::unique();
 
         let get_assigned_run = move |run_id: &RunId| {
-            let manifest = ManifestMessage::new(Manifest::new(
-                [echo_test(proto, "hello".to_string())],
-                Default::default(),
-            ));
+            let manifest = ManifestMessage::new(
+                proto,
+                Manifest::new(
+                    proto,
+                    [echo_test(proto, "hello".to_string())],
+                    Default::default(),
+                ),
+            );
             AssignedRunStatus::Run(AssignedRun {
                 run_id: run_id.clone(),
-                runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
+                runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
                 should_generate_manifest: true,
                 results_batch_size_hint: 2,
             })
@@ -1171,7 +1178,10 @@ mod test {
         );
     }
 
-    fn test_negotiator(server: Box<dyn net::ServerListener>) -> (QueueNegotiator, ShutdownManager) {
+    fn test_negotiator(
+        protocol: ProtocolWitness,
+        server: Box<dyn net::ServerListener>,
+    ) -> (QueueNegotiator, ShutdownManager) {
         let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
 
         let negotiator = QueueNegotiator::new(
@@ -1186,7 +1196,10 @@ mod test {
                     run_id: RunId::unique(),
                     runner_kind: RunnerKind::TestLikeRunner(
                         TestLikeRunner::Echo,
-                        ManifestMessage::new(Manifest::new([], Default::default())).into(),
+                        ManifestMessage::new(
+                            protocol,
+                            Manifest::new(protocol, [], Default::default()),
+                        ),
                     ),
                     should_generate_manifest: true,
                     results_batch_size_hint: 2,
@@ -1206,7 +1219,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(proto, server);
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()
@@ -1232,7 +1245,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(proto, server);
 
         let client = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
             .build()
@@ -1260,7 +1273,7 @@ mod test {
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(proto, server);
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()
