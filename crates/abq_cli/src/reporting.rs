@@ -160,7 +160,7 @@ impl SuiteResultBuilder {
                 self.success = false;
                 self.suggested_exit_code = ExitCode(exit::CODE_ERROR);
             }
-            Status::Failure | Status::Error if self.success => {
+            Status::Failure { .. } | Status::Error { .. } | Status::TimedOut if self.success => {
                 // If we already recorded a failure or error, that takes priority.
                 self.success = false;
                 self.suggested_exit_code = ExitCode(1);
@@ -194,8 +194,8 @@ impl SuiteResult {
         write!(w, "Finished in ")?;
         format_duration_to_partial_seconds(w, self.wall_time)?;
         write!(w, " (")?;
-        let TestRuntime::Milliseconds(test_time_millis) = self.test_time;
-        format_duration_to_partial_seconds(w, Duration::from_millis(test_time_millis as _))?;
+        let duration = self.test_time.duration();
+        format_duration_to_partial_seconds(w, duration)?;
         writeln!(w, " spent in test code)")?;
         writeln!(w, "{} tests, {} failures", self.count, self.count_failed)
     }
@@ -251,9 +251,7 @@ impl Reporter for LineReporter {
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
             format_result_summary(&mut self.buffer, test_result)?;
-        }
-
-        if matches!(test_result.status, Status::Failure | Status::Error) {
+        } else if test_result.status.is_fail_like() {
             self.delayed_failure_reports.push(test_result.clone());
         }
 
@@ -302,9 +300,7 @@ impl Reporter for DotReporter {
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
             format_result_summary(&mut self.buffer, test_result)?;
-        }
-
-        if matches!(test_result.status, Status::Failure | Status::Error) {
+        } else if test_result.status.is_fail_like() {
             self.delayed_failure_reports.push(test_result.clone());
         }
 
@@ -652,6 +648,7 @@ fn default_result() -> TestResultSpec {
         output: Some("default output".to_owned()),
         runtime: TestRuntime::Milliseconds((1 * 60 * 1000 + 15 * 1000 + 3) as _),
         meta: Default::default(),
+        ..TestResultSpec::fake()
     }
 }
 
@@ -728,7 +725,10 @@ mod test_line_reporter {
                 .unwrap();
             reporter
                 .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Failure,
+                    status: Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    },
                     display_name: "abq/test2".to_string(),
                     output: Some("Assertion failed: 1 != 2".to_string()),
                     ..default_result()
@@ -744,7 +744,10 @@ mod test_line_reporter {
                 .unwrap();
             reporter
                 .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Error,
+                    status: Status::Error {
+                        exception: None,
+                        backtrace: None,
+                    },
                     display_name: "abq/test4".to_string(),
                     output: Some("Process 28821 terminated early via SIGTERM".to_string()),
                     ..default_result()
@@ -858,7 +861,10 @@ mod test_dot_reporter {
                 .unwrap();
             reporter
                 .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Failure,
+                    status: Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    },
                     display_name: "abq/test2".to_string(),
                     output: Some("Assertion failed: 1 != 2".to_string()),
                     ..default_result()
@@ -874,7 +880,10 @@ mod test_dot_reporter {
                 .unwrap();
             reporter
                 .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Error,
+                    status: Status::Error {
+                        exception: None,
+                        backtrace: None,
+                    },
                     display_name: "abq/test4".to_string(),
                     output: Some("Process 28821 terminated early via SIGTERM".to_string()),
                     ..default_result()
@@ -972,7 +981,10 @@ mod test_dot_reporter {
         } = with_reporter(|mut reporter| {
             for i in 0..(DOT_REPORTER_LINE_LIMIT * 2) + DOT_REPORTER_LINE_LIMIT / 3 {
                 let status = if i == 1 {
-                    Status::Failure
+                    Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    }
                 } else {
                     Status::Success
                 };
@@ -1009,7 +1021,10 @@ mod test_dot_reporter {
         } = with_reporter(|mut reporter| {
             for i in 0..(DOT_REPORTER_LINE_LIMIT * 2) {
                 let status = if i == 1 {
-                    Status::Failure
+                    Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    }
                 } else {
                     Status::Success
                 };
@@ -1082,16 +1097,40 @@ mod suite {
 
     test_status! {
         success_if_no_errors, [Success, Pending, Skipped], ExitCode(0), 3
-        fail_if_success_then_error, [Success, Error], ExitCode(1), 2
-        fail_if_error_then_success, [Error, Success], ExitCode(1), 2
-        fail_if_success_then_failure, [Success, Failure], ExitCode(1), 2
-        fail_if_failure_then_success, [Failure, Success], ExitCode(1), 2
+        fail_if_success_then_error, [
+            Success,
+            Error { exception: None, backtrace: None }],
+            ExitCode(1), 2
+        fail_if_error_then_success, [
+            Error { exception: None, backtrace: None },
+            Success],
+            ExitCode(1), 2
+        fail_if_success_then_failure, [
+            Success,
+            Failure { exception: None, backtrace: None }],
+            ExitCode(1), 2
+        fail_if_failure_then_success, [
+            Failure { exception: None, backtrace: None },
+            Success],
+            ExitCode(1), 2
         error_if_success_then_internal_error, [Success, PrivateNativeRunnerError], ExitCode(exit::CODE_ERROR), 2
         error_if_internal_error_then_success, [PrivateNativeRunnerError, Success], ExitCode(exit::CODE_ERROR), 2
-        error_if_error_then_internal_error, [Error, PrivateNativeRunnerError], ExitCode(exit::CODE_ERROR), 2
-        error_if_internal_error_then_error, [PrivateNativeRunnerError, Error], ExitCode(exit::CODE_ERROR), 2
-        error_if_failure_then_internal_error, [Failure, PrivateNativeRunnerError], ExitCode(exit::CODE_ERROR), 2
-        error_if_internal_error_then_failure, [PrivateNativeRunnerError, Failure], ExitCode(exit::CODE_ERROR), 2
+        error_if_error_then_internal_error, [
+            Error { exception: None, backtrace: None },
+            PrivateNativeRunnerError],
+            ExitCode(exit::CODE_ERROR), 2
+        error_if_internal_error_then_error, [
+            PrivateNativeRunnerError,
+            Error { exception: None, backtrace: None }],
+            ExitCode(exit::CODE_ERROR), 2
+        error_if_failure_then_internal_error, [
+            Failure { exception: None, backtrace: None },
+            PrivateNativeRunnerError],
+            ExitCode(exit::CODE_ERROR), 2
+        error_if_internal_error_then_failure, [
+            PrivateNativeRunnerError,
+            Failure { exception: None, backtrace: None }],
+            ExitCode(exit::CODE_ERROR), 2
     }
 
     fn get_short_summary_lines(summary: SuiteResult) -> String {

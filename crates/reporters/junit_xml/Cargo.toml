@@ -9,4 +9,5 @@ junit-report = "0.8.1"
 strip-ansi-escapes = "0.1.1"
 
 [dev-dependencies]
+abq_utils = { path = "../../abq_utils", features = ["expose-native-protocols"] }
 insta = "1.21.2"

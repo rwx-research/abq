@@ -25,6 +25,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 
 static_assertions.workspace = true
+derive_more.workspace = true
 
 [features]
 default = []
