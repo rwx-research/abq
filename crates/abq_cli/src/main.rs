@@ -164,6 +164,19 @@ fn setup_tracing() -> anyhow::Result<TracingGuards> {
         TracingGuards {
             _file_appender_guard: None,
         }
+    } else if std::env::var("ABQ_LOG_JSON").as_deref() == Ok("1") {
+        // Log JSON to stdout
+        let stdout_layer = fmt::Layer::default()
+            .json()
+            .with_writer(std::io::stdout)
+            .with_span_events(fmt::format::FmtSpan::ACTIVE)
+            .with_filter(env_filter);
+
+        Registry::default().with(stdout_layer).init();
+
+        TracingGuards {
+            _file_appender_guard: None,
+        }
     } else {
         let with_ansi_colors = match std::env::var("ABQ_LOG_COLORS").as_deref() {
             Ok(s) => !matches!(s.trim(), "0"),
