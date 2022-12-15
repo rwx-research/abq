@@ -54,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     std::process::exit(exit_code.get());
 }
 
+#[must_use]
 struct TracingGuards {
     _file_appender_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
@@ -108,16 +109,14 @@ where
     }
 }
 
-#[must_use]
-fn setup_tracing() -> TracingGuards {
+fn setup_tracing() -> anyhow::Result<TracingGuards> {
     // Trace to standard error with ABQ_LOG set. If unset, trace and log nothing.
     let env_filter = EnvFilter::builder()
         .with_env_var("ABQ_LOG")
         .with_default_directive(LevelFilter::OFF.into())
-        .from_env()
-        .unwrap();
+        .from_env()?;
 
-    if let Ok(dir) = std::env::var("ABQ_LOGTO") {
+    let guards = if let Ok(dir) = std::env::var("ABQ_LOGTO") {
         // Trace to a rotating log file under ABQ_LOGTO, if it's set.
         let file_appender = tracing_appender::rolling::hourly(dir, "abq.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
@@ -186,7 +185,9 @@ fn setup_tracing() -> TracingGuards {
         TracingGuards {
             _file_appender_guard: None,
         }
-    }
+    };
+
+    Ok(guards)
 }
 
 fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
@@ -222,17 +223,9 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
 fn abq_main() -> anyhow::Result<ExitCode> {
     use clap::{error::ErrorKind, CommandFactory};
 
-    let _tracing_guards = setup_tracing();
+    let _tracing_guards = setup_tracing()?;
 
     let inferred_run_id = get_inferred_run_id(RunIdEnvironment::from_env());
-
-    // todo: drop me once we've upgraded all of our scripts
-    if let (Ok(access_token), Err(_)) = (
-        std::env::var("ABQ_API_KEY"),
-        std::env::var("RWX_ACCESS_TOKEN"),
-    ) {
-        std::env::set_var("RWX_ACCESS_TOKEN", access_token)
-    };
 
     let Cli { command } = Cli::parse();
 
