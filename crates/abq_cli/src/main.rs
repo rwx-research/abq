@@ -309,7 +309,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 token,
                 queue_addr,
                 tls_cert,
-            } = resolve_config(token, queue_addr, tls_cert, access_token, &run_id)?;
+            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
 
             let queue_addr = queue_addr.unwrap_or_else(|| {
                 let error = cmd.error(
@@ -369,7 +369,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
-            } = resolve_config(token, queue_addr, tls_cert, access_token, &run_id)?;
+            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
 
             let client_auth = resolved_token.into();
 
@@ -395,6 +395,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             run_tests(
                 entity,
+                &access_token,
                 runner_params,
                 abq,
                 run_id,
@@ -491,10 +492,10 @@ fn resolve_config(
     token_from_cli: Option<UserToken>,
     queue_addr_from_cli: Option<SocketAddr>,
     tls_cert_from_cli: Option<Vec<u8>>,
-    access_token: Option<AccessToken>,
+    access_token: &Option<AccessToken>,
     run_id: &RunId,
 ) -> anyhow::Result<ResolvedConfig> {
-    let (queue_addr_from_api, token_from_api, tls_from_api) = match access_token {
+    let (queue_addr_from_api, token_from_api, tls_from_api) = match access_token.as_ref() {
         Some(access_token) => {
             let config = get_config_from_api(access_token, run_id)?;
             (
@@ -517,10 +518,17 @@ fn resolve_config(
     })
 }
 
-fn get_config_from_api(access_token: AccessToken, run_id: &RunId) -> anyhow::Result<ConfigFromApi> {
-    use abq_hosted::{HostedQueueConfig, DEFAULT_RWX_ABQ_API_URL};
+fn get_hosted_api_base_url() -> String {
+    std::env::var("ABQ_API").unwrap_or_else(|_| abq_hosted::DEFAULT_RWX_ABQ_API_URL.to_string())
+}
 
-    let api_url = std::env::var("ABQ_API").unwrap_or_else(|_| DEFAULT_RWX_ABQ_API_URL.to_string());
+fn get_config_from_api(
+    access_token: &AccessToken,
+    run_id: &RunId,
+) -> anyhow::Result<ConfigFromApi> {
+    use abq_hosted::HostedQueueConfig;
+
+    let api_url = get_hosted_api_base_url();
 
     let HostedQueueConfig {
         addr,
@@ -597,6 +605,7 @@ fn find_or_create_abq(
 
 fn run_tests(
     entity: EntityId,
+    access_token: &Option<AccessToken>,
     runner_params: NativeTestRunnerParams,
     abq: AbqInstance,
     run_id: RunId,
@@ -642,11 +651,11 @@ fn run_tests(
             working_dir,
             abq.negotiator_handle(),
             abq.client_options().clone(),
-            run_id,
+            run_id.clone(),
         )?;
         Some(workers)
     } else {
-        println!("Starting test run with ID {}", run_id);
+        println!("Starting test run with ID {}", &run_id);
         None
     };
 
@@ -657,8 +666,24 @@ fn run_tests(
         let _exit_code = workers.shutdown();
     }
 
-    if let Err(invoke_error) = opt_invoked_error {
-        return Err(elaborate_invocation_error(invoke_error, runner_params));
+    let completed_summary = match opt_invoked_error {
+        Ok(summary) => summary,
+        Err(invoke_error) => return Err(elaborate_invocation_error(invoke_error, runner_params)),
+    };
+
+    // NB: right now, this last step of flushing the reporters and sending home the native runner
+    // info is sequential. Can we parallelize it? Or, even better, can we send home the native
+    // runner info during a test run?
+
+    if let Some(access_token) = access_token {
+        // Send home information about the native test runner that was involved in this test run.
+        // For non-hosted uses, there is nothing meaningful for us to do with the summary here.
+        abq_hosted::record_test_run_metadata(
+            get_hosted_api_base_url(),
+            access_token,
+            &run_id,
+            &completed_summary.native_runner_info.specification,
+        )
     }
 
     let (suite_result, errors) = reporters.finish();
