@@ -196,6 +196,17 @@ async fn retrieve_manifest<'a>(
 }
 
 #[derive(Debug, Error)]
+pub struct FailureExit(Option<i32>);
+impl std::fmt::Display for FailureExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(i) => i.fmt(f),
+            None => write!(f, "<unknown exit code>"),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
 pub enum GenericRunnerError {
     #[error("{0}")]
     Io(#[from] io::Error),
@@ -203,6 +214,8 @@ pub enum GenericRunnerError {
     ProtocolVersion(ProtocolVersionError),
     #[error("{0}")]
     NativeRunner(#[from] NativeTestRunnerError),
+    #[error("native runner executed ABQ work successfully, but exited with {0}")]
+    NonZeroExit(#[from] FailureExit),
 }
 
 impl From<RetrieveManifestError> for GenericRunnerError {
@@ -404,8 +417,12 @@ where
                     FastExit(true),
                 );
                 net_protocol::async_write(&mut runner_conn, &init_message).await?;
-                native_runner_handle.wait().await?;
-                return Ok(());
+                let exit_status = native_runner_handle.wait().await?;
+                if exit_status.success() {
+                    return Ok(());
+                } else {
+                    return Err(FailureExit(exit_status.code()).into());
+                }
             }
         };
     }
@@ -492,9 +509,14 @@ where
         drop(results_tx);
         drop(runner_conn);
         drop(our_listener);
-        native_runner_handle.wait().await?;
-
-        Result::<(), GenericRunnerError>::Ok(())
+        let exit_status = native_runner_handle.wait().await?;
+        if exit_status.success() {
+            Ok(())
+        } else {
+            Err(GenericRunnerError::NonZeroExit(FailureExit(
+                exit_status.code(),
+            )))
+        }
     };
 
     let ((), run_tests_result, ()) =
