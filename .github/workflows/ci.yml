@@ -8,24 +8,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    name: Source formatting check
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v3
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.64.0
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: fmt
-          args: -- --check
-
   test_and_package_development:
     name: Test and package development build
     uses: ./.github/workflows/test_and_package_development.yml

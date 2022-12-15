@@ -1,6 +1,6 @@
 use std::io;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -339,7 +339,7 @@ impl ThreadWorker {
                 start_generic_test_runner(worker_env, params)
             }
             RunnerKind::TestLikeRunner(runner, manifest) => {
-                start_test_like_runner(worker_env, runner, manifest)
+                start_test_like_runner(worker_env, runner, *manifest)
             }
         });
 
@@ -546,10 +546,20 @@ fn start_test_like_runner(
                         let (status, output) = match attempt_result {
                             Ok(output) => (Status::Success, output),
                             Err(AttemptError::ShouldRetry) => continue 'attempts,
-                            Err(AttemptError::Panic(msg)) => (Status::Error, msg),
-                            Err(AttemptError::Timeout(time)) => {
-                                (Status::Error, format!("Timeout: {}ms", time.as_millis()))
-                            }
+                            Err(AttemptError::Panic(msg)) => (
+                                Status::Error {
+                                    exception: None,
+                                    backtrace: None,
+                                },
+                                msg,
+                            ),
+                            Err(AttemptError::Timeout(time)) => (
+                                Status::Error {
+                                    exception: None,
+                                    backtrace: None,
+                                },
+                                format!("Timeout: {}ms", time.as_millis()),
+                            ),
                         };
                         let result = TestResult::new(TestResultSpec {
                             status,
@@ -558,6 +568,7 @@ fn start_test_like_runner(
                             output: Some(output),
                             runtime: TestRuntime::Milliseconds(runtime),
                             meta: Default::default(),
+                            ..TestResultSpec::fake()
                         });
 
                         rt.block_on(notify_results(
@@ -579,17 +590,15 @@ fn start_test_like_runner(
 
 #[inline(always)]
 fn attempt_test_id_for_test_like_runner(
-    my_context: &WorkerContext,
+    _my_context: &WorkerContext,
     runner: TestLikeRunner,
     test_id: TestId,
     init_context: InitContext,
-    requested_context: &WorkContext,
+    _requested_context: &WorkContext,
     timeout: Duration,
     attempt: u8,
     allowed_attempts: u8,
 ) -> AttemptResult {
-    let working_dir = resolve_context(my_context, requested_context).to_owned();
-
     use TestLikeRunner as R;
 
     let init_context = serde_json::to_string(&init_context).unwrap();
@@ -598,7 +607,6 @@ fn attempt_test_id_for_test_like_runner(
 
     let started = Instant::now();
     let result_handle = thread::spawn(move || {
-        std::env::set_current_dir(working_dir).unwrap();
         let _attempt = attempt;
         match (runner, test_id) {
             (R::Echo, s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
@@ -674,34 +682,10 @@ fn attempt_test_id_for_test_like_runner(
     }
 }
 
-fn resolve_context<'a>(
-    worker_context: &'a WorkerContext,
-    work_context: &'a WorkContext,
-) -> &'a Path {
-    let WorkContext {
-        working_dir: asked_working_dir,
-    } = work_context;
-
-    match worker_context {
-        WorkerContext::AssumeLocal => {
-            // Everything is available locally, switch to the directory the work asked for.
-            asked_working_dir
-        }
-        WorkerContext::AlwaysWorkIn { working_dir } => {
-            // We must always work in the specified `working_dir`, regardless of what the unit of
-            // work thinks.
-            // TODO: it would be nice to have some way to verify that our working dir is actually
-            // in line with `asked_working_dir`.
-            working_dir
-        }
-    }
-}
-
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, VecDeque};
     use std::num::NonZeroUsize;
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -709,7 +693,7 @@ mod test {
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol;
     use abq_utils::net_protocol::runners::{
-        Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestCase, TestOrGroup, TestResult,
+        Manifest, ManifestMessage, ProtocolWitness, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
@@ -720,7 +704,6 @@ mod test {
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_with_protocol_version::with_protocol_version;
     use futures::FutureExt;
-    use tempfile::TempDir;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
@@ -830,22 +813,7 @@ mod test {
     }
 
     pub fn echo_test(protocol: ProtocolWitness, echo_msg: String) -> TestOrGroup {
-        TestOrGroup::test(
-            protocol,
-            Test::new(protocol, echo_msg, [], Default::default()),
-        )
-    }
-
-    pub fn exec_test(protocol: ProtocolWitness, cmd: &str, args: &[&str]) -> TestOrGroup {
-        let exec_str = std::iter::once(cmd)
-            .chain(args.iter().copied())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        TestOrGroup::test(
-            protocol,
-            Test::new(protocol, exec_str, [], Default::default()),
-        )
+        TestOrGroup::test(Test::new(protocol, echo_msg, [], Default::default()))
     }
 
     fn await_manifest_test_cases(manifest: ManifestCollector) -> Vec<TestCase> {
@@ -887,11 +855,10 @@ mod test {
 
             echo_test(protocol, echo_string)
         });
-        let manifest =
-            ManifestMessage::new(protocol, Manifest::new(protocol, tests, Default::default()));
+        let manifest = ManifestMessage::new(Manifest::new(tests, Default::default()));
 
         let (default_config, manifest_collector) = setup_pool(
-            RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest),
+            RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
             run_id.clone(),
             &get_next_tests,
             notify_results,
@@ -1094,76 +1061,6 @@ mod test {
         });
 
         pool.shutdown();
-    }
-
-    #[test]
-    #[with_protocol_version]
-    fn work_in_constant_context() {
-        let (write_work, get_next_tests) = work_writer();
-        let (results, notify_results, run_completed_successfully) = results_collector();
-
-        let working_dir = TempDir::new().unwrap();
-        std::fs::write(working_dir.path().join("testfile"), "testcontent").unwrap();
-
-        let worker_context = WorkerContext::AlwaysWorkIn {
-            working_dir: working_dir.path().to_owned(),
-        };
-
-        let run_id = RunId::unique();
-        let manifest = ManifestMessage::new(
-            proto,
-            Manifest::new(
-                proto,
-                [exec_test(proto, "cat", &["testfile"])],
-                Default::default(),
-            ),
-        );
-
-        let (default_config, manifest_collector) = setup_pool(
-            RunnerKind::TestLikeRunner(TestLikeRunner::Exec, manifest),
-            run_id.clone(),
-            &get_next_tests,
-            notify_results,
-            run_completed_successfully,
-        );
-
-        let pool_config = WorkerPoolConfig {
-            worker_context,
-            ..default_config
-        };
-        let mut pool = WorkerPool::new(pool_config);
-
-        // Send the unit of work with a fake working directory to make sure the worker actually
-        // uses the working directory given in the worker's context.
-        let fake_working_dir_of_work = PathBuf::from("/zzz/i/do/not/exist");
-        assert!(!fake_working_dir_of_work.exists());
-
-        let context = WorkContext {
-            working_dir: fake_working_dir_of_work,
-        };
-
-        for test_case in await_manifest_test_cases(manifest_collector) {
-            write_work(NextWork::Work(WorkerTest {
-                test_case,
-                context: context.clone(),
-                run_id: run_id.clone(),
-                work_id: WorkId("id1".to_string()),
-            }));
-        }
-        write_work(NextWork::EndOfWork);
-
-        await_results(results, |results| {
-            let results = results.lock().unwrap();
-            if results.is_empty() {
-                return false;
-            }
-
-            let result = results.get("id1").unwrap();
-            result.status == Status::Success && result.output.as_ref().unwrap() == "testcontent"
-        });
-
-        let exit = pool.shutdown();
-        assert!(matches!(exit, WorkersExit::Success));
     }
 
     #[test]

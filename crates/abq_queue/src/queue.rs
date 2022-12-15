@@ -2413,10 +2413,7 @@ mod test {
             self,
             entity::EntityId,
             queue::InvokeWork,
-            runners::{
-                Manifest, ManifestMessage, ProtocolWitness, Status, TestResult, TestResultSpec,
-                TestRuntime,
-            },
+            runners::{Manifest, ManifestMessage, TestResult},
             workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
         },
         shutdown::ShutdownManager,
@@ -2430,17 +2427,6 @@ mod test {
     };
     use tracing_test::{internal::logs_with_scope_contain, traced_test};
 
-    fn fake_test_result() -> TestResult {
-        TestResult::new(TestResultSpec {
-            status: Status::Success,
-            id: "".to_string(),
-            display_name: "".to_string(),
-            output: None,
-            runtime: TestRuntime::Milliseconds(0.),
-            meta: Default::default(),
-        })
-    }
-
     fn one_nonzero() -> NonZeroU64 {
         1.try_into().unwrap()
     }
@@ -2453,14 +2439,14 @@ mod test {
         Ok((stream, addr))
     }
 
-    fn empty_manifest_msg(proto: ProtocolWitness) -> ManifestMessage {
-        ManifestMessage::new(proto, Manifest::new(proto, [], Default::default()))
+    fn empty_manifest_msg() -> Box<ManifestMessage> {
+        Box::new(ManifestMessage::new(Manifest::new([], Default::default())))
     }
 
-    fn faux_invoke_work(proto: ProtocolWitness) -> InvokeWork {
+    fn faux_invoke_work() -> InvokeWork {
         InvokeWork {
             run_id: RunId::unique(),
-            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
             batch_size_hint: one_nonzero(),
         }
     }
@@ -2697,7 +2683,7 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id.clone(),
-                vec![(buffered_work_id.clone(), fake_test_result())],
+                vec![(buffered_work_id.clone(), TestResult::fake())],
             )
             .await
             .unwrap();
@@ -2762,7 +2748,7 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id,
-                vec![(second_work_id.clone(), fake_test_result())],
+                vec![(second_work_id.clone(), TestResult::fake())],
             ));
 
             let (work_id, _) = match client.next().await.unwrap() {
@@ -3084,7 +3070,7 @@ mod test {
         queues
             .create_queue(
                 RunId::unique(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3102,7 +3088,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3122,7 +3108,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3143,7 +3129,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3170,7 +3156,7 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                 )
                 .unwrap();
@@ -3198,7 +3184,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3224,7 +3210,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3252,7 +3238,7 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
             )
             .unwrap();
@@ -3297,7 +3283,7 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg(proto)),
+                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                 )
                 .unwrap();
@@ -3337,7 +3323,7 @@ mod test {
             worker_next_tests_tasks.clone(),
             entity,
             run_id.clone(),
-            vec![(WorkId("work".into()), fake_test_result())],
+            vec![(WorkId("work".into()), TestResult::fake())],
         );
         let cancellation_fut = QueueServer::handle_run_cancellation(
             queues.clone(),
@@ -3405,7 +3391,7 @@ mod test {
                 &mut conn,
                 queue::Request {
                     entity: EntityId::new(),
-                    message: queue::Message::InvokeWork(faux_invoke_work(proto)),
+                    message: queue::Message::InvokeWork(faux_invoke_work()),
                 },
             )
             .unwrap();

@@ -22,7 +22,6 @@ futures.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tracing-test.workspace = true
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 abq_with_protocol_version = { path = "../abq_test_support/with_protocol_version" }
