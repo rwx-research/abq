@@ -62,6 +62,8 @@ start () {
   mkdir -p $STATEDIR
   echo "$instance_id" > $INSTANCE_FILE
   echo "$data" | jq -r '.tls_public_certificate' > $CERT_FILE
+  echo "$(echo "$data" | jq -r '.public_host')" > $HOST_FILE
+  echo "$(echo "$data" | jq -r '.queue_port')" > $PORT_FILE
   echo "$(echo "$data" | jq -r '.public_host'):$(echo "$data" | jq -r '.queue_port')" > $IP_FILE
   echo "$data" | jq -r '.user_token' > $USER_TOKEN_FILE
   echo "$QUEUE_VERSION" > $VERSION_FILE
