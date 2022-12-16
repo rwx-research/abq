@@ -358,7 +358,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             tls_key,
             color,
             batch_size,
-            result_timeout_seconds,
+            test_timeout_seconds,
         } => {
             let external_run_id = run_id.or(inferred_run_id);
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
@@ -389,7 +389,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 client_auth,
                 resolved_tls,
             )?;
-            let results_timeout = Duration::from_secs(result_timeout_seconds.get());
+            let results_timeout = Duration::from_secs(test_timeout_seconds.get());
 
             let actual_num_workers = match num_workers {
                 Some(CpuCores) => {

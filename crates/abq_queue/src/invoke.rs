@@ -130,7 +130,7 @@ impl Client {
         run_id: RunId,
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
-        poll_timeout: Duration,
+        test_results_timeout: Duration,
         cancellation_rx: RunCancellationRx,
     ) -> Result<Self, InvocationError> {
         let client = client_options.build_async()?;
@@ -144,6 +144,7 @@ impl Client {
                 run_id: run_id.clone(),
                 runner,
                 batch_size_hint,
+                test_results_timeout,
             }),
         };
 
@@ -170,7 +171,7 @@ impl Client {
             client,
             run_id,
             stream,
-            poll_timeout,
+            poll_timeout: test_results_timeout,
             cancellation_rx,
         })
     }

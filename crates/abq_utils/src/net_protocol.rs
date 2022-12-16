@@ -231,6 +231,7 @@ pub mod queue {
         pub run_id: RunId,
         pub runner: RunnerKind,
         pub batch_size_hint: NonZeroU64,
+        pub test_results_timeout: Duration,
     }
 
     /// Why an invocation of some work did not succeed.

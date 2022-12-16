@@ -266,9 +266,9 @@ pub enum Command {
         ///
         /// Hitting a timeout is typically indicative of a failure in ABQ workers.
         ///
-        /// By default, the timeout is unbound.
+        /// By default, the timeout is 2 minutes (120 seconds).
         #[clap(long, default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs().try_into().unwrap())]
-        result_timeout_seconds: NonZeroU64,
+        test_timeout_seconds: NonZeroU64,
 
         /// Arguments to the test executable.
         #[clap(required = true, num_args = 1.., allow_hyphen_values = true, last = true)]

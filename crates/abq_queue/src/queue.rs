@@ -7,6 +7,7 @@ use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use abq_utils::atomic;
 use abq_utils::auth::ServerAuthStrategy;
@@ -88,6 +89,9 @@ enum RunState {
         // Co-locate this here so that we don't have to index `run_data` when grabbing a
         // test.
         batch_size_hint: NonZeroU64,
+
+        /// The timeout for the last test result.
+        last_test_timeout: Duration,
     },
     Done {
         succeeded: bool,
@@ -102,10 +106,12 @@ struct RunData {
     runner: Box<RunnerKind>,
     /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
     batch_size_hint: NonZeroU64,
+    /// The timeout for the last test result.
+    last_test_timeout: Duration,
 }
 
 // Just the stack size of the RunData, the closure of RunData may be much larger.
-static_assertions::assert_eq_size!(RunData, (usize, u64));
+static_assertions::assert_eq_size!(RunData, (usize, u64, Duration));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
@@ -197,7 +203,7 @@ enum PulledTestsStatus {
     MoreTestsRemaining,
     /// The bundle of tests just pulled have exhausted the queue of tests.
     /// The last test to be handed out is in this bundle.
-    PulledLastTest,
+    PulledLastTest { last_test_timeout: Duration },
     /// The queue was already empty when tests were pulled.
     QueueWasEmpty,
 }
@@ -207,7 +213,7 @@ impl PulledTestsStatus {
         match self {
             PulledTestsStatus::MoreTestsRemaining => false,
 
-            PulledTestsStatus::PulledLastTest => true,
+            PulledTestsStatus::PulledLastTest { .. } => true,
             PulledTestsStatus::QueueWasEmpty => true,
         }
     }
@@ -221,6 +227,7 @@ impl AllRuns {
         run_id: RunId,
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
+        last_test_timeout: Duration,
     ) -> Result<(), NewQueueError> {
         // Take an exclusive lock over the run state for the entirety of the update.
         let mut runs = self.runs.write();
@@ -247,6 +254,7 @@ impl AllRuns {
             data: Some(RunData {
                 runner: Box::new(runner),
                 batch_size_hint,
+                last_test_timeout,
             }),
         };
         let old_run = runs.insert(run_id, Mutex::new(run));
@@ -269,6 +277,7 @@ impl AllRuns {
             Some(RunData {
                 runner,
                 batch_size_hint,
+                last_test_timeout: _,
             }) => ((**runner).clone(), *batch_size_hint),
             None => {
                 // If there is an active run, then the run data exists iff the run state exists;
@@ -370,10 +379,16 @@ impl AllRuns {
         let mut queue = JobQueue::default();
         queue.add_batch_work(work_from_manifest);
 
+        let run_data = run
+            .data
+            .as_ref()
+            .expect("illegal state - run data must exist at this step");
+
         run.state = RunState::HasWork {
             queue,
-            batch_size_hint: run.data.as_ref().expect("no data for run").batch_size_hint,
+            batch_size_hint: run_data.batch_size_hint,
             init_metadata,
+            last_test_timeout: run_data.last_test_timeout,
         }
     }
 
@@ -390,6 +405,7 @@ impl AllRuns {
                 init_metadata,
                 queue: _,
                 batch_size_hint: _,
+                last_test_timeout: _,
             } => InitMetadata::Metadata(init_metadata.clone()),
             RunState::Done { .. } | RunState::Cancelled { .. } => InitMetadata::RunAlreadyCompleted,
         }
@@ -406,6 +422,7 @@ impl AllRuns {
                 queue,
                 init_metadata: _,
                 batch_size_hint,
+                last_test_timeout,
             } => {
                 // NB: in the future, the batch size is likely to be determined intellegently, i.e.
                 // from off-line timing data. But for now, we use the hint the client provided.
@@ -417,7 +434,7 @@ impl AllRuns {
                 let pulled_tests_status = if queue.is_empty() {
                     if !bundle.is_empty() {
                         // We pulled the last test just now.
-                        PulledTestsStatus::PulledLastTest
+                        PulledTestsStatus::PulledLastTest { last_test_timeout: *last_test_timeout }
                     } else {
                         PulledTestsStatus::QueueWasEmpty
                     }
@@ -450,11 +467,7 @@ impl AllRuns {
         let mut run = runs.get(run_id).expect("no run recorded").lock();
 
         match &mut run.state {
-            RunState::HasWork {
-                queue,
-                init_metadata: _,
-                batch_size_hint: _,
-            } => {
+            RunState::HasWork { queue, .. } => {
                 assert!(queue.is_empty(), "Invalid state - queue is not complete!");
             }
             RunState::Cancelled { .. } => {
@@ -1450,6 +1463,7 @@ impl QueueServer {
             run_id,
             runner,
             batch_size_hint,
+            test_results_timeout,
         } = invoke_work;
 
         tracing::debug!(?run_id, ?batch_size_hint, "new invoked work");
@@ -1466,7 +1480,12 @@ impl QueueServer {
             batch_size_hint
         };
 
-        let could_create_queue = queues.create_queue(run_id.clone(), runner, batch_size_hint);
+        let could_create_queue = queues.create_queue(
+            run_id.clone(),
+            runner,
+            batch_size_hint,
+            test_results_timeout,
+        );
 
         match could_create_queue {
             Ok(()) => {
@@ -2349,16 +2368,16 @@ impl WorkScheduler {
                     let NextTestRequest {} = opt_read_error?;
 
                     // Pull the next bundle of work.
-                    let (bundle,pulled_tests_status) = { queues.next_work(run_id.clone()) };
+                    let (bundle, pulled_tests_status) = { queues.next_work(run_id.clone()) };
 
                     let response = NextTestResponse::Bundle(bundle);
 
                     net_protocol::async_write(&mut conn, &response).await?;
 
-                    if matches!(pulled_tests_status, PulledTestsStatus::PulledLastTest) {
+                    if let PulledTestsStatus::PulledLastTest { last_test_timeout } = pulled_tests_status {
                         // This was the last test, so start a timeout for the whole test run to
                         // complete - if it doesn't, we'll fire and timeout the run.
-                        let timeout = timeout_strategy.timeout();
+                        let timeout = timeout_strategy.resolve(last_test_timeout);
 
                         tracing::info!(
                             ?run_id,
@@ -2448,6 +2467,7 @@ mod test {
             run_id: RunId::unique(),
             runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
             batch_size_hint: one_nonzero(),
+            test_results_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
         }
     }
 
@@ -2715,8 +2735,8 @@ mod test {
             abq_server_addr: fake_server_addr,
             client: client_opts.build_async().unwrap(),
             run_id: run_id.clone(),
-            stream: client_conn,
             poll_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
+            stream: client_conn,
             cancellation_rx,
         };
         {
@@ -3072,6 +3092,7 @@ mod test {
                 RunId::unique(),
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
             )
             .unwrap();
 
@@ -3090,6 +3111,7 @@ mod test {
                 run_id.clone(),
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
             )
             .unwrap();
 
@@ -3110,6 +3132,7 @@ mod test {
                 run_id.clone(),
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
             )
             .unwrap();
 
@@ -3131,6 +3154,7 @@ mod test {
                 run_id.clone(),
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
             )
             .unwrap();
 
@@ -3158,6 +3182,7 @@ mod test {
                     run_id.clone(),
                     RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
+                    DEFAULT_CLIENT_POLL_TIMEOUT,
                 )
                 .unwrap();
 
@@ -3186,6 +3211,7 @@ mod test {
                 run_id.clone(),
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
             )
             .unwrap();
 
@@ -3212,6 +3238,7 @@ mod test {
                 run_id.clone(),
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
             )
             .unwrap();
 
@@ -3240,6 +3267,7 @@ mod test {
                 run_id.clone(),
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
             )
             .unwrap();
 
@@ -3285,6 +3313,7 @@ mod test {
                     run_id.clone(),
                     RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
+                    DEFAULT_CLIENT_POLL_TIMEOUT,
                 )
                 .unwrap();
             queues.get_run_for_worker(&run_id);
