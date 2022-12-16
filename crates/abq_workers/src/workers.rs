@@ -13,8 +13,8 @@ use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersion, ManifestMessage, NativeRunnerSpecification, Status, TestId, TestResult,
-    TestResultSpec, TestRuntime,
+    AbqProtocolVersion, ManifestMessage, NativeRunnerSpecification, OutOfBandError, Status, TestId,
+    TestResult, TestResultSpec, TestRuntime,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -420,8 +420,13 @@ fn start_generic_test_runner(
     opt_runner_err
 }
 
-fn build_test_like_runner_reported_manifest(manifest_message: ManifestMessage) -> ReportedManifest {
-    let manifest = manifest_message.into_manifest();
+fn build_test_like_runner_manifest_result(
+    manifest_message: ManifestMessage,
+) -> Result<ReportedManifest, OutOfBandError> {
+    let manifest = match manifest_message {
+        ManifestMessage::Success(m) => m.manifest,
+        ManifestMessage::Failure(fail) => return Err(fail.error),
+    };
 
     let native_runner_protocol = AbqProtocolVersion::V0_1;
     let native_runner_specification = NativeRunnerSpecification {
@@ -434,11 +439,11 @@ fn build_test_like_runner_reported_manifest(manifest_message: ManifestMessage) -
         host: Some("ruby 3.1.2p20 (2022-04-12 revision 4491bb740a) [x86_64-darwin21]".to_owned()),
     };
 
-    ReportedManifest {
+    Ok(ReportedManifest {
         manifest,
         native_runner_protocol,
         native_runner_specification: Box::new(native_runner_specification),
-    }
+    })
 }
 
 fn start_test_like_runner(
@@ -468,8 +473,22 @@ fn start_test_like_runner(
     }
 
     if let Some(notify_manifest) = notify_manifest {
-        let reported_manifest = build_test_like_runner_reported_manifest(manifest);
-        notify_manifest(entity, &run_id, ManifestResult::Manifest(reported_manifest));
+        let manifest_result = build_test_like_runner_manifest_result(manifest);
+        match manifest_result {
+            Ok(manifest) => {
+                notify_manifest(entity, &run_id, ManifestResult::Manifest(manifest));
+            }
+            Err(oob) => {
+                notify_manifest(
+                    entity,
+                    &run_id,
+                    ManifestResult::TestRunnerError {
+                        error: oob.to_string(),
+                    },
+                );
+                return Err(GenericRunnerError::NativeRunner(oob.into()));
+            }
+        };
     }
 
     let init_context = match get_init_context() {

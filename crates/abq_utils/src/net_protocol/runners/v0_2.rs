@@ -3,6 +3,7 @@
 //! https://www.notion.so/rwx/Native-Runner-Protocol-0-2-d992ef3b4fde4289b02244c1b89a8cc7
 
 use serde_derive::{Deserialize, Serialize};
+use thiserror::Error;
 
 use super::{v0_1, AbqProtocolVersion, MetadataMap};
 
@@ -228,7 +229,7 @@ pub struct Location {
     pub column: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Error)]
 pub struct OutOfBandError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
