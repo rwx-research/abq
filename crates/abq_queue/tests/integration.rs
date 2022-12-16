@@ -239,7 +239,10 @@ fn action_to_fut(
 
     macro_rules! get_run_id {
         ($n:expr) => {
-            run_ids.entry($n).or_insert_with(RunId::unique).clone()
+            run_ids
+                .entry($n)
+                .or_insert_with(|| RunId($n.0.to_string()))
+                .clone()
         };
     }
 

@@ -520,6 +520,8 @@ mod persistent_next_tests_connection {
                 Err(e) => {
                     if attempt < MAX_TRIES_FOR_ONE_CYCLE {
                         tracing::warn!(?attempt, ?run_id, "Retrying fetch of work bundle");
+                        // Assume the connection was dropped, and force a re-connect.
+                        *conn = None;
                         continue;
                     }
                     return Err(e);
