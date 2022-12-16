@@ -372,22 +372,18 @@ impl From<RawManifestMessage> for ManifestMessage {
 }
 
 impl ManifestMessage {
-    /// Extract the [manifest][Manifest] from the manifest message.
-    pub fn into_manifest(self) -> Manifest {
-        use v0_2::ManifestSuccessMessage;
-        match self {
-            ManifestMessage::Success(ManifestSuccessMessage {
-                manifest,
-                other_errors: _,
-            }) => manifest,
-            ManifestMessage::Failure(_) => todo!(),
-        }
-    }
-
     #[cfg(feature = "expose-native-protocols")]
     pub fn new(manifest: Manifest) -> Self {
         Self::Success(v0_2::ManifestSuccessMessage {
             manifest,
+            other_errors: None,
+        })
+    }
+
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new_failure(error: OutOfBandError) -> Self {
+        Self::Failure(v0_2::ManifestFailureMessage {
+            error,
             other_errors: None,
         })
     }
@@ -522,7 +518,46 @@ impl From<v0_2::Status> for Status {
 
 pub use v0_2::Iso8601;
 pub use v0_2::Location;
+
+impl std::fmt::Display for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Location { file, line, column } = self;
+        write!(f, "{file}")?;
+        if let Some(line) = line {
+            write!(f, "[{line}")?;
+            if let Some(column) = column {
+                write!(f, ":{column}")?;
+            }
+            write!(f, "]")?;
+        }
+        Ok(())
+    }
+}
+
 pub use v0_2::OutOfBandError;
+
+impl std::fmt::Display for OutOfBandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let OutOfBandError {
+            message,
+            backtrace,
+            exception,
+            location,
+            meta: _,
+        } = self;
+        write!(f, "{message}")?;
+        if let Some(exception) = exception {
+            write!(f, "\n\n{exception}")?;
+        }
+        if let Some(location) = location {
+            write!(f, " at {location}")?;
+        }
+        for bt_line in backtrace.iter().flatten() {
+            write!(f, "\n{bt_line}")?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TestResultSpec {
@@ -552,6 +587,7 @@ pub struct TestResultSpec {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout: Option<String>,
 }
 
@@ -770,3 +806,128 @@ impl InitMessage {
 type PrivInitSuccessMessage = v0_1::InitSuccessMessage;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InitSuccessMessage(PrivInitSuccessMessage);
+
+#[cfg(test)]
+mod dispay {
+    use super::{Location, OutOfBandError};
+
+    macro_rules! display_test {
+        ($name:ident, $value:expr, @$result:literal) => {
+            #[test]
+            fn $name() {
+                let formatted = $value.to_string();
+                insta::assert_snapshot!(formatted, @$result);
+            }
+        }
+    }
+
+    display_test!(
+        location_with_file_col,
+        Location { file: "a/b/c.x".to_string(), line: Some(10), column: Some(15) },
+        @"a/b/c.x[10:15]"
+    );
+
+    display_test!(
+        location_with_file_no_col,
+        Location { file: "a/b/c.x".to_string(), line: Some(10), column: None },
+        @"a/b/c.x[10]"
+    );
+
+    display_test!(
+        location_no_file_no_col,
+        Location { file: "a/b/c.x".to_string(), line: None, column: None },
+        @"a/b/c.x"
+    );
+
+    display_test!(
+        location_no_file_with_col,
+        Location { file: "a/b/c.x".to_string(), line: None, column: Some(15) },
+        @"a/b/c.x"
+    );
+
+    display_test!(
+        oob_error_full,
+        OutOfBandError {
+            message: "1 != 2 (2 > 1)".to_string(),
+            backtrace: Some(vec!["at compare".to_string(), "at add".to_string()]),
+            exception: Some("CompareException".to_owned()),
+            location: Some(Location { file: "it/cmp.x".to_string(), line: Some(10), column: Some(15) }),
+            meta: Some(vec![("left".to_owned(), "1".into()), ("right".to_owned(), "2".into())].into_iter().collect()),
+        },
+        @r###"
+    1 != 2 (2 > 1)
+
+    CompareException at it/cmp.x[10:15]
+    at compare
+    at add
+    "###
+    );
+
+    display_test!(
+        oob_error_no_backtrace,
+        OutOfBandError {
+            message: "1 != 2 (2 > 1)".to_string(),
+            backtrace: None,
+            exception: Some("CompareException".to_owned()),
+            location: Some(Location { file: "it/cmp.x".to_string(), line: Some(10), column: Some(15) }),
+            meta: Some(vec![("left".to_owned(), "1".into()), ("right".to_owned(), "2".into())].into_iter().collect()),
+        },
+        @r###"
+    1 != 2 (2 > 1)
+
+    CompareException at it/cmp.x[10:15]
+    "###
+    );
+
+    display_test!(
+        oob_error_no_exception,
+        OutOfBandError {
+            message: "1 != 2 (2 > 1)".to_string(),
+            backtrace: Some(vec!["at compare".to_string(), "at add".to_string()]),
+            exception: None,
+            location: Some(Location { file: "it/cmp.x".to_string(), line: Some(10), column: Some(15) }),
+            meta: Some(vec![("left".to_owned(), "1".into()), ("right".to_owned(), "2".into())].into_iter().collect()),
+        },
+        @r###"
+    1 != 2 (2 > 1) at it/cmp.x[10:15]
+    at compare
+    at add
+    "###
+    );
+
+    display_test!(
+        oob_error_no_location,
+        OutOfBandError {
+            message: "1 != 2 (2 > 1)".to_string(),
+            backtrace: Some(vec!["at compare".to_string(), "at add".to_string()]),
+            exception: Some("CompareException".to_owned()),
+            location: None,
+            meta: Some(vec![("left".to_owned(), "1".into()), ("right".to_owned(), "2".into())].into_iter().collect()),
+        },
+        @r###"
+    1 != 2 (2 > 1)
+
+    CompareException
+    at compare
+    at add
+    "###
+    );
+
+    display_test!(
+        oob_error_no_meta,
+        OutOfBandError {
+            message: "1 != 2 (2 > 1)".to_string(),
+            backtrace: Some(vec!["at compare".to_string(), "at add".to_string()]),
+            exception: Some("CompareException".to_owned()),
+            location: Some(Location { file: "it/cmp.x".to_string(), line: Some(10), column: Some(15) }),
+            meta: None,
+        },
+        @r###"
+    1 != 2 (2 > 1)
+
+    CompareException at it/cmp.x[10:15]
+    at compare
+    at add
+    "###
+    );
+}

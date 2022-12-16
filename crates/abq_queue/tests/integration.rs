@@ -24,8 +24,8 @@ use abq_utils::{
         entity::EntityId,
         queue::NativeRunnerInfo,
         runners::{
-            AbqProtocolVersion, Manifest, ManifestMessage, MetadataMap, ProtocolWitness, Test,
-            TestOrGroup, TestResult,
+            AbqProtocolVersion, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
+            ProtocolWitness, Test, TestOrGroup, TestResult,
         },
         work_server::{InitContext, InitContextResponse},
         workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
@@ -157,10 +157,7 @@ enum Action {
 enum Assert<'a> {
     CheckSupervisor(Sid, &'a dyn Fn(&Result<Client, InvocationError>) -> bool),
 
-    TestExit(
-        Sid,
-        &'a dyn Fn(&Result<CompletedSummary, TestResultError>) -> bool,
-    ),
+    TestExit(Sid, &'a dyn Fn(&Result<CompletedSummary, TestResultError>)),
     TestExitWithoutErr(Sid),
     TestResults(Sid, &'a dyn Fn(&[(WorkId, TestResult)]) -> bool),
 
@@ -433,7 +430,7 @@ fn run_test(servers: Servers, steps: Steps) {
                     TestExit(n, check) => loop {
                         let results = supervisor_results.lock().await;
                         if let Some(exit) = results.get(&n) {
-                            assert!(check(exit));
+                            check(exit);
                             return;
                         }
                     },
@@ -760,7 +757,7 @@ fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
                 RunTest(Run(1), Sid(1), SupervisorConfig::new(runner.clone())),
                 StartWorkers(Run(1), Wid(1), default_workers_config()),
             ],
-            [TestExit(Sid(1), &|result| result.is_ok())],
+            [TestExit(Sid(1), &|result| assert!(result.is_ok()))],
         )
         .step(
             [StopWorkers(Wid(1))],
@@ -1035,7 +1032,7 @@ fn test_cancellation_drops_remaining_work() {
         .step(
             [CancelTest(Sid(1))],
             [TestExit(Sid(1), &|result| {
-                matches!(result, Err(TestResultError::Cancelled))
+                assert!(matches!(result, Err(TestResultError::Cancelled)))
             })],
         )
         .step(
@@ -1060,10 +1057,10 @@ fn failure_to_run_worker_command_exits_gracefully() {
                 StartWorkers(Run(1), Wid(1), default_workers_config()),
             ],
             [TestExit(Sid(1), &|results_err| {
-                matches!(
+                assert!(matches!(
                     results_err.as_ref().unwrap_err(),
                     TestResultError::TestCommandError(..)
-                )
+                ))
             })],
         )
         .step(
@@ -1101,7 +1098,7 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
             StartWorkers(Run(1), Wid(1), workers_config),
         ],
         [TestExit(Sid(1), &|result| {
-            matches!(result, Err(TestResultError::TimedOut(..)))
+            assert!(matches!(result, Err(TestResultError::TimedOut(..))));
         })],
     )
     .act([StopWorkers(Wid(1))])
@@ -1109,7 +1106,6 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
 }
 
 #[test]
-#[with_protocol_version]
 fn pending_worker_attachment_does_not_block_other_attachers() {
     TestBuilder::default()
         // Start a set of workers that will never find their execution context, and just
@@ -1132,6 +1128,49 @@ fn pending_worker_attachment_does_not_block_other_attachers() {
         .step(
             [StopWorkers(Wid(2))],
             [WorkerExit(Wid(2), WorkersExit::Success)],
+        )
+        .test();
+}
+
+#[test]
+fn native_runner_returns_manifest_failure() {
+    let manifest = ManifestMessage::new_failure(OutOfBandError {
+        message: "1 != 2".to_owned(),
+        backtrace: Some(vec!["cmp.x".to_string(), "add.x".to_string()]),
+        exception: Some("CompareException".to_string()),
+        location: Some(Location {
+            file: "cmp.x".to_string(),
+            line: Some(10),
+            column: Some(15),
+        }),
+        meta: None,
+    });
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    TestBuilder::default()
+        .step(
+            [
+                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
+                StartWorkers(Run(1), Wid(1), default_workers_config()),
+            ],
+            [TestExit(Sid(1), &|result| {
+                let err = result.as_ref().unwrap_err();
+                assert!(matches!(err, TestResultError::TestCommandError(..)));
+                let msg = err.to_string();
+                insta::assert_snapshot!(msg, @r###"
+                The given test command failed to be executed by all workers. The recorded error message is:
+                1 != 2
+
+                CompareException at cmp.x[10:15]
+                cmp.x
+                add.x
+                "###);
+            })],
+        )
+        .step(
+            [StopWorkers(Wid(1))],
+            [WorkerExit(Wid(1), WorkersExit::Error)],
         )
         .test();
 }

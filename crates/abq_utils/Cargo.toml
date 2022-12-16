@@ -27,6 +27,9 @@ async-trait.workspace = true
 static_assertions.workspace = true
 derive_more.workspace = true
 
+[dev-dependencies]
+insta.workspace = true
+
 [features]
 default = []
 test-actions = []

@@ -15,7 +15,7 @@ use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
-    NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
+    NativeRunnerSpecification, OutOfBandError, ProtocolWitness, RawNativeRunnerSpawnedMessage,
     RawTestResultMessage, Status, TestCase, TestCaseMessage, TestResult, TestResultSpec,
     TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
 };
@@ -128,6 +128,8 @@ enum RetrieveManifestError {
     Io(#[from] io::Error),
     #[error("{0}")]
     ProtocolVersion(#[from] ProtocolVersionError),
+    #[error("{0}")]
+    OOBError(#[from] OutOfBandError),
 }
 
 impl From<ProtocolVersionMessageError> for RetrieveManifestError {
@@ -185,7 +187,12 @@ async fn retrieve_manifest<'a>(
         let status = native_runner_handle.wait().await?;
         debug_assert!(status.success());
 
-        (runner_info, manifest_message.into_manifest())
+        let manifest = match manifest_message {
+            ManifestMessage::Success(manifest) => manifest.manifest,
+            ManifestMessage::Failure(failure) => return Err(failure.error.into()),
+        };
+
+        (runner_info, manifest)
     };
 
     Ok(ReportedManifest {
@@ -223,6 +230,7 @@ impl From<RetrieveManifestError> for GenericRunnerError {
         match e {
             RetrieveManifestError::Io(e) => Self::Io(e),
             RetrieveManifestError::ProtocolVersion(e) => Self::ProtocolVersion(e),
+            RetrieveManifestError::OOBError(e) => Self::NativeRunner(e.into()),
         }
     }
 }
@@ -531,6 +539,8 @@ where
 pub enum NativeTestRunnerError {
     #[error("{0}")]
     Io(#[from] io::Error),
+    #[error("{0}")]
+    OOBError(#[from] OutOfBandError),
 }
 
 async fn handle_one_test(

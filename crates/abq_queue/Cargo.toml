@@ -27,6 +27,7 @@ futures.workspace = true
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 abq_with_protocol_version = { path = "../abq_test_support/with_protocol_version" }
 
+insta.workspace = true
 ntest.workspace = true
 # Needed for testing abq_workers.
 # TODO: figure out a better way to implement abq_workers::test_support to avoid this!
