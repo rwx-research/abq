@@ -655,7 +655,7 @@ fn attempt_test_id_for_test_like_runner(
     while !result_handle.is_finished() {
         if started.elapsed() >= timeout {
             timed_out = true;
-            send_shutdown.send(()).unwrap();
+            let _ = send_shutdown.send(());
             break;
         }
 
