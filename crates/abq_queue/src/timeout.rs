@@ -25,14 +25,9 @@ impl Default for RunTimeoutStrategy {
 }
 
 impl RunTimeoutStrategy {
-    const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120); // 2 minutes
-
-    pub fn timeout(&self) -> Duration {
+    pub fn resolve(&self, timeout_for_run: Duration) -> Duration {
         match self {
-            RunTimeoutStrategy::RunBased => {
-                // TODO: eventually get this from the run data
-                Self::DEFAULT_TIMEOUT
-            }
+            RunTimeoutStrategy::RunBased => timeout_for_run,
             RunTimeoutStrategy::Constant(timeout) => *timeout,
         }
     }
