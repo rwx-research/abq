@@ -1,7 +1,9 @@
 use serde_derive::{Deserialize, Serialize};
 use std::{io::Write, ops::Deref};
 
-use abq_utils::net_protocol::runners::{self, Status, TestResult, TestResultSpec, TestRuntime};
+use abq_utils::net_protocol::runners::{
+    self, NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime,
+};
 
 // Note: this is intentionally permissive right now for `kind` and `language` until we have
 // implemented native runner support for specifying language and framework. Once we do that,
@@ -17,6 +19,23 @@ pub struct Framework {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "providedLanguage")]
     provided_language: Option<String>,
+}
+
+impl From<&NativeRunnerSpecification> for Framework {
+    fn from(spec: &NativeRunnerSpecification) -> Self {
+        // Normalize kind/language for native runners we know to https://github.com/rwx-research/test-results-schema/blob/main/v1.json
+        let (kind, language) = match (spec.language.as_deref(), spec.test_framework.as_deref()) {
+            (Some("ruby"), Some("rspec")) => ("Ruby", "RSpec"),
+            (lang, framework) => (lang.unwrap_or("other"), framework.unwrap_or("other")),
+        };
+
+        Self {
+            kind: kind.to_string(),
+            language: language.to_string(),
+            provided_kind: None,
+            provided_language: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -160,7 +179,7 @@ impl From<&TestResult> for Attempt {
             meta,
             started_at,
             finished_at,
-            other_errors: _, // TODO
+            other_errors: _,
             stderr,
             stdout,
             ..
@@ -324,25 +343,30 @@ impl Collector {
         self.tests.push(test);
     }
 
-    pub fn write_json(self, writer: impl Write) -> Result<(), String> {
-        serde_json::to_writer(writer, &self.test_results()).map_err(|e| e.to_string())
+    pub fn write_json(
+        self,
+        writer: impl Write,
+        runner_specification: &NativeRunnerSpecification,
+    ) -> Result<(), String> {
+        serde_json::to_writer(writer, &self.test_results(runner_specification))
+            .map_err(|e| e.to_string())
     }
 
-    pub fn write_json_pretty(self, writer: impl Write) -> Result<(), String> {
-        serde_json::to_writer_pretty(writer, &self.test_results()).map_err(|e| e.to_string())
+    pub fn write_json_pretty(
+        self,
+        writer: impl Write,
+        runner_specification: &NativeRunnerSpecification,
+    ) -> Result<(), String> {
+        serde_json::to_writer_pretty(writer, &self.test_results(runner_specification))
+            .map_err(|e| e.to_string())
     }
 
-    fn test_results(self) -> TestResults {
+    fn test_results(self, runner_specification: &NativeRunnerSpecification) -> TestResults {
         TestResults {
             schema:
                 "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json"
                     .to_string(),
-            framework: Framework {
-                kind: "other".to_string(),
-                language: "other".to_string(),
-                provided_kind: None,
-                provided_language: None,
-            },
+            framework: runner_specification.into(),
             summary: self.summary,
             tests: self.tests,
         }
@@ -351,7 +375,9 @@ impl Collector {
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime};
+    use abq_utils::net_protocol::runners::{
+        NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime,
+    };
 
     use crate::Collector;
 
@@ -371,7 +397,7 @@ mod test {
             output: Some("Test 1 passed".to_string()),
             runtime: TestRuntime::Milliseconds(11.0),
             meta,
-            ..TestResultSpec::fake() // TODO
+            ..TestResultSpec::fake()
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Failure {
@@ -383,7 +409,7 @@ mod test {
             output: Some("Test 2 failed".to_string()),
             runtime: TestRuntime::Milliseconds(22.0),
             meta: Default::default(),
-            ..TestResultSpec::fake() // TODO
+            ..TestResultSpec::fake()
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Error {
@@ -395,7 +421,7 @@ mod test {
             output: None,
             runtime: TestRuntime::Milliseconds(33.0),
             meta: Default::default(),
-            ..TestResultSpec::fake() // TODO
+            ..TestResultSpec::fake()
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Pending,
@@ -404,7 +430,7 @@ mod test {
             output: Some("Test 4 pending".to_string()),
             runtime: TestRuntime::Milliseconds(44.0),
             meta: Default::default(),
-            ..TestResultSpec::fake() // TODO
+            ..TestResultSpec::fake()
         }));
         collector.push_result(&TestResult::new(TestResultSpec {
             status: Status::Skipped,
@@ -413,14 +439,14 @@ mod test {
             output: None,
             runtime: TestRuntime::Milliseconds(55.0),
             meta: Default::default(),
-            ..TestResultSpec::fake() // TODO
+            ..TestResultSpec::fake()
         }));
 
         {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json(&mut buf)
+                .write_json(&mut buf, &NativeRunnerSpecification::fake())
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_all_statuses__compact", json)
@@ -430,7 +456,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json_pretty(&mut buf)
+                .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_all_statuses__pretty", json)
@@ -448,14 +474,14 @@ mod test {
             output: Some("Test 1 passed".to_string()),
             runtime: TestRuntime::Milliseconds(11.0),
             meta: Default::default(),
-            ..TestResultSpec::fake() // TODO
+            ..TestResultSpec::fake()
         }));
 
         {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json(&mut buf)
+                .write_json(&mut buf, &NativeRunnerSpecification::fake())
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__compact", json)
@@ -465,7 +491,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json_pretty(&mut buf)
+                .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__pretty", json)

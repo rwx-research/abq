@@ -229,6 +229,17 @@ pub struct Location {
     pub column: Option<u64>,
 }
 
+impl Location {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn fake() -> Self {
+        Self {
+            file: "a/b/x.file".to_string(),
+            line: Some(10),
+            column: Some(15),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Error)]
 pub struct OutOfBandError {
     pub message: String,

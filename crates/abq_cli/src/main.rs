@@ -692,7 +692,7 @@ fn run_tests(
         )
     }
 
-    let (suite_result, errors) = reporters.finish();
+    let (suite_result, errors) = reporters.finish(&completed_summary);
 
     for error in errors {
         eprintln!("{error}");
