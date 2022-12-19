@@ -112,6 +112,21 @@ impl From<NativeRunnerSpecification> for v0_2::AbqNativeRunnerSpecification {
     }
 }
 
+impl NativeRunnerSpecification {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn fake() -> Self {
+        Self {
+            name: "test-runner".to_owned(),
+            version: "1.2.3".to_owned(),
+            test_framework: Some("zframework".to_owned()),
+            test_framework_version: Some("4.5.6".to_owned()),
+            language: Some("zlang".to_owned()),
+            language_version: Some("7.8.9".to_owned()),
+            host: Some("zmachine".to_owned()),
+        }
+    }
+}
+
 // NORMALIZE: runner specification 0.1
 pub use v0_1::AbqNativeRunnerSpawnedMessage as NativeRunnerSpawnedMessage;
 
@@ -279,8 +294,6 @@ impl Test {
     }
 }
 
-// TODO 0.2: expose this as flat manifest to the rest of ABQ rather than keeping everything around
-// here (for now).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RawManifest(PrivManifest);
 #[derive(Serialize, Deserialize, Debug, Clone, derive_more::From)]
@@ -598,17 +611,21 @@ impl TestResultSpec {
             status: Status::Success,
             id: "zzz-faux".to_string(),
             display_name: "zzz-faux".to_string(),
-            output: None,
+            output: Some("my test output".to_owned()),
             runtime: TestRuntime::ZERO,
             meta: Default::default(),
-            location: None,
-            started_at: None,
-            finished_at: None,
-            lineage: None,
+            location: Some(Location::fake()),
+            started_at: Some(Iso8601("1994-11-05T13:15:30Z".to_owned())),
+            finished_at: Some(Iso8601("1994-11-05T13:17:30Z".to_owned())),
+            lineage: Some(vec![
+                "TopLevel".to_string(),
+                "SubModule".to_string(),
+                "Test".to_string(),
+            ]),
             past_attempts: None,
             other_errors: None,
-            stderr: None,
-            stdout: None,
+            stderr: Some("my stdout".to_string()),
+            stdout: Some("my stderr".to_string()),
         }
     }
 }

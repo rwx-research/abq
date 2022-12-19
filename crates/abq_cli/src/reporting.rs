@@ -10,6 +10,7 @@ use abq_output::{
     format_duration_to_partial_seconds, format_result_dot, format_result_line,
     format_result_summary,
 };
+use abq_queue::invoke::CompletedSummary;
 use abq_utils::{
     exit,
     net_protocol::runners::{Status, TestResult, TestRuntime},
@@ -215,7 +216,7 @@ pub(crate) trait Reporter: Send {
     /// Consume the reporter, and perform any needed finalization steps.
     ///
     /// This method is only called when all test results for a run have been consumed.
-    fn finish(self: Box<Self>) -> Result<(), ReportingError>;
+    fn finish(self: Box<Self>, summary: &CompletedSummary) -> Result<(), ReportingError>;
 }
 
 fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> {
@@ -258,7 +259,7 @@ impl Reporter for LineReporter {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         write_summary_results(&mut self.buffer, self.delayed_failure_reports)?;
 
         self.buffer
@@ -307,7 +308,7 @@ impl Reporter for DotReporter {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         if !self.delayed_failure_reports.is_empty()
             && self.num_results % DOT_REPORTER_LINE_LIMIT != 0
         {
@@ -338,7 +339,7 @@ impl Reporter for JUnitXmlReporter {
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -368,7 +369,7 @@ impl Reporter for RwxV1JsonReporter {
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Result<(), ReportingError> {
+    fn finish(self: Box<Self>, summary: &CompletedSummary) -> Result<(), ReportingError> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -380,7 +381,7 @@ impl Reporter for RwxV1JsonReporter {
             .open(self.path)?;
 
         self.collector
-            .write_json(fd)
+            .write_json(fd, &summary.native_runner_info.specification)
             .map_err(|_| ReportingError::FailedToFormat)?;
 
         Ok(())
@@ -461,7 +462,7 @@ impl SuiteReporters {
         }
     }
 
-    pub fn finish(self) -> (SuiteResult, Vec<ReportingError>) {
+    pub fn finish(self, summary: &CompletedSummary) -> (SuiteResult, Vec<ReportingError>) {
         let Self {
             reporters,
             overall_result,
@@ -471,7 +472,7 @@ impl SuiteReporters {
 
         let errors: Vec<_> = reporters
             .into_iter()
-            .filter_map(|reporter| reporter.finish().err())
+            .filter_map(|reporter| reporter.finish(summary).err())
             .collect();
 
         (overall_result, errors)
@@ -639,6 +640,26 @@ impl io::Write for MockWriter {
 use abq_utils::net_protocol::runners::TestResultSpec;
 
 #[cfg(test)]
+fn mock_summary() -> CompletedSummary {
+    use abq_utils::net_protocol::{queue::NativeRunnerInfo, runners::NativeRunnerSpecification};
+
+    CompletedSummary {
+        native_runner_info: NativeRunnerInfo {
+            protocol_version: abq_utils::net_protocol::runners::AbqProtocolVersion::V0_2,
+            specification: NativeRunnerSpecification {
+                name: "test-runner".to_owned(),
+                version: "1.2.3".to_owned(),
+                test_framework: Some("zframework".to_owned()),
+                test_framework_version: Some("4.5.6".to_owned()),
+                language: Some("zlang".to_owned()),
+                language_version: Some("7.8.9".to_owned()),
+                host: Some("zmachine".to_owned()),
+            },
+        },
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::identity_op)]
 fn default_result() -> TestResultSpec {
     TestResultSpec {
@@ -655,6 +676,8 @@ fn default_result() -> TestResultSpec {
 #[cfg(test)]
 mod test_line_reporter {
     use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec};
+
+    use crate::reporting::mock_summary;
 
     use super::{default_result, LineReporter, MockWriter, Reporter};
 
@@ -702,7 +725,7 @@ mod test_line_reporter {
             buffer,
             num_writes,
             num_flushes,
-        } = with_reporter(|reporter| reporter.finish().unwrap());
+        } = with_reporter(|reporter| reporter.finish(&mock_summary()).unwrap());
 
         assert!(buffer.is_empty());
         assert_eq!(num_writes, 0);
@@ -763,7 +786,7 @@ mod test_line_reporter {
                     ..default_result()
                 }))
                 .unwrap();
-            reporter.finish().unwrap();
+            reporter.finish(&mock_summary()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -789,7 +812,7 @@ mod test_line_reporter {
 mod test_dot_reporter {
     use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec};
 
-    use crate::reporting::DOT_REPORTER_LINE_LIMIT;
+    use crate::reporting::{mock_summary, DOT_REPORTER_LINE_LIMIT};
 
     use super::{default_result, DotReporter, MockWriter, Reporter};
 
@@ -838,7 +861,7 @@ mod test_dot_reporter {
             buffer,
             num_writes,
             num_flushes,
-        } = with_reporter(|reporter| reporter.finish().unwrap());
+        } = with_reporter(|reporter| reporter.finish(&mock_summary()).unwrap());
 
         assert!(buffer.is_empty());
         assert_eq!(num_writes, 0);
@@ -899,7 +922,7 @@ mod test_dot_reporter {
                     ..default_result()
                 }))
                 .unwrap();
-            reporter.finish().unwrap();
+            reporter.finish(&mock_summary()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -940,7 +963,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&mock_summary()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -963,7 +986,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&mock_summary()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -997,7 +1020,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&mock_summary()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -1037,7 +1060,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
-            reporter.finish().unwrap();
+            reporter.finish(&mock_summary()).unwrap();
         });
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
@@ -1063,14 +1086,16 @@ mod suite {
 
     use crate::reporting::ExitCode;
 
-    use super::{default_result, ColorPreference, MockWriter, SuiteReporters, SuiteResult};
+    use super::{
+        default_result, mock_summary, ColorPreference, MockWriter, SuiteReporters, SuiteResult,
+    };
 
     fn get_overall_result<'a>(results: impl IntoIterator<Item = &'a TestResult>) -> SuiteResult {
         let mut suite = SuiteReporters::new([], ColorPreference::Auto, "test");
         results
             .into_iter()
             .for_each(|r| suite.push_result(r).unwrap());
-        let (suite_result, _) = suite.finish();
+        let (suite_result, _) = suite.finish(&mock_summary());
         suite_result
     }
 
