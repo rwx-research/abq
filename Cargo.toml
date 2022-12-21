@@ -2,17 +2,18 @@
 
 members = [
   "crates/abq_cli",
-  "crates/abq_queue",
-  "crates/abq_workers",
-  "crates/abq_utils",
   "crates/abq_hosted",
-  "crates/abq_runners/protocol",
+  "crates/abq_output",
+  "crates/abq_queue",
   "crates/abq_runners/echo",
   "crates/abq_runners/exec",
   "crates/abq_runners/generic_test_runner",
-  "crates/reporters/junit_xml",
-
+  "crates/abq_runners/protocol",
   "crates/abq_test_support/with_protocol_version",
+  "crates/abq_utils",
+  "crates/abq_workers",
+  "crates/reporters/junit_xml",
+  "crates/reporters/rwx_v1_json",
 ]
 
 [workspace.dependencies]

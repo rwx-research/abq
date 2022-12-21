@@ -12,4 +12,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 abq_utils = { path = "../../abq_utils", features = ["expose-native-protocols"] }
-insta = "1.21.2"
+insta.workspace = true
