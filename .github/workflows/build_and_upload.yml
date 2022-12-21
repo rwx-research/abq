@@ -155,12 +155,15 @@ jobs:
           rcodesign sign --pem-source rwx-developer-id-application-cert.pem --code-signature-flags runtime "$RELEASE_NAME/abq"
           zip -r abq.zip "$RELEASE_NAME"
           echo "$RWX_APPLE_APP_STORE_CONNECT_API_KEY" > rwx-apple-app-store-connect-api-key.json
-          submission_id="$(rcodesign notary-submit --api-key-path rwx-apple-app-store-connect-api-key.json abq.zip 2>&1 | tee /dev/fd/2 | grep "created submission ID:" | awk '{print $4}')"
+          submission_id="$(rcodesign notary-submit --wait --api-key-path rwx-apple-app-store-connect-api-key.json abq.zip 2>&1 | tee /dev/fd/2 | grep "created submission ID:" | awk '{print $4}')"
           echo "Submission ID: $submission_id"
           echo "submission_id=$submission_id" >> "$GITHUB_OUTPUT"
         env:
           RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT: ${{ secrets.RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT }}
           RWX_APPLE_APP_STORE_CONNECT_API_KEY: ${{ secrets.RWX_APPLE_APP_STORE_CONNECT_API_KEY }}
+      - name: ensure sign & notary cleanup happens
+        if: contains(matrix.platform, 'darwin') && always()
+        run: rm -f rwx-apple-app-store-connect-api-key.json rwx-developer-id-application-cert.pem
 
       - name: Archive release
         # we do this in its own step so that for darwin, abq is already signed
@@ -225,17 +228,6 @@ jobs:
         id: abq_version
         run: |
           echo "abq_version=$ABQ_VERSION" >> "$GITHUB_OUTPUT"
-      - name: check notarization status
-        timeout-minutes: 2
-        if: contains(matrix.platform, 'darwin')
-        run: |
-          # apple-codesign installed & app store connect api key written in previous notarization step
-          rcodesign notary-wait --max-wait-seconds 120 --api-key-path rwx-apple-app-store-connect-api-key.json "$SUBMISSION_ID"
-        env:
-          SUBMISSION_ID: ${{ steps.sign_and_notarize.outputs.submission_id }}
-      - name: ensure sign & notary cleanup happens
-        if: contains(matrix.platform, 'darwin') && always()
-        run: rm -f rwx-apple-app-store-connect-api-key.json rwx-developer-id-application-cert.pem
 
   notify-staging-api:
     name: Release new abq to staging API
