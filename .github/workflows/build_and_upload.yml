@@ -149,7 +149,7 @@ jobs:
         id: sign_and_notarize
         if: contains(matrix.platform, 'darwin')
         run: |
-          cargo install apple-codesign
+          (rcodesign --version | grep "$CODESIGN_VERSION")  || cargo install apple-codesign --force --version "$CODESIGN_VERSION"
           echo "$RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT" > rwx-developer-id-application-cert.pem
           # first we sign the binary. This happens locally.
           rcodesign sign --pem-source rwx-developer-id-application-cert.pem --code-signature-flags runtime "$RELEASE_NAME/abq"
@@ -159,6 +159,7 @@ jobs:
           echo "Submission ID: $submission_id"
           echo "submission_id=$submission_id" >> "$GITHUB_OUTPUT"
         env:
+          CODESIGN_VERSION: 0.22.0
           RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT: ${{ secrets.RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT }}
           RWX_APPLE_APP_STORE_CONNECT_API_KEY: ${{ secrets.RWX_APPLE_APP_STORE_CONNECT_API_KEY }}
       - name: ensure sign & notary cleanup happens
