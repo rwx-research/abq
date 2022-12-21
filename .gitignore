@@ -25,3 +25,4 @@ result
 bigtest/*/out
 .bundle/
 vendor/
+.vscode

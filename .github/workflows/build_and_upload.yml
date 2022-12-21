@@ -59,6 +59,11 @@ jobs:
           - os: ubuntu-latest
             platform: linux_x86-64
             cross-target: 'x86_64-unknown-linux-musl'
+            install-musl-tools: true
+          - os: ubuntu-latest
+            platform: linux_aarch64
+            cross-target: 'aarch64-unknown-linux-musl'
+            container: messense/rust-musl-cross:aarch64-musl
           - os: macos-10.15 # use an older version for broader osx support
             platform: darwin_x86-64
             cross-target: ''
@@ -66,6 +71,7 @@ jobs:
             platform: darwin_aarch64
             cross-target: 'aarch64-apple-darwin'
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
     env:
@@ -111,7 +117,7 @@ jobs:
 
       # We don't build a musl ABQ on MacOS
       - name: Install musl libc tools
-        if: contains(matrix.platform, 'linux')
+        if: matrix.install-musl-tools
         run: |
           sudo apt-get install -y musl-tools
 
@@ -129,11 +135,13 @@ jobs:
           RELEASE_NAME="abq_${ABQ_VERSION}_${{ matrix.platform }}"
           RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
           RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
+          RELEASE_S3_NIGHTLY_OBJECT="abq/nightly/abq_nightly_${{ matrix.platform }}"
           {
           echo "ABQ_VERSION=$ABQ_VERSION"
           echo "RELEASE_NAME=$RELEASE_NAME"
           echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE"
           echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT"
+          echo "RELEASE_S3_NIGHTLY_OBJECT=$RELEASE_S3_NIGHTLY_OBJECT"
           } >> "$GITHUB_ENV"
 
       - name: Move release to consistent directory
@@ -170,6 +178,27 @@ jobs:
         # we do this in its own step so that for darwin, abq is already signed
         run: tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
 
+      - name: Install tools to container that are baked into default image
+        if: matrix.container
+        # we need to install aws tools if we use a container. The default images have the tools baked in.
+        # AWS bit is approximately copied from the native image, https://github.com/actions/runner-images/blob/4aeccc7b5b5a63058b2d8a9a29072708e1f267bf/images/linux/scripts/installers/aws.sh#L11
+        # perhasp we should fork the musl container
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -qq awscliv2.zip
+          ./aws/install -i /usr/local/aws-cli -b /usr/local/bin
+
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+          apt install -y ./session-manager-plugin.deb
+
+          # Download & install the latest aws sam cli release
+          curl -L "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip" -o "aws-sam-cli-linux-x86_64.zip"
+          mkdir aws-sam
+          unzip aws-sam-cli-linux-x86_64.zip -d aws-sam
+          ./aws-sam/install
+
+          apt-get update && apt-get install jq -y
+
       - name: Push release to development S3
         env:
           RELEASE_BUCKET: abq-releases-development
@@ -186,7 +215,7 @@ jobs:
 
           aws s3 cp \
             "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
+            "s3://$RELEASE_BUCKET/$RELEASE_S3_NIGHTLY_OBJECT" \
             --profile development
 
       - name: Push release to staging S3
@@ -205,7 +234,7 @@ jobs:
 
           aws s3 cp \
             "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
+            "s3://$RELEASE_BUCKET/$RELEASE_S3_NIGHTLY_OBJECT" \
             --profile staging
       - name: Push release to production S3
         env:
@@ -223,7 +252,7 @@ jobs:
 
           aws s3 cp \
             "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
+            "s3://$RELEASE_BUCKET/$RELEASE_S3_NIGHTLY_OBJECT" \
             --profile production
       - name: export abq version
         id: abq_version
