@@ -24,7 +24,15 @@ serde_json = "1.0.91"
 rustls = "0.20.7"
 rustls-pemfile = "1.0.1"
 
-tokio = { version = "1.21.2", features = ["io-util", "net", "rt", "macros", "sync", "time", "process"] }
+tokio = { version = "1.21.2", features = [
+  "io-util",
+  "net",
+  "rt",
+  "macros",
+  "sync",
+  "time",
+  "process",
+] }
 tokio-rustls = "0.23.4"
 futures = "0.3.25"
 
@@ -66,7 +74,17 @@ nix = "0.26.1"
 [workspace.dependencies.uuid]
 version = "1.2.2"
 features = [
-    "v4",                # Lets you generate random UUIDs
-    "fast-rng",          # Use a faster (but still sufficiently random) RNG
-    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+  "v4",                # Lets you generate random UUIDs
+  "fast-rng",          # Use a faster (but still sufficiently random) RNG
+  "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ]
+
+# documentation: https://doc.rust-lang.org/stable/cargo/reference/profiles.html
+# a guide to makign rust binaries smaller: https://github.com/johnthagen/min-sized-rust
+# some minimal experimentation with these flags: https://docs.google.com/spreadsheets/d/1ley23pp_uvSQiy_jbTUc2K1cvoc2dCO_9MptyAue-DA/edit#gid=0
+[profile.release]
+lto = "fat"       # this should create faster & smaller builds at the cost of compile time
+strip = "symbols" # with this set, we can't use gdb (we still can aginst dev builds)
+opt-level = "s"   # may be slightly slower than the default of 3, but the benchmark results don't show any significant speed difference
+panic = "abort"   # disable rust backtraces on panic
+codegen-units = 1 # disables parallelism during the build, making the code faster & smaller at the cost of compile time
