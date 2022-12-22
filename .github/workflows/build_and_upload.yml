@@ -63,7 +63,7 @@ jobs:
           - os: ubuntu-latest
             platform: linux_aarch64
             cross-target: 'aarch64-unknown-linux-musl'
-            container: messense/rust-musl-cross:aarch64-musl
+            container: messense/rust-musl-cross:aarch64-musl@sha256:777bd4c61179c38dc213bb8472500584646d28fd4a7c3e0b30b9ef70cb446d58
           - os: macos-10.15 # use an older version for broader osx support
             platform: darwin_x86-64
             cross-target: ''
