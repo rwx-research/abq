@@ -84,7 +84,5 @@ features = [
 # some minimal experimentation with these flags: https://docs.google.com/spreadsheets/d/1ley23pp_uvSQiy_jbTUc2K1cvoc2dCO_9MptyAue-DA/edit#gid=0
 [profile.release]
 lto = "fat"       # this should create faster & smaller builds at the cost of compile time
-strip = "symbols" # with this set, we can't use gdb (we still can aginst dev builds)
 opt-level = "s"   # may be slightly slower than the default of 3, but the benchmark results don't show any significant speed difference
-panic = "abort"   # disable rust backtraces on panic
 codegen-units = 1 # disables parallelism during the build, making the code faster & smaller at the cost of compile time
