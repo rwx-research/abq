@@ -173,10 +173,12 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prepare release
+        id: prepare_release
         run: |
           mkdir "${RELEASE_NAME}"
           cp "target/$RUST_TARGET/release/abq" "${RELEASE_NAME}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
+          echo "filesize=$(wc -c "$RELEASE_ARCHIVE" | awk '{ print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Push release to staging S3
         env:
@@ -201,6 +203,33 @@ jobs:
         id: abq_version
         run: |
           echo "abq_version=${ABQ_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Analayze filesize
+        id: filesize
+        run: |
+          {
+            echo "formatted_filesize=$(printf "%'d" "$FILESIZE")"
+            echo "filesize=$FILESIZE"
+            echo "smaller_than_4mb=${{ steps.prepare_release.outputs.filesize < 4000000 && 'true' || 'false' }}"
+          } >> "$GITHUB_OUTPUT"
+        env:
+          FILESIZE: ${{ steps.prepare_release.outputs.filesize }}
+
+      - name: Get associated PR
+        uses: 8BitJonny/gh-get-current-pr@v2.2.0
+        id: pr
+
+      - name: Report filesize
+        uses: thollander/actions-comment-pull-request@v2
+        if: steps.PR.outputs.pr_found == 'true'
+        with:
+          pr_number: ${{ steps.pr.outputs.number }}
+          message: |
+            **Zipped Filesize for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
+            ${{ steps.filesize.outputs.smaller_than_4mb == 'true' && ':white_check_mark: smaller than 4MB' || ':x: greater than 4MB' }}
+            ${{ steps.filesize.outputs.formatted_filesize }} bytes
+
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   notify-api:
     name: Release new abq to staging API
