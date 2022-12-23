@@ -87,12 +87,12 @@ jobs:
           echo "emoji=$EMOJI" >> "$GITHUB_OUTPUT"
 
       - name: Get associated PR
-        uses: 8BitJonny/gh-get-current-pr@v2.2.0
+        uses: 8BitJonny/gh-get-current-pr@f4d16fd424adba1334de83b538f6cac7529d4683 # v2.2.0, locking to a ref to avoid supply chain attacks
         id: pr
         if: always() && github.ref != 'refs/heads/main'
 
       - name: Report bigtest
-        uses: thollander/actions-comment-pull-request@v2
+        uses: thollander/actions-comment-pull-request@d117ef6afcc405eca3137f55f39a2d4f7d559f6f # v2.3.0, locking to a ref to avoid supply chain attacks
         if: always() && github.ref != 'refs/heads/main'
         with:
           pr_number: ${{ steps.pr.outputs.number }}
