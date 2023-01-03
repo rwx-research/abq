@@ -24,16 +24,23 @@ pub struct Framework {
 impl From<&NativeRunnerSpecification> for Framework {
     fn from(spec: &NativeRunnerSpecification) -> Self {
         // Normalize kind/language for native runners we know to https://github.com/rwx-research/test-results-schema/blob/main/v1.json
-        let (kind, language) = match (spec.language.as_deref(), spec.test_framework.as_deref()) {
+        let mut provided_language = None;
+        let mut provided_kind = None;
+        let (language, kind) = match (spec.language.as_deref(), spec.test_framework.as_deref()) {
             (Some("ruby"), Some("rspec")) => ("Ruby", "RSpec"),
-            (lang, framework) => (lang.unwrap_or("other"), framework.unwrap_or("other")),
+            (Some("javascript"), Some("jest")) => ("JavaScript", "Jest"),
+            (lang, kind) => {
+                provided_language = lang;
+                provided_kind = kind;
+                ("other", "other")
+            }
         };
 
         Self {
             kind: kind.to_string(),
             language: language.to_string(),
-            provided_kind: None,
-            provided_language: None,
+            provided_kind: provided_kind.map(ToOwned::to_owned),
+            provided_language: provided_language.map(ToOwned::to_owned),
         }
     }
 }
@@ -496,5 +503,49 @@ mod test {
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__pretty", json)
         }
+    }
+
+    #[test]
+    fn ruby_rspec_lang() {
+        let collector = Collector::default();
+
+        let runner_spec = NativeRunnerSpecification {
+            name: "rspec-abq".to_string(),
+            version: "1.0.0".to_string(),
+            test_framework: Some("rspec".to_string()),
+            test_framework_version: Some("4.2.1".to_string()),
+            language: Some("ruby".to_string()),
+            language_version: Some("3.1.0".to_string()),
+            host: Some("abqmachine".to_string()),
+        };
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, &runner_spec)
+            .expect("failed to write");
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
+    }
+
+    #[test]
+    fn javascript_jest_lang() {
+        let collector = Collector::default();
+
+        let runner_spec = NativeRunnerSpecification {
+            name: "jest-abq".to_string(),
+            version: "29.3.100".to_string(),
+            test_framework: Some("jest".to_string()),
+            test_framework_version: Some("29.3.1".to_string()),
+            language: Some("javascript".to_string()),
+            language_version: Some("node-16.0.0".to_string()),
+            host: Some("abqnode-16.0.0".to_string()),
+        };
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, &runner_spec)
+            .expect("failed to write");
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
     }
 }

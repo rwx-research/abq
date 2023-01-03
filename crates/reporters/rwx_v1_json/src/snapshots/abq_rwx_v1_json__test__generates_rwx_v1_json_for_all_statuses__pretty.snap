@@ -5,8 +5,10 @@ expression: json
 {
   "$schema": "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json",
   "framework": {
-    "kind": "zlang",
-    "language": "zframework"
+    "kind": "other",
+    "language": "other",
+    "providedKind": "zframework",
+    "providedLanguage": "zlang"
   },
   "summary": {
     "status": {
