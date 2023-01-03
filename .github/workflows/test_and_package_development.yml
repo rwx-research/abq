@@ -104,34 +104,6 @@ jobs:
           cache: 'npm'
           cache-dependency-path: 'testdata/**/package-lock.json'
 
-      - name: Install Yarn
-        run: npm install -g yarn
-
-      - name: Pull native test runners
-        run: |
-          set -x
-
-          eval "$(ssh-agent -s)"
-
-          echo "${{secrets.SSH_KEY_ABQ_JEST}}" | ssh-add -
-          git submodule update --init -- native-runners/abq-jest
-
-          eval "$(ssh-agent -k)"
-
-      - name: Get yarn cache directory path
-        id: yarn-cache-dir-path
-        run: echo "dir=$(yarn config get cacheFolder)" >> "$GITHUB_OUTPUT"
-        shell: bash
-        working-directory: native-runners/abq-jest
-
-      - name: Restore yarn cache
-        uses: actions/cache@v3
-        with:
-          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
-          key: yarn-cache-folder-${{ hashFiles('native-runners/abq-jest/yarn.lock', '.yarnrc.yml') }}
-          restore-keys: |
-            yarn-cache-folder-
-
       - name: Load test dependencies
         run: |
           scripts/init_testdata
