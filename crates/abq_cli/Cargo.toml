@@ -35,6 +35,7 @@ indoc.workspace = true
 mimalloc = "0.1.32"
 
 [dev-dependencies]
+abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 insta.workspace = true
 paste.workspace = true
 serial_test.workspace = true

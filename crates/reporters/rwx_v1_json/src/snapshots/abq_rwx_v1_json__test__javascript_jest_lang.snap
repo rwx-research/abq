@@ -1,0 +1,28 @@
+---
+source: crates/reporters/rwx_v1_json/src/lib.rs
+expression: json
+---
+{
+  "$schema": "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json",
+  "framework": {
+    "kind": "Jest",
+    "language": "JavaScript"
+  },
+  "summary": {
+    "status": {
+      "kind": "successful"
+    },
+    "tests": 0,
+    "otherErrors": 0,
+    "retries": 0,
+    "canceled": 0,
+    "failed": 0,
+    "pended": 0,
+    "quarantined": 0,
+    "skipped": 0,
+    "successful": 0,
+    "timedOut": 0,
+    "todo": 0
+  },
+  "tests": []
+}
