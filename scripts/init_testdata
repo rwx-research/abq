@@ -5,11 +5,6 @@ set -exv
 cd "$(git rev-parse --show-toplevel)"
 
 if [ -z "$NO_ABQ_JEST" ]; then
-  pushd native-runners/abq-jest
-  yarn
-  yarn build:js
-  popd
-
   pushd testdata/jest/npm-jest-project
   npm install --include=dev
   popd
