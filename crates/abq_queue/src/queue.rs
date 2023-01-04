@@ -1331,8 +1331,9 @@ impl QueueServer {
                 .await
             }
             Message::CancelRun(run_id) => {
-                // The test supervisor will not wait for an ACK, so drop the stream immediately to
-                // avoid leaks.
+                // Immediately ACK the cancellation and drop the stream
+                net_protocol::async_write(&mut stream, &net_protocol::queue::AckTestResults {})
+                    .await?;
                 drop(stream);
 
                 Self::handle_run_cancellation(
