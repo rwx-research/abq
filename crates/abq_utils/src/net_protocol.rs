@@ -327,6 +327,12 @@ pub mod queue {
     #[serde(tag = "type")]
     pub struct AckTestResults {}
 
+    /// An acknowledgement of receiving a test cancellation request from a supervisor
+    /// Sent by the queue.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub struct AckTestCancellation {}
+
     /// **ADMIN RESPONSE**
     /// The queue acknowledges retirement.
     #[derive(Serialize, Deserialize)]

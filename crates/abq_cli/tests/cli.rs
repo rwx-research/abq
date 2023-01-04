@@ -505,7 +505,7 @@ test_all_network_config_options! {
         } = run_abq(&(name.to_string() + "_worker"), worker_args);
 
         // The worker should exit with a failure as well.
-        assert!(!exit_status.success(), "{:?}", (stdout, stderr));
+        assert!(!exit_status.success(), "EXIT:\n{:?}\nSTDOUT:\n{}\nSTDERR:\n{}", exit_status, stdout, stderr);
 
         term_queue(queue_proc);
     })

@@ -206,6 +206,8 @@ impl Client {
         )
         .await?;
 
+        let queue::AckTestCancellation {} = net_protocol::async_read(&mut conn).await?;
+
         Ok(())
     }
 
