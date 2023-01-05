@@ -10,6 +10,7 @@ members = [
   "crates/abq_runners/generic_test_runner",
   "crates/abq_runners/protocol",
   "crates/abq_test_support/with_protocol_version",
+  "crates/abq_test_support/write_runner_number",
   "crates/abq_utils",
   "crates/abq_workers",
   "crates/reporters/junit_xml",
@@ -64,6 +65,7 @@ derive_more = "0.99.17"
 insta = { version = "1.21.2", features = ["json"] }
 paste = "1.0.11"
 
+fs4 = "0.6.2"
 tempfile = "3.3.0"
 tracing-test = "0.2.3"
 

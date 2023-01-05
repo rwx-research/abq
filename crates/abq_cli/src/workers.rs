@@ -88,7 +88,7 @@ pub fn start_workers_forever(
             let exit_code = match exit_status {
                 WorkersExit::Success => 0,
                 WorkersExit::Failure => 1,
-                WorkersExit::Error => exit::CODE_ERROR,
+                WorkersExit::Error { .. } => exit::CODE_ERROR,
             };
             std::process::exit(exit_code);
         }
