@@ -112,6 +112,8 @@ pub mod workers {
     pub enum TestLikeRunner {
         /// A worker that echos strings given to it.
         Echo,
+        /// A worker that echos strings given to it as many test results, given by the separator.
+        EchoMany { seperator: char },
         /// A worker that echos initialization context.
         EchoInitContext,
         /// A worker that executes commands given to it.
@@ -275,14 +277,14 @@ pub mod queue {
         Failure(InvokeFailureReason),
     }
 
-    /// A test result associated with an individual unit of work.
-    pub type AssociatedTestResult = (WorkId, TestResult);
+    /// A set of test results associated with an individual unit of work.
+    pub type AssociatedTestResults = (WorkId, Vec<TestResult>);
 
     /// An incremental unit of information about the state of a test suite, or its test result.
     #[derive(Serialize, Deserialize, Debug)]
     pub enum InvokerTestData {
         /// A batch of test results.
-        Results(Vec<AssociatedTestResult>),
+        Results(Vec<AssociatedTestResults>),
         /// No more results are known.
         EndOfResults,
         /// The present test run has timed out, and not all test results have been reported in
@@ -381,7 +383,7 @@ pub mod queue {
         /// A work manifest for a given run.
         ManifestResult(RunId, ManifestResult),
         /// The result of some work from the queue.
-        WorkerResult(RunId, Vec<(WorkId, TestResult)>),
+        WorkerResult(RunId, Vec<AssociatedTestResults>),
         /// An ask to return information about whether a given test run failed or not.
         /// A worker issues this request before exiting to determine whether they should exit
         /// cleanly, or fail.

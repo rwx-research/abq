@@ -11,7 +11,7 @@ use abq_exec_worker as exec;
 use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner};
 use abq_runner_protocol::Runner;
 use abq_utils::net_protocol::entity::EntityId;
-use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
+use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, ManifestMessage, NativeRunnerSpecification, OutOfBandError, Status, TestId,
     TestResult, TestResultSpec, TestRuntime,
@@ -38,7 +38,7 @@ pub type GetNextTestsGenerator<'a> = &'a dyn Fn() -> GetNextTests;
 pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResults = Arc<
-    dyn Fn(EntityId, &RunId, Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>
+    dyn Fn(EntityId, &RunId, Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>
         + Send
         + Sync
         + 'static,
@@ -328,7 +328,7 @@ enum AttemptError {
     Timeout(Duration),
 }
 
-type AttemptResult = Result<String, AttemptError>;
+type AttemptResult = Result<Vec<String>, AttemptError>;
 
 struct WorkerEnv {
     msg_from_pool_rx: MessageFromPoolRx,
@@ -575,7 +575,7 @@ fn start_test_like_runner(
                         );
                         let runtime = start_time.elapsed().as_millis() as f64;
 
-                        let (status, output) = match attempt_result {
+                        let (status, outputs) = match attempt_result {
                             Ok(output) => (Status::Success, output),
                             Err(AttemptError::ShouldRetry) => continue 'attempts,
                             Err(AttemptError::Panic(msg)) => (
@@ -583,30 +583,35 @@ fn start_test_like_runner(
                                     exception: None,
                                     backtrace: None,
                                 },
-                                msg,
+                                vec![msg],
                             ),
                             Err(AttemptError::Timeout(time)) => (
                                 Status::Error {
                                     exception: None,
                                     backtrace: None,
                                 },
-                                format!("Timeout: {}ms", time.as_millis()),
+                                vec![format!("Timeout: {}ms", time.as_millis())],
                             ),
                         };
-                        let result = TestResult::new(TestResultSpec {
-                            status,
-                            id: test_case.id().clone(),
-                            display_name: test_case.id().clone(),
-                            output: Some(output),
-                            runtime: TestRuntime::Milliseconds(runtime),
-                            meta: Default::default(),
-                            ..TestResultSpec::fake()
-                        });
+                        let results = outputs
+                            .into_iter()
+                            .map(|output| {
+                                TestResult::new(TestResultSpec {
+                                    status: status.clone(),
+                                    id: test_case.id().clone(),
+                                    display_name: test_case.id().clone(),
+                                    output: Some(output),
+                                    runtime: TestRuntime::Milliseconds(runtime),
+                                    meta: Default::default(),
+                                    ..TestResultSpec::fake()
+                                })
+                            })
+                            .collect();
 
                         rt.block_on(notify_results(
                             entity,
                             &run_id,
-                            vec![(work_id.clone(), result)],
+                            vec![(work_id.clone(), results)],
                         ));
                         break 'attempts;
                     }
@@ -641,17 +646,32 @@ fn attempt_test_id_for_test_like_runner(
     let result_handle = thread::spawn(move || {
         let _attempt = attempt;
         match (runner, test_id) {
-            (R::Echo, s) => echo::EchoWorker::run(echo::EchoWork { message: s }),
-            (R::EchoInitContext, _) => echo::EchoWorker::run(echo::EchoWork {
-                message: init_context,
-            }),
+            (R::Echo, s) => {
+                let result = echo::EchoWorker::run(echo::EchoWork { message: s });
+                vec![result]
+            }
+            (R::EchoMany { seperator }, s) => {
+                let split_results = s.split(seperator).map(|s| {
+                    echo::EchoWorker::run(echo::EchoWork {
+                        message: s.to_string(),
+                    })
+                });
+                split_results.collect()
+            }
+            (R::EchoInitContext, _) => {
+                let ctx_result = echo::EchoWorker::run(echo::EchoWork {
+                    message: init_context,
+                });
+                vec![ctx_result]
+            }
             (R::Exec, cmd_and_args) => {
                 let mut args = cmd_and_args
                     .split(' ')
                     .map(ToOwned::to_owned)
                     .collect::<Vec<String>>();
                 let cmd = args.remove(0);
-                exec::ExecWorker::run(exec::Work { cmd, args })
+                let result = exec::ExecWorker::run(exec::Work { cmd, args });
+                vec![result]
             }
             (R::InduceTimeout, _) => {
                 // Sleep until we get the shutdown signal.
@@ -662,7 +682,7 @@ fn attempt_test_id_for_test_like_runner(
                 if test == fail_name {
                     panic!("INDUCED FAIL")
                 } else {
-                    "PASS".to_string()
+                    vec!["PASS".to_string()]
                 }
             }
             (R::NeverReturnManifest, _) => unreachable!(),
@@ -670,7 +690,8 @@ fn attempt_test_id_for_test_like_runner(
             #[cfg(feature = "test-test_ids")]
             (R::EchoOnRetry(succeed_on), s) => {
                 if succeed_on == _attempt {
-                    echo::EchoWorker::run(echo::EchoWork { message: s })
+                    let result = echo::EchoWorker::run(echo::EchoWork { message: s });
+                    vec![result]
                 } else {
                     panic!("Failed to echo!");
                 }
@@ -748,7 +769,7 @@ mod test {
     use crate::workers::WorkerPoolConfig;
     use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkContext, WorkId};
 
-    type ResultsCollector = Arc<Mutex<HashMap<String, TestResult>>>;
+    type ResultsCollector = Arc<Mutex<HashMap<String, Vec<TestResult>>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestResult>>>;
 
     fn work_writer() -> (impl Fn(NextWork), impl Fn() -> GetNextTests) {
@@ -795,7 +816,7 @@ mod test {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(_, result)| !result.status.is_fail_like())
+                .all(|(_, results)| !(results.iter().any(|r| r.status.is_fail_like())))
         });
         (results, notify_results, get_completed_status)
     }
@@ -884,7 +905,7 @@ mod test {
         let mut expected_results = HashMap::new();
         let tests = (0..num_echos).into_iter().map(|i| {
             let echo_string = format!("echo {}", i);
-            expected_results.insert(i.to_string(), echo_string.clone());
+            expected_results.insert(i.to_string(), vec![echo_string.clone()]);
 
             echo_test(protocol, echo_string)
         });
@@ -923,7 +944,10 @@ mod test {
                 .unwrap()
                 .clone()
                 .into_iter()
-                .map(|(k, v)| (k, v.into_spec().output.unwrap()))
+                .map(|(k, rs)| {
+                    let results_outputs = rs.into_iter().map(|r| r.into_spec().output.unwrap());
+                    (k, results_outputs.collect())
+                })
                 .collect();
 
             results == expected_results

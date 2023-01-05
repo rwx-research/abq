@@ -1,9 +1,9 @@
-use abq_utils::net_protocol::queue::AssociatedTestResult;
+use abq_utils::net_protocol::queue::AssociatedTestResults;
 
 use crate::SendTestResults;
 
 pub(crate) struct BufferedResults<'a> {
-    buffer: Vec<AssociatedTestResult>,
+    buffer: Vec<AssociatedTestResults>,
     batch_size: usize,
     send_test_results: SendTestResults<'a>,
 }
@@ -19,7 +19,7 @@ impl<'a> BufferedResults<'a> {
 }
 
 impl BufferedResults<'_> {
-    pub async fn push(&mut self, result: AssociatedTestResult) {
+    pub async fn push(&mut self, result: AssociatedTestResults) {
         self.buffer.push(result);
         if self.buffer.len() >= self.batch_size {
             self.send().await;

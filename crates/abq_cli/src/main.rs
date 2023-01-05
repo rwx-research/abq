@@ -25,7 +25,7 @@ use abq_utils::{
         entity::EntityId,
         health::Health,
         runners::{TestResult, TestRuntime},
-        workers::{NativeTestRunnerParams, RunId, RunnerKind, WorkId},
+        workers::{NativeTestRunnerParams, RunId, RunnerKind},
     },
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
@@ -631,7 +631,7 @@ fn run_tests(
         // escape; it vanishes at the end of this function, before `collector` is dropped.
         let reporters: &'static mut SuiteReporters = unsafe { std::mem::transmute(&mut reporters) };
 
-        move |_, test_result| {
+        move |test_result| {
             // TODO: is there a reasonable way to surface the error?
             let _opt_error = reporters.push_result(&test_result);
         }
@@ -784,7 +784,7 @@ fn start_test_result_reporter(
     runner: RunnerKind,
     batch_size: NonZeroU64,
     results_timeout: Duration,
-    on_result: impl FnMut(WorkId, TestResult) + Send + 'static,
+    on_result: impl FnMut(TestResult) + Send + 'static,
 ) -> io::Result<JoinHandle<Result<CompletedSummary, InvocationError>>> {
     let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
 

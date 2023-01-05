@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, Command};
 
 use abq_utils::net_protocol::entity::EntityId;
-use abq_utils::net_protocol::queue::{AssociatedTestResult, RunAlreadyCompleted};
+use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
     NativeRunnerSpecification, OutOfBandError, ProtocolWitness, RawNativeRunnerSpawnedMessage,
@@ -244,7 +244,7 @@ impl From<ProtocolVersionMessageError> for GenericRunnerError {
     }
 }
 
-pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResult>) -> BoxFuture<'static, ()>;
+pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>;
 
 pub type GetNextTests<'a> = &'a dyn Fn() -> BoxFuture<'static, NextWorkBundle>;
 
@@ -285,7 +285,7 @@ impl GenericTestRunner {
     }
 }
 
-type ResultsSender = mpsc::Sender<AssociatedTestResult>;
+type ResultsSender = mpsc::Sender<AssociatedTestResults>;
 
 async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     worker_entity: EntityId,
@@ -561,7 +561,7 @@ async fn handle_one_test(
     match opt_test_result_cycle {
         Ok(test_result_message) => {
             let send_to_chan_result = results_chan
-                .send((work_id, test_result_message.into_test_result()))
+                .send((work_id, test_result_message.into_test_results()))
                 .await;
 
             if let Err(se) = send_to_chan_result {
@@ -706,7 +706,7 @@ fn handle_native_runner_failure<I>(
             ..TestResultSpec::fake()
         });
 
-        final_results.push((work_id, error_result));
+        final_results.push((work_id, vec![error_result]));
     }
 
     send_test_result(final_results);
@@ -717,7 +717,7 @@ fn handle_native_runner_failure<I>(
 pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
     working_dir: PathBuf,
-) -> Result<(ReportedManifest, Vec<TestResult>), GenericRunnerError> {
+) -> Result<(ReportedManifest, Vec<Vec<TestResult>>), GenericRunnerError> {
     let mut manifest_message = None;
 
     // Currently, an atomic mutex is used here because `send_manifest`, `get_next_test`, and the
@@ -1138,8 +1138,11 @@ mod test_abq_jest {
 
         let (_, test_results) = execute_wrapped_runner(input, working_dir).unwrap();
 
-        let mut test_results: Vec<TestResultSpec> =
-            test_results.into_iter().map(|r| r.into_spec()).collect();
+        let mut test_results: Vec<TestResultSpec> = test_results
+            .into_iter()
+            .flatten()
+            .map(|result| result.into_spec())
+            .collect();
         test_results.sort_by_key(|r| r.id.clone());
 
         assert_eq!(test_results.len(), 2, "{:#?}", test_results);
