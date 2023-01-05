@@ -147,6 +147,27 @@ pub mod workers {
         TestLikeRunner(TestLikeRunner, Box<ManifestMessage>),
     }
 
+    /// Each native test runner spawned by a worker has the enviornment variable
+    /// `ABQ_RUNNER` set to a integer, counting from 1, that is unique to the runners launched by
+    /// the worker.
+    const ABQ_RUNNER: &str = "ABQ_RUNNER";
+
+    impl RunnerKind {
+        pub fn set_runner_id(&mut self, id: usize) {
+            match self {
+                RunnerKind::GenericNativeTestRunner(params) => {
+                    debug_assert!(!params.extra_env.contains_key(ABQ_RUNNER));
+                    params
+                        .extra_env
+                        .insert(ABQ_RUNNER.to_string(), id.to_string());
+                }
+                RunnerKind::TestLikeRunner(_, _) => {
+                    // Do nothing
+                }
+            }
+        }
+    }
+
     /// Context for a unit of work.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
     pub struct WorkContext {

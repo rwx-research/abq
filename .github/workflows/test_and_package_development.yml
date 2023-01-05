@@ -112,7 +112,7 @@ jobs:
 
       - name: Build release with tests
         run: |
-          cargo build --tests --release --all-features --target="$RUST_TARGET"
+          cargo build --tests --bins --release --all-features --target="$RUST_TARGET"
 
       - name: Run tests with cargo
         timeout-minutes: 4

@@ -150,7 +150,8 @@ pub enum WorkersExit {
     /// Corresponds to any workers for a given [run][RunId] having any work that failed.
     Failure,
     /// Some worker in this pool errored in an unexpected way.
-    Error,
+    /// Includes all noted errors.
+    Error { errors: Vec<String> },
 }
 
 impl WorkerPool {
@@ -213,7 +214,13 @@ impl WorkerPool {
                 debug_native_runner,
             };
 
-            workers.push(ThreadWorker::new(runner_kind.clone(), worker_env));
+            let runner_kind = {
+                let mut runner = runner_kind.clone();
+                runner.set_runner_id(1);
+                runner
+            };
+
+            workers.push(ThreadWorker::new(runner_kind, worker_env));
         }
 
         // Provision the rest of the workers.
@@ -238,7 +245,13 @@ impl WorkerPool {
                 debug_native_runner,
             };
 
-            workers.push(ThreadWorker::new(runner_kind.clone(), worker_env));
+            let runner_kind = {
+                let mut runner = runner_kind.clone();
+                runner.set_runner_id(_id + 1);
+                runner
+            };
+
+            workers.push(ThreadWorker::new(runner_kind, worker_env));
         }
 
         Self {
@@ -270,7 +283,7 @@ impl WorkerPool {
             let _ = self.worker_msg_tx.send(MessageFromPool::Shutdown);
         }
 
-        let mut worker_has_error = false;
+        let mut errors = vec![];
         for worker_thead in self.workers.iter_mut() {
             let opt_err = worker_thead
                 .handle
@@ -282,12 +295,12 @@ impl WorkerPool {
             if let Err(error) = opt_err {
                 tracing::error!(?error, "worker thread exited with error");
                 eprintln!("{}", error);
-                worker_has_error = true;
+                errors.push(error.to_string());
             }
         }
 
-        if worker_has_error {
-            WorkersExit::Error
+        if !errors.is_empty() {
+            WorkersExit::Error { errors }
         } else if (self.run_completed_successfully)(self.entity) {
             WorkersExit::Success
         } else {
@@ -705,6 +718,7 @@ fn attempt_test_id_for_test_like_runner(
 mod test {
     use std::collections::{HashMap, VecDeque};
     use std::num::NonZeroUsize;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -917,6 +931,20 @@ mod test {
 
         let exit = pool.shutdown();
         assert!(matches!(exit, WorkersExit::Success));
+    }
+
+    const WORKSPACE: &str = std::env!("ABQ_WORKSPACE_DIR");
+
+    fn abqtest_write_runner_number_path() -> PathBuf {
+        let prefix = if cfg!(all(target_arch = "x86_64", target_env = "musl")) {
+            // GHA is using a musl target
+            PathBuf::from(WORKSPACE).join("target/x86_64-unknown-linux-musl/release")
+        } else if cfg!(debug_assertions) {
+            PathBuf::from(WORKSPACE).join("target/debug")
+        } else {
+            PathBuf::from(WORKSPACE).join("target/release")
+        };
+        prefix.join("abqtest_write_runner_number")
     }
 
     #[test]
@@ -1136,6 +1164,37 @@ mod test {
 
         let pool_exit = pool.shutdown();
 
-        assert!(matches!(pool_exit, WorkersExit::Error));
+        assert!(matches!(pool_exit, WorkersExit::Error { .. }));
+    }
+
+    #[test]
+    fn sets_abq_native_runner_env_vars() {
+        let (_write_work, get_next_tests) = work_writer();
+        let (_results, notify_results, run_completed_successfully) = results_collector();
+
+        let writefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let writefile_path = writefile.to_path_buf();
+
+        let (mut config, _manifest_collector) = setup_pool(
+            RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+                cmd: abqtest_write_runner_number_path().display().to_string(),
+                args: vec![writefile_path.display().to_string()],
+                extra_env: Default::default(),
+            }),
+            RunId::unique(),
+            &get_next_tests,
+            notify_results,
+            run_completed_successfully,
+        );
+
+        config.size = NonZeroUsize::new(5).unwrap();
+
+        let mut pool = WorkerPool::new(config);
+        let _pool_exit = pool.shutdown();
+
+        let worker_ids = std::fs::read_to_string(writefile).unwrap();
+        let mut worker_ids: Vec<_> = worker_ids.trim().split('\n').collect();
+        worker_ids.sort();
+        assert_eq!(worker_ids, &["1", "2", "3", "4", "5"]);
     }
 }
