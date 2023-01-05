@@ -104,7 +104,7 @@ pub fn format_duration(writer: &mut impl io::Write, duration: TestRuntime) -> io
 
     let millis = match duration {
         TestRuntime::Milliseconds(ms) => ms as u64,
-        TestRuntime::Nanoseconds(ns) => ns * 1_000_000,
+        TestRuntime::Nanoseconds(ns) => ns / 1_000_000,
     };
     let (minutes, millis) = (millis / MILLIS_IN_MINUTE, millis % MILLIS_IN_MINUTE);
     let (seconds, millis) = (millis / MILLIS_IN_SECOND, millis % MILLIS_IN_SECOND);
@@ -340,8 +340,22 @@ mod test {
     );
 
     test_format!(
+        format_exact_seconds_leftover_millis_from_nanos, format_duration,
+        TestRuntime::Nanoseconds(Duration::from_millis(15 * 1000 + 35).as_nanos() as _),
+        @"15 s, 35 ms"
+        @"15 s, 35 ms"
+    );
+
+    test_format!(
         format_exact_millis, format_duration,
         TestRuntime::Milliseconds(Duration::from_millis(35).as_millis() as _),
+        @"35 ms"
+        @"35 ms"
+    );
+
+    test_format!(
+        format_exact_millis_from_nanos, format_duration,
+        TestRuntime::Nanoseconds(35_000_000),
         @"35 ms"
         @"35 ms"
     );
