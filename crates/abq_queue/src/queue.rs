@@ -16,7 +16,7 @@ use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResult, InvokerTestData, NativeRunnerInfo, Request,
+    AssociatedTestResults, InvokerTestData, NativeRunnerInfo, Request,
 };
 use abq_utils::net_protocol::runners::{MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
@@ -841,7 +841,7 @@ fn start_queue(config: QueueConfig) -> Abq {
 
 #[derive(Debug)]
 struct BufferedResults {
-    buffer: Vec<AssociatedTestResult>,
+    buffer: Vec<AssociatedTestResults>,
     max_size: usize,
 }
 
@@ -861,8 +861,8 @@ impl BufferedResults {
     /// to be drained are returned.
     fn extend(
         &mut self,
-        results: impl IntoIterator<Item = AssociatedTestResult>,
-    ) -> Option<Vec<AssociatedTestResult>> {
+        results: impl IntoIterator<Item = AssociatedTestResults>,
+    ) -> Option<Vec<AssociatedTestResults>> {
         self.buffer.extend(results);
         if self.buffer.len() >= self.max_size {
             return Some(self.buffer.drain(..).collect());
@@ -870,7 +870,7 @@ impl BufferedResults {
         None
     }
 
-    fn drain_all(&mut self) -> Vec<AssociatedTestResult> {
+    fn drain_all(&mut self) -> Vec<AssociatedTestResults> {
         std::mem::take(&mut self.buffer)
     }
 
@@ -890,7 +890,7 @@ enum ClientResponder {
     /// There is not yet an open connection we can stream the test results back on.
     /// This state may be reached during the time a client is disconnected.
     Disconnected {
-        results: Vec<AssociatedTestResult>,
+        results: Vec<AssociatedTestResults>,
         pending_runner_info: Option<NativeRunnerInfo>,
         /// Size of the [buffer][BufferedResults] we should create when moving back into connected
         /// mode.
@@ -909,7 +909,7 @@ impl ClientResponder {
     async fn stream_test_result_batch_help(
         stream: &mut Box<dyn net_async::ServerStream>,
         buffer: &mut BufferedResults,
-        results: Vec<AssociatedTestResult>,
+        results: Vec<AssociatedTestResults>,
     ) -> Result<(), Self> {
         use net_protocol::client::AckTestData;
 
@@ -950,7 +950,7 @@ impl ClientResponder {
 
     async fn send_test_results(
         &mut self,
-        test_results: impl IntoIterator<Item = AssociatedTestResult>,
+        test_results: impl IntoIterator<Item = AssociatedTestResults>,
     ) {
         match self {
             ClientResponder::DirectStream { stream, buffer } => {
@@ -1850,14 +1850,14 @@ impl QueueServer {
         worker_next_tests_tasks: ConnectedWorkers,
         entity: EntityId,
         run_id: RunId,
-        results: Vec<AssociatedTestResult>,
+        results: Vec<AssociatedTestResults>,
     ) -> Result<(), AnyError> {
         // IFTTT: handle_fired_timeout
 
         let num_results = results.len();
         let any_result_is_fail_like = results
             .iter()
-            .any(|(_, result)| result.status.is_fail_like());
+            .any(|(_, results_for_id)| results_for_id.iter().any(|r| r.status.is_fail_like()));
 
         {
             // First up, chuck the test result back over to `abq test`. Make sure we don't steal
@@ -2704,7 +2704,7 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id.clone(),
-                vec![(buffered_work_id.clone(), TestResult::fake())],
+                vec![(buffered_work_id.clone(), vec![TestResult::fake()])],
             )
             .await
             .unwrap();
@@ -2769,7 +2769,7 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id,
-                vec![(second_work_id.clone(), TestResult::fake())],
+                vec![(second_work_id.clone(), vec![TestResult::fake()])],
             ));
 
             let (work_id, _) = match client.next().await.unwrap() {
@@ -3353,7 +3353,7 @@ mod test {
             worker_next_tests_tasks.clone(),
             entity,
             run_id.clone(),
-            vec![(WorkId("work".into()), TestResult::fake())],
+            vec![(WorkId("work".into()), vec![TestResult::fake()])],
         );
         let cancellation_fut = QueueServer::handle_run_cancellation(
             queues.clone(),

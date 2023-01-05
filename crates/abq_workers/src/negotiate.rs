@@ -1030,8 +1030,8 @@ mod test {
                 net_protocol::queue::Message::WorkerResult(_, results) => {
                     net_protocol::write(&mut client, net_protocol::queue::AckTestResults {})
                         .unwrap();
-                    for (_, result) in results {
-                        msgs2.lock().unwrap().push(result);
+                    for (_, results_for_id) in results {
+                        msgs2.lock().unwrap().extend(results_for_id);
                     }
                 }
                 net_protocol::queue::Message::ManifestResult(_, manifest_result) => {

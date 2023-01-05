@@ -254,8 +254,28 @@ pub struct OutOfBandError {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TestResultMessage {
+pub struct SingleTestResultMessage {
     pub test_result: TestResult,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct MultipleTestResultsMessage {
+    pub test_results: Vec<TestResult>,
+}
 pub type TestId = String;
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TestResultMessage {
+    Single(SingleTestResultMessage),
+    Multiple(MultipleTestResultsMessage),
+}
+
+impl TestResultMessage {
+    pub fn into_test_results(self) -> Vec<super::TestResult> {
+        match self {
+            Self::Single(msg) => vec![msg.test_result.into()],
+            Self::Multiple(msg) => msg.test_results.into_iter().map(|r| r.into()).collect(),
+        }
+    }
+}

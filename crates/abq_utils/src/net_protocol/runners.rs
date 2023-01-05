@@ -778,11 +778,11 @@ static_assertions::assert_eq_size!(RawTestResultMessage, [u8; 112]);
 
 impl RawTestResultMessage {
     /// Extract the [test result][TestResult] from the message.
-    pub fn into_test_result(self) -> TestResult {
+    pub fn into_test_results(self) -> Vec<TestResult> {
         use PrivTestResultMessage::*;
         match self.0 {
-            V0_1(msg) => msg.test_result.into(),
-            V0_2(msg) => msg.test_result.into(),
+            V0_1(msg) => vec![msg.test_result.into()],
+            V0_2(msg) => msg.into_test_results(),
         }
     }
 }

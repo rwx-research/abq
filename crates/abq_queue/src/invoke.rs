@@ -20,9 +20,11 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::EntityId,
-        queue::{self, InvokeWork, InvokerTestData, Message, NativeRunnerInfo},
+        queue::{
+            self, AssociatedTestResults, InvokeWork, InvokerTestData, Message, NativeRunnerInfo,
+        },
         runners::TestResult,
-        workers::{RunId, RunnerKind, WorkId},
+        workers::{RunId, RunnerKind},
     },
 };
 
@@ -104,7 +106,7 @@ impl RunCancellationRx {
 }
 
 pub(crate) enum IncrementalTestData {
-    Results(Vec<(WorkId, TestResult)>),
+    Results(Vec<AssociatedTestResults>),
     Finished,
     NativeRunnerInfo(NativeRunnerInfo),
 }
@@ -298,7 +300,7 @@ impl Client {
     /// result is received.
     pub async fn stream_results(
         mut self,
-        mut on_result: impl FnMut(WorkId, TestResult),
+        mut on_result: impl FnMut(TestResult),
     ) -> Result<CompletedSummary, TestResultError> {
         use IncrementalTestData::*;
 
@@ -310,8 +312,10 @@ impl Client {
                     break;
                 }
                 Results(results) => {
-                    for (work_id, test_result) in results {
-                        on_result(work_id, test_result);
+                    for (_work_id, test_results_for_id) in results {
+                        for test_result in test_results_for_id {
+                            on_result(test_result);
+                        }
                     }
                 }
                 NativeRunnerInfo(runner_info) => {

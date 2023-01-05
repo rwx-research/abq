@@ -28,7 +28,7 @@ use abq_utils::{
             ProtocolWitness, Test, TestOrGroup, TestResult,
         },
         work_server::{InitContext, InitContextResponse},
-        workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
+        workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner},
     },
     tls::ClientTlsStrategy,
 };
@@ -102,10 +102,10 @@ fn default_workers_config() -> WorkersConfig {
     }
 }
 
-fn sort_results<Id>(results: &mut [(Id, TestResult)]) -> Vec<&str> {
+fn sort_results(results: &mut [TestResult]) -> Vec<&str> {
     let mut results = results
         .iter()
-        .map(|(_id, result)| result.output.as_ref().unwrap().as_str())
+        .map(|result| result.output.as_ref().unwrap().as_str())
         .collect::<Vec<_>>();
     results.sort_unstable();
     results
@@ -159,7 +159,7 @@ enum Assert<'a> {
 
     TestExit(Sid, &'a dyn Fn(&Result<CompletedSummary, TestResultError>)),
     TestExitWithoutErr(Sid),
-    TestResults(Sid, &'a dyn Fn(&[(WorkId, TestResult)]) -> bool),
+    TestResults(Sid, &'a dyn Fn(&[TestResult]) -> bool),
 
     WorkersAreRedundant(Wid),
     WorkerExit(Wid, &'a dyn Fn(&WorkersExit)),
@@ -202,9 +202,8 @@ impl<'a> TestBuilder<'a> {
 }
 
 type Supervisors = Arc<Mutex<HashMap<Sid, Result<Client, InvocationError>>>>;
-type SupervisorData = Arc<
-    tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, Arc<Mutex<Vec<(WorkId, TestResult)>>>)>>,
->;
+type SupervisorData =
+    Arc<tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, Arc<Mutex<Vec<TestResult>>>)>>>;
 type SupervisorResults =
     Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedSummary, TestResultError>>>>;
 
@@ -287,9 +286,7 @@ fn action_to_fut(
                 let client = client.unwrap();
 
                 let result = client
-                    .stream_results(move |work_id, result| {
-                        collected_results.lock().push((work_id, result))
-                    })
+                    .stream_results(move |result| collected_results.lock().push(result))
                     .await;
 
                 supervisor_results.lock().await.insert(super_id, result);
@@ -1197,6 +1194,47 @@ fn native_runner_returns_manifest_failure() {
         .step(
             [StopWorkers(Wid(1))],
             [WorkerExit(Wid(1), &|e| assert!(matches!(e, WorkersExit::Error {..})))],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn multiple_tests_per_work_id_reported() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1,echo2,echo3".to_string()),
+            echo_test(proto, "echo4,echo5,echo6".to_string()),
+        ],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(
+        TestLikeRunner::EchoMany { seperator: ',' },
+        Box::new(manifest),
+    );
+
+    TestBuilder::default()
+        .step(
+            [
+                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
+                StartWorkers(Run(1), Wid(1), default_workers_config()),
+            ],
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results(&mut results);
+                    results == ["echo1", "echo2", "echo3", "echo4", "echo5", "echo6"]
+                }),
+            ],
+        )
+        .step(
+            [StopWorkers(Wid(1))],
+            [WorkerExit(Wid(1), &|e| {
+                assert!(matches!(e, WorkersExit::Success))
+            })],
         )
         .test();
 }
