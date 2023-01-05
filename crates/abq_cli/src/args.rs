@@ -212,6 +212,7 @@ pub enum Command {
         queue_addr: Option<SocketAddr>,
 
         /// Number of workers to start when running in standalone mode.
+        ///
         /// NOTE: If present, will always launch in standalone mode.
         /// Set to "cpu-cores" to use the number of available (physical) CPUs cores - 1.
         ///
@@ -242,7 +243,11 @@ pub enum Command {
         #[clap(long, requires("tls_cert"))]
         tls_key: Option<PathBuf>,
 
-        /// Test result reporter to use for a test run.
+        /// Test result reporter to use for a test run. Options are:{n}
+        ///- dot: prints a dot for each test{n}
+        ///- line: prints a line for each test{n}
+        ///- junit-xml[=path/to/results.xml]: outputs a junit-compatible xml file to specified path. Defaults to ./abq-test-results.xml{n}
+        ///- rwx-v1-json[=path/to/results.json]: outputs a rwx-v1-compatible json file to specified path. Defaults to ./abq-test-results.json
         #[clap(long, default_value = "dot")]
         reporter: Vec<ReporterKind>,
 
