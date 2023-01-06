@@ -63,6 +63,7 @@ dependencies = [
  "futures",
  "indoc",
  "insta",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",

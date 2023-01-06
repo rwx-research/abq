@@ -622,7 +622,7 @@ test_all_network_config_options! {
 
         let mut lines = stdout.lines();
         assert!(lines.next().unwrap().contains("Starting test run"));
-        assert_eq!(lines.next().unwrap(), "F");
+        assert_eq!(lines.next().unwrap(), "FF");
 
         assert!(stderr.is_empty());
 
