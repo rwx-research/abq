@@ -14,5 +14,8 @@
     "@jest/core": "npm:@rwx-research/jest-core@29.3.100-alpha.0",
     "jest-config": "npm:@rwx-research/jest-config@29.3.100-alpha.0",
     "jest-runner": "npm:@rwx-research/jest-runner@29.3.100-alpha.0"
+  },
+  "jest": {
+    "verbose": true
   }
 }

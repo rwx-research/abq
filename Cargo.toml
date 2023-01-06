@@ -27,6 +27,7 @@ rustls-pemfile = "1.0.1"
 
 tokio = { version = "1.21.2", features = [
   "io-util",
+  "io-std",
   "net",
   "rt",
   "macros",

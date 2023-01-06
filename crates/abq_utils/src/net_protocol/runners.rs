@@ -21,6 +21,7 @@
 //!
 //! The sum type is then normalized to one data structure that the rest of ABQ operates over.
 
+use std::ops::DerefMut;
 use std::time::Duration;
 use std::{collections::VecDeque, ops::Deref};
 
@@ -726,6 +727,12 @@ impl Deref for TestResult {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl DerefMut for TestResult {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 

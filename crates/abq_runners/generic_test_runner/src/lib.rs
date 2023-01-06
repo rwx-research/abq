@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 use buffered_results::BufferedResults;
 use message_buffer::{Completed, RefillStrategy};
+use mux_output::MuxOutput;
+use tokio::io::{Stderr, Stdout};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{self, Command};
+use tokio::process::{self, ChildStderr, ChildStdout, Command};
 
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
@@ -32,8 +34,11 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
+use crate::mux_output::mux_output;
+
 mod buffered_results;
 mod message_buffer;
+mod mux_output;
 
 pub struct GenericTestRunner;
 
@@ -369,11 +374,10 @@ where
     native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
     native_runner.envs(additional_env);
     native_runner.current_dir(working_dir);
-    // NB(130): we'd like to surface native runner output today, but tomorrow
-    // (with https://github.com/rwx-research/abq/issues/130) this should either
-    // be captured or hidden behind the `debug_native_runner` flag.
-    native_runner.stdout(Stdio::inherit());
-    native_runner.stderr(Stdio::inherit());
+
+    // The stdout/stderr will be multiplexed manually below.
+    native_runner.stdout(Stdio::piped());
+    native_runner.stderr(Stdio::piped());
 
     // If launching the native runner fails here, it should have failed during manifest
     // generation as well (unless this is a flakey error in the underlying test runner, channel
@@ -381,6 +385,16 @@ where
     // will have notified the queue, at this point, failures should just result in the worker
     // exiting silently itself.
     let mut native_runner_handle = native_runner.spawn()?;
+
+    // Set up multiplexing of the native runner's stdout/stderr.
+    // We want both standard pipes of the child to point to our (the parent's) standard pipes, and
+    // to managed buffers we'll extract when an individual test completes.
+    let mux_pipes = {
+        let child_stdout = native_runner_handle.stdout.take().expect("just spawned");
+        let child_stderr = native_runner_handle.stderr.take().expect("just spawned");
+        MuxPipes::new(child_stdout, child_stderr)
+    };
+
     let native_runner_died = async {
         let _ = native_runner_handle.wait().await;
     };
@@ -492,8 +506,14 @@ where
         {
             let estimated_start = Instant::now();
 
-            let handled_test =
-                handle_one_test(&mut runner_conn, work_id, test_case, &results_tx).await?;
+            let handled_test = handle_one_test(
+                &mut runner_conn,
+                &mux_pipes,
+                work_id,
+                test_case,
+                &results_tx,
+            )
+            .await?;
 
             let estimated_runtime = estimated_start.elapsed();
 
@@ -518,6 +538,10 @@ where
         drop(runner_conn);
         drop(our_listener);
         let exit_status = native_runner_handle.wait().await?;
+
+        // TODO: report unassociated standard output/error.
+        let (_unassoc_stdout, _unassoc_stderr) = mux_pipes.finish().await?;
+
         if exit_status.success() {
             Ok(())
         } else {
@@ -543,12 +567,72 @@ pub enum NativeTestRunnerError {
     OOBError(#[from] OutOfBandError),
 }
 
+struct MuxPipes {
+    stdout: MuxOutput<ChildStdout, Stdout>,
+    stderr: MuxOutput<ChildStderr, Stderr>,
+}
+
+impl MuxPipes {
+    fn new(child_stdout: ChildStdout, child_stderr: ChildStderr) -> Self {
+        let our_stdout: Stdout = tokio::io::stdout();
+        let our_stderr: Stderr = tokio::io::stderr();
+        Self {
+            stdout: mux_output(child_stdout, our_stdout),
+            stderr: mux_output(child_stderr, our_stderr),
+        }
+    }
+
+    fn begin_capture(&self) {
+        self.stdout.side_channel.begin_capture();
+        self.stderr.side_channel.begin_capture();
+    }
+
+    fn end_capture(&self) -> (String, String) {
+        // NB: if we ever measure this to be compute-expensive, consider making `end_capture` async
+        // and not allocating a new buf for `from_utf8_lossy`
+        let stdout = self.stdout.side_channel.end_capture();
+        let stderr = self.stderr.side_channel.end_capture();
+
+        // Must be lossy here because the capture ordering is not guaranteed, and it very well may
+        // be that we splice off the capture in the middle of writing a UTF-8 word!
+        (
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )
+    }
+
+    async fn finish(self) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let MuxOutput {
+            copied_all_output: copied_stdout,
+            side_channel: side_stdout,
+            ..
+        } = self.stdout;
+        let MuxOutput {
+            copied_all_output: copied_stderr,
+            side_channel: side_stderr,
+            ..
+        } = self.stderr;
+        copied_stdout.await.unwrap()?;
+        copied_stderr.await.unwrap()?;
+        let unassoc_stdout = side_stdout
+            .finish()
+            .expect("channel reference must be unique at this point");
+        let unassoc_stderr = side_stderr
+            .finish()
+            .expect("channel reference must be unique at this point");
+        Ok((unassoc_stdout, unassoc_stderr))
+    }
+}
+
 async fn handle_one_test(
     runner_conn: &mut RunnerConnection,
+    mux_pipes: &MuxPipes,
     work_id: WorkId,
     test_case: TestCase,
     results_chan: &ResultsSender,
 ) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError> {
+    mux_pipes.begin_capture();
+
     let test_case_message = TestCaseMessage::new(test_case);
 
     use futures::TryFutureExt;
@@ -558,11 +642,14 @@ async fn handle_one_test(
             .and_then(|_| net_protocol::async_read(runner_conn))
             .await;
 
+    let (stdout, stderr) = mux_pipes.end_capture();
+
     match opt_test_result_cycle {
         Ok(test_result_message) => {
-            let send_to_chan_result = results_chan
-                .send((work_id, test_result_message.into_test_results()))
-                .await;
+            let mut test_results = test_result_message.into_test_results();
+            attach_pipe_output_to_test_results(&mut test_results, stdout, stderr);
+
+            let send_to_chan_result = results_chan.send((work_id, test_results)).await;
 
             if let Err(se) = send_to_chan_result {
                 let (work_id, _) = se.0;
@@ -576,6 +663,30 @@ async fn handle_one_test(
             Ok(Ok(()))
         }
         Err(err) => Ok(Err((work_id, err.into()))),
+    }
+}
+
+fn attach_pipe_output_to_test_results(
+    test_results: &mut [TestResult],
+    stdout: String,
+    stderr: String,
+) {
+    // Happier path: exactly one test result, we can hand over the output uniquely.
+    // TODO: can we pass stdout/stderr to `TestResult` as borrowed for the purposes of sending?
+    match test_results {
+        [tr] => {
+            tr.stdout = Some(stdout);
+            tr.stderr = Some(stderr);
+        }
+        _ => {
+            // NB: when a manifest test returns multiple test results, we currently cannot
+            // distinguish what stdout belongs to what test!
+            // Consider protocol-level support for this, with aid from native runners.
+            for tr in test_results {
+                tr.stdout = Some(stdout.clone());
+                tr.stderr = Some(stderr.clone());
+            }
+        }
     }
 }
 
@@ -803,7 +914,7 @@ pub fn execute_wrapped_runner(
         }
     };
 
-    GenericTestRunner::run(
+    let _opt_exit_error = GenericTestRunner::run(
         EntityId::new(),
         native_runner_params,
         &working_dir,
@@ -814,7 +925,7 @@ pub fn execute_wrapped_runner(
         get_next_test,
         send_test_result,
         false,
-    )?;
+    );
 
     if let Some(error) = opt_error_cell {
         return Err(GenericRunnerError::Io(io::Error::new(
@@ -1063,6 +1174,19 @@ mod test_abq_jest {
             .join("testdata/jest/npm-jest-project")
     }
 
+    fn npm_jest_failing_project_path() -> PathBuf {
+        PathBuf::from(std::env::var("ABQ_WORKSPACE_DIR").unwrap())
+            .join("testdata/jest/npm-jest-project-with-failures")
+    }
+
+    fn write_leading_markers(s: &str) -> String {
+        s.lines()
+            .into_iter()
+            .map(|s| format!("|{s}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn get_manifest() {
         let input = NativeTestRunnerParams {
@@ -1152,6 +1276,63 @@ mod test_abq_jest {
 
         assert_eq!(test_results[1].status, Status::Success);
         assert!(test_results[1].id.ends_with("names.test.js"));
+    }
+
+    #[test]
+    fn get_manifest_and_run_tests_with_stdout() {
+        let working_dir = npm_jest_failing_project_path();
+        let input = NativeTestRunnerParams {
+            cmd: "npm".to_string(),
+            args: vec!["test".to_string()],
+            extra_env: vec![("TERM".to_string(), "dumb".to_string())]
+                .into_iter()
+                .collect(),
+        };
+
+        let (_, test_results) = execute_wrapped_runner(input, working_dir).unwrap();
+
+        let mut test_results: Vec<TestResultSpec> = test_results
+            .into_iter()
+            .flatten()
+            .map(|result| result.into_spec())
+            .collect();
+        test_results.sort_by_key(|r| r.id.clone());
+
+        assert_eq!(test_results.len(), 2, "{:#?}", test_results);
+
+        {
+            assert!(matches!(test_results[0].status, Status::Failure { .. }));
+            assert!(test_results[0].id.ends_with("add.test.js"));
+            assert!(matches!(&test_results[0].stderr, Some(s) if !s.is_empty()));
+
+            let stdout = test_results[0].stdout.as_deref().unwrap();
+            let stdout = write_leading_markers(stdout);
+
+            insta::assert_snapshot!(stdout, @r###"
+            |  console.log
+            |    hello from a first jest test
+            |
+            |      at Object.log (add.test.js:4:11)
+            |
+            "###);
+        }
+
+        {
+            assert!(matches!(test_results[1].status, Status::Failure { .. }));
+            assert!(test_results[1].id.ends_with("add2.test.js"));
+            assert!(matches!(&test_results[1].stderr, Some(s) if !s.is_empty()));
+
+            let stdout = test_results[1].stdout.as_deref().unwrap();
+            let stdout = write_leading_markers(stdout);
+
+            insta::assert_snapshot!(stdout, @r###"
+            |  console.log
+            |    hello from a second jest test
+            |
+            |      at Object.log (add2.test.js:4:11)
+            |
+            "###);
+        }
     }
 
     #[test]
