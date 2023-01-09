@@ -554,7 +554,12 @@ pub fn write<T: serde::Serialize>(writer: &mut impl Write, msg: T) -> Result<(),
     let mut msg_buf = Vec::new();
     msg_buf.extend_from_slice(&msg_size_buf);
     msg_buf.extend_from_slice(&msg_json);
+
+    // NB: to be safe, always flush after writing.
+    // See `async_write` for motivation.
     writer.write_all(&msg_buf)?;
+    writer.flush()?;
+
     Ok(())
 }
 
@@ -590,7 +595,12 @@ where
             read_result?;
         }
         _ = tokio::time::sleep(timeout) => {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "timed out attempting to read exact message size"));
+            // NB: in practice messages may contain null bytes, so this is just an estimate;
+            // however, they are unlikely to contain multiple null bytes in a row.
+            let estimated_read = msg_size - (msg_buf.iter().rev().take_while(|c| **c != 0).count() as u32);
+            let msg = format!("timed out waiting to read {msg_size} bytes; estimated read {estimated_read}");
+
+            return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
         }
     }
 
@@ -611,10 +621,21 @@ where
     let msg_size = msg_json.len();
     let msg_size_buf = u32::to_be_bytes(msg_size as u32);
 
-    let mut msg_buf = Vec::new();
+    let mut msg_buf = Vec::with_capacity(msg_size_buf.len() + msg_json.len());
     msg_buf.extend_from_slice(&msg_size_buf);
     msg_buf.extend_from_slice(&msg_json);
+
+    // NB: to be safe, always flush after writing. [tokio::io::AsyncWrite::poll_write] makes no
+    // guarantee about the behavior after `write_all`, including whether the implementing type must
+    // flush any intermediate buffers upon destruction.
+    //
+    // In fact, our tokio-tls shim does not ensure TLS frames are flushed upon connection
+    // destruction:
+    //
+    //   https://github.com/tokio-rs/tls/blob/master/tokio-rustls/src/client.rs#L138-L139
     writer.write_all(&msg_buf).await?;
+    writer.flush().await?;
+
     Ok(())
 }
 
