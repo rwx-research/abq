@@ -36,6 +36,7 @@ mimalloc = "0.1.32"
 
 [dev-dependencies]
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
+abq_test_utils = { path = "../abq_test_support/abq_test_utils" }
 insta.workspace = true
 paste.workspace = true
 serial_test.workspace = true

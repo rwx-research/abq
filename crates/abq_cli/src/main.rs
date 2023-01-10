@@ -20,6 +20,7 @@ use abq_output::format_duration;
 use abq_queue::invoke::{self, Client, CompletedSummary, InvocationError, TestResultError};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
+    exit::ExitCode,
     net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
         entity::EntityId,
@@ -38,7 +39,7 @@ use args::{
 use clap::Parser;
 
 use instance::AbqInstance;
-use reporting::{ColorPreference, ExitCode, ReporterKind, SuiteReporters};
+use reporting::{ColorPreference, ReporterKind, SuiteReporters};
 use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
@@ -466,7 +467,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 }
             }
             let exit = if all_healthy { 0 } else { 1 };
-            Ok(reporting::ExitCode::new(exit))
+            Ok(ExitCode::new(exit))
         }
         Command::Token(Token::New) => {
             let token = UserToken::new_random();

@@ -17,6 +17,7 @@ use abq_queue::{
 };
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
+    exit::ExitCode,
     net::{ClientStream, ConfiguredClient},
     net_opt::ClientOptions,
     net_protocol::{
@@ -650,7 +651,12 @@ fn worker_exits_with_failure_if_test_fails() {
         .step(
             [StopWorkers(Wid(1))],
             [WorkerExit(Wid(1), &|e| {
-                assert!(matches!(e, WorkersExit::Failure { .. }))
+                assert!(matches!(
+                    e,
+                    WorkersExit::Failure {
+                        exit_code: ExitCode::FAILURE
+                    }
+                ))
             })],
         )
         .test();
@@ -705,10 +711,20 @@ fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
             [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
             [
                 WorkerExit(Wid(1), &|e| {
-                    assert!(matches!(e, WorkersExit::Failure { .. }))
+                    assert!(matches!(
+                        e,
+                        WorkersExit::Failure {
+                            exit_code: ExitCode::FAILURE
+                        }
+                    ))
                 }),
                 WorkerExit(Wid(2), &|e| {
-                    assert!(matches!(e, WorkersExit::Failure { .. }))
+                    assert!(matches!(
+                        e,
+                        WorkersExit::Failure {
+                            exit_code: ExitCode::FAILURE
+                        }
+                    ))
                 }),
             ],
         )

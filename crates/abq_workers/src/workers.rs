@@ -10,6 +10,7 @@ use abq_echo_worker as echo;
 use abq_exec_worker as exec;
 use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner};
 use abq_runner_protocol::Runner;
+use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
@@ -148,7 +149,7 @@ pub enum WorkersExit {
     Success,
     /// This pool of workers was determined to fail.
     /// Corresponds to any workers for a given [run][RunId] having any work that failed.
-    Failure,
+    Failure { exit_code: ExitCode },
     /// Some worker in this pool errored in an unexpected way.
     /// Includes all noted errors.
     Error { errors: Vec<String> },
@@ -284,6 +285,7 @@ impl WorkerPool {
         }
 
         let mut errors = vec![];
+        let mut failure_exit_code = ExitCode::new(1);
         for worker_thead in self.workers.iter_mut() {
             let opt_err = worker_thead
                 .handle
@@ -292,10 +294,19 @@ impl WorkerPool {
                 .join()
                 .expect("runner thread panicked rather than erroring");
 
-            if let Err(error) = opt_err {
-                tracing::error!(?error, "worker thread exited with error");
-                eprintln!("{}", error);
-                errors.push(error.to_string());
+            match opt_err {
+                Ok(ec) => {
+                    // Choose the highest exit code of all the test runners this worker started to
+                    // be the exit code of the worker.
+                    if ec.get() > failure_exit_code.get() {
+                        failure_exit_code = ec;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(?error, "worker thread exited with error");
+                    eprintln!("{}", error);
+                    errors.push(error.to_string());
+                }
             }
         }
 
@@ -304,7 +315,9 @@ impl WorkerPool {
         } else if (self.run_completed_successfully)(self.entity) {
             WorkersExit::Success
         } else {
-            WorkersExit::Failure
+            WorkersExit::Failure {
+                exit_code: failure_exit_code,
+            }
         }
     }
 }
@@ -319,7 +332,7 @@ impl Drop for WorkerPool {
 }
 
 struct ThreadWorker {
-    handle: Option<thread::JoinHandle<Result<(), GenericRunnerError>>>,
+    handle: Option<thread::JoinHandle<Result<ExitCode, GenericRunnerError>>>,
 }
 
 enum AttemptError {
@@ -365,7 +378,7 @@ impl ThreadWorker {
 fn start_generic_test_runner(
     env: WorkerEnv,
     native_runner_params: NativeTestRunnerParams,
-) -> Result<(), GenericRunnerError> {
+) -> Result<ExitCode, GenericRunnerError> {
     let WorkerEnv {
         get_next_tests: get_next_tests_bundle,
         run_id,
@@ -463,7 +476,7 @@ fn start_test_like_runner(
     env: WorkerEnv,
     runner: TestLikeRunner,
     manifest: ManifestMessage,
-) -> Result<(), GenericRunnerError> {
+) -> Result<ExitCode, GenericRunnerError> {
     let WorkerEnv {
         msg_from_pool_rx,
         get_next_tests,
@@ -481,8 +494,14 @@ fn start_test_like_runner(
 
     let entity = EntityId::new();
 
-    if matches!(runner, TestLikeRunner::NeverReturnManifest) {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "will not return manifest").into());
+    match runner {
+        TestLikeRunner::NeverReturnManifest => {
+            return Err(
+                io::Error::new(io::ErrorKind::Unsupported, "will not return manifest").into(),
+            );
+        }
+        TestLikeRunner::ExitWith(ec) => return Ok(ExitCode::new(ec)),
+        _ => { /* pass through */ }
     }
 
     if let Some(notify_manifest) = notify_manifest {
@@ -506,7 +525,7 @@ fn start_test_like_runner(
 
     let init_context = match get_init_context() {
         Ok(ctx) => ctx,
-        Err(RunAlreadyCompleted {}) => return Ok(()),
+        Err(RunAlreadyCompleted {}) => return Ok(ExitCode::SUCCESS),
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -622,7 +641,7 @@ fn start_test_like_runner(
 
     mark_worker_complete();
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 #[inline(always)]
@@ -743,6 +762,7 @@ mod test {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use abq_test_utils::artifacts_dir;
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol;
@@ -957,18 +977,8 @@ mod test {
         assert!(matches!(exit, WorkersExit::Success));
     }
 
-    const WORKSPACE: &str = std::env!("ABQ_WORKSPACE_DIR");
-
     fn abqtest_write_runner_number_path() -> PathBuf {
-        let prefix = if cfg!(all(target_arch = "x86_64", target_env = "musl")) {
-            // GHA is using a musl target
-            PathBuf::from(WORKSPACE).join("target/x86_64-unknown-linux-musl/release")
-        } else if cfg!(debug_assertions) {
-            PathBuf::from(WORKSPACE).join("target/debug")
-        } else {
-            PathBuf::from(WORKSPACE).join("target/release")
-        };
-        prefix.join("abqtest_write_runner_number")
+        artifacts_dir().join("abqtest_write_runner_number")
     }
 
     #[test]
@@ -1220,5 +1230,40 @@ mod test {
         let mut worker_ids: Vec<_> = worker_ids.trim().split('\n').collect();
         worker_ids.sort();
         assert_eq!(worker_ids, &["1", "2", "3", "4", "5"]);
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn worker_exits_with_runner_exit() {
+        let (_write_work, get_next_tests) = work_writer();
+        let (_results, notify_results, _run_completed_successfully) = results_collector();
+        let run_completed_successfully = Arc::new(Box::new(|_| false));
+
+        let manifest = ManifestMessage::new(Manifest::new(
+            [echo_test(proto, "test1".to_string())],
+            Default::default(),
+        ));
+        let (mut config, _manifest_collector) = setup_pool(
+            RunnerKind::TestLikeRunner(TestLikeRunner::ExitWith(27), Box::new(manifest)),
+            RunId::unique(),
+            &get_next_tests,
+            notify_results,
+            run_completed_successfully,
+        );
+
+        config.size = NonZeroUsize::new(1).unwrap();
+
+        let mut pool = WorkerPool::new(config);
+        let pool_exit = pool.shutdown();
+
+        assert!(
+            matches!(
+                pool_exit,
+                WorkersExit::Failure {
+                    exit_code
+                } if exit_code.get() == 27
+            ),
+            "{pool_exit:?}"
+        )
     }
 }
