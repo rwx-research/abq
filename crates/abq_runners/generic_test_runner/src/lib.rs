@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use abq_utils::exit::ExitCode;
 use buffered_results::BufferedResults;
 use message_buffer::{Completed, RefillStrategy};
 use mux_output::MuxOutput;
@@ -226,8 +227,6 @@ pub enum GenericRunnerError {
     ProtocolVersion(ProtocolVersionError),
     #[error("{0}")]
     NativeRunner(#[from] NativeTestRunnerError),
-    #[error("native runner executed ABQ work successfully, but exited with {0}")]
-    NonZeroExit(#[from] FailureExit),
 }
 
 impl From<RetrieveManifestError> for GenericRunnerError {
@@ -265,7 +264,7 @@ impl GenericTestRunner {
         get_next_test_bundle: GetNextTests,
         send_test_results: SendTestResults,
         debug_native_runner: bool,
-    ) -> Result<(), GenericRunnerError>
+    ) -> Result<ExitCode, GenericRunnerError>
     where
         ShouldShutdown: Fn() -> bool,
         // TODO: make both of these async!
@@ -303,7 +302,7 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     get_next_test_bundle: GetNextTests<'_>,
     send_test_results: SendTestResults<'_>,
     _debug_native_runner: bool,
-) -> Result<(), GenericRunnerError>
+) -> Result<ExitCode, GenericRunnerError>
 where
     ShouldShutdown: Fn() -> bool,
     SendManifest: FnMut(ManifestResult),
@@ -440,11 +439,7 @@ where
                 );
                 net_protocol::async_write(&mut runner_conn, &init_message).await?;
                 let exit_status = native_runner_handle.wait().await?;
-                if exit_status.success() {
-                    return Ok(());
-                } else {
-                    return Err(FailureExit(exit_status.code()).into());
-                }
+                return Ok(exit_status.into());
             }
         };
     }
@@ -530,7 +525,7 @@ where
                     remaining_tests,
                 );
 
-                return Err(native_error.into());
+                return Err(GenericRunnerError::from(native_error));
             }
         }
 
@@ -542,21 +537,15 @@ where
         // TODO: report unassociated standard output/error.
         let (_unassoc_stdout, _unassoc_stderr) = mux_pipes.finish().await?;
 
-        if exit_status.success() {
-            Ok(())
-        } else {
-            Err(GenericRunnerError::NonZeroExit(FailureExit(
-                exit_status.code(),
-            )))
-        }
+        Ok(ExitCode::from(exit_status))
     };
 
     let ((), run_tests_result, ()) =
         tokio::join!(fetch_tests_task, run_tests_task, send_results_task);
 
-    run_tests_result?;
+    let exit_code = run_tests_result?;
 
-    Ok(())
+    Ok(exit_code)
 }
 
 #[derive(Debug, Error)]

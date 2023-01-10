@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use abq_test_utils::{artifacts_dir, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
 use serial_test::serial;
 use std::process::{ExitStatus, Output};
@@ -11,8 +12,6 @@ use std::{
 };
 
 use abq_utils::net_protocol::workers::RunId;
-
-const WORKSPACE: &str = std::env!("ABQ_WORKSPACE_DIR");
 
 const TLS_CERT: &str = std::concat!(std::env!("ABQ_WORKSPACE_DIR"), "testdata/certs/server.crt");
 const TLS_KEY: &str = std::concat!(std::env!("ABQ_WORKSPACE_DIR"), "testdata/certs/server.key");
@@ -37,14 +36,7 @@ fn debug_log_for_ci() -> bool {
 }
 
 fn abq_binary() -> PathBuf {
-    if cfg!(all(target_arch = "x86_64", target_env = "musl")) {
-        // GHA is using a musl target
-        PathBuf::from(WORKSPACE).join("target/x86_64-unknown-linux-musl/release/abq")
-    } else if cfg!(debug_assertions) {
-        PathBuf::from(WORKSPACE).join("target/debug/abq")
-    } else {
-        PathBuf::from(WORKSPACE).join("target/release/abq")
-    }
+    artifacts_dir().join("abq")
 }
 
 #[cfg(feature = "test-abq-jest")]

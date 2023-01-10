@@ -126,6 +126,8 @@ pub mod workers {
         NeverReturnManifest,
         /// A worker that errors when a test of a name is received, never returning a result.
         NeverReturnOnTest(String),
+        /// Yields the given exit code.
+        ExitWith(i32),
         /// A worker that echos a string given to it after a number of retries.
         #[cfg(feature = "test-actions")]
         EchoOnRetry(u8),

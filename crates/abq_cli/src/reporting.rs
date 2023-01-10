@@ -12,7 +12,7 @@ use abq_output::{
 };
 use abq_queue::invoke::CompletedSummary;
 use abq_utils::{
-    exit,
+    exit::{self, ExitCode},
     net_protocol::runners::{Status, TestResult, TestRuntime},
 };
 use termcolor::{ColorChoice, StandardStream};
@@ -103,19 +103,6 @@ pub enum ReportingError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-pub(crate) struct ExitCode(i32);
-
-impl ExitCode {
-    pub fn get(&self) -> i32 {
-        self.0
-    }
-
-    pub fn new(code: i32) -> Self {
-        Self(code)
-    }
-}
-
 struct SuiteResultBuilder {
     success: bool,
     suggested_exit_code: ExitCode,
@@ -129,7 +116,7 @@ impl Default for SuiteResultBuilder {
     fn default() -> Self {
         Self {
             success: true,
-            suggested_exit_code: ExitCode(0),
+            suggested_exit_code: ExitCode::new(0),
             count: 0,
             count_failed: 0,
             start_time: Instant::now(),
@@ -159,12 +146,12 @@ impl SuiteResultBuilder {
         match test_result.status {
             Status::PrivateNativeRunnerError => {
                 self.success = false;
-                self.suggested_exit_code = ExitCode(exit::CODE_ERROR);
+                self.suggested_exit_code = ExitCode::new(exit::CODE_ERROR);
             }
             Status::Failure { .. } | Status::Error { .. } | Status::TimedOut if self.success => {
                 // If we already recorded a failure or error, that takes priority.
                 self.success = false;
-                self.suggested_exit_code = ExitCode(1);
+                self.suggested_exit_code = ExitCode::new(1);
             }
             _ => {}
         }
@@ -1121,41 +1108,41 @@ mod suite {
     }
 
     test_status! {
-        success_if_no_errors, [Success, Pending, Skipped], ExitCode(0), 3
+        success_if_no_errors, [Success, Pending, Skipped], ExitCode::new(0), 3
         fail_if_success_then_error, [
             Success,
             Error { exception: None, backtrace: None }],
-            ExitCode(1), 2
+            ExitCode::new(1), 2
         fail_if_error_then_success, [
             Error { exception: None, backtrace: None },
             Success],
-            ExitCode(1), 2
+            ExitCode::new(1), 2
         fail_if_success_then_failure, [
             Success,
             Failure { exception: None, backtrace: None }],
-            ExitCode(1), 2
+            ExitCode::new(1), 2
         fail_if_failure_then_success, [
             Failure { exception: None, backtrace: None },
             Success],
-            ExitCode(1), 2
-        error_if_success_then_internal_error, [Success, PrivateNativeRunnerError], ExitCode(exit::CODE_ERROR), 2
-        error_if_internal_error_then_success, [PrivateNativeRunnerError, Success], ExitCode(exit::CODE_ERROR), 2
+            ExitCode::new(1), 2
+        error_if_success_then_internal_error, [Success, PrivateNativeRunnerError], ExitCode::new(exit::CODE_ERROR), 2
+        error_if_internal_error_then_success, [PrivateNativeRunnerError, Success], ExitCode::new(exit::CODE_ERROR), 2
         error_if_error_then_internal_error, [
             Error { exception: None, backtrace: None },
             PrivateNativeRunnerError],
-            ExitCode(exit::CODE_ERROR), 2
+            ExitCode::new(exit::CODE_ERROR), 2
         error_if_internal_error_then_error, [
             PrivateNativeRunnerError,
             Error { exception: None, backtrace: None }],
-            ExitCode(exit::CODE_ERROR), 2
+            ExitCode::new(exit::CODE_ERROR), 2
         error_if_failure_then_internal_error, [
             Failure { exception: None, backtrace: None },
             PrivateNativeRunnerError],
-            ExitCode(exit::CODE_ERROR), 2
+            ExitCode::new(exit::CODE_ERROR), 2
         error_if_internal_error_then_failure, [
             PrivateNativeRunnerError,
             Failure { exception: None, backtrace: None }],
-            ExitCode(exit::CODE_ERROR), 2
+            ExitCode::new(exit::CODE_ERROR), 2
     }
 
     fn get_short_summary_lines(summary: SuiteResult) -> String {
@@ -1167,7 +1154,7 @@ mod suite {
     #[test]
     fn summary_when_no_tests_fail() {
         let summary = SuiteResult {
-            suggested_exit_code: ExitCode(0),
+            suggested_exit_code: ExitCode::new(0),
             count: 10,
             count_failed: 0,
             wall_time: Duration::from_secs(78),
@@ -1182,7 +1169,7 @@ mod suite {
     #[test]
     fn summary_when_some_tests_fail() {
         let summary = SuiteResult {
-            suggested_exit_code: ExitCode(0),
+            suggested_exit_code: ExitCode::new(0),
             count: 10,
             count_failed: 5,
             wall_time: Duration::from_secs(78),

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
-use abq_utils::exit;
+use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::workers::RunId;
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
@@ -86,11 +86,11 @@ pub fn start_workers_forever(
             // failures of workers, and it is enough to restart all unsuccessful processes to
             // re-initialize an ABQ run.
             let exit_code = match exit_status {
-                WorkersExit::Success => 0,
-                WorkersExit::Failure => 1,
-                WorkersExit::Error { .. } => exit::CODE_ERROR,
+                WorkersExit::Success => ExitCode::SUCCESS,
+                WorkersExit::Failure { exit_code } => exit_code,
+                WorkersExit::Error { .. } => ExitCode::ABQ_ERROR,
             };
-            std::process::exit(exit_code);
+            std::process::exit(exit_code.get());
         }
     }
 }

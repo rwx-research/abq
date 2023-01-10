@@ -12,6 +12,7 @@ dependencies = [
  "abq_queue",
  "abq_runner_protocol",
  "abq_rwx_v1_json",
+ "abq_test_utils",
  "abq_utils",
  "abq_workers",
  "anyhow",
@@ -152,6 +153,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "abq_test_utils"
+version = "0.1.0"
+dependencies = [
+ "abq_utils",
+]
+
+[[package]]
 name = "abq_utils"
 version = "0.1.0"
 dependencies = [
@@ -190,6 +198,7 @@ dependencies = [
  "abq_exec_worker",
  "abq_generic_test_runner",
  "abq_runner_protocol",
+ "abq_test_utils",
  "abq_utils",
  "abq_with_protocol_version",
  "futures",

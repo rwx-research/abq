@@ -20,6 +20,7 @@ use crate::workers::{
 };
 use abq_utils::{
     auth::User,
+    exit::ExitCode,
     net, net_async,
     net_opt::ClientOptions,
     net_protocol::{
@@ -138,7 +139,9 @@ impl NegotiatedWorkers {
                 if *success {
                     WorkersExit::Success
                 } else {
-                    WorkersExit::Failure
+                    WorkersExit::Failure {
+                        exit_code: ExitCode::FAILURE,
+                    }
                 }
             }
             NegotiatedWorkers::Pool(pool) => pool.shutdown(),
