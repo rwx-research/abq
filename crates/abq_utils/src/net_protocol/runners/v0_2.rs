@@ -253,6 +253,8 @@ pub struct OutOfBandError {
     pub meta: Option<MetadataMap>,
 }
 
+pub type TestId = String;
+
 #[derive(Serialize, Deserialize)]
 pub struct SingleTestResultMessage {
     pub test_result: TestResult,
@@ -262,20 +264,51 @@ pub struct SingleTestResultMessage {
 pub struct MultipleTestResultsMessage {
     pub test_results: Vec<TestResult>,
 }
-pub type TestId = String;
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename = "incremental_result")]
+pub struct IncrementalTestResultOne {
+    pub one_test_result: TestResult,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename = "incremental_result_done")]
+pub struct IncrementalTestResultDone {
+    pub last_test_result: Option<TestResult>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IncrementalTestResultMessage {
+    One(IncrementalTestResultOne),
+    Done(IncrementalTestResultDone),
+}
+
+impl IncrementalTestResultMessage {
+    pub fn into_step(self) -> super::IncrementalTestResultStep {
+        use super::IncrementalTestResultStep::*;
+        match self {
+            Self::One(r) => One(r.one_test_result.into()),
+            Self::Done(r) => Done(r.last_test_result.map(Into::into)),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TestResultMessage {
+    Incremental(IncrementalTestResultMessage),
     Single(SingleTestResultMessage),
     Multiple(MultipleTestResultsMessage),
 }
 
 impl TestResultMessage {
-    pub fn into_test_results(self) -> Vec<super::TestResult> {
+    pub fn into_test_results(self) -> super::TestResultSet {
+        use super::TestResultSet::*;
         match self {
-            Self::Single(msg) => vec![msg.test_result.into()],
-            Self::Multiple(msg) => msg.test_results.into_iter().map(|r| r.into()).collect(),
+            Self::Single(msg) => All(vec![msg.test_result.into()]),
+            Self::Multiple(msg) => All(msg.test_results.into_iter().map(|r| r.into()).collect()),
+            Self::Incremental(msg) => Incremental(msg.into_step()),
         }
     }
 }
