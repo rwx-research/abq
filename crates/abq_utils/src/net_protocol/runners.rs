@@ -785,11 +785,41 @@ static_assertions::assert_eq_size!(RawTestResultMessage, [u8; 112]);
 
 impl RawTestResultMessage {
     /// Extract the [test result][TestResult] from the message.
-    pub fn into_test_results(self) -> Vec<TestResult> {
+    pub fn into_test_results(self) -> TestResultSet {
         use PrivTestResultMessage::*;
         match self.0 {
-            V0_1(msg) => vec![msg.test_result.into()],
+            V0_1(msg) => TestResultSet::All(vec![msg.test_result.into()]),
             V0_2(msg) => msg.into_test_results(),
+        }
+    }
+}
+
+pub enum TestResultSet {
+    /// All test results for this unit of work are yielded.
+    All(Vec<TestResult>),
+    /// More test results for this unit of work may be delivered incrementally; parse
+    /// [`RawIncrementalTestResult`]s.
+    Incremental(IncrementalTestResultStep),
+}
+
+pub enum IncrementalTestResultStep {
+    One(TestResult),
+    Done(Option<TestResult>),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RawIncrementalTestResultMessage(PrivIncrementalTestResultMessage);
+#[derive(Serialize, Deserialize, derive_more::From)]
+#[serde(untagged)]
+enum PrivIncrementalTestResultMessage {
+    V0_2(v0_2::IncrementalTestResultMessage),
+}
+
+impl RawIncrementalTestResultMessage {
+    pub fn into_step(self) -> IncrementalTestResultStep {
+        use PrivIncrementalTestResultMessage::*;
+        match self.0 {
+            V0_2(msg) => msg.into_step(),
         }
     }
 }

@@ -27,7 +27,7 @@ use abq_utils::net_protocol::workers::{
     WorkContext, WorkId, WorkerTest,
 };
 use abq_utils::{atomic, net_protocol};
-use futures::future::{self, BoxFuture};
+use futures::future::BoxFuture;
 use futures::{Future, FutureExt};
 use indoc::indoc;
 use thiserror::Error;
@@ -631,24 +631,13 @@ async fn handle_one_test(
     test_case: TestCase,
     results_chan: &ResultsSender,
 ) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError> {
-    mux_pipes.begin_capture();
-
     let test_case_message = TestCaseMessage::new(test_case);
 
-    use futures::TryFutureExt;
+    let opt_test_results =
+        send_and_wait_for_test_results(runner_conn, mux_pipes, test_case_message).await;
 
-    let opt_test_result_cycle: Result<RawTestResultMessage, _> =
-        future::ready(net_protocol::async_write(runner_conn, &test_case_message).await)
-            .and_then(|_| net_protocol::async_read(runner_conn))
-            .await;
-
-    let (stdout, stderr) = mux_pipes.end_capture();
-
-    match opt_test_result_cycle {
-        Ok(test_result_message) => {
-            let mut test_results = test_result_message.into_test_results();
-            attach_pipe_output_to_test_results(&mut test_results, stdout, stderr);
-
+    match opt_test_results {
+        Ok(test_results) => {
             let send_to_chan_result = results_chan.send((work_id, test_results)).await;
 
             if let Err(se) = send_to_chan_result {
@@ -666,6 +655,72 @@ async fn handle_one_test(
     }
 }
 
+async fn send_and_wait_for_test_results(
+    runner_conn: &mut RunnerConnection,
+    mux_pipes: &MuxPipes,
+    test_case_message: TestCaseMessage,
+) -> io::Result<Vec<TestResult>> {
+    // start capturing stdout before we send the test case
+    mux_pipes.begin_capture();
+
+    net_protocol::async_write(runner_conn, &test_case_message).await?;
+    let raw_msg: RawTestResultMessage = net_protocol::async_read(runner_conn).await?;
+
+    use net_protocol::runners::{
+        IncrementalTestResultStep, RawIncrementalTestResultMessage, TestResultSet,
+    };
+
+    // stop capturing stdout after we receive a
+    let (mut result_stdout, mut result_stderr) = mux_pipes.end_capture();
+
+    let results = match raw_msg.into_test_results() {
+        TestResultSet::All(mut results) => {
+            attach_pipe_output_to_test_results(&mut results, result_stdout, result_stderr);
+            results
+        }
+        TestResultSet::Incremental(mut step) => {
+            // We need to poll until we get a marker that all test results are done.
+            let mut results = Vec::with_capacity(4);
+            loop {
+                use IncrementalTestResultStep::*;
+                match step {
+                    One(mut res) => {
+                        // If there's a next test case, it's already off; start capturing.
+                        mux_pipes.begin_capture();
+
+                        // Add the stdout/stderr for the last incremental result.
+                        attach_pipe_output_to_test_result(&mut res, result_stdout, result_stderr);
+                        results.push(res);
+
+                        // Wait for the next incremental result.
+                        let raw_increment: RawIncrementalTestResultMessage =
+                            net_protocol::async_read(runner_conn).await?;
+
+                        // Get the captured output for the next result (the one that just completed, not `res`)
+                        (result_stdout, result_stderr) = mux_pipes.end_capture();
+
+                        step = raw_increment.into_step();
+                    }
+                    Done(opt_res) => {
+                        if let Some(mut result) = opt_res {
+                            attach_pipe_output_to_test_result(
+                                &mut result,
+                                result_stdout,
+                                result_stderr,
+                            );
+                            results.push(result);
+                        }
+                        break;
+                    }
+                }
+            }
+            results
+        }
+    };
+
+    Ok(results)
+}
+
 fn attach_pipe_output_to_test_results(
     test_results: &mut [TestResult],
     stdout: String,
@@ -674,20 +729,21 @@ fn attach_pipe_output_to_test_results(
     // Happier path: exactly one test result, we can hand over the output uniquely.
     // TODO: can we pass stdout/stderr to `TestResult` as borrowed for the purposes of sending?
     match test_results {
-        [tr] => {
-            tr.stdout = Some(stdout);
-            tr.stderr = Some(stderr);
-        }
+        [tr] => attach_pipe_output_to_test_result(tr, stdout, stderr),
         _ => {
             // NB: when a manifest test returns multiple test results, we currently cannot
             // distinguish what stdout belongs to what test!
             // Consider protocol-level support for this, with aid from native runners.
             for tr in test_results {
-                tr.stdout = Some(stdout.clone());
-                tr.stderr = Some(stderr.clone());
+                attach_pipe_output_to_test_result(tr, stdout.clone(), stderr.clone());
             }
         }
     }
+}
+
+fn attach_pipe_output_to_test_result(test_result: &mut TestResult, stdout: String, stderr: String) {
+    test_result.stdout = Some(stdout);
+    test_result.stderr = Some(stderr);
 }
 
 const INDENT: &str = "    ";
