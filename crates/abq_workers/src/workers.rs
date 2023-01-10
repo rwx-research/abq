@@ -704,8 +704,6 @@ fn attempt_test_id_for_test_like_runner(
                     vec!["PASS".to_string()]
                 }
             }
-            (R::NeverReturnManifest, _) => unreachable!(),
-            (R::NeverReturnOnTest(..), _) => unreachable!(),
             #[cfg(feature = "test-test_ids")]
             (R::EchoOnRetry(succeed_on), s) => {
                 if succeed_on == _attempt {
@@ -715,7 +713,6 @@ fn attempt_test_id_for_test_like_runner(
                     panic!("Failed to echo!");
                 }
             }
-            #[cfg(feature = "test-actions")]
             (runner, test_id) => unreachable!(
                 "Invalid runner/test_id combination: {:?} and {:?}",
                 runner, test_id
