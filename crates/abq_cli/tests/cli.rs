@@ -263,7 +263,7 @@ test_all_network_config_options! {
         let mut args = conf.extend_args_for_in_band_client(args);
         args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
-            stdout: _,
+            stdout,
             stderr: _,
             exit_status,
         } = run_abq_in(
@@ -274,6 +274,7 @@ test_all_network_config_options! {
         );
 
         assert!(exit_status.success());
+        assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{}", stdout);
         // TODO(130): add back once https://github.com/rwx-research/abq/issues/130 lands; right now
         // this prints more than needed because we don't capture worker stdout/stderr
         // assert_eq!(stdout, "..");
@@ -395,6 +396,7 @@ test_all_network_config_options! {
         let mut lines = stdout.lines();
         assert!(lines.next().unwrap().contains("Starting test run"));
         assert_eq!(lines.next().unwrap(), "..");
+        assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{}", stdout);
 
         assert!(stderr.is_empty());
 
@@ -536,6 +538,7 @@ test_all_network_config_options! {
         // assert_eq!(stdout_lines.next().unwrap(), "F");
         // assert!(stderr.is_empty(), "{:?}", stderr);
         assert!(stdout_lines.into_iter().any(|line| line.contains('F')));
+        assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{}", stdout);
     })
 }
 
@@ -615,6 +618,7 @@ test_all_network_config_options! {
         let mut lines = stdout.lines();
         assert!(lines.next().unwrap().contains("Starting test run"));
         assert_eq!(lines.next().unwrap(), "FF");
+        assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{}", stdout);
 
         assert!(stderr.is_empty());
 

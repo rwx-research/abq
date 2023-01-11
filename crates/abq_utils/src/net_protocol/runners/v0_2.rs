@@ -190,10 +190,10 @@ pub enum Status {
     TimedOut,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Iso8601(pub String);
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TestResult {
     pub status: Status,
     pub id: TestId,
@@ -222,7 +222,7 @@ pub struct TestResult {
     pub other_errors: Option<Vec<OutOfBandError>>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub file: String,
     pub line: Option<u64>,
@@ -240,7 +240,7 @@ impl Location {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Error)]
+#[derive(Serialize, Deserialize, Debug, Clone, Error, PartialEq, Eq)]
 pub struct OutOfBandError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -255,46 +255,38 @@ pub struct OutOfBandError {
 
 pub type TestId = String;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct SingleTestResultMessage {
     pub test_result: TestResult,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct MultipleTestResultsMessage {
     pub test_results: Vec<TestResult>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename = "incremental_result")]
-pub struct IncrementalTestResultOne {
-    pub one_test_result: TestResult,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", rename = "incremental_result_done")]
-pub struct IncrementalTestResultDone {
-    pub last_test_result: Option<TestResult>,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type")]
 pub enum IncrementalTestResultMessage {
-    One(IncrementalTestResultOne),
-    Done(IncrementalTestResultDone),
+    #[serde(rename = "incremental_result")]
+    One { one_test_result: TestResult },
+    #[serde(rename = "incremental_result_done")]
+    Done {
+        last_test_result: Option<TestResult>,
+    },
 }
 
 impl IncrementalTestResultMessage {
     pub fn into_step(self) -> super::IncrementalTestResultStep {
         use super::IncrementalTestResultStep::*;
         match self {
-            Self::One(r) => One(r.one_test_result.into()),
-            Self::Done(r) => Done(r.last_test_result.map(Into::into)),
+            Self::One { one_test_result } => One(one_test_result.into()),
+            Self::Done { last_test_result } => Done(last_test_result.map(Into::into)),
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 pub enum TestResultMessage {
     Incremental(IncrementalTestResultMessage),
@@ -310,5 +302,102 @@ impl TestResultMessage {
             Self::Multiple(msg) => All(msg.test_results.into_iter().map(|r| r.into()).collect()),
             Self::Incremental(msg) => Incremental(msg.into_step()),
         }
+    }
+}
+
+#[cfg(test)]
+mod result_message {
+    use serde_json;
+
+    use super::{
+        IncrementalTestResultMessage, MultipleTestResultsMessage, SingleTestResultMessage, Status,
+        TestResult, TestResultMessage,
+    };
+    use IncrementalTestResultMessage::*;
+    use TestResultMessage::*;
+
+    fn fake_test_result() -> TestResult {
+        TestResult {
+            status: Status::Success,
+            id: "fake-id".to_owned(),
+            display_name: "fake".to_owned(),
+            output: None,
+            runtime: super::Nanoseconds(17823),
+            meta: Default::default(),
+            location: None,
+            started_at: None,
+            finished_at: None,
+            lineage: None,
+            past_attempts: None,
+            other_errors: None,
+        }
+    }
+
+    fn fake_result_str() -> String {
+        serde_json::to_string(&fake_test_result()).unwrap()
+    }
+
+    fn parse(s: &str) -> serde_json::Result<TestResultMessage> {
+        serde_json::from_str(s)
+    }
+
+    #[test]
+    fn parse_incremental_success() {
+        assert!(matches!(parse(&format!(
+            r#"{{ "type": "incremental_result", "one_test_result": {} }}"#,
+            fake_result_str()
+        )), Ok(Incremental(One { one_test_result })) if one_test_result == fake_test_result()));
+
+        assert!(matches!(parse(&format!(
+            r#"{{ "type": "incremental_result_done", "last_test_result": {} }}"#,
+            fake_result_str()
+        )), Ok(Incremental(Done { last_test_result: Some(r) })) if r == fake_test_result()));
+
+        assert!(matches!(
+            parse(r#"{ "type": "incremental_result_done" }"#),
+            Ok(Incremental(Done {
+                last_test_result: None
+            }))
+        ));
+    }
+
+    #[test]
+    fn parse_incremental_fail() {
+        assert!(matches!(
+            parse(r#"{ "type": "incremental_result" }"#),
+            Err(..)
+        ));
+
+        assert!(matches!(parse(r#"{  }"#), Err(..)));
+    }
+
+    #[test]
+    fn parse_single_success() {
+        assert!(matches!(parse(&format!(
+            r#"{{ "test_result": {} }}"#,
+            fake_result_str()
+        )), Ok(Single(SingleTestResultMessage { test_result })) if test_result == fake_test_result()));
+    }
+
+    #[test]
+    fn parse_single_fail() {
+        assert!(matches!(parse(r#"{  }"#), Err(..)));
+    }
+
+    #[test]
+    fn parse_multiple_success() {
+        assert!(matches!(parse(&format!(
+            r#"{{ "test_results": [{}] }}"#,
+            fake_result_str()
+        )), Ok(Multiple(MultipleTestResultsMessage { test_results })) if test_results == vec![fake_test_result()]));
+    }
+
+    #[test]
+    fn parse_multiple_fail() {
+        assert!(matches!(
+            parse(&format!(r#"{{ "test_results": {} }}"#, fake_result_str())),
+            Err(..)
+        ));
+        assert!(matches!(parse(r#"{  }"#), Err(..)));
     }
 }

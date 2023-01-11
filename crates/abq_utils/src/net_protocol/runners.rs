@@ -777,8 +777,8 @@ pub struct RawTestResultMessage(PrivTestResultMessage);
 #[derive(Serialize, Deserialize, derive_more::From)]
 #[serde(untagged)]
 enum PrivTestResultMessage {
-    V0_1(v0_1::TestResultMessage),
     V0_2(Box<v0_2::TestResultMessage>),
+    V0_1(v0_1::TestResultMessage),
 }
 
 static_assertions::assert_eq_size!(RawTestResultMessage, [u8; 112]);
