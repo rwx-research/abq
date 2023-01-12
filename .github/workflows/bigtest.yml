@@ -39,6 +39,16 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           bundler-cache: true
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+          cache-dependency-path: 'bigtest/**/package-lock.json'
+
+      - name: Load testdata
+        run: |
+          scripts/init_bigtest
+
       - name: Pull down abq binary to test
         run: |
           aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
@@ -64,17 +74,27 @@ jobs:
         run: |
           bin/manage_dev_queue start ${{ inputs.version }}
 
-      - name: BIGTEST benchmark
+      - name: BIGTEST benchmarks
         id: benchmark
         run: |
           EXIT=0
-          bigtest/benchmark/test.sh || EXIT=$?
 
-          source bigtest/benchmark/out/exports
+          # RSPEC
+          node bigtest/benchmark_rspec/bench.js || EXIT=$?
+          source bigtest/benchmark_rspec/out/exports
           {
-          echo "abq_worker_time=$ABQ_WORKER_TIME"
-          echo "rspec_time=$RSPEC_TIME"
-          echo "abq_worker_overhead=$ABQ_WORKER_OVERHEAD"
+          echo "rspec_abq_worker_time=$ABQ_WORKER_TIME"
+          echo "rspec_raw_time=$RAW_TIME"
+          echo "rspec_abq_worker_overhead=$ABQ_WORKER_OVERHEAD"
+          } >> "$GITHUB_OUTPUT"
+
+          # JEST
+          node bigtest/benchmark_jest/bench.js || EXIT=$?
+          source bigtest/benchmark_jest/out/exports
+          {
+          echo "jest_abq_worker_time=$ABQ_WORKER_TIME"
+          echo "jest_raw_time=$RAW_TIME"
+          echo "jest_abq_worker_overhead=$ABQ_WORKER_OVERHEAD"
           } >> "$GITHUB_OUTPUT"
 
           exit $EXIT
@@ -100,9 +120,12 @@ jobs:
             ${{ steps.status.outputs.emoji }} **Bigtest for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
 
             Benchmarks:
-              - ${{ steps.benchmark.outputs.abq_worker_overhead }}% worker overhead
-                - RSpec time: ${{ steps.benchmark.outputs.rspec_time }} seconds
-                - ABQ worker time: ${{ steps.benchmark.outputs.abq_worker_time }} seconds
+              - RSpec: ${{ steps.benchmark.outputs.rspec_abq_worker_overhead }}% worker overhead
+                - RSpec time: ${{ steps.benchmark.outputs.rspec_raw_time }} seconds
+                - ABQ worker time: ${{ steps.benchmark.outputs.rspec_abq_worker_time }} seconds
+              - Jest: ${{ steps.benchmark.outputs.jest_abq_worker_overhead }}% worker overhead
+                - Jest time: ${{ steps.benchmark.outputs.jest_raw_time }} seconds
+                - ABQ worker time: ${{ steps.benchmark.outputs.jest_abq_worker_time }} seconds
 
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

@@ -57,6 +57,25 @@ aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN
   - Only one dev queue can be active at a time.
 - `bin/manage_dev_queue stop` - stops the active dev queue instance, if any.
 
+#### Running dev-queue integration tests
+
+Set up the integration tests:
+
+```
+scripts/init_bigtest
+```
+
+Make sure you've started a dev queue as described above.
+Then, you can run individual integration tests, such as
+
+```
+# Benchmark rspec-abq
+node bigtest/benchmark_rspec/bench.js
+
+# Benchmark the jest integration
+node bigtest/benchmark_jest/bench.js
+```
+
 ## Operations
 
 ### Releasing a new version

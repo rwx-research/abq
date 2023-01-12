@@ -1,10 +1,10 @@
 {
-  "name": "npm-jest-project",
+  "name": "bench-abq-jest",
   "version": "0.0.0",
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "jest"
+    "test": "jest -i"
   },
   "author": "",
   "devDependencies": {
@@ -15,8 +15,5 @@
     "jest-config": "npm:@rwx-research/jest-config@29.3.100-alpha.8",
     "jest-runner": "npm:@rwx-research/jest-runner@29.3.100-alpha.8",
     "jest-circus": "npm:@rwx-research/jest-circus@29.3.100-alpha.8"
-  },
-  "jest": {
-    "verbose": true
   }
 }

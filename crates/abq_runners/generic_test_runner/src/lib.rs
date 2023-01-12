@@ -1288,8 +1288,8 @@ mod test_abq_jest {
             ManifestResult::TestRunnerError { .. } => unreachable!(),
         };
 
-        assert_eq!(native_runner_protocol, AbqProtocolVersion::V0_1);
-        assert_eq!(native_runner_specification.name, "abq-jest");
+        assert_eq!(native_runner_protocol, AbqProtocolVersion::V0_2);
+        assert_eq!(native_runner_specification.name, "jest-abq");
 
         manifest.sort();
 
@@ -1317,10 +1317,18 @@ mod test_abq_jest {
         assert_eq!(test_results.len(), 2, "{:#?}", test_results);
 
         assert_eq!(test_results[0].status, Status::Success);
-        assert!(test_results[0].id.ends_with("add.test.js"));
+        assert!(
+            test_results[0].id.ends_with("mona + lisa"),
+            "{:?}",
+            &test_results
+        );
 
         assert_eq!(test_results[1].status, Status::Success);
-        assert!(test_results[1].id.ends_with("names.test.js"));
+        assert!(
+            test_results[1].id.ends_with("three names"),
+            "{:?}",
+            &test_results
+        );
     }
 
     #[test]
@@ -1347,27 +1355,14 @@ mod test_abq_jest {
 
         {
             assert!(matches!(test_results[0].status, Status::Failure { .. }));
-            assert!(test_results[0].id.ends_with("add.test.js"));
-            assert!(matches!(&test_results[0].stderr, Some(s) if !s.is_empty()));
+            assert!(test_results[0].id.ends_with("1 + 2"));
+            assert!(
+                matches!(&test_results[0].stderr, Some(s) if s.is_empty()),
+                "{:?}",
+                &test_results[0].stderr
+            );
 
             let stdout = test_results[0].stdout.as_deref().unwrap();
-            let stdout = write_leading_markers(stdout);
-
-            insta::assert_snapshot!(stdout, @r###"
-            |  console.log
-            |    hello from a first jest test
-            |
-            |      at Object.log (add.test.js:4:11)
-            |
-            "###);
-        }
-
-        {
-            assert!(matches!(test_results[1].status, Status::Failure { .. }));
-            assert!(test_results[1].id.ends_with("add2.test.js"));
-            assert!(matches!(&test_results[1].stderr, Some(s) if !s.is_empty()));
-
-            let stdout = test_results[1].stdout.as_deref().unwrap();
             let stdout = write_leading_markers(stdout);
 
             insta::assert_snapshot!(stdout, @r###"
@@ -1375,6 +1370,27 @@ mod test_abq_jest {
             |    hello from a second jest test
             |
             |      at Object.log (add2.test.js:4:11)
+            |
+            "###);
+        }
+
+        {
+            assert!(matches!(test_results[1].status, Status::Failure { .. }));
+            assert!(test_results[1].id.ends_with("mona + lisa"));
+            assert!(
+                matches!(&test_results[1].stderr, Some(s) if s.is_empty()),
+                "{:?}",
+                &test_results[1].stderr
+            );
+
+            let stdout = test_results[1].stdout.as_deref().unwrap();
+            let stdout = write_leading_markers(stdout);
+
+            insta::assert_snapshot!(stdout, @r###"
+            |  console.log
+            |    hello from a first jest test
+            |
+            |      at Object.log (add.test.js:4:11)
             |
             "###);
         }
