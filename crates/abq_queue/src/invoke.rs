@@ -32,8 +32,8 @@ use thiserror::Error;
 
 /// The default maximum amount of a time a client will wait between consecutive
 /// test results streamed from the queue.
-/// The current default is unbounded.
-pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::MAX;
+/// The current default is 1 hour.
+pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
 pub struct Client {

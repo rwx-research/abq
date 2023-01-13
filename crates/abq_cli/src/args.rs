@@ -263,17 +263,28 @@ pub enum Command {
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
-        /// The maximum number of seconds to wait for a test result to be reported back.
+        /// A broad measure of inactivity timeout seconds, after which a test run is cancelled.
         ///
-        /// Note that this applies to both the first test result reported back, and all subsequent
-        /// test results. When setting a timeout, it is recommended to significantly over-estimate
-        /// based on historical runtimes you have observed for abq.
+        /// The inactivity timeout is applied in the following cases:
         ///
-        /// Hitting a timeout is typically indicative of a failure in ABQ workers.
+        /// - If `abq test` does not receive a batch of test results (as indicated by `--batch-size`)
+        ///   within the inactivity timeout. This includes the first set of test results after a
+        ///   test run is started.
         ///
-        /// By default, the timeout is 2 minutes (120 seconds).
-        #[clap(long, default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs().try_into().unwrap())]
-        test_timeout_seconds: NonZeroU64,
+        /// - If after the last test in the run begins execution, the test run has not completed
+        ///   within the inactivity timeout.
+        ///
+        /// When setting the inactivity, it is recommended to over-estimate
+        /// based on historical test runtimes you have observed for abq.
+        ///
+        /// Hitting a timeout is typically indicative of a failure in a test suite's setup or
+        /// configuration.
+        ///
+        /// ALIASES:
+        ///
+        /// - `--test-timeout-seconds` (deprecated)
+        #[clap(long, alias = "test-timeout-seconds", default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
+        inactivity_timeout_seconds: u64,
 
         /// Arguments to the test executable.
         #[clap(required = true, num_args = 1.., allow_hyphen_values = true, last = true)]
