@@ -58,7 +58,7 @@ jobs:
           sudo apt-get install -y musl-tools
 
       - name: Restore cargo cache
-        uses: actions/cache@v3.0.11
+        uses: actions/cache@v3.2.3
         env:
           cache-name: ci
         with:
@@ -192,7 +192,7 @@ jobs:
         id: pr
 
       - name: Report filesize
-        uses: thollander/actions-comment-pull-request@d117ef6afcc405eca3137f55f39a2d4f7d559f6f # v2.3.0, locking to a ref to avoid supply chain attacks
+        uses: thollander/actions-comment-pull-request@632cf9ce90574d125be56b5f3405cda41a84e2fd # v2.3.1, locking to a ref to avoid supply chain attacks
         if: steps.pr.outputs.pr_found == 'true'
         with:
           pr_number: ${{ steps.pr.outputs.number }}

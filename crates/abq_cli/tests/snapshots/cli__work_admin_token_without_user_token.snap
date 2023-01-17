@@ -2,10 +2,10 @@
 source: crates/abq_cli/tests/cli.rs
 expression: stderr
 ---
-error: The following required arguments were not provided:
+error: the following required arguments were not provided:
   --user-token <USER_TOKEN>
 
 Usage: abq start --admin-token <ADMIN_TOKEN> --user-token <USER_TOKEN>
 
-For more information try '--help'
+For more information, try '--help'.
 
