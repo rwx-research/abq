@@ -99,11 +99,16 @@ jobs:
 
           exit $EXIT
 
+      - name: BIGTEST fuzz test result sizes
+        id: fuzz_result_sizes
+        run: |
+          bigtest/fuzz_result_sizes/test.sh
+
       - name: Get status emoji
         id: status
         if: always()
         run: |
-          EMOJI="${{ (steps.benchmark.conclusion == 'success') && ':white_check_mark:' || ':x:' }}"
+          EMOJI="${{ (steps.benchmark.conclusion == 'success' && steps.fuzz_result_sizes.conclusion == 'success') && ':white_check_mark:' || ':x:' }}"
           echo "emoji=$EMOJI" >> "$GITHUB_OUTPUT"
 
       - name: Get associated PR
@@ -126,6 +131,9 @@ jobs:
               - Jest: ${{ steps.benchmark.outputs.jest_abq_worker_overhead }}% worker overhead
                 - Jest time: ${{ steps.benchmark.outputs.jest_raw_time }} seconds
                 - ABQ worker time: ${{ steps.benchmark.outputs.jest_abq_worker_time }} seconds
+
+            Fuzz result sizes:
+              - PASSED
 
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
