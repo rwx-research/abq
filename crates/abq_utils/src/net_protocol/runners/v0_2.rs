@@ -5,6 +5,8 @@
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::net_protocol::entity::EntityId;
+
 use super::{v0_1, AbqProtocolVersion, MetadataMap};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -277,11 +279,11 @@ pub enum IncrementalTestResultMessage {
 }
 
 impl IncrementalTestResultMessage {
-    pub fn into_step(self) -> super::IncrementalTestResultStep {
+    pub fn into_step(self, source: EntityId) -> super::IncrementalTestResultStep {
         use super::IncrementalTestResultStep::*;
         match self {
-            Self::One { one_test_result } => One(one_test_result.into()),
-            Self::Done { last_test_result } => Done(last_test_result.map(Into::into)),
+            Self::One { one_test_result } => One(one_test_result.reify(source)),
+            Self::Done { last_test_result } => Done(last_test_result.map(|r| r.reify(source))),
         }
     }
 }
@@ -295,12 +297,16 @@ pub enum TestResultMessage {
 }
 
 impl TestResultMessage {
-    pub fn into_test_results(self) -> super::TestResultSet {
+    pub fn into_test_results(self, source: EntityId) -> super::TestResultSet {
         use super::TestResultSet::*;
         match self {
-            Self::Single(msg) => All(vec![msg.test_result.into()]),
-            Self::Multiple(msg) => All(msg.test_results.into_iter().map(|r| r.into()).collect()),
-            Self::Incremental(msg) => Incremental(msg.into_step()),
+            Self::Single(msg) => All(vec![msg.test_result.reify(source)]),
+            Self::Multiple(msg) => All(msg
+                .test_results
+                .into_iter()
+                .map(|r| r.reify(source))
+                .collect()),
+            Self::Incremental(msg) => Incremental(msg.into_step(source)),
         }
     }
 }

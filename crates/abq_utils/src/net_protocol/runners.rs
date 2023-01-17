@@ -550,6 +550,8 @@ impl std::fmt::Display for Location {
 
 pub use v0_2::OutOfBandError;
 
+use super::entity::EntityId;
+
 impl std::fmt::Display for OutOfBandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let OutOfBandError {
@@ -595,7 +597,7 @@ pub struct TestResultSpec {
     pub lineage: Option<Vec<String>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub past_attempts: Option<Vec<TestResult>>,
+    pub past_attempts: Option<Vec<TestResultSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_errors: Option<Vec<OutOfBandError>>,
 
@@ -719,55 +721,67 @@ static_assertions::assert_eq_size!(RawNativeTestResult, [u8; 112]);
 
 /// Test result reported to ABQ, normalizing from a native runner.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct TestResult(PrivReportedTestResult);
-type PrivReportedTestResult = TestResultSpec;
+pub struct TestResult {
+    /// The worker this test result originated from
+    pub source: EntityId,
+    pub result: TestResultSpec,
+}
 
 impl Deref for TestResult {
     type Target = TestResultSpec;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.result
     }
 }
 
 impl DerefMut for TestResult {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.result
     }
 }
 
 impl TestResult {
-    pub fn new(spec: TestResultSpec) -> Self {
-        Self(spec)
+    pub fn new(source: EntityId, result: TestResultSpec) -> Self {
+        Self { source, result }
     }
 
     pub fn into_spec(self) -> TestResultSpec {
-        self.0
+        self.result
     }
 
     #[cfg(feature = "expose-native-protocols")]
     pub fn fake() -> Self {
-        Self(TestResultSpec::fake())
+        Self {
+            source: EntityId::fake(),
+            result: TestResultSpec::fake(),
+        }
     }
 }
 
-impl From<v0_1::TestResult> for TestResult {
-    fn from(tr: v0_1::TestResult) -> Self {
-        Self(tr.into())
+impl v0_1::TestResult {
+    fn reify(self, source: EntityId) -> TestResult {
+        TestResult {
+            source,
+            result: self.into(),
+        }
     }
 }
-impl From<v0_2::TestResult> for TestResult {
-    fn from(tr: v0_2::TestResult) -> Self {
-        Self(tr.into())
+impl v0_2::TestResult {
+    fn reify(self, source: EntityId) -> TestResult {
+        TestResult {
+            source,
+            result: self.into(),
+        }
     }
 }
-impl From<RawNativeTestResult> for TestResult {
-    fn from(native_result: RawNativeTestResult) -> Self {
+impl RawNativeTestResult {
+    pub fn reify(self, source: EntityId) -> TestResult {
         use PrivNativeTestResult::*;
 
-        match native_result.0 {
-            V0_1(tr) => tr.into(),
-            V0_2(tr) => (*tr).into(),
+        match self.0 {
+            V0_1(tr) => tr.reify(source),
+            V0_2(tr) => (*tr).reify(source),
         }
     }
 }
@@ -785,11 +799,11 @@ static_assertions::assert_eq_size!(RawTestResultMessage, [u8; 112]);
 
 impl RawTestResultMessage {
     /// Extract the [test result][TestResult] from the message.
-    pub fn into_test_results(self) -> TestResultSet {
+    pub fn into_test_results(self, source: EntityId) -> TestResultSet {
         use PrivTestResultMessage::*;
         match self.0 {
-            V0_1(msg) => TestResultSet::All(vec![msg.test_result.into()]),
-            V0_2(msg) => msg.into_test_results(),
+            V0_1(msg) => TestResultSet::All(vec![msg.test_result.reify(source)]),
+            V0_2(msg) => msg.into_test_results(source),
         }
     }
 }
@@ -816,10 +830,10 @@ enum PrivIncrementalTestResultMessage {
 }
 
 impl RawIncrementalTestResultMessage {
-    pub fn into_step(self) -> IncrementalTestResultStep {
+    pub fn into_step(self, source: EntityId) -> IncrementalTestResultStep {
         use PrivIncrementalTestResultMessage::*;
         match self.0 {
-            V0_2(msg) => msg.into_step(),
+            V0_2(msg) => msg.into_step(source),
         }
     }
 }

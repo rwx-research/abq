@@ -173,6 +173,8 @@ impl WorkerPool {
             debug_native_runner,
         } = config;
 
+        let entity = EntityId::new();
+
         let num_workers = size.get();
         let mut workers = Vec::with_capacity(num_workers);
 
@@ -201,6 +203,7 @@ impl WorkerPool {
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
+                entity,
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
@@ -232,6 +235,7 @@ impl WorkerPool {
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
+                entity,
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
@@ -261,7 +265,7 @@ impl WorkerPool {
             worker_msg_tx,
             live_count,
             run_completed_successfully,
-            entity: EntityId::new(),
+            entity,
         }
     }
 
@@ -344,6 +348,7 @@ enum AttemptError {
 type AttemptResult = Result<Vec<String>, AttemptError>;
 
 struct WorkerEnv {
+    entity: EntityId,
     msg_from_pool_rx: MessageFromPoolRx,
     run_id: RunId,
     notify_manifest: Option<NotifyManifest>,
@@ -380,6 +385,7 @@ fn start_generic_test_runner(
     native_runner_params: NativeTestRunnerParams,
 ) -> Result<ExitCode, GenericRunnerError> {
     let WorkerEnv {
+        entity,
         get_next_tests: get_next_tests_bundle,
         run_id,
         get_init_context,
@@ -395,13 +401,11 @@ fn start_generic_test_runner(
         debug_native_runner,
     } = env;
 
-    let entity = EntityId::new();
-
     tracing::debug!(?entity, ?run_id, "Starting new generic test runner");
 
     // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
     // so that they can correlate failures observed in workers with the workers they've launched.
-    eprintln!("Worker started with id {:?}", entity);
+    eprintln!("Generic test runner started on worker {:?}", entity);
 
     let notify_manifest = notify_manifest.map(|notify_manifest| {
         let run_id = run_id.clone();
@@ -478,6 +482,7 @@ fn start_test_like_runner(
     manifest: ManifestMessage,
 ) -> Result<ExitCode, GenericRunnerError> {
     let WorkerEnv {
+        entity,
         msg_from_pool_rx,
         get_next_tests,
         get_init_context,
@@ -491,8 +496,6 @@ fn start_test_like_runner(
         mark_worker_complete,
         debug_native_runner: _,
     } = env;
-
-    let entity = EntityId::new();
 
     match runner {
         TestLikeRunner::NeverReturnManifest => {
@@ -615,15 +618,18 @@ fn start_test_like_runner(
                         let results = outputs
                             .into_iter()
                             .map(|output| {
-                                TestResult::new(TestResultSpec {
-                                    status: status.clone(),
-                                    id: test_case.id().clone(),
-                                    display_name: test_case.id().clone(),
-                                    output: Some(output),
-                                    runtime: TestRuntime::Milliseconds(runtime),
-                                    meta: Default::default(),
-                                    ..TestResultSpec::fake()
-                                })
+                                TestResult::new(
+                                    entity,
+                                    TestResultSpec {
+                                        status: status.clone(),
+                                        id: test_case.id().clone(),
+                                        display_name: test_case.id().clone(),
+                                        output: Some(output),
+                                        runtime: TestRuntime::Milliseconds(runtime),
+                                        meta: Default::default(),
+                                        ..TestResultSpec::fake()
+                                    },
+                                )
                             })
                             .collect();
 

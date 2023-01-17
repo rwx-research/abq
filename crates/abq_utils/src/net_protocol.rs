@@ -40,6 +40,11 @@ pub mod entity {
         pub fn new() -> Self {
             Self(uuid::Uuid::new_v4().into_bytes())
         }
+
+        #[cfg(feature = "expose-native-protocols")]
+        pub fn fake() -> Self {
+            Self([7; 16])
+        }
     }
 
     impl std::fmt::Debug for EntityId {

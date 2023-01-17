@@ -26,7 +26,7 @@ pub fn format_result_dot(writer: &mut impl WriteColor, result: &TestResult) -> i
 pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
     // --- test/name: {status} ---
     // {output}
-    // (completed in {runtime})
+    // (completed in {runtime}; worker [{worker_id}])
 
     let TestResultSpec {
         status,
@@ -54,7 +54,7 @@ pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) 
     writeln!(writer, "{output}")?;
     write!(writer, "(completed in ")?;
     format_duration(writer, *runtime)?;
-    writeln!(writer, ")")
+    writeln!(writer, "; worker [{:?}])", result.source)
 }
 
 fn status_color(status: &Status) -> Color {
@@ -142,7 +142,10 @@ pub fn format_duration_to_partial_seconds(
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime};
+    use abq_utils::net_protocol::{
+        entity::EntityId,
+        runners::{Status, TestResult, TestResultSpec, TestRuntime},
+    };
 
     use crate::{format_duration_to_partial_seconds, format_result_dot};
 
@@ -224,7 +227,7 @@ mod test {
 
     test_format!(
         format_line_success, format_result_line,
-        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
         @r###"
     abq/test: <green>ok<reset>
     "###
@@ -232,7 +235,7 @@ mod test {
 
     test_format!(
         format_line_failure, format_result_line,
-        &TestResult::new(TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         @r###"
     abq/test: <red>FAILED<reset>
     "###
@@ -240,7 +243,7 @@ mod test {
 
     test_format!(
         format_line_error, format_result_line,
-        &TestResult::new(TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         @r###"
     abq/test: <red>ERRORED<reset>
     "###
@@ -248,7 +251,7 @@ mod test {
 
     test_format!(
         format_line_pending, format_result_line,
-        &TestResult::new(TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
         @r###"
     abq/test: <yellow>pending<reset>
     "###
@@ -256,7 +259,7 @@ mod test {
 
     test_format!(
         format_line_skipped, format_result_line,
-        &TestResult::new(TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         @r###"
     abq/test: <yellow>skipped<reset>
     "###
@@ -264,31 +267,31 @@ mod test {
 
     test_format!(
         format_dot_success, format_result_dot,
-        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
         @"<green>.<reset>"
     );
 
     test_format!(
         format_dot_failure, format_result_dot,
-        &TestResult::new(TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         @"<red>F<reset>"
     );
 
     test_format!(
         format_dot_error, format_result_dot,
-        &TestResult::new(TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         @"<red>E<reset>"
     );
 
     test_format!(
         format_dot_pending, format_result_dot,
-        &TestResult::new(TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
         @"<yellow>P<reset>"
     );
 
     test_format!(
         format_dot_skipped, format_result_dot,
-        &TestResult::new(TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         @"<yellow>S<reset>"
     );
 
@@ -366,74 +369,74 @@ mod test {
 
     test_format!(
         format_summary_success, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
     Test passed!
-    (completed in 1 m, 15 s, 3 ms)
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
 
     test_format!(
         format_summary_failure, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>FAILED<reset> ---
     Assertion failed: 1 != 2
-    (completed in 1 m, 15 s, 3 ms)
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
 
     test_format!(
         format_summary_error, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>ERRORED<reset> ---
     Process at pid 72818 exited early with SIGTERM
-    (completed in 1 m, 15 s, 3 ms)
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
 
     test_format!(
         format_summary_pending, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>pending<reset> ---
     Test not implemented yet for reason: "need to implement feature A"
-    (completed in 1 m, 15 s, 3 ms)
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
 
     test_format!(
         format_summary_skipped, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>skipped<reset> ---
     Test skipped for reason: "only enabled on summer Fridays"
-    (completed in 1 m, 15 s, 3 ms)
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
 
     test_format!(
         format_summary_multiline, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
     Test passed!
     To see rendered webpage, see:
     	https://example.com
 
-    (completed in 1 m, 15 s, 3 ms)
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
 
     test_format!(
         format_summary_no_output, format_result_summary,
-        &TestResult::new(TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
     <no output>
-    (completed in 1 m, 15 s, 3 ms)
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
 }

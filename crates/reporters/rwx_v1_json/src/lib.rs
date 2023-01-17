@@ -177,8 +177,8 @@ pub struct Attempt {
     finished_at: Option<String>,
 }
 
-impl From<&TestResult> for Attempt {
-    fn from(test_result: &TestResult) -> Self {
+impl From<&TestResultSpec> for Attempt {
+    fn from(test_result: &TestResultSpec) -> Self {
         let TestResultSpec {
             status,
             output,
@@ -190,7 +190,7 @@ impl From<&TestResult> for Attempt {
             stderr,
             stdout,
             ..
-        } = &test_result.deref();
+        } = test_result;
 
         let status = match status {
             Status::Success => AttemptStatus::Successful,
@@ -266,7 +266,7 @@ impl From<&TestResult> for Test {
             ..
         } = &test_result.deref();
 
-        let attempt = test_result.into();
+        let attempt = test_result.deref().into();
         let past_attempts = past_attempts
             .as_ref()
             .map(|attempts| attempts.iter().map(Into::into).collect());
@@ -382,8 +382,9 @@ impl Collector {
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::runners::{
-        NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime,
+    use abq_utils::net_protocol::{
+        entity::EntityId,
+        runners::{NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime},
     };
 
     use crate::Collector;
@@ -397,57 +398,72 @@ mod test {
             serde_json::Value::String("value".to_string()),
         );
 
-        collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Success,
-            id: "id1".to_string(),
-            display_name: "app::module::test1".to_string(),
-            output: Some("Test 1 passed".to_string()),
-            runtime: TestRuntime::Milliseconds(11.0),
-            meta,
-            ..TestResultSpec::fake()
-        }));
-        collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Failure {
-                exception: Some("test-exception".to_string()),
-                backtrace: Some(vec!["file1.cpp:10".to_string(), "file2.cpp:20".to_string()]),
+        collector.push_result(&TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Success,
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("Test 1 passed".to_string()),
+                runtime: TestRuntime::Milliseconds(11.0),
+                meta,
+                ..TestResultSpec::fake()
             },
-            id: "id2".to_string(),
-            display_name: "app::module::test2".to_string(),
-            output: Some("Test 2 failed".to_string()),
-            runtime: TestRuntime::Milliseconds(22.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        }));
-        collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Error {
-                exception: None,
-                backtrace: None,
+        ));
+        collector.push_result(&TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: Some("test-exception".to_string()),
+                    backtrace: Some(vec!["file1.cpp:10".to_string(), "file2.cpp:20".to_string()]),
+                },
+                id: "id2".to_string(),
+                display_name: "app::module::test2".to_string(),
+                output: Some("Test 2 failed".to_string()),
+                runtime: TestRuntime::Milliseconds(22.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
             },
-            id: "id3".to_string(),
-            display_name: "app::module::test3".to_string(),
-            output: None,
-            runtime: TestRuntime::Milliseconds(33.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        }));
-        collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Pending,
-            id: "id4".to_string(),
-            display_name: "app::module::test4".to_string(),
-            output: Some("Test 4 pending".to_string()),
-            runtime: TestRuntime::Milliseconds(44.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        }));
-        collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Skipped,
-            id: "id5".to_string(),
-            display_name: "app::module::test5".to_string(),
-            output: None,
-            runtime: TestRuntime::Milliseconds(55.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        }));
+        ));
+        collector.push_result(&TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Error {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id3".to_string(),
+                display_name: "app::module::test3".to_string(),
+                output: None,
+                runtime: TestRuntime::Milliseconds(33.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
+            },
+        ));
+        collector.push_result(&TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Pending,
+                id: "id4".to_string(),
+                display_name: "app::module::test4".to_string(),
+                output: Some("Test 4 pending".to_string()),
+                runtime: TestRuntime::Milliseconds(44.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
+            },
+        ));
+        collector.push_result(&TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Skipped,
+                id: "id5".to_string(),
+                display_name: "app::module::test5".to_string(),
+                output: None,
+                runtime: TestRuntime::Milliseconds(55.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
+            },
+        ));
 
         {
             let mut buf = vec![];
@@ -474,15 +490,18 @@ mod test {
     fn generates_rwx_v1_json_for_successful_runs() {
         let mut collector = Collector::default();
 
-        collector.push_result(&TestResult::new(TestResultSpec {
-            status: Status::Success,
-            id: "id1".to_string(),
-            display_name: "app::module::test1".to_string(),
-            output: Some("Test 1 passed".to_string()),
-            runtime: TestRuntime::Milliseconds(11.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        }));
+        collector.push_result(&TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Success,
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("Test 1 passed".to_string()),
+                runtime: TestRuntime::Milliseconds(11.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
+            },
+        ));
 
         {
             let mut buf = vec![];

@@ -502,6 +502,7 @@ where
             let estimated_start = Instant::now();
 
             let handled_test = handle_one_test(
+                worker_entity,
                 &mut runner_conn,
                 &mux_pipes,
                 work_id,
@@ -614,6 +615,7 @@ impl MuxPipes {
 }
 
 async fn handle_one_test(
+    worker_entity: EntityId,
     runner_conn: &mut RunnerConnection,
     mux_pipes: &MuxPipes,
     work_id: WorkId,
@@ -623,7 +625,8 @@ async fn handle_one_test(
     let test_case_message = TestCaseMessage::new(test_case);
 
     let opt_test_results =
-        send_and_wait_for_test_results(runner_conn, mux_pipes, test_case_message).await;
+        send_and_wait_for_test_results(worker_entity, runner_conn, mux_pipes, test_case_message)
+            .await;
 
     match opt_test_results {
         Ok(test_results) => {
@@ -645,6 +648,7 @@ async fn handle_one_test(
 }
 
 async fn send_and_wait_for_test_results(
+    worker_entity: EntityId,
     runner_conn: &mut RunnerConnection,
     mux_pipes: &MuxPipes,
     test_case_message: TestCaseMessage,
@@ -662,7 +666,7 @@ async fn send_and_wait_for_test_results(
     // stop capturing stdout after we receive a
     let (mut result_stdout, mut result_stderr) = mux_pipes.end_capture();
 
-    let results = match raw_msg.into_test_results() {
+    let results = match raw_msg.into_test_results(worker_entity) {
         TestResultSet::All(mut results) => {
             attach_pipe_output_to_test_results(&mut results, result_stdout, result_stderr);
             results
@@ -688,7 +692,7 @@ async fn send_and_wait_for_test_results(
                         // Get the captured output for the next result (the one that just completed, not `res`)
                         (result_stdout, result_stderr) = mux_pipes.end_capture();
 
-                        step = raw_increment.into_step();
+                        step = raw_increment.into_step(worker_entity);
                     }
                     Done(opt_res) => {
                         if let Some(mut result) = opt_res {
@@ -852,15 +856,18 @@ fn handle_native_runner_failure<I>(
 
     let mut final_results = vec![];
     for work_id in remaining_work {
-        let error_result = TestResult::new(TestResultSpec {
-            status: Status::PrivateNativeRunnerError,
-            id: format!("internal-error-{}", uuid::Uuid::new_v4()),
-            display_name: "<internal test runner error>".to_string(),
-            output: Some(error_message.clone()),
-            runtime: TestRuntime::Milliseconds(estimated_time_to_failure.as_millis() as _),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        });
+        let error_result = TestResult::new(
+            worker_entity,
+            TestResultSpec {
+                status: Status::PrivateNativeRunnerError,
+                id: format!("internal-error-{}", uuid::Uuid::new_v4()),
+                display_name: "<internal test runner error>".to_string(),
+                output: Some(error_message.clone()),
+                runtime: TestRuntime::Milliseconds(estimated_time_to_failure.as_millis() as _),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
+            },
+        );
 
         final_results.push((work_id, vec![error_result]));
     }

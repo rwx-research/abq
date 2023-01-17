@@ -662,7 +662,10 @@ fn default_result() -> TestResultSpec {
 
 #[cfg(test)]
 mod test_line_reporter {
-    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec};
+    use abq_utils::net_protocol::{
+        entity::EntityId,
+        runners::{Status, TestResult, TestResultSpec},
+    };
 
     use crate::reporting::mock_summary;
 
@@ -694,10 +697,10 @@ mod test_line_reporter {
             num_flushes,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(default_result()))
+                .push_result(&TestResult::new(EntityId::fake(), default_result()))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(default_result()))
+                .push_result(&TestResult::new(EntityId::fake(), default_result()))
                 .unwrap();
         });
 
@@ -727,51 +730,66 @@ mod test_line_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Success,
-                    display_name: "abq/test1".to_string(),
-                    ..default_result()
-                }))
-                .unwrap();
-            reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Failure {
-                        exception: None,
-                        backtrace: None,
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Success,
+                        display_name: "abq/test1".to_string(),
+                        ..default_result()
                     },
-                    display_name: "abq/test2".to_string(),
-                    output: Some("Assertion failed: 1 != 2".to_string()),
-                    ..default_result()
-                }))
+                ))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Skipped,
-                    display_name: "abq/test3".to_string(),
-                    output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
-                    ..default_result()
-                }))
-                .unwrap();
-            reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Error {
-                        exception: None,
-                        backtrace: None,
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Failure {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test2".to_string(),
+                        output: Some("Assertion failed: 1 != 2".to_string()),
+                        ..default_result()
                     },
-                    display_name: "abq/test4".to_string(),
-                    output: Some("Process 28821 terminated early via SIGTERM".to_string()),
-                    ..default_result()
-                }))
+                ))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Pending,
-                    display_name: "abq/test5".to_string(),
-                    output: Some(
-                        r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
-                    ),
-                    ..default_result()
-                }))
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Skipped,
+                        display_name: "abq/test3".to_string(),
+                        output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
+                        ..default_result()
+                    },
+                ))
+                .unwrap();
+            reporter
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Error {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test4".to_string(),
+                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                        ..default_result()
+                    },
+                ))
+                .unwrap();
+            reporter
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Pending,
+                        display_name: "abq/test5".to_string(),
+                        output: Some(
+                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
+                        ),
+                        ..default_result()
+                    },
+                ))
                 .unwrap();
             reporter.finish(&mock_summary()).unwrap();
         });
@@ -786,18 +804,21 @@ mod test_line_reporter {
 
         --- abq/test2: FAILED ---
         Assertion failed: 1 != 2
-        (completed in 1 m, 15 s, 3 ms)
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
-        (completed in 1 m, 15 s, 3 ms)
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
 }
 
 #[cfg(test)]
 mod test_dot_reporter {
-    use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec};
+    use abq_utils::net_protocol::{
+        entity::EntityId,
+        runners::{Status, TestResult, TestResultSpec},
+    };
 
     use crate::reporting::{mock_summary, DOT_REPORTER_LINE_LIMIT};
 
@@ -830,10 +851,10 @@ mod test_dot_reporter {
             num_flushes,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(default_result()))
+                .push_result(&TestResult::new(EntityId::fake(), default_result()))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(default_result()))
+                .push_result(&TestResult::new(EntityId::fake(), default_result()))
                 .unwrap();
         });
 
@@ -863,51 +884,66 @@ mod test_dot_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Success,
-                    display_name: "abq/test1".to_string(),
-                    ..default_result()
-                }))
-                .unwrap();
-            reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Failure {
-                        exception: None,
-                        backtrace: None,
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Success,
+                        display_name: "abq/test1".to_string(),
+                        ..default_result()
                     },
-                    display_name: "abq/test2".to_string(),
-                    output: Some("Assertion failed: 1 != 2".to_string()),
-                    ..default_result()
-                }))
+                ))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Skipped,
-                    display_name: "abq/test3".to_string(),
-                    output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
-                    ..default_result()
-                }))
-                .unwrap();
-            reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Error {
-                        exception: None,
-                        backtrace: None,
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Failure {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test2".to_string(),
+                        output: Some("Assertion failed: 1 != 2".to_string()),
+                        ..default_result()
                     },
-                    display_name: "abq/test4".to_string(),
-                    output: Some("Process 28821 terminated early via SIGTERM".to_string()),
-                    ..default_result()
-                }))
+                ))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(TestResultSpec {
-                    status: Status::Pending,
-                    display_name: "abq/test5".to_string(),
-                    output: Some(
-                        r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
-                    ),
-                    ..default_result()
-                }))
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Skipped,
+                        display_name: "abq/test3".to_string(),
+                        output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
+                        ..default_result()
+                    },
+                ))
+                .unwrap();
+            reporter
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Error {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test4".to_string(),
+                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                        ..default_result()
+                    },
+                ))
+                .unwrap();
+            reporter
+                .push_result(&TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Pending,
+                        display_name: "abq/test5".to_string(),
+                        output: Some(
+                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
+                        ),
+                        ..default_result()
+                    },
+                ))
                 .unwrap();
             reporter.finish(&mock_summary()).unwrap();
         });
@@ -918,11 +954,11 @@ mod test_dot_reporter {
 
         --- abq/test2: FAILED ---
         Assertion failed: 1 != 2
-        (completed in 1 m, 15 s, 3 ms)
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
-        (completed in 1 m, 15 s, 3 ms)
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
 
@@ -943,10 +979,13 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult::new(TestResultSpec {
-                        status,
-                        ..default_result()
-                    }))
+                    .push_result(&TestResult::new(
+                        EntityId::fake(),
+                        TestResultSpec {
+                            status,
+                            ..default_result()
+                        },
+                    ))
                     .unwrap();
             }
 
@@ -969,7 +1008,7 @@ mod test_dot_reporter {
         } = with_reporter(|mut reporter| {
             for _ in 0..DOT_REPORTER_LINE_LIMIT {
                 reporter
-                    .push_result(&TestResult::new(default_result()))
+                    .push_result(&TestResult::new(EntityId::fake(), default_result()))
                     .unwrap();
             }
 
@@ -1000,10 +1039,13 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult::new(TestResultSpec {
-                        status,
-                        ..default_result()
-                    }))
+                    .push_result(&TestResult::new(
+                        EntityId::fake(),
+                        TestResultSpec {
+                            status,
+                            ..default_result()
+                        },
+                    ))
                     .unwrap();
             }
 
@@ -1018,7 +1060,7 @@ mod test_dot_reporter {
 
         --- default name: FAILED ---
         default output
-        (completed in 1 m, 15 s, 3 ms)
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
 
@@ -1040,10 +1082,13 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult::new(TestResultSpec {
-                        status,
-                        ..default_result()
-                    }))
+                    .push_result(&TestResult::new(
+                        EntityId::fake(),
+                        TestResultSpec {
+                            status,
+                            ..default_result()
+                        },
+                    ))
                     .unwrap();
             }
 
@@ -1057,7 +1102,7 @@ mod test_dot_reporter {
 
         --- default name: FAILED ---
         default output
-        (completed in 1 m, 15 s, 3 ms)
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
 }
@@ -1068,6 +1113,7 @@ mod suite {
 
     use abq_utils::{
         exit,
+        net_protocol::entity::EntityId,
         net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime},
     };
 
@@ -1092,7 +1138,7 @@ mod suite {
             fn $test_name() {
                 use Status::*;
 
-                let results = $status_order.into_iter().map(|status| TestResult::new(TestResultSpec {
+                let results = $status_order.into_iter().map(|status| TestResult::new(EntityId::fake(),TestResultSpec {
                     status,
                     ..default_result()
                 })).collect::<Vec<_>>();

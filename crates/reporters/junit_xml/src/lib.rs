@@ -115,8 +115,9 @@ impl Collector {
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::runners::{
-        Status, TestResult, TestResultSpec, TestRuntime::Milliseconds,
+    use abq_utils::net_protocol::{
+        entity::EntityId,
+        runners::{Status, TestResult, TestResultSpec, TestRuntime::Milliseconds},
     };
 
     use crate::Collector;
@@ -125,57 +126,75 @@ mod test {
     fn generates_junit_xml_for_all_statuses() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[
-            TestResult::new(TestResultSpec {
-                status: Status::Success,
-                id: "id1".to_string(),
-                display_name: "app::module::test1".to_string(),
-                output: Some("Test 1 passed".to_string()),
-                runtime: Milliseconds(11.0),
-                meta: Default::default(),
-                ..TestResultSpec::fake()
-            }),
-            TestResult::new(TestResultSpec {
-                status: Status::Failure {
-                    exception: Some("test-exception".to_string()),
-                    backtrace: Some(vec!["file1.cpp:10".to_string(), "file2.cpp:20".to_string()]),
+            TestResult::new(
+                EntityId::fake(),
+                TestResultSpec {
+                    status: Status::Success,
+                    id: "id1".to_string(),
+                    display_name: "app::module::test1".to_string(),
+                    output: Some("Test 1 passed".to_string()),
+                    runtime: Milliseconds(11.0),
+                    meta: Default::default(),
+                    ..TestResultSpec::fake()
                 },
-                id: "id2".to_string(),
-                display_name: "app::module::test2".to_string(),
-                output: Some("Test 2 failed".to_string()),
-                runtime: Milliseconds(22.0),
-                meta: Default::default(),
-                ..TestResultSpec::fake()
-            }),
-            TestResult::new(TestResultSpec {
-                status: Status::Error {
-                    exception: None,
-                    backtrace: None,
+            ),
+            TestResult::new(
+                EntityId::fake(),
+                TestResultSpec {
+                    status: Status::Failure {
+                        exception: Some("test-exception".to_string()),
+                        backtrace: Some(vec![
+                            "file1.cpp:10".to_string(),
+                            "file2.cpp:20".to_string(),
+                        ]),
+                    },
+                    id: "id2".to_string(),
+                    display_name: "app::module::test2".to_string(),
+                    output: Some("Test 2 failed".to_string()),
+                    runtime: Milliseconds(22.0),
+                    meta: Default::default(),
+                    ..TestResultSpec::fake()
                 },
-                id: "id3".to_string(),
-                display_name: "app::module::test3".to_string(),
-                output: Some("Test 3 errored".to_string()),
-                runtime: Milliseconds(33.0),
-                meta: Default::default(),
-                ..TestResultSpec::fake()
-            }),
-            TestResult::new(TestResultSpec {
-                status: Status::Pending,
-                id: "id4".to_string(),
-                display_name: "app::module::test4".to_string(),
-                output: Some("Test 4 pending".to_string()),
-                runtime: Milliseconds(44.0),
-                meta: Default::default(),
-                ..TestResultSpec::fake()
-            }),
-            TestResult::new(TestResultSpec {
-                status: Status::Skipped,
-                id: "id5".to_string(),
-                display_name: "app::module::test5".to_string(),
-                output: Some("Test 5 skipped".to_string()),
-                runtime: Milliseconds(55.0),
-                meta: Default::default(),
-                ..TestResultSpec::fake()
-            }),
+            ),
+            TestResult::new(
+                EntityId::fake(),
+                TestResultSpec {
+                    status: Status::Error {
+                        exception: None,
+                        backtrace: None,
+                    },
+                    id: "id3".to_string(),
+                    display_name: "app::module::test3".to_string(),
+                    output: Some("Test 3 errored".to_string()),
+                    runtime: Milliseconds(33.0),
+                    meta: Default::default(),
+                    ..TestResultSpec::fake()
+                },
+            ),
+            TestResult::new(
+                EntityId::fake(),
+                TestResultSpec {
+                    status: Status::Pending,
+                    id: "id4".to_string(),
+                    display_name: "app::module::test4".to_string(),
+                    output: Some("Test 4 pending".to_string()),
+                    runtime: Milliseconds(44.0),
+                    meta: Default::default(),
+                    ..TestResultSpec::fake()
+                },
+            ),
+            TestResult::new(
+                EntityId::fake(),
+                TestResultSpec {
+                    status: Status::Skipped,
+                    id: "id5".to_string(),
+                    display_name: "app::module::test5".to_string(),
+                    output: Some("Test 5 skipped".to_string()),
+                    runtime: Milliseconds(55.0),
+                    meta: Default::default(),
+                    ..TestResultSpec::fake()
+                },
+            ),
         ]);
 
         let mut buf = vec![];
@@ -210,28 +229,34 @@ mod test {
     #[test]
     fn extend_appends_tests() {
         let mut collector = Collector::new("suite");
-        collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Success,
-            id: "id1".to_string(),
-            display_name: "app::module::test1".to_string(),
-            output: Some("Test 1 passed".to_string()),
-            runtime: Milliseconds(11.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        })]);
-
-        collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Failure {
-                exception: None,
-                backtrace: None,
+        collector.extend_with_results(&[TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Success,
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("Test 1 passed".to_string()),
+                runtime: Milliseconds(11.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
             },
-            id: "id2".to_string(),
-            display_name: "app::module::test2".to_string(),
-            output: Some("Test 2 failed".to_string()),
-            runtime: Milliseconds(22.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        })]);
+        )]);
+
+        collector.extend_with_results(&[TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id2".to_string(),
+                display_name: "app::module::test2".to_string(),
+                output: Some("Test 2 failed".to_string()),
+                runtime: Milliseconds(22.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
+            },
+        )]);
 
         let mut buf = vec![];
         collector.write_xml(&mut buf).expect("failed to write");
@@ -256,18 +281,21 @@ mod test {
     #[test]
     fn failure_with_empty_output_prints_empty_output() {
         let mut collector = Collector::new("suite");
-        collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Failure {
-                exception: None,
-                backtrace: None,
+        collector.extend_with_results(&[TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: None,
+                runtime: Milliseconds(11.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
             },
-            id: "id1".to_string(),
-            display_name: "app::module::test1".to_string(),
-            output: None,
-            runtime: Milliseconds(11.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        })]);
+        )]);
 
         let mut buf = vec![];
         collector.write_xml(&mut buf).expect("failed to write");
@@ -291,18 +319,21 @@ mod test {
     #[test]
     fn error_with_empty_output_prints_empty_output() {
         let mut collector = Collector::new("suite");
-        collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Error {
-                exception: None,
-                backtrace: None,
+        collector.extend_with_results(&[TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Error {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: None,
+                runtime: Milliseconds(11.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
             },
-            id: "id1".to_string(),
-            display_name: "app::module::test1".to_string(),
-            output: None,
-            runtime: Milliseconds(11.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        })]);
+        )]);
 
         let mut buf = vec![];
         collector.write_xml(&mut buf).expect("failed to write");
@@ -326,18 +357,21 @@ mod test {
     #[test]
     fn strip_ansi_escape_codes() {
         let mut collector = Collector::new("suite");
-        collector.extend_with_results(&[TestResult::new(TestResultSpec {
-            status: Status::Error {
-                exception: None,
-                backtrace: None,
+        collector.extend_with_results(&[TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Error {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some(String::from_utf8(b"\x1b[32mRESULT\x1b[m of test".to_vec()).unwrap()),
+                runtime: Milliseconds(11.0),
+                meta: Default::default(),
+                ..TestResultSpec::fake()
             },
-            id: "id1".to_string(),
-            display_name: "app::module::test1".to_string(),
-            output: Some(String::from_utf8(b"\x1b[32mRESULT\x1b[m of test".to_vec()).unwrap()),
-            runtime: Milliseconds(11.0),
-            meta: Default::default(),
-            ..TestResultSpec::fake()
-        })]);
+        )]);
 
         let mut buf = vec![];
         collector.write_xml(&mut buf).expect("failed to write");
