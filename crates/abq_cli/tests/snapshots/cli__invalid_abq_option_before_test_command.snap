@@ -2,11 +2,11 @@
 source: crates/abq_cli/tests/cli.rs
 expression: stderr
 ---
-error: Found argument '--zzz-not-an-abq-option' which wasn't expected, or isn't valid in this context
+error: unexpected argument '--zzz-not-an-abq-option' found
 
-  If you tried to supply '--zzz-not-an-abq-option' as a value rather than a flag, use '-- --zzz-not-an-abq-option'
+  note: to pass '--zzz-not-an-abq-option' as a value, use '-- --zzz-not-an-abq-option'
 
 Usage: abq test [OPTIONS] -- <ARGS>...
 
-For more information try '--help'
+For more information, try '--help'.
 
