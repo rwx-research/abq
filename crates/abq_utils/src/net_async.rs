@@ -15,6 +15,9 @@ pub trait ServerListener {
     /// Accept a stream, without performing any additional validation.
     /// This is meant to be called in main paths to avoid blocking; to get a stream that you can
     /// actually communicate across, feed the result to [ServerHandshakeCtx::handshake].
+    ///
+    /// This method is cancel-safe. If the future is cancelled before yielding, no new connection
+    /// was accepted.
     async fn accept(&self) -> io::Result<(UnverifiedServerStream, SocketAddr)>;
 
     fn handshake_ctx(&self) -> Box<dyn ServerHandshakeCtx>;

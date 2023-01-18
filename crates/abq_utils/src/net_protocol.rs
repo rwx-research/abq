@@ -570,52 +570,123 @@ pub fn write<T: serde::Serialize>(writer: &mut impl Write, msg: T) -> Result<(),
     Ok(())
 }
 
+/// A cancel-safe async reader of protocol messages.
+///
+/// In cases where an async read might be a part of a `select` branch, it's pivotal to use an
+/// AsyncReader rather than [async_read] directly, to ensure that if the reading future is
+/// cancelled, it can be resumed without losing place of where the read stopped.
+pub struct AsyncReader {
+    size_buf: [u8; 4],
+    msg_size: Option<usize>,
+    msg_buf: Vec<u8>,
+    read: usize,
+    timeout: Duration,
+    next_expiration: Option<tokio::time::Instant>,
+}
+
+impl Default for AsyncReader {
+    fn default() -> Self {
+        Self::new(READ_TIMEOUT)
+    }
+}
+
+impl AsyncReader {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            size_buf: [0; 4],
+            msg_size: None,
+            msg_buf: Default::default(),
+            read: 0,
+            timeout,
+            next_expiration: None,
+        }
+    }
+}
+
+impl AsyncReader {
+    /// Reads the next message from a given reader.
+    ///
+    /// Cancellation-safe, but the same `reader` must be provided between cancellable calls.
+    /// If errors, not resumable.
+    pub async fn next<R, T: serde::de::DeserializeOwned>(&mut self, reader: &mut R) -> io::Result<T>
+    where
+        R: tokio::io::AsyncReadExt + Unpin,
+    {
+        loop {
+            match self.msg_size {
+                None => {
+                    // Do not timeout reading the message size, since we might just be waiting indefinitely for a
+                    // new message to come in.
+                    debug_assert_ne!(self.read, 4);
+
+                    let num_bytes_read = reader.read(&mut self.size_buf[self.read..]).await?;
+                    if num_bytes_read == 0 {
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "early eof"));
+                    }
+
+                    self.read += num_bytes_read;
+                    if self.read == 4 {
+                        let msg_size = u32::from_be_bytes(self.size_buf);
+                        validate_max_message_size(msg_size)?;
+                        self.read = 0;
+                        self.msg_size = Some(msg_size as _);
+                    }
+                }
+                Some(size) => {
+                    // Prime the message buffer with the number of bytes we're looking to read here.
+                    if self.read == 0 {
+                        self.msg_buf.reserve(size);
+                        self.msg_buf.extend(std::iter::repeat(0).take(size));
+                    }
+
+                    // Prime the expiration time, since we are now starting to read an incoming
+                    // message.
+                    if self.next_expiration.is_none() {
+                        self.next_expiration = Some(tokio::time::Instant::now() + self.timeout);
+                    }
+
+                    let num_bytes_read = tokio::select! {
+                        num_bytes_read = reader.read(&mut self.msg_buf[self.read..]) => {
+                            num_bytes_read?
+                        }
+                        _ = tokio::time::sleep_until(self.next_expiration.unwrap()) => {
+                            let read = self.read;
+                            let msg = format!("timed out waiting to read {size} bytes; read {read}");
+                            return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
+                        }
+                    };
+
+                    self.read += num_bytes_read;
+                    if self.read == size {
+                        // Clear for the next read
+                        let msg = serde_json::from_slice(&self.msg_buf)?;
+                        self.msg_size = None;
+                        self.read = 0;
+                        self.msg_buf.clear();
+                        self.next_expiration = None;
+                        return Ok(msg);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Like [read], but async.
+///
+/// Not cancellation-safe. If you need a cancellation-safe read, use an [AsyncReader].
 pub async fn async_read<R, T: serde::de::DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T, std::io::Error>
 where
     R: tokio::io::AsyncReadExt + Unpin,
 {
-    async_read_help(reader, READ_TIMEOUT).await
-}
-
-async fn async_read_help<R, T: serde::de::DeserializeOwned>(
-    reader: &mut R,
-    timeout: Duration,
-) -> Result<T, std::io::Error>
-where
-    R: tokio::io::AsyncReadExt + Unpin,
-{
-    // Do not timeout reading the message size, since we might just be waiting indefinitely for a
-    // new message to come in.
-    let mut msg_size_buf = [0; 4];
-    reader.read_exact(&mut msg_size_buf).await?;
-
-    let msg_size = u32::from_be_bytes(msg_size_buf);
-    validate_max_message_size(msg_size)?;
-
-    let mut msg_buf = vec![0; msg_size as usize];
-
-    tokio::select! {
-        read_result = reader.read_exact(&mut msg_buf) => {
-            read_result?;
-        }
-        _ = tokio::time::sleep(timeout) => {
-            // NB: in practice messages may contain null bytes, so this is just an estimate;
-            // however, they are unlikely to contain multiple null bytes in a row.
-            let estimated_read = msg_size - (msg_buf.iter().rev().take_while(|c| **c != 0).count() as u32);
-            let msg = format!("timed out waiting to read {msg_size} bytes; estimated read {estimated_read}");
-
-            return Err(io::Error::new(io::ErrorKind::TimedOut, msg));
-        }
-    }
-
-    let msg = serde_json::from_slice(&msg_buf)?;
-    Ok(msg)
+    AsyncReader::default().next(reader).await
 }
 
 /// Like [write], but async.
+///
+/// Not cancellation-safe. Do not use this in `select!` branches!
 pub async fn async_write<R, T: serde::Serialize>(
     writer: &mut R,
     msg: &T,
@@ -653,9 +724,10 @@ mod test {
         time::Duration,
     };
 
+    use rand::Rng;
     use tokio::io::AsyncWriteExt;
 
-    use crate::net_protocol::{async_read_help, read_help};
+    use crate::net_protocol::{read_help, AsyncReader};
 
     use super::{async_read, read};
 
@@ -733,10 +805,147 @@ mod test {
         let msg_size = 10_u32.to_be_bytes();
         client_conn.write_all(&msg_size).await.unwrap();
 
-        let read_result: Result<(), _> =
-            async_read_help(&mut server_conn, Duration::from_secs(0)).await;
+        let read_result: Result<(), _> = AsyncReader::new(Duration::from_secs(0))
+            .next(&mut server_conn)
+            .await;
         assert!(read_result.is_err());
         let err = read_result.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn async_reader_is_cancellation_safe() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_conn, _) = server.accept().await.unwrap();
+
+        let splits = [
+            // Chop up the size message
+            &[0u8, 0] as &[u8],
+            &[0, 10],
+            // Chop up the rest of the message
+            &[b'"', b'1', b'1'],
+            &[b'1', b'1'],
+            &[b'1', b'1', b'1', b'1', b'"'],
+        ];
+
+        let mut async_reader = AsyncReader::default();
+        let mut splits = splits.iter().peekable();
+
+        while let Some(split) = splits.next() {
+            // The reader and server connection are only relevant in the `handle` below until
+            // we cancel it, which we explicitly do on every iteration, so we can tell rustc to
+            // pretend that these things are effectively static relative to the lifetime of the
+            // reader job.
+            let async_reader: &'static mut AsyncReader =
+                unsafe { std::mem::transmute(&mut async_reader) };
+            let server_conn: &'static mut TcpStream =
+                unsafe { std::mem::transmute(&mut server_conn) };
+
+            let handle = tokio::spawn(async_reader.next::<_, String>(server_conn));
+
+            client_conn.write_all(split).await.unwrap();
+
+            if splits.peek().is_some() {
+                handle.abort();
+                let err = handle.await.unwrap_err();
+                assert!(err.is_cancelled());
+            } else {
+                // After we read the last message, we should in fact end up with the message we
+                // expect.
+                let msg = handle.await.unwrap().unwrap();
+                assert_eq!(msg, "11111111");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn async_reader_is_cancellation_safe_fuzz() {
+        // Fuzz-test the AsyncReader to make sure it's cancel-safe.
+
+        use tokio::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_conn, _) = server.accept().await.unwrap();
+
+        let mut rng = rand::thread_rng();
+        for _ in 0..1000 {
+            // Make ourselves a string message, built in the network protocol
+            // <msg_size>"11111...111111"
+            let (msg, expected_str) = {
+                let raw_msg_size: u32 = rng.gen_range(10..100);
+                let mut msg = vec![];
+                msg.extend_from_slice(&u32::to_be_bytes(raw_msg_size + 2));
+                msg.push(b'"');
+                msg.extend(std::iter::repeat(b'1').take(raw_msg_size as usize));
+                msg.push(b'"');
+                (msg, "1".repeat(raw_msg_size as _))
+            };
+
+            // Choose slices of the msg that we'll send one-at-a-time, and make sure that
+            // cancelling the async reader after each send doesn't drop the whole message.
+            let splits = {
+                let msg_len = msg.len();
+
+                let num_splits = rng.gen_range(1..(msg_len / 2)) as usize;
+                let mut split_idxs = vec![];
+                while split_idxs.len() != num_splits {
+                    let split_idx = rng.gen_range(1..msg_len - 1);
+                    if split_idxs.contains(&split_idx) {
+                        continue;
+                    }
+                    split_idxs.push(split_idx);
+                }
+
+                assert!(!split_idxs.contains(&msg_len));
+                split_idxs.push(msg_len);
+                split_idxs.sort();
+
+                let mut splits = vec![];
+                let mut i = 0;
+                for j in split_idxs {
+                    splits.push(&msg[i..j as usize]);
+                    i = j as usize;
+                }
+                assert_eq!(splits.iter().map(|l| l.len()).sum::<usize>(), msg_len);
+                splits
+            };
+
+            let mut async_reader = AsyncReader::default();
+            let mut splits = splits.into_iter().peekable();
+
+            while let Some(split) = splits.next() {
+                // The reader and server connection are only relevant in the `handle` below until
+                // we cancel it, which we explicitly do on every iteration, so we can tell rustc to
+                // pretend that these things are effectively static relative to the lifetime of the
+                // reader job.
+                let async_reader: &'static mut AsyncReader =
+                    unsafe { std::mem::transmute(&mut async_reader) };
+                let server_conn: &'static mut TcpStream =
+                    unsafe { std::mem::transmute(&mut server_conn) };
+
+                let handle = tokio::spawn(async_reader.next::<_, String>(server_conn));
+
+                client_conn.write_all(split).await.unwrap();
+
+                if splits.peek().is_some() {
+                    handle.abort();
+                    let err = handle.await.unwrap_err();
+                    assert!(err.is_cancelled());
+                } else {
+                    // After we read the last message, we should in fact end up with the message we
+                    // expect.
+                    let msg = handle.await.unwrap().unwrap();
+                    assert_eq!(msg, expected_str);
+                }
+            }
+        }
     }
 }

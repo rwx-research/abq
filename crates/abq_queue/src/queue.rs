@@ -2739,6 +2739,7 @@ mod test {
             poll_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
             stream: client_conn,
             cancellation_rx,
+            async_reader: Default::default(),
         };
         {
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
