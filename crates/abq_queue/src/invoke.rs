@@ -25,6 +25,7 @@ use abq_utils::{
         },
         runners::TestResult,
         workers::{RunId, RunnerKind},
+        AsyncReader,
     },
 };
 
@@ -49,6 +50,7 @@ pub struct Client {
     pub(crate) poll_timeout: Duration,
     /// Signal to cancel an active test run.
     pub(crate) cancellation_rx: RunCancellationRx,
+    pub(crate) async_reader: AsyncReader,
 }
 
 #[derive(Debug, Error)]
@@ -175,6 +177,7 @@ impl Client {
             stream,
             poll_timeout: test_results_timeout,
             cancellation_rx,
+            async_reader: Default::default(),
         })
     }
 
@@ -218,7 +221,7 @@ impl Client {
     pub(crate) async fn next(&mut self) -> Result<IncrementalTestData, TestResultError> {
         loop {
             let read_result = tokio::select! {
-                read = net_protocol::async_read(&mut self.stream) => {
+                read = self.async_reader.next(&mut self.stream) => {
                     read
                 }
                 _ = tokio::time::sleep(self.poll_timeout) => {
