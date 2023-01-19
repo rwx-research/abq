@@ -27,7 +27,7 @@ use abq_utils::{
         self,
         entity::EntityId,
         publicize_addr,
-        queue::RunAlreadyCompleted,
+        queue::{NegotiatorInfo, RunAlreadyCompleted},
         workers::{RunId, RunnerKind},
     },
     shutdown::ShutdownReceiver,
@@ -601,6 +601,11 @@ pub enum QueueNegotiatorHandleError {
     CouldNotConnect,
     #[error("{0}")]
     Io(#[from] io::Error),
+    #[error("this abq ({local_version}) is incompatible with the remote queue version ({remote_version})")]
+    IncompatibleVersion {
+        local_version: &'static str,
+        remote_version: String,
+    },
 }
 
 impl QueueNegotiatorHandle {
@@ -620,14 +625,23 @@ impl QueueNegotiatorHandle {
 
         let request = net_protocol::queue::Request {
             entity,
-            message: net_protocol::queue::Message::NegotiatorAddr,
+            message: net_protocol::queue::Message::NegotiatorInfo,
         };
 
         net_protocol::write(&mut conn, request).map_err(|_| CouldNotConnect)?;
-        let negotiator_addr: SocketAddr =
-            net_protocol::read(&mut conn).map_err(|_| CouldNotConnect)?;
+        let NegotiatorInfo {
+            negotiator_address,
+            version,
+        } = net_protocol::read(&mut conn).map_err(|_| CouldNotConnect)?;
 
-        Ok(Self(negotiator_addr))
+        if version != abq_utils::VERSION {
+            return Err(QueueNegotiatorHandleError::IncompatibleVersion {
+                local_version: abq_utils::VERSION,
+                remote_version: version,
+            });
+        }
+
+        Ok(Self(negotiator_address))
     }
 }
 

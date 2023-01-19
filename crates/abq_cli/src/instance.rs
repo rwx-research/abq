@@ -116,8 +116,20 @@ enum AbqLocator {
 
 #[derive(Debug, Error)]
 pub(crate) enum AbqInstanceError {
-    #[error("{0}")]
     QueueNegotiatorHandleError(#[from] QueueNegotiatorHandleError),
+}
+
+impl std::fmt::Display for AbqInstanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use QueueNegotiatorHandleError::*;
+        match self {
+            Self::QueueNegotiatorHandleError(e @ IncompatibleVersion { .. }) => {
+                writeln!(f, "{e}.")?;
+                writeln!(f, "If you are using `setup-abq`, please ensure that `abq` is invoked with the same run-id as `setup-abq`.")
+            }
+            Self::QueueNegotiatorHandleError(e) => e.fmt(f),
+        }
+    }
 }
 
 impl AbqInstance {
@@ -193,5 +205,9 @@ impl AbqInstance {
 
     pub fn client_options(&self) -> &ClientOptions {
         &self.client_options
+    }
+
+    pub fn take_client_options(self) -> ClientOptions {
+        self.client_options
     }
 }

@@ -16,7 +16,7 @@ use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResults, InvokerTestData, NativeRunnerInfo, Request,
+    AssociatedTestResults, InvokerTestData, NativeRunnerInfo, NegotiatorInfo, Request,
 };
 use abq_utils::net_protocol::runners::{MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
@@ -1316,8 +1316,8 @@ impl QueueServer {
             Message::ActiveTestRuns => {
                 Self::handle_active_test_runs(ctx.queues, entity, stream).await
             }
-            Message::NegotiatorAddr => {
-                Self::handle_negotiator_addr(entity, stream, ctx.public_negotiator_addr).await
+            Message::NegotiatorInfo => {
+                Self::handle_negotiator_info(entity, stream, ctx.public_negotiator_addr).await
             }
             Message::InvokeWork(invoke_work) => {
                 Self::handle_invoked_work(
@@ -1440,12 +1440,16 @@ impl QueueServer {
 
     #[inline(always)]
     #[instrument(level = "trace", skip(stream, public_negotiator_addr))]
-    async fn handle_negotiator_addr(
+    async fn handle_negotiator_info(
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
         public_negotiator_addr: SocketAddr,
     ) -> Result<(), AnyError> {
-        net_protocol::async_write(&mut stream, &public_negotiator_addr).await?;
+        let negotiator_info = NegotiatorInfo {
+            negotiator_address: public_negotiator_addr,
+            version: abq_utils::VERSION.to_string(),
+        };
+        net_protocol::async_write(&mut stream, &negotiator_info).await?;
         Ok(())
     }
 
@@ -2432,7 +2436,7 @@ mod test {
         net_protocol::{
             self,
             entity::EntityId,
-            queue::InvokeWork,
+            queue::{InvokeWork, NegotiatorInfo},
             runners::{Manifest, ManifestMessage, TestResult},
             workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
         },
@@ -2939,13 +2943,17 @@ mod test {
             &mut conn,
             net_protocol::queue::Request {
                 entity: EntityId::new(),
-                message: net_protocol::queue::Message::NegotiatorAddr,
+                message: net_protocol::queue::Message::NegotiatorInfo,
             },
         )
         .unwrap();
 
-        let recv_negotiator_addr = net_protocol::read(&mut conn).unwrap();
+        let NegotiatorInfo {
+            negotiator_address: recv_negotiator_addr,
+            version,
+        } = net_protocol::read(&mut conn).unwrap();
         assert_eq!(negotiator_addr, recv_negotiator_addr);
+        assert_eq!(version, abq_utils::VERSION);
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
@@ -2983,7 +2991,7 @@ mod test {
             &mut conn,
             net_protocol::queue::Request {
                 entity: EntityId::new(),
-                message: net_protocol::queue::Message::NegotiatorAddr,
+                message: net_protocol::queue::Message::NegotiatorInfo,
             },
         )
         .unwrap();

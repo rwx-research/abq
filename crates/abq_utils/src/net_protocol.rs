@@ -240,7 +240,7 @@ pub mod workers {
 }
 
 pub mod queue {
-    use std::{num::NonZeroU64, time::Duration};
+    use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
 
     use serde_derive::{Deserialize, Serialize};
 
@@ -249,6 +249,14 @@ pub mod queue {
         runners::{AbqProtocolVersion, NativeRunnerSpecification, TestResult},
         workers::{ManifestResult, RunId, RunnerKind, WorkId},
     };
+
+    /// Information about the queue and its negotiation server.
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct NegotiatorInfo {
+        pub negotiator_address: SocketAddr,
+        /// ABQ version
+        pub version: String,
+    }
 
     /// A marker that a test run has already completed.
     #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
@@ -379,8 +387,8 @@ pub mod queue {
         /// lifecycle.
         // TODO: should this be gated behind additional authz?
         ActiveTestRuns,
-        /// An ask to return the address of the queue negotiator.
-        NegotiatorAddr,
+        /// An ask to return information needed to begin negotiation with the queue.
+        NegotiatorInfo,
         /// An ask to run some work by an invoker.
         InvokeWork(InvokeWork),
         /// An ask to mark an active test run as cancelled.

@@ -30,7 +30,6 @@ use abq_utils::{
     },
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
-use abq_workers::negotiate::QueueNegotiatorHandle;
 
 use args::{
     Cli, Command,
@@ -331,9 +330,12 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 None => ClientTlsStrategy::no_tls(),
             };
 
-            let client_opts = ClientOptions::new(ClientAuthStrategy::from(token), client_tls);
-            let queue_negotiator =
-                QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_opts.clone())?;
+            let abq = AbqInstance::from_remote(
+                entity,
+                queue_addr,
+                ClientAuthStrategy::from(token),
+                client_tls,
+            )?;
             let num_workers = match num {
                 CpuCores => NonZeroUsize::new(num_cpus::get_physical()).unwrap(),
                 Fixed(num) => num,
@@ -342,8 +344,8 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             workers::start_workers_forever(
                 num_workers,
                 working_dir,
-                queue_negotiator,
-                client_opts,
+                abq.negotiator_handle(),
+                abq.take_client_options(),
                 run_id,
             )
         }
