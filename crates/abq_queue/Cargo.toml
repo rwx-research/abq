@@ -5,12 +5,8 @@ version = "0.1.0"
 
 [dependencies]
 abq_workers = { path = "../abq_workers" }
-abq_runner_protocol = { path = "../abq_runners/protocol" }
-abq_echo_worker = { path = "../abq_runners/echo" }
-abq_exec_worker = { path = "../abq_runners/exec" }
 abq_utils = { path = "../abq_utils" }
 
-anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true

@@ -12,7 +12,6 @@ name = "abq_worker_harness"
 path = "src/test_harness.rs"
 
 [dependencies]
-abq_runner_protocol = { path = "../protocol" }
 abq_utils = { path = "../../abq_utils" }
 serde.workspace = true
 serde_json.workspace = true

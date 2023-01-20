@@ -6,10 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{sync::mpsc, thread};
 
-use abq_echo_worker as echo;
-use abq_exec_worker as exec;
 use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner};
-use abq_runner_protocol::Runner;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
@@ -24,6 +21,8 @@ use abq_utils::net_protocol::workers::{
 use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind};
 
 use futures::future::BoxFuture;
+
+use crate::test_like_runner;
 
 enum MessageFromPool {
     Shutdown,
@@ -624,21 +623,17 @@ fn attempt_test_id_for_test_like_runner(
         let _attempt = attempt;
         match (runner, test_id) {
             (R::Echo, s) => {
-                let result = echo::EchoWorker::run(echo::EchoWork { message: s });
+                let result = test_like_runner::echo(s);
                 vec![result]
             }
             (R::EchoMany { seperator }, s) => {
-                let split_results = s.split(seperator).map(|s| {
-                    echo::EchoWorker::run(echo::EchoWork {
-                        message: s.to_string(),
-                    })
-                });
+                let split_results = s
+                    .split(seperator)
+                    .map(|s| test_like_runner::echo(s.to_string()));
                 split_results.collect()
             }
             (R::EchoInitContext, _) => {
-                let ctx_result = echo::EchoWorker::run(echo::EchoWork {
-                    message: init_context,
-                });
+                let ctx_result = test_like_runner::echo(init_context);
                 vec![ctx_result]
             }
             (R::Exec, cmd_and_args) => {
@@ -647,7 +642,7 @@ fn attempt_test_id_for_test_like_runner(
                     .map(ToOwned::to_owned)
                     .collect::<Vec<String>>();
                 let cmd = args.remove(0);
-                let result = exec::ExecWorker::run(exec::Work { cmd, args });
+                let result = test_like_runner::exec(test_like_runner::ExecWork { cmd, args });
                 vec![result]
             }
             (R::FailOnTestName(fail_name), test) => {
