@@ -21,7 +21,7 @@ use abq_utils::net_protocol::queue::{
 use abq_utils::net_protocol::runners::{MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{
-    ManifestResult, NextWorkBundle, ReportedManifest, RunnerKind, WorkContext, WorkerTest,
+    ManifestResult, NextWorkBundle, ReportedManifest, RunnerKind, WorkerTest,
 };
 use abq_utils::net_protocol::{
     self,
@@ -45,8 +45,6 @@ use crate::connections::{self, ConnectedWorkers};
 use crate::prelude::{AnyError, OpaqueResult};
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun};
 
-// TODO: we probably want something more sophisticated here, in particular a concurrent
-// work-stealing queue.
 #[derive(Default, Debug)]
 struct JobQueue {
     queue: VecDeque<NextWork>,
@@ -366,13 +364,7 @@ impl AllRuns {
         let work_from_manifest = flat_manifest.into_iter().map(|test_case| {
             NextWork::Work(WorkerTest {
                 test_case,
-                run_id: run_id.clone(),
-                // TODO: populate correctly
-                work_id: WorkId("".to_string()),
-                // TODO: populate correctly
-                context: WorkContext {
-                    working_dir: std::env::current_dir().unwrap(),
-                },
+                work_id: WorkId::new(),
             })
         });
 
@@ -1308,11 +1300,7 @@ impl QueueServer {
         let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
 
         let result: Result<(), AnyError> = match message {
-            Message::HealthCheck => {
-                // TODO here and in other servers - healthchecks currently require auth, whenever
-                // auth is configured. Should they?
-                Self::handle_healthcheck(entity, stream).await
-            }
+            Message::HealthCheck => Self::handle_healthcheck(entity, stream).await,
             Message::ActiveTestRuns => {
                 Self::handle_active_test_runs(ctx.queues, entity, stream).await
             }
@@ -1649,7 +1637,6 @@ impl QueueServer {
                 } = reported_manifest;
 
                 // Record the manifest for this run in its appropriate queue.
-                // TODO: actually record the manifest metadata
                 let (flat_manifest, metadata) = manifest.flatten();
 
                 let native_runner_info = NativeRunnerInfo {
@@ -2697,7 +2684,7 @@ mod test {
             drop(client_conn);
         };
 
-        let buffered_work_id = WorkId("test1".to_string());
+        let buffered_work_id = WorkId::new();
         {
             // Send a test result, will force the responder to go into disconnected mode
             QueueServer::handle_worker_results(
@@ -2708,7 +2695,7 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id.clone(),
-                vec![(buffered_work_id.clone(), vec![TestResult::fake()])],
+                vec![(buffered_work_id, vec![TestResult::fake()])],
             )
             .await
             .unwrap();
@@ -2765,7 +2752,7 @@ mod test {
 
         {
             // Make sure that new test results also get send to the new client connectiion.
-            let second_work_id = WorkId("test2".to_string());
+            let second_work_id = WorkId::new();
             let worker_result_future = tokio::spawn(QueueServer::handle_worker_results(
                 run_queues,
                 Arc::clone(&active_runs),
@@ -2774,7 +2761,7 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id,
-                vec![(second_work_id.clone(), vec![TestResult::fake()])],
+                vec![(second_work_id, vec![TestResult::fake()])],
             ));
 
             let (work_id, _) = match client.next().await.unwrap() {
@@ -3362,7 +3349,7 @@ mod test {
             worker_next_tests_tasks.clone(),
             entity,
             run_id.clone(),
-            vec![(WorkId("work".into()), vec![TestResult::fake()])],
+            vec![(WorkId::new(), vec![TestResult::fake()])],
         );
         let cancellation_fut = QueueServer::handle_run_cancellation(
             queues.clone(),

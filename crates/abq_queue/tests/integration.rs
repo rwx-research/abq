@@ -97,8 +97,6 @@ fn default_workers_config() -> WorkersConfig {
     WorkersConfig {
         num_workers: 2.try_into().unwrap(),
         worker_context: WorkerContext::AssumeLocal,
-        work_retries: 0,
-        work_timeout: Duration::from_secs(1),
         debug_native_runner: false,
     }
 }
@@ -636,7 +634,6 @@ fn worker_exits_with_failure_if_test_fails() {
     );
 
     let workers_config = WorkersConfig {
-        work_timeout: Duration::from_secs(0),
         ..default_workers_config()
     };
 
@@ -687,7 +684,6 @@ fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
     );
 
     let workers_config = WorkersConfig {
-        work_timeout: Duration::from_secs(0),
         ..default_workers_config()
     };
 

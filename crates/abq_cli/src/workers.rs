@@ -23,12 +23,9 @@ pub fn start_workers(
 ) -> anyhow::Result<NegotiatedWorkers> {
     let context = WorkerContext::AlwaysWorkIn { working_dir };
 
-    // TODO: make this configurable
     let workers_config = WorkersConfig {
         num_workers,
         worker_context: context,
-        work_timeout: Duration::from_secs(30),
-        work_retries: 2,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
     };
 

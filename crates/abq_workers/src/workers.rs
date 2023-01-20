@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicUsize};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{sync::mpsc, thread};
 
 use abq_echo_worker as echo;
@@ -21,7 +21,7 @@ use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
     ManifestResult, NativeTestRunnerParams, ReportedManifest, TestLikeRunner, WorkerTest,
 };
-use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind, WorkContext};
+use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind};
 
 use futures::future::BoxFuture;
 
@@ -87,14 +87,6 @@ pub struct WorkerPoolConfig<'a> {
     pub run_completed_successfully: RunCompletedSuccessfully,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
-    /// Timeout for a single unit of work in the pool.
-    pub work_timeout: Duration,
-    /// How many times failed work processes should be retried.
-    ///
-    /// NOTE: this refers to retrying a worker process when the process itself has failed, either
-    /// during startup or exit. Failure modes related to the result of a cleanly-exiting piece of
-    /// work (e.g. a test fails, but the process exits cleanly) are not accounted for here.
-    pub work_retries: u8,
 
     // Whether to allow passthrough of stdout/stderr from the native runner process.
     pub debug_native_runner: bool,
@@ -168,8 +160,6 @@ impl WorkerPool {
             notify_manifest,
             run_completed_successfully,
             worker_context,
-            work_timeout,
-            work_retries,
             debug_native_runner,
         } = config;
 
@@ -211,8 +201,6 @@ impl WorkerPool {
                 results_batch_size,
                 notify_results,
                 context: worker_context.clone(),
-                work_timeout,
-                work_retries,
                 notify_manifest,
                 mark_worker_complete,
                 debug_native_runner,
@@ -243,8 +231,6 @@ impl WorkerPool {
                 results_batch_size,
                 notify_results,
                 context: worker_context.clone(),
-                work_timeout,
-                work_retries,
                 notify_manifest: None,
                 mark_worker_complete,
                 debug_native_runner,
@@ -342,7 +328,6 @@ struct ThreadWorker {
 enum AttemptError {
     ShouldRetry,
     Panic(String),
-    Timeout(Duration),
 }
 
 type AttemptResult = Result<Vec<String>, AttemptError>;
@@ -357,8 +342,6 @@ struct WorkerEnv {
     results_batch_size: u64,
     notify_results: NotifyResults,
     context: WorkerContext,
-    work_timeout: Duration,
-    work_retries: u8,
     mark_worker_complete: MarkWorkerComplete,
     debug_native_runner: bool,
 }
@@ -394,9 +377,6 @@ fn start_generic_test_runner(
         results_batch_size,
         context,
         msg_from_pool_rx,
-        // TODO: actually use these
-        work_timeout: _,
-        work_retries: _,
         mark_worker_complete,
         debug_native_runner,
     } = env;
@@ -490,8 +470,6 @@ fn start_test_like_runner(
         results_batch_size: _,
         notify_results,
         context,
-        work_timeout,
-        work_retries,
         notify_manifest,
         mark_worker_complete,
         debug_native_runner: _,
@@ -552,9 +530,6 @@ fn start_test_like_runner(
             Err(mpsc::TryRecvError::Disconnected) => panic!("Pool died before worker did"),
             Err(mpsc::TryRecvError::Empty) => {
                 // No message from the parent. Wait for the next test_id to come in.
-                //
-                // TODO: add a timeout here, in case we get a message from the parent while
-                // blocking on the next test_id from the queue.
                 let NextWorkBundle(bundle) = rt.block_on(get_next_tests());
                 bundle
             }
@@ -566,12 +541,7 @@ fn start_test_like_runner(
                     // Shut down the worker
                     break 'tests_done;
                 }
-                NextWork::Work(WorkerTest {
-                    test_case,
-                    context: work_context,
-                    run_id,
-                    work_id,
-                }) => {
+                NextWork::Work(WorkerTest { test_case, work_id }) => {
                     if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == test_case.id() )
                     {
                         return Err(io::Error::new(
@@ -582,7 +552,7 @@ fn start_test_like_runner(
                     }
 
                     // Try the test_id once + how ever many retries were requested.
-                    let allowed_attempts = 1 + work_retries;
+                    let allowed_attempts = 1;
                     'attempts: for attempt_number in 1.. {
                         let start_time = Instant::now();
                         let attempt_result = attempt_test_id_for_test_like_runner(
@@ -590,8 +560,6 @@ fn start_test_like_runner(
                             runner.clone(),
                             test_case.id().clone(),
                             init_context.clone(),
-                            &work_context,
-                            work_timeout,
                             attempt_number,
                             allowed_attempts,
                         );
@@ -606,13 +574,6 @@ fn start_test_like_runner(
                                     backtrace: None,
                                 },
                                 vec![msg],
-                            ),
-                            Err(AttemptError::Timeout(time)) => (
-                                Status::Error {
-                                    exception: None,
-                                    backtrace: None,
-                                },
-                                vec![format!("Timeout: {}ms", time.as_millis())],
                             ),
                         };
                         let results = outputs
@@ -633,11 +594,7 @@ fn start_test_like_runner(
                             })
                             .collect();
 
-                        rt.block_on(notify_results(
-                            entity,
-                            &run_id,
-                            vec![(work_id.clone(), results)],
-                        ));
+                        rt.block_on(notify_results(entity, &run_id, vec![(work_id, results)]));
                         break 'attempts;
                     }
                 }
@@ -656,8 +613,6 @@ fn attempt_test_id_for_test_like_runner(
     runner: TestLikeRunner,
     test_id: TestId,
     init_context: InitContext,
-    _requested_context: &WorkContext,
-    timeout: Duration,
     attempt: u8,
     allowed_attempts: u8,
 ) -> AttemptResult {
@@ -665,9 +620,6 @@ fn attempt_test_id_for_test_like_runner(
 
     let init_context = serde_json::to_string(&init_context).unwrap();
 
-    let (send_shutdown, recv_shutdown) = std::sync::mpsc::channel();
-
-    let started = Instant::now();
     let result_handle = thread::spawn(move || {
         let _attempt = attempt;
         match (runner, test_id) {
@@ -698,11 +650,6 @@ fn attempt_test_id_for_test_like_runner(
                 let result = exec::ExecWorker::run(exec::Work { cmd, args });
                 vec![result]
             }
-            (R::InduceTimeout, _) => {
-                // Sleep until we get the shutdown signal.
-                recv_shutdown.recv().unwrap();
-                unreachable!()
-            }
             (R::FailOnTestName(fail_name), test) => {
                 if test == fail_name {
                     panic!("INDUCED FAIL")
@@ -726,24 +673,12 @@ fn attempt_test_id_for_test_like_runner(
         }
     });
 
-    let mut timed_out = false;
-    while !result_handle.is_finished() {
-        if started.elapsed() >= timeout {
-            timed_out = true;
-            let _ = send_shutdown.send(());
-            break;
-        }
-
-        thread::sleep(Duration::from_micros(100));
-    }
     let result = result_handle.join();
     match result {
         Ok(output) => Ok(output),
         Err(e) => {
             if attempt < allowed_attempts {
                 Err(AttemptError::ShouldRetry)
-            } else if timed_out {
-                Err(AttemptError::Timeout(timeout))
             } else {
                 let msg = if let Some(msg) = e.downcast_ref::<&'static str>() {
                     msg.to_string()
@@ -790,9 +725,9 @@ mod test {
     };
     use crate::negotiate::QueueNegotiator;
     use crate::workers::WorkerPoolConfig;
-    use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkContext, WorkId};
+    use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkId};
 
-    type ResultsCollector = Arc<Mutex<HashMap<String, Vec<TestResult>>>>;
+    type ResultsCollector = Arc<Mutex<HashMap<WorkId, Vec<TestResult>>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestResult>>>;
 
     fn work_writer() -> (impl Fn(NextWork), impl Fn() -> GetNextTests) {
@@ -828,7 +763,7 @@ mod test {
         let results2 = Arc::clone(&results);
         let notify_results: NotifyResults = Arc::new(move |_, _, results| {
             for (work_id, result) in results {
-                let old_result = results2.lock().unwrap().insert(work_id.0, result);
+                let old_result = results2.lock().unwrap().insert(work_id, result);
                 debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
             }
             Box::pin(async {})
@@ -870,21 +805,15 @@ mod test {
             notify_results,
             run_completed_successfully,
             worker_context: WorkerContext::AssumeLocal,
-            work_timeout: Duration::from_secs(5),
-            work_retries: 0,
             debug_native_runner: false,
         };
 
         (config, manifest_collector)
     }
 
-    fn local_work(test: TestCase, run_id: RunId, work_id: WorkId) -> NextWork {
+    fn local_work(test: TestCase, work_id: WorkId) -> NextWork {
         NextWork::Work(WorkerTest {
             test_case: test,
-            context: WorkContext {
-                working_dir: std::env::current_dir().unwrap(),
-            },
-            run_id,
             work_id,
         })
     }
@@ -928,7 +857,7 @@ mod test {
         let mut expected_results = HashMap::new();
         let tests = (0..num_echos).into_iter().map(|i| {
             let echo_string = format!("echo {}", i);
-            expected_results.insert(i.to_string(), vec![echo_string.clone()]);
+            expected_results.insert(WorkId([i as _; 16]), vec![echo_string.clone()]);
 
             echo_test(protocol, echo_string)
         });
@@ -936,7 +865,7 @@ mod test {
 
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
-            run_id.clone(),
+            run_id,
             &get_next_tests,
             notify_results,
             run_completed_successfully,
@@ -953,7 +882,7 @@ mod test {
         let test_ids = await_manifest_test_cases(manifest_collector);
 
         for (i, test_id) in test_ids.into_iter().enumerate() {
-            write_work(local_work(test_id, run_id.clone(), WorkId(i.to_string())))
+            write_work(local_work(test_id, WorkId([i as _; 16])))
         }
 
         for _ in 0..num_workers {

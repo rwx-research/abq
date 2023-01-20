@@ -1,12 +1,8 @@
 //! Utilities for buffering and acting on messages (from the queue), refilling messages on-demand.
 
-#![allow(unused)] // TODO remove
-
 use std::future::IntoFuture;
-use std::io;
 
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 
 enum Msg<T> {
     BatchSize(usize),
@@ -17,7 +13,7 @@ impl<T> std::fmt::Debug for Msg<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BatchSize(arg0) => f.debug_tuple("BatchSize").field(arg0).finish(),
-            Self::Msg(arg0) => f.debug_tuple("Msg").finish(),
+            Self::Msg(_) => f.debug_tuple("Msg").finish(),
         }
     }
 }

@@ -24,8 +24,8 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
-    ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, RunId,
-    WorkContext, WorkId, WorkerTest,
+    ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, WorkId,
+    WorkerTest,
 };
 use abq_utils::{atomic, net_protocol};
 use futures::future::BoxFuture;
@@ -492,13 +492,7 @@ where
     };
 
     let run_tests_task = async {
-        while let Some(WorkerTest {
-            test_case,
-            context: _,
-            run_id: _,
-            work_id,
-        }) = tests_rx.recv().await
-        {
+        while let Some(WorkerTest { test_case, work_id }) = tests_rx.recv().await {
             let estimated_start = Instant::now();
 
             let handled_test = handle_one_test(
@@ -923,7 +917,6 @@ pub fn execute_wrapped_runner(
 
     let get_next_test: GetNextTests = {
         let manifest = Arc::clone(&flat_manifest);
-        let working_dir = working_dir.clone();
         &move || {
             loop {
                 let manifest_and_data = manifest.lock().unwrap();
@@ -940,10 +933,6 @@ pub fn execute_wrapped_runner(
 
                         NextWork::Work(WorkerTest {
                             test_case: test_case.clone(),
-                            context: WorkContext {
-                                working_dir: working_dir.clone(),
-                            },
-                            run_id: RunId::unique(),
                             work_id: WorkId(Default::default()),
                         })
                     }
@@ -1212,8 +1201,8 @@ mod test_abq_jest {
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, RunId,
-        WorkContext, WorkId, WorkerTest,
+        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, WorkId,
+        WorkerTest,
     };
     use abq_with_protocol_version::with_protocol_version;
     use futures::FutureExt;
@@ -1417,11 +1406,7 @@ mod test_abq_jest {
             async move {
                 NextWorkBundle(vec![NextWork::Work(WorkerTest {
                     test_case: TestCase::new(proto, "unreachable", Default::default()),
-                    context: WorkContext {
-                        working_dir: std::env::current_dir().unwrap(),
-                    },
-                    run_id: RunId::unique(),
-                    work_id: WorkId("unreachable".to_string()),
+                    work_id: WorkId::new(),
                 })])
             }
             .boxed()
