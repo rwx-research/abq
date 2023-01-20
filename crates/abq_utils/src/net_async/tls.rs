@@ -36,8 +36,6 @@ impl AsyncRead for ServerStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        // TODO(ayaz): i think we can get rid of these pins we mark `Stream` as transparent, since
-        // it should be compiled that way anyway.
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }
@@ -131,6 +129,7 @@ impl super::ServerHandshakeCtx for HandshakeCtx {
     }
 }
 
+#[repr(transparent)]
 pub struct ClientStream(tokio_tls::client::TlsStream<tokio::net::TcpStream>);
 
 impl super::ClientStream for ClientStream {
@@ -145,8 +144,6 @@ impl AsyncRead for ClientStream {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        // TODO(ayaz): i think we can get rid of these pins we mark `Stream` as transparent, since
-        // it should be compiled that way anyway.
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }

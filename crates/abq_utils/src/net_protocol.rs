@@ -62,7 +62,6 @@ pub mod workers {
     use std::{
         collections::HashMap,
         fmt::{self, Display},
-        path::PathBuf,
         str::FromStr,
     };
 
@@ -106,11 +105,30 @@ pub mod workers {
         }
     }
 
-    /// ID for a piece of work, reflected both during work queueing and completion.
-    /// For example, a test may have ID "vanguard:test.rb:test_homepage".
-    // TODO: maybe we want uuids here and some mappings to test IDs
-    #[derive(Serialize, Deserialize, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-    pub struct WorkId(pub String);
+    /// ABQ-internal-ID for a piece of work, reflected both during work queueing and completion.
+    ///
+    /// Distinct from the test ID reflected for a native test runner, this is used for associating
+    /// manifest entries inside ABQ itself.
+    #[derive(Serialize, Deserialize, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct WorkId(pub [u8; 16]);
+
+    impl WorkId {
+        #[allow(clippy::new_without_default)]
+        pub fn new() -> Self {
+            Self(uuid::Uuid::new_v4().into_bytes())
+        }
+    }
+
+    impl std::fmt::Display for WorkId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+        }
+    }
+    impl std::fmt::Debug for WorkId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+        }
+    }
 
     /// Runners used only for integration testing.
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -177,17 +195,9 @@ pub mod workers {
         }
     }
 
-    /// Context for a unit of work.
-    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-    pub struct WorkContext {
-        pub working_dir: PathBuf,
-    }
-
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
     pub struct WorkerTest {
         pub test_case: TestCase,
-        pub context: WorkContext,
-        pub run_id: RunId,
         pub work_id: WorkId,
     }
 

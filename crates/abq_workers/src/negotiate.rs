@@ -71,8 +71,6 @@ struct ExecutionContext {
     worker_should_generate_manifest: bool,
     /// Hint for how many test results should be sent back in a batch by a worker.
     results_batch_size_hint: u64,
-    // TODO: do we want the queue to be able to modify the # workers configured and their
-    // capabilities (timeout, retries, etc)?
 }
 
 #[allow(clippy::large_enum_variant)] // I believe we can drop this after we upgrade to rust 1.65.0
@@ -102,10 +100,7 @@ pub enum MessageToQueueNegotiator {
 pub struct WorkersConfig {
     pub num_workers: NonZeroUsize,
     /// Context under which workers should operate.
-    /// TODO: should this be user specified, or inferred, or either-or?
     pub worker_context: WorkerContext,
-    pub work_timeout: Duration,
-    pub work_retries: u8,
     pub debug_native_runner: bool,
 }
 
@@ -218,8 +213,6 @@ impl WorkersNegotiator {
         let WorkersConfig {
             num_workers,
             worker_context,
-            work_timeout,
-            work_retries,
             debug_native_runner,
         } = workers_config;
 
@@ -361,8 +354,6 @@ impl WorkersNegotiator {
             run_completed_successfully,
             results_batch_size_hint,
             worker_context,
-            work_timeout,
-            work_retries,
             run_id,
             notify_manifest,
             debug_native_runner,
@@ -885,7 +876,6 @@ impl Drop for QueueNegotiator {
 mod test {
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
-    use std::path::PathBuf;
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
@@ -906,7 +896,7 @@ mod test {
     };
     use abq_utils::net_protocol::workers::{
         ManifestResult, NextWork, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
-        TestLikeRunner, WorkContext, WorkId, WorkerTest,
+        TestLikeRunner, WorkId, WorkerTest,
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
@@ -950,11 +940,7 @@ mod test {
                             .map(|(i, test_case)| {
                                 NextWork::Work(WorkerTest {
                                     test_case,
-                                    context: WorkContext {
-                                        working_dir: PathBuf::from("/"),
-                                    },
-                                    run_id: RunId::unique(),
-                                    work_id: WorkId(i.to_string()),
+                                    work_id: WorkId([i as _; 16]),
                                 })
                             })
                             .collect();
@@ -1154,8 +1140,6 @@ mod test {
         let workers_config = WorkersConfig {
             num_workers: NonZeroUsize::new(1).unwrap(),
             worker_context: WorkerContext::AssumeLocal,
-            work_timeout: Duration::from_secs(1),
-            work_retries: 0,
             debug_native_runner: false,
         };
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(

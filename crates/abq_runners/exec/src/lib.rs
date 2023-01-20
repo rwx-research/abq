@@ -16,7 +16,6 @@ impl Runner for ExecWorker {
         let output = process::Command::new(input.cmd)
             .args(input.args)
             .output()
-            // TODO: handle failure
             .unwrap();
 
         let success = output.status.success();
@@ -25,7 +24,6 @@ impl Runner for ExecWorker {
         } else {
             output.stderr
         };
-        // TODO: handle not utf8 encodable
         String::from_utf8(message).unwrap()
     }
 }

@@ -29,9 +29,6 @@ abq_with_protocol_version = { path = "../abq_test_support/with_protocol_version"
 
 insta.workspace = true
 ntest.workspace = true
-# Needed for testing abq_workers.
-# TODO: figure out a better way to implement abq_workers::test_support to avoid this!
-procspawn = { version = "0.10.1", features = ["test-support"] }
 tempfile.workspace = true
 tracing-test.workspace = true
 tracing-subscriber.workspace = true
