@@ -1,8 +1,0 @@
-[package]
-name = "abq_echo_worker"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-abq_runner_protocol = { path = "../protocol" }
-abq_utils = { path = "../../abq_utils" }
