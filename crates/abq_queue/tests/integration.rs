@@ -285,7 +285,7 @@ fn action_to_fut(
                 let client = client.unwrap();
 
                 let result = client
-                    .stream_results(move |result| collected_results.lock().push(result))
+                    .stream_results(move |result| collected_results.lock().push(result.test_result))
                     .await;
 
                 supervisor_results.lock().await.insert(super_id, result);

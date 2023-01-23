@@ -497,6 +497,8 @@ pub mod work_server {
 pub mod client {
     use serde_derive::{Deserialize, Serialize};
 
+    use super::runners::{CapturedOutput, TestResult};
+
     /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
     #[derive(Serialize, Deserialize)]
     pub struct AckTestData {}
@@ -505,6 +507,22 @@ pub mod client {
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "type")]
     pub struct AckTestRunEnded {}
+
+    pub struct ReportedResult {
+        pub output_before: Option<CapturedOutput>,
+        pub test_result: TestResult,
+        pub output_after: Option<CapturedOutput>,
+    }
+
+    impl ReportedResult {
+        pub fn no_captures(test_result: TestResult) -> Self {
+            Self {
+                output_before: Default::default(),
+                test_result,
+                output_after: Default::default(),
+            }
+        }
+    }
 }
 
 pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketAddr {
