@@ -4,10 +4,14 @@ use std::{
     time::Duration,
 };
 
+pub mod colors;
+
 use abq_utils::net_protocol::{
     entity::EntityId,
     runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
 };
+use colors::ColorProvider;
+use indoc::formatdoc;
 use termcolor::{Color, ColorSpec, WriteColor};
 
 /// Formats a test result on a single line.
@@ -19,7 +23,7 @@ pub fn format_result_line(
     output_after: &Option<CapturedOutput>,
 ) -> io::Result<()> {
     if let Some(output_before) = output_before {
-        if !is_first_result {
+        if !is_first_result && would_write_output(Some(output_before)) {
             writeln!(writer)?;
         }
         format_worker_output(
@@ -36,7 +40,9 @@ pub fn format_result_line(
     writeln!(writer)?;
 
     if let Some(output_after) = output_after {
-        writeln!(writer)?;
+        if would_write_output(Some(output_after)) {
+            writeln!(writer)?;
+        }
         format_worker_output(
             writer,
             result.source,
@@ -88,6 +94,13 @@ pub fn format_summary(writer: &mut impl WriteColor, summary: SummaryKind) -> io:
     }
 }
 
+pub fn would_write_summary(summary: &SummaryKind) -> bool {
+    match summary {
+        SummaryKind::Test(_) => true,
+        SummaryKind::Output { output, .. } => would_write_output(Some(output)),
+    }
+}
+
 /// Formats a test result as a summary, possibly across multiple lines.
 pub fn format_test_result_summary(
     writer: &mut impl WriteColor,
@@ -126,7 +139,14 @@ pub fn format_test_result_summary(
     writeln!(writer, "; worker [{:?}])", result.source)
 }
 
-fn format_worker_output(
+pub fn would_write_output(output: Option<&CapturedOutput>) -> bool {
+    match output {
+        Some(o) => !o.stderr.is_empty() || !o.stdout.is_empty(),
+        None => false,
+    }
+}
+
+pub fn format_worker_output(
     writer: &mut impl WriteColor,
     worker: EntityId,
     test_name: &str,
@@ -139,12 +159,12 @@ fn format_worker_output(
     // ----- STDERR
     // {stderr}
 
-    let CapturedOutput { stderr, stdout } = output;
-
-    if stderr.is_empty() && stdout.is_empty() {
+    if !would_write_output(Some(output)) {
         // Don't write anything if we have nothing actionable
         return Ok(());
     }
+
+    let CapturedOutput { stderr, stdout } = output;
 
     let when = match when {
         OutputOrdering::BeforeTest => "BEFORE",
@@ -192,6 +212,62 @@ fn push_newline_if_needed(writer: &mut impl WriteColor, bytes: &[u8]) -> io::Res
     Ok(trailing_newlines)
 }
 
+pub fn format_interactive_progress(
+    colors: &ColorProvider,
+    elapsed: impl std::fmt::Display,
+    num_results: u64,
+    num_failing: u64,
+) -> String {
+    formatdoc! {
+        r#"
+        {bold}> ABQ status{reset}
+        {bold}> [{elapsed}] {num_tests} tests run{reset}, {green_bold}{num_passed} passed{reset}, {fail_color}{num_failing} failing{reset}
+        "#,
+        num_tests=num_results,
+        num_passed=num_results - num_failing,
+        num_failing=num_failing,
+        reset=colors.reset,
+        bold=colors.bold,
+        green_bold=colors.green_bold,
+        fail_color=if num_failing == 0 { colors.reset } else { colors.red_bold },
+    }
+}
+
+pub fn format_non_interactive_progress(
+    writer: &mut impl WriteColor,
+    elapsed: impl std::fmt::Display,
+    num_tests: u64,
+    num_failing: u64,
+) -> io::Result<()> {
+    // --- [abq progress] {elapsed} ---
+    // {num_tests} tests run, {num_passed} passed, {num_failing} failing
+
+    let num_passed = num_tests - num_failing;
+    let mut spec = ColorSpec::new();
+
+    writeln!(writer, "--- [abq progress] {elapsed} ---")?;
+    {
+        spec.clear();
+        spec.set_bold(true);
+        with_color_spec(writer, &spec, |w| write!(w, "{num_tests} tests run"))?;
+        write!(writer, ", ")?;
+    }
+    {
+        spec.clear();
+        spec.set_fg(Some(Color::Green)).set_bold(true);
+        with_color_spec(writer, &spec, |w| write!(w, "{num_passed} passed"))?;
+        write!(writer, ", ")?;
+    }
+    {
+        spec.clear();
+        if num_failing > 0 {
+            spec.set_fg(Some(Color::Red)).set_bold(true);
+        }
+        with_color_spec(writer, &spec, |w| write!(w, "{num_failing} failing"))?;
+    }
+    writeln!(writer)
+}
+
 fn status_color(status: &Status) -> Color {
     match status {
         Status::Success { .. } => Color::Green,
@@ -204,6 +280,7 @@ fn status_color(status: &Status) -> Color {
     }
 }
 
+#[inline]
 fn with_color<W>(
     writer: &mut W,
     color: Color,
@@ -212,7 +289,19 @@ fn with_color<W>(
 where
     W: WriteColor,
 {
-    writer.set_color(ColorSpec::new().set_fg(Some(color)))?;
+    with_color_spec(writer, ColorSpec::new().set_fg(Some(color)), f)
+}
+
+#[inline]
+fn with_color_spec<W>(
+    writer: &mut W,
+    color_spec: &ColorSpec,
+    f: impl FnOnce(&mut W) -> io::Result<()>,
+) -> io::Result<()>
+where
+    W: WriteColor,
+{
+    writer.set_color(color_spec)?;
     f(writer)?;
     writer.reset()
 }
