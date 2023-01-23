@@ -192,6 +192,34 @@ pub enum Status {
     TimedOut,
 }
 
+#[cfg(feature = "expose-native-protocols")]
+impl From<super::Status> for Status {
+    fn from(s: super::Status) -> Self {
+        match s {
+            super::Status::Failure {
+                exception,
+                backtrace,
+            } => Self::Failure(Failure {
+                exception,
+                backtrace,
+            }),
+            super::Status::Success => Self::Success,
+            super::Status::Error {
+                exception,
+                backtrace,
+            } => Self::Error(Error {
+                exception,
+                backtrace,
+            }),
+            super::Status::Pending => Self::Pending,
+            super::Status::Todo => Self::Todo,
+            super::Status::Skipped => Self::Skipped,
+            super::Status::TimedOut => Self::TimedOut,
+            super::Status::PrivateNativeRunnerError => Self::TimedOut,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Iso8601(pub String);
 
@@ -222,6 +250,41 @@ pub struct TestResult {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub other_errors: Option<Vec<OutOfBandError>>,
+}
+
+#[cfg(feature = "expose-native-protocols")]
+impl From<super::TestResult> for TestResult {
+    fn from(r: super::TestResult) -> Self {
+        let super::TestResultSpec {
+            status,
+            id,
+            display_name,
+            output,
+            runtime,
+            meta,
+            location,
+            started_at,
+            finished_at,
+            lineage,
+            other_errors,
+            ..
+        } = r.result;
+
+        Self {
+            status: status.into(),
+            id,
+            display_name,
+            output,
+            runtime: Nanoseconds(runtime.duration().as_nanos() as _),
+            meta,
+            location,
+            started_at,
+            finished_at,
+            lineage,
+            past_attempts: None, // TODO
+            other_errors,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

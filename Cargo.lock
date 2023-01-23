@@ -39,6 +39,8 @@ dependencies = [
 name = "abq_generic_test_runner"
 version = "0.1.0"
 dependencies = [
+ "abq_native_runner_simulation",
+ "abq_test_utils",
  "abq_utils",
  "abq_with_protocol_version",
  "anyhow",
@@ -76,6 +78,16 @@ dependencies = [
  "insta",
  "junit-report",
  "strip-ansi-escapes",
+]
+
+[[package]]
+name = "abq_native_runner_simulation"
+version = "0.1.0"
+dependencies = [
+ "abq_utils",
+ "serde",
+ "serde_derive",
+ "serde_json",
 ]
 
 [[package]]

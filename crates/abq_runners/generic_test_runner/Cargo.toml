@@ -33,4 +33,6 @@ test-abq-jest = []
 [dev-dependencies]
 insta.workspace = true
 abq_utils = { path = "../../abq_utils", features = ["expose-native-protocols"] }
+abq_test_utils = { path = "../../abq_test_support/abq_test_utils" }
 abq_with_protocol_version = { path = "../../abq_test_support/with_protocol_version" }
+abq_native_runner_simulation = { path = "../../abq_test_support/native_runner_simulator" }

@@ -602,9 +602,9 @@ pub struct TestResultSpec {
     pub other_errors: Option<Vec<OutOfBandError>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stderr: Option<String>,
+    pub stderr: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stdout: Option<String>,
+    pub stdout: Option<Vec<u8>>,
 }
 
 impl TestResultSpec {
@@ -627,8 +627,8 @@ impl TestResultSpec {
             ]),
             past_attempts: None,
             other_errors: None,
-            stderr: Some("my stdout".to_string()),
-            stdout: Some("my stderr".to_string()),
+            stderr: Some(b"my stdout".to_vec()),
+            stdout: Some(b"my stderr".to_vec()),
         }
     }
 }
@@ -786,9 +786,9 @@ impl RawNativeTestResult {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct RawTestResultMessage(PrivTestResultMessage);
-#[derive(Serialize, Deserialize, derive_more::From)]
+#[derive(Serialize, Deserialize, Debug, derive_more::From)]
 #[serde(untagged)]
 enum PrivTestResultMessage {
     V0_2(Box<v0_2::TestResultMessage>),
@@ -804,6 +804,22 @@ impl RawTestResultMessage {
         match self.0 {
             V0_1(msg) => TestResultSet::All(vec![msg.test_result.reify(source)]),
             V0_2(msg) => msg.into_test_results(source),
+        }
+    }
+
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn fake(witness: ProtocolWitness) -> Self {
+        use PrivProtocolWitness::*;
+        match witness.0 {
+            V0_1 => Self(PrivTestResultMessage::V0_1(v0_1::TestResultMessage {
+                test_result: TestResult::fake().into(),
+            })),
+
+            V0_2 => Self(PrivTestResultMessage::V0_2(Box::new(
+                v0_2::TestResultMessage::Single(v0_2::SingleTestResultMessage {
+                    test_result: TestResult::fake().into(),
+                }),
+            ))),
         }
     }
 }
@@ -874,6 +890,28 @@ impl InitMessage {
 type PrivInitSuccessMessage = v0_1::InitSuccessMessage;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InitSuccessMessage(PrivInitSuccessMessage);
+
+impl InitSuccessMessage {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(_witness: ProtocolWitness) -> Self {
+        InitSuccessMessage(v0_1::InitSuccessMessage {})
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CapturedOutput {
+    pub stderr: Vec<u8>,
+    pub stdout: Vec<u8>,
+}
+
+impl CapturedOutput {
+    pub fn empty() -> Self {
+        Self {
+            stderr: Default::default(),
+            stdout: Default::default(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod dispay {

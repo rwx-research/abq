@@ -28,9 +28,7 @@ where
 
 #[derive(Default, Debug)]
 struct SideChannelInner {
-    capturing: bool,
-    capture_buf: Vec<u8>,
-    unassociated_output: Vec<u8>,
+    buf: Vec<u8>,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -39,43 +37,21 @@ pub struct SideChannel(Arc<Mutex<SideChannelInner>>);
 impl SideChannel {
     fn write(&self, buf: &[u8]) {
         let mut channel = self.0.lock();
-        if channel.capturing {
-            channel.capture_buf.extend(buf);
-        } else {
-            channel.unassociated_output.extend(buf);
-        }
+        channel.buf.extend(buf);
     }
 
-    pub fn begin_capture(&self) {
+    pub fn get_captured(&self) -> Vec<u8> {
         let mut channel = self.0.lock();
-        assert!(
-            !channel.capturing,
-            "cannot call begin_capture while already capturing"
-        );
-        channel.capturing = true;
+        let new_buf = Vec::with_capacity(channel.buf.len());
+        std::mem::replace(&mut channel.buf, new_buf)
     }
 
-    pub fn end_capture(&self) -> Vec<u8> {
-        let mut channel = self.0.lock();
-        assert!(
-            channel.capturing,
-            "cannot call end_capture while not capturing"
-        );
-        channel.capturing = false;
-        std::mem::take(&mut channel.capture_buf)
-    }
-
-    /// Consumes the side channel and returns all output that was not associated with a capturing
-    /// region.
+    /// Consumes the side channel and returns all remaining output.
     /// Returns an error if the side channel is not exclusively referenced.
     pub fn finish(self) -> Result<Vec<u8>, Self> {
         let channel = Arc::try_unwrap(self.0).map_err(Self)?;
         let channel = Mutex::into_inner(channel);
-        assert!(
-            !channel.capturing,
-            "finish called on channel while still capturing"
-        );
-        Ok(channel.unassociated_output)
+        Ok(channel.buf)
     }
 }
 
@@ -121,8 +97,13 @@ where
         cx: &mut task::Context<'_>,
         buf: &[u8],
     ) -> task::Poll<Result<usize, std::io::Error>> {
-        self.side_channel.write(buf);
-        Pin::new(&mut self.pipe).poll_write(cx, buf)
+        let poll = Pin::new(&mut self.pipe).poll_write(cx, buf);
+        if let task::Poll::Ready(Ok(num_bytes_read)) = poll {
+            // Only read as many bytes as the underlying stream read, since we'll get polled
+            // again for anything missed.
+            self.side_channel.write(&buf[..num_bytes_read]);
+        }
+        poll
     }
 
     fn poll_flush(
@@ -278,13 +259,11 @@ mod test {
         } = mux_output(inc.clone(), parent.clone());
 
         {
-            side_channel.begin_capture();
-
             inc.push_buf(&[1, 2, 3]);
             inc.push_buf(&[4, 5, 6]);
             wait_until(|| parent.read().ends_with(&[6])).await;
 
-            assert_eq!(side_channel.end_capture(), &[1, 2, 3, 4, 5, 6]);
+            assert_eq!(side_channel.get_captured(), &[1, 2, 3, 4, 5, 6]);
         }
 
         inc.finish();
@@ -301,7 +280,7 @@ mod test {
             _witness,
         } = mux_output(inc.clone(), parent.clone());
 
-        // Before any capture - should write to unassociated buffer
+        // First write - should end up in Capture 1
         {
             inc.push_buf(&[1, 2, 3]);
             wait_until(|| parent.read().ends_with(&[3])).await;
@@ -309,15 +288,13 @@ mod test {
 
         // Capture 1
         {
-            side_channel.begin_capture();
-
             inc.push_buf(&[4, 5, 6]);
             wait_until(|| parent.read().ends_with(&[6])).await;
 
-            assert_eq!(side_channel.end_capture(), &[4, 5, 6]);
+            assert_eq!(side_channel.get_captured(), &[1, 2, 3, 4, 5, 6]);
         }
 
-        // Between captures - should write to unassociated buffer
+        // write - should end up in Capture 2
         {
             inc.push_buf(&[7, 8, 9]);
             wait_until(|| parent.read().ends_with(&[9])).await;
@@ -325,15 +302,13 @@ mod test {
 
         // Capture 2
         {
-            side_channel.begin_capture();
-
             inc.push_buf(&[10, 11, 12]);
             wait_until(|| parent.read().ends_with(&[12])).await;
 
-            assert_eq!(side_channel.end_capture(), &[10, 11, 12]);
+            assert_eq!(side_channel.get_captured(), &[7, 8, 9, 10, 11, 12]);
         }
 
-        // After all captures - should write to unassociated buffer
+        // After all above captures - should be resolved on finish
         {
             inc.push_buf(&[13, 14, 15]);
             wait_until(|| parent.read().ends_with(&[15])).await;
@@ -342,8 +317,8 @@ mod test {
         inc.finish();
         copied_all_output.await.unwrap().unwrap();
 
-        let unassociated = side_channel.finish().unwrap();
-        assert_eq!(unassociated, &[1, 2, 3, 7, 8, 9, 13, 14, 15]);
+        let rest = side_channel.finish().unwrap();
+        assert_eq!(rest, &[13, 14, 15]);
         assert_eq!(&*parent.read(), &(1..=15).collect::<Vec<_>>());
     }
 }
