@@ -19,11 +19,11 @@ use abq_utils::{
     net_opt::ClientOptions,
     net_protocol::{
         self,
+        client::ReportedResult,
         entity::EntityId,
         queue::{
             self, AssociatedTestResults, InvokeWork, InvokerTestData, Message, NativeRunnerInfo,
         },
-        runners::TestResult,
         workers::{RunId, RunnerKind},
         AsyncReader,
     },
@@ -303,7 +303,7 @@ impl Client {
     /// result is received.
     pub async fn stream_results(
         mut self,
-        mut on_result: impl FnMut(TestResult),
+        mut on_result: impl FnMut(ReportedResult),
     ) -> Result<CompletedSummary, TestResultError> {
         use IncrementalTestData::*;
 
@@ -318,13 +318,35 @@ impl Client {
                     for AssociatedTestResults {
                         work_id: _,
                         results,
-                        // TODO: emit before/after test result output
-                        before_any_test: _,
-                        after_all_tests: _,
+                        before_any_test,
+                        after_all_tests,
                     } in results
                     {
-                        for test_result in results {
-                            on_result(test_result);
+                        assert!(
+                            !results.is_empty(),
+                            "ABQ protocol must never ship empty list of test results"
+                        );
+
+                        let mut output_before = Some(before_any_test);
+                        let mut output_after = after_all_tests;
+
+                        let mut results = results.into_iter().peekable();
+
+                        while let Some(test_result) = results.next() {
+                            let output_before = std::mem::take(&mut output_before);
+                            let output_after = if results.peek().is_none() {
+                                // This is the last test result, the output-after is associated
+                                // with it
+                                std::mem::take(&mut output_after)
+                            } else {
+                                None
+                            };
+
+                            on_result(ReportedResult {
+                                output_before,
+                                test_result,
+                                output_after,
+                            })
                         }
                     }
                 }

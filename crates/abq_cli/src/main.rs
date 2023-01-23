@@ -23,9 +23,10 @@ use abq_utils::{
     exit::ExitCode,
     net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
+        client::ReportedResult,
         entity::EntityId,
         health::Health,
-        runners::{TestResult, TestRuntime},
+        runners::TestRuntime,
         workers::{NativeTestRunnerParams, RunId, RunnerKind},
     },
     tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -787,7 +788,7 @@ fn start_test_result_reporter(
     runner: RunnerKind,
     batch_size: NonZeroU64,
     results_timeout: Duration,
-    on_result: impl FnMut(TestResult) + Send + 'static,
+    on_result: impl FnMut(ReportedResult) + Send + 'static,
 ) -> io::Result<JoinHandle<Result<CompletedSummary, InvocationError>>> {
     let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
 

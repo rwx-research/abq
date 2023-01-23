@@ -7,13 +7,16 @@ use std::{
 };
 
 use abq_output::{
-    format_duration_to_partial_seconds, format_result_dot, format_result_line,
-    format_result_summary,
+    format_duration_to_partial_seconds, format_result_dot, format_result_line, format_summary,
+    format_test_result_summary, OutputOrdering, SummaryKind,
 };
 use abq_queue::invoke::CompletedSummary;
 use abq_utils::{
     exit::{self, ExitCode},
-    net_protocol::runners::{Status, TestResult, TestRuntime},
+    net_protocol::{
+        client::ReportedResult,
+        runners::{CapturedOutput, Status, TestResult, TestRuntime},
+    },
 };
 use termcolor::{ColorChoice, StandardStream};
 use thiserror::Error;
@@ -198,7 +201,7 @@ impl SuiteResult {
 /// A reporter is allowed to be side-effectful.
 pub(crate) trait Reporter: Send {
     /// Consume the next test result.
-    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError>;
+    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError>;
 
     /// Consume the reporter, and perform any needed finalization steps.
     ///
@@ -214,11 +217,11 @@ fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> 
 
 fn write_summary_results(
     writer: &mut impl termcolor::WriteColor,
-    results: Vec<TestResult>,
+    summaries: Vec<SummaryKind>,
 ) -> Result<(), ReportingError> {
-    for test_result in results {
+    for summary in summaries {
         write(writer, &[b'\n'])?;
-        format_result_summary(writer, &test_result)?;
+        format_summary(writer, summary)?;
     }
     Ok(())
 }
@@ -230,24 +233,41 @@ struct LineReporter {
     buffer: Box<dyn termcolor::WriteColor + Send>,
 
     /// Failures and errors for which a longer summary should be printed at the end.
-    delayed_failure_reports: Vec<TestResult>,
+    delayed_summaries: Vec<SummaryKind>,
+
+    seen_first: bool,
 }
 
 impl Reporter for LineReporter {
-    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
-        format_result_line(&mut self.buffer, test_result)?;
+    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+        let ReportedResult {
+            output_before,
+            output_after,
+            test_result,
+        } = result;
+
+        format_result_line(
+            &mut self.buffer,
+            test_result,
+            !self.seen_first,
+            output_before,
+            output_after,
+        )?;
+
+        self.seen_first = true;
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
-            format_result_summary(&mut self.buffer, test_result)?;
+            format_test_result_summary(&mut self.buffer, test_result)?;
         } else if test_result.status.is_fail_like() {
-            self.delayed_failure_reports.push(test_result.clone());
+            self.delayed_summaries
+                .push(SummaryKind::Test(test_result.clone()));
         }
 
         Ok(())
     }
 
     fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
-        write_summary_results(&mut self.buffer, self.delayed_failure_reports)?;
+        write_summary_results(&mut self.buffer, self.delayed_summaries)?;
 
         self.buffer
             .flush()
@@ -267,11 +287,34 @@ struct DotReporter {
 
     num_results: u64,
 
-    delayed_failure_reports: Vec<TestResult>,
+    delayed_summaries: Vec<SummaryKind>,
+}
+impl DotReporter {
+    fn maybe_push_delayed_output(
+        &mut self,
+        test_result: &TestResult,
+        opt_output: &Option<CapturedOutput>,
+        when: OutputOrdering,
+    ) {
+        if let Some(output) = opt_output.as_ref() {
+            self.delayed_summaries.push(SummaryKind::Output {
+                when,
+                worker: test_result.source,
+                test_name: test_result.display_name.clone(),
+                output: output.clone(),
+            });
+        }
+    }
 }
 
 impl Reporter for DotReporter {
-    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
+    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+        let ReportedResult {
+            output_before,
+            output_after,
+            test_result,
+        } = result;
+
         self.num_results += 1;
 
         format_result_dot(&mut self.buffer, test_result)?;
@@ -286,25 +329,28 @@ impl Reporter for DotReporter {
             .flush()
             .map_err(|_| ReportingError::FailedToWrite)?;
 
+        self.maybe_push_delayed_output(test_result, output_before, OutputOrdering::BeforeTest);
+
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
-            format_result_summary(&mut self.buffer, test_result)?;
+            format_test_result_summary(&mut self.buffer, test_result)?;
         } else if test_result.status.is_fail_like() {
-            self.delayed_failure_reports.push(test_result.clone());
+            self.delayed_summaries
+                .push(SummaryKind::Test(test_result.clone()));
         }
+
+        self.maybe_push_delayed_output(test_result, output_after, OutputOrdering::AfterTest);
 
         Ok(())
     }
 
     fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
-        if !self.delayed_failure_reports.is_empty()
-            && self.num_results % DOT_REPORTER_LINE_LIMIT != 0
-        {
+        if !self.delayed_summaries.is_empty() && self.num_results % DOT_REPORTER_LINE_LIMIT != 0 {
             // We have summaries to print and the last dot would not have printed a newline, so
             // print one before we display the summaries.
             write(&mut self.buffer, &[b'\n'])?;
         }
 
-        write_summary_results(&mut self.buffer, self.delayed_failure_reports)?;
+        write_summary_results(&mut self.buffer, self.delayed_summaries)?;
 
         self.buffer
             .flush()
@@ -321,8 +367,8 @@ struct JUnitXmlReporter {
 }
 
 impl Reporter for JUnitXmlReporter {
-    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
-        self.collector.push_result(test_result);
+    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+        self.collector.push_result(&result.test_result);
         Ok(())
     }
 
@@ -351,8 +397,8 @@ struct RwxV1JsonReporter {
 }
 
 impl Reporter for RwxV1JsonReporter {
-    fn push_result(&mut self, test_result: &TestResult) -> Result<(), ReportingError> {
-        self.collector.push_result(test_result);
+    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+        self.collector.push_result(&result.test_result);
         Ok(())
     }
 
@@ -395,12 +441,13 @@ fn reporter_from_kind(
     match kind {
         ReporterKind::Line => Box::new(LineReporter {
             buffer: Box::new(stdout),
-            delayed_failure_reports: Default::default(),
+            delayed_summaries: Default::default(),
+            seen_first: false,
         }),
         ReporterKind::Dot => Box::new(DotReporter {
             buffer: Box::new(stdout),
             num_results: 0,
-            delayed_failure_reports: Default::default(),
+            delayed_summaries: Default::default(),
         }),
         ReporterKind::JUnitXml(path) => Box::new(JUnitXmlReporter {
             path,
@@ -433,14 +480,14 @@ impl SuiteReporters {
         }
     }
 
-    pub fn push_result(&mut self, test_result: &TestResult) -> Result<(), Vec<ReportingError>> {
+    pub fn push_result(&mut self, result: &ReportedResult) -> Result<(), Vec<ReportingError>> {
         let errors: Vec<_> = self
             .reporters
             .iter_mut()
-            .filter_map(|reporter| reporter.push_result(test_result).err())
+            .filter_map(|reporter| reporter.push_result(result).err())
             .collect();
 
-        self.overall_result.account_result(test_result);
+        self.overall_result.account_result(&result.test_result);
 
         if errors.is_empty() {
             Ok(())
@@ -663,8 +710,9 @@ fn default_result() -> TestResultSpec {
 #[cfg(test)]
 mod test_line_reporter {
     use abq_utils::net_protocol::{
+        client::ReportedResult,
         entity::EntityId,
-        runners::{Status, TestResult, TestResultSpec},
+        runners::{CapturedOutput, Status, TestResult, TestResultSpec},
     };
 
     use crate::reporting::mock_summary;
@@ -681,7 +729,8 @@ mod test_line_reporter {
 
             let reporter = LineReporter {
                 buffer: Box::new(borrow_writer),
-                delayed_failure_reports: Default::default(),
+                delayed_summaries: Default::default(),
+                seen_first: false,
             };
 
             f(Box::new(reporter));
@@ -697,10 +746,16 @@ mod test_line_reporter {
             num_flushes,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(EntityId::fake(), default_result()))
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    default_result(),
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(EntityId::fake(), default_result()))
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    default_result(),
+                )))
                 .unwrap();
         });
 
@@ -730,17 +785,17 @@ mod test_line_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Success,
                         display_name: "abq/test1".to_string(),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Failure {
@@ -751,21 +806,30 @@ mod test_line_reporter {
                         output: Some("Assertion failed: 1 != 2".to_string()),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
-                    EntityId::fake(),
-                    TestResultSpec {
-                        status: Status::Skipped,
-                        display_name: "abq/test3".to_string(),
-                        output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
-                        ..default_result()
-                    },
-                ))
+                .push_result(&ReportedResult {
+                    test_result: TestResult::new(
+                        EntityId::fake(),
+                        TestResultSpec {
+                            status: Status::Skipped,
+                            display_name: "abq/test3".to_string(),
+                            output: Some(
+                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                            ),
+                            ..default_result()
+                        },
+                    ),
+                    output_before: Some(CapturedOutput {
+                        stderr: b"test3-stderr".to_vec(),
+                        stdout: b"test3-stdout".to_vec(),
+                    }),
+                    output_after: None,
+                })
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Error {
@@ -776,10 +840,10 @@ mod test_line_reporter {
                         output: Some("Process 28821 terminated early via SIGTERM".to_string()),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Pending,
@@ -789,7 +853,7 @@ mod test_line_reporter {
                         ),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter.finish(&mock_summary()).unwrap();
         });
@@ -798,6 +862,13 @@ mod test_line_reporter {
         insta::assert_snapshot!(output, @r###"
         abq/test1: ok
         abq/test2: FAILED
+
+        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        ----- STDOUT
+        test3-stdout
+        ----- STDERR
+        test3-stderr
+
         abq/test3: skipped
         abq/test4: ERRORED
         abq/test5: pending
@@ -816,8 +887,9 @@ mod test_line_reporter {
 #[cfg(test)]
 mod test_dot_reporter {
     use abq_utils::net_protocol::{
+        client::ReportedResult,
         entity::EntityId,
-        runners::{Status, TestResult, TestResultSpec},
+        runners::{CapturedOutput, Status, TestResult, TestResultSpec},
     };
 
     use crate::reporting::{mock_summary, DOT_REPORTER_LINE_LIMIT};
@@ -835,7 +907,7 @@ mod test_dot_reporter {
             let reporter = DotReporter {
                 buffer: Box::new(borrow_writer),
                 num_results: 0,
-                delayed_failure_reports: Default::default(),
+                delayed_summaries: Default::default(),
             };
 
             f(Box::new(reporter));
@@ -851,10 +923,16 @@ mod test_dot_reporter {
             num_flushes,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(EntityId::fake(), default_result()))
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    default_result(),
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(EntityId::fake(), default_result()))
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    default_result(),
+                )))
                 .unwrap();
         });
 
@@ -884,17 +962,17 @@ mod test_dot_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Success,
                         display_name: "abq/test1".to_string(),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Failure {
@@ -905,21 +983,30 @@ mod test_dot_reporter {
                         output: Some("Assertion failed: 1 != 2".to_string()),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
-                    EntityId::fake(),
-                    TestResultSpec {
-                        status: Status::Skipped,
-                        display_name: "abq/test3".to_string(),
-                        output: Some(r#"Skipped for reason: "not a summer Friday""#.to_string()),
-                        ..default_result()
-                    },
-                ))
+                .push_result(&ReportedResult {
+                    test_result: TestResult::new(
+                        EntityId::fake(),
+                        TestResultSpec {
+                            status: Status::Skipped,
+                            display_name: "abq/test3".to_string(),
+                            output: Some(
+                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                            ),
+                            ..default_result()
+                        },
+                    ),
+                    output_before: Some(CapturedOutput {
+                        stderr: b"test3-stderr".to_vec(),
+                        stdout: b"test3-stdout".to_vec(),
+                    }),
+                    output_after: None,
+                })
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Error {
@@ -930,10 +1017,10 @@ mod test_dot_reporter {
                         output: Some("Process 28821 terminated early via SIGTERM".to_string()),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter
-                .push_result(&TestResult::new(
+                .push_result(&ReportedResult::no_captures(TestResult::new(
                     EntityId::fake(),
                     TestResultSpec {
                         status: Status::Pending,
@@ -943,7 +1030,7 @@ mod test_dot_reporter {
                         ),
                         ..default_result()
                     },
-                ))
+                )))
                 .unwrap();
             reporter.finish(&mock_summary()).unwrap();
         });
@@ -955,6 +1042,13 @@ mod test_dot_reporter {
         --- abq/test2: FAILED ---
         Assertion failed: 1 != 2
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+
+        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        ----- STDOUT
+        test3-stdout
+        ----- STDERR
+        test3-stderr
+
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
@@ -979,13 +1073,13 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult::new(
+                    .push_result(&ReportedResult::no_captures(TestResult::new(
                         EntityId::fake(),
                         TestResultSpec {
                             status,
                             ..default_result()
                         },
-                    ))
+                    )))
                     .unwrap();
             }
 
@@ -1008,7 +1102,10 @@ mod test_dot_reporter {
         } = with_reporter(|mut reporter| {
             for _ in 0..DOT_REPORTER_LINE_LIMIT {
                 reporter
-                    .push_result(&TestResult::new(EntityId::fake(), default_result()))
+                    .push_result(&ReportedResult::no_captures(TestResult::new(
+                        EntityId::fake(),
+                        default_result(),
+                    )))
                     .unwrap();
             }
 
@@ -1039,13 +1136,13 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult::new(
+                    .push_result(&ReportedResult::no_captures(TestResult::new(
                         EntityId::fake(),
                         TestResultSpec {
                             status,
                             ..default_result()
                         },
-                    ))
+                    )))
                     .unwrap();
             }
 
@@ -1082,13 +1179,13 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&TestResult::new(
+                    .push_result(&ReportedResult::no_captures(TestResult::new(
                         EntityId::fake(),
                         TestResultSpec {
                             status,
                             ..default_result()
                         },
-                    ))
+                    )))
                     .unwrap();
             }
 
@@ -1113,8 +1210,8 @@ mod suite {
 
     use abq_utils::{
         exit,
-        net_protocol::entity::EntityId,
         net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime},
+        net_protocol::{client::ReportedResult, entity::EntityId},
     };
 
     use crate::reporting::ExitCode;
@@ -1123,7 +1220,9 @@ mod suite {
         default_result, mock_summary, ColorPreference, MockWriter, SuiteReporters, SuiteResult,
     };
 
-    fn get_overall_result<'a>(results: impl IntoIterator<Item = &'a TestResult>) -> SuiteResult {
+    fn get_overall_result<'a>(
+        results: impl IntoIterator<Item = &'a ReportedResult>,
+    ) -> SuiteResult {
         let mut suite = SuiteReporters::new([], ColorPreference::Auto, "test");
         results
             .into_iter()
@@ -1138,10 +1237,10 @@ mod suite {
             fn $test_name() {
                 use Status::*;
 
-                let results = $status_order.into_iter().map(|status| TestResult::new(EntityId::fake(),TestResultSpec {
+                let results = $status_order.into_iter().map(|status| ReportedResult::no_captures(TestResult::new(EntityId::fake(),TestResultSpec {
                     status,
                     ..default_result()
-                })).collect::<Vec<_>>();
+                }))).collect::<Vec<_>>();
 
                 let SuiteResult {
                     suggested_exit_code, count, ..

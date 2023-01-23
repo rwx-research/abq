@@ -898,7 +898,7 @@ impl InitSuccessMessage {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CapturedOutput {
     pub stderr: Vec<u8>,
     pub stdout: Vec<u8>,

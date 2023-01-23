@@ -1,13 +1,52 @@
-use std::{io, ops::Deref, time::Duration};
+use std::{
+    io::{self},
+    ops::Deref,
+    time::Duration,
+};
 
-use abq_utils::net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime};
+use abq_utils::net_protocol::{
+    entity::EntityId,
+    runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
+};
 use termcolor::{Color, ColorSpec, WriteColor};
 
 /// Formats a test result on a single line.
-pub fn format_result_line(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
+pub fn format_result_line(
+    writer: &mut impl WriteColor,
+    result: &TestResult,
+    is_first_result: bool,
+    output_before: &Option<CapturedOutput>,
+    output_after: &Option<CapturedOutput>,
+) -> io::Result<()> {
+    if let Some(output_before) = output_before {
+        if !is_first_result {
+            writeln!(writer)?;
+        }
+        format_worker_output(
+            writer,
+            result.source,
+            &result.display_name,
+            OutputOrdering::BeforeTest,
+            output_before,
+        )?;
+    }
+
     write!(writer, "{}: ", &result.display_name)?;
     format_status(writer, &result.status)?;
-    writeln!(writer)
+    writeln!(writer)?;
+
+    if let Some(output_after) = output_after {
+        writeln!(writer)?;
+        format_worker_output(
+            writer,
+            result.source,
+            &result.display_name,
+            OutputOrdering::AfterTest,
+            output_after,
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Formats a test result as a single dot.
@@ -22,8 +61,38 @@ pub fn format_result_dot(writer: &mut impl WriteColor, result: &TestResult) -> i
     with_color(writer, status_color(&result.status), |w| write!(w, "{dot}"))
 }
 
+pub enum SummaryKind {
+    Test(TestResult),
+    Output {
+        when: OutputOrdering,
+        worker: EntityId,
+        test_name: String,
+        output: CapturedOutput,
+    },
+}
+
+pub enum OutputOrdering {
+    BeforeTest,
+    AfterTest,
+}
+
+pub fn format_summary(writer: &mut impl WriteColor, summary: SummaryKind) -> io::Result<()> {
+    match summary {
+        SummaryKind::Test(result) => format_test_result_summary(writer, &result),
+        SummaryKind::Output {
+            when,
+            worker,
+            test_name,
+            output,
+        } => format_worker_output(writer, worker, &test_name, when, &output),
+    }
+}
+
 /// Formats a test result as a summary, possibly across multiple lines.
-pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) -> io::Result<()> {
+pub fn format_test_result_summary(
+    writer: &mut impl WriteColor,
+    result: &TestResult,
+) -> io::Result<()> {
     // --- test/name: {status} ---
     // {output}
     // (completed in {runtime}; worker [{worker_id}])
@@ -55,6 +124,72 @@ pub fn format_result_summary(writer: &mut impl WriteColor, result: &TestResult) 
     write!(writer, "(completed in ")?;
     format_duration(writer, *runtime)?;
     writeln!(writer, "; worker [{:?}])", result.source)
+}
+
+fn format_worker_output(
+    writer: &mut impl WriteColor,
+    worker: EntityId,
+    test_name: &str,
+    when: OutputOrdering,
+    output: &CapturedOutput,
+) -> io::Result<()> {
+    // --- [worker {worker_id}] BEFORE|AFTER test_name ---
+    // ----- STDOUT
+    // {stdout}
+    // ----- STDERR
+    // {stderr}
+
+    let CapturedOutput { stderr, stdout } = output;
+
+    if stderr.is_empty() && stdout.is_empty() {
+        // Don't write anything if we have nothing actionable
+        return Ok(());
+    }
+
+    let when = match when {
+        OutputOrdering::BeforeTest => "BEFORE",
+        OutputOrdering::AfterTest => "AFTER",
+    };
+
+    let mut trailing_newlines = 0;
+
+    writeln!(writer, "--- [worker {worker:?}] {when} {test_name} ---")?;
+
+    if !stdout.is_empty() {
+        // TODO: don't print if stdout is only whitespace
+        writeln!(writer, "----- STDOUT")?;
+        writer.write_all(stdout)?;
+        trailing_newlines = push_newline_if_needed(writer, stdout)?;
+    }
+
+    if !stderr.is_empty() {
+        // TODO: don't print if stderr is only whitespace
+        writeln!(writer, "----- STDERR")?;
+        writer.write_all(stderr)?;
+        trailing_newlines = push_newline_if_needed(writer, stderr)?;
+    }
+
+    // Make sure we have at least one blank line between this output and the next
+    for _ in 0..(2usize.saturating_sub(trailing_newlines)) {
+        writeln!(writer)?;
+    }
+
+    Ok(())
+}
+
+fn push_newline_if_needed(writer: &mut impl WriteColor, bytes: &[u8]) -> io::Result<usize> {
+    let mut trailing_newlines = 0;
+    for &byte in bytes.iter().rev() {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        trailing_newlines += (byte == b'\n') as usize;
+    }
+    if trailing_newlines == 0 {
+        writeln!(writer)?;
+        trailing_newlines += 1;
+    }
+    Ok(trailing_newlines)
 }
 
 fn status_color(status: &Status) -> Color {
@@ -144,12 +279,12 @@ pub fn format_duration_to_partial_seconds(
 mod test {
     use abq_utils::net_protocol::{
         entity::EntityId,
-        runners::{Status, TestResult, TestResultSpec, TestRuntime},
+        runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
     };
 
     use crate::{format_duration_to_partial_seconds, format_result_dot};
 
-    use super::{format_duration, format_result_line, format_result_summary};
+    use super::{format_duration, format_result_line, format_test_result_summary};
     use std::{io, time::Duration};
 
     #[allow(clippy::identity_op)]
@@ -223,11 +358,22 @@ mod test {
                 insta::assert_snapshot!(formatted, @$expect_colored);
             }
         };
+        ($name:ident, $fn:ident, $item:expr, $out_before:expr, $out_after:expr, @$expect_colored:literal) => {
+            #[test]
+            fn $name() {
+                // Test colored output
+                let mut buf = TestColorWriter(vec![]);
+                $fn(&mut buf, $item, true, $out_before, $out_after).unwrap();
+                let formatted = String::from_utf8(buf.0).unwrap();
+                insta::assert_snapshot!(formatted, @$expect_colored);
+            }
+        };
     }
 
     test_format!(
         format_line_success, format_result_line,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
+        &None, &None,
         @r###"
     abq/test: <green>ok<reset>
     "###
@@ -236,6 +382,7 @@ mod test {
     test_format!(
         format_line_failure, format_result_line,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &None, &None,
         @r###"
     abq/test: <red>FAILED<reset>
     "###
@@ -244,6 +391,7 @@ mod test {
     test_format!(
         format_line_error, format_result_line,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &None, &None,
         @r###"
     abq/test: <red>ERRORED<reset>
     "###
@@ -252,6 +400,7 @@ mod test {
     test_format!(
         format_line_pending, format_result_line,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
+        &None, &None,
         @r###"
     abq/test: <yellow>pending<reset>
     "###
@@ -260,8 +409,135 @@ mod test {
     test_format!(
         format_line_skipped, format_result_line,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &None, &None,
         @r###"
     abq/test: <yellow>skipped<reset>
+    "###
+    );
+
+    test_format!(
+        format_line_output_before_after, format_result_line,
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
+        @r###"
+    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    ----- STDOUT
+    stdout
+    before
+    ----- STDERR
+    stderr
+    before
+
+    abq/test: <yellow>skipped<reset>
+
+    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    ----- STDOUT
+    stdout
+    after
+    ----- STDERR
+    stderr
+    after
+
+    "###
+    );
+
+    test_format!(
+        format_line_output_only_before, format_result_line,
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &None,
+        @r###"
+    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    ----- STDOUT
+    stdout
+    before
+    ----- STDERR
+    stderr
+    before
+
+    abq/test: <yellow>skipped<reset>
+    "###
+    );
+
+    test_format!(
+        format_line_output_only_before_only_stdout, format_result_line,
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &Some(CapturedOutput { stderr: b"".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &None,
+        @r###"
+    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    ----- STDOUT
+    stdout
+    before
+
+    abq/test: <yellow>skipped<reset>
+    "###
+    );
+
+    test_format!(
+        format_line_output_only_before_only_stderr, format_result_line,
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"".to_vec() }),
+        &None,
+        @r###"
+    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    ----- STDERR
+    stderr
+    before
+
+    abq/test: <yellow>skipped<reset>
+    "###
+    );
+
+    test_format!(
+        format_line_output_only_after, format_result_line,
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &None,
+        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
+        @r###"
+    abq/test: <yellow>skipped<reset>
+
+    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    ----- STDOUT
+    stdout
+    after
+    ----- STDERR
+    stderr
+    after
+
+    "###
+    );
+
+    test_format!(
+        format_line_output_only_after_only_stdout, format_result_line,
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &None,
+        &Some(CapturedOutput { stdout: b"stdout\nafter".to_vec(), stderr: b"".to_vec() }),
+        @r###"
+    abq/test: <yellow>skipped<reset>
+
+    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    ----- STDOUT
+    stdout
+    after
+
+    "###
+    );
+
+    test_format!(
+        format_line_output_only_after_only_stderr, format_result_line,
+        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &None,
+        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"".to_vec() }),
+        @r###"
+    abq/test: <yellow>skipped<reset>
+
+    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    ----- STDERR
+    stderr
+    after
+
     "###
     );
 
@@ -368,7 +644,7 @@ mod test {
     );
 
     test_format!(
-        format_summary_success, format_result_summary,
+        format_summary_success, format_test_result_summary,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
@@ -378,7 +654,7 @@ mod test {
     );
 
     test_format!(
-        format_summary_failure, format_result_summary,
+        format_summary_failure, format_test_result_summary,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>FAILED<reset> ---
@@ -388,7 +664,7 @@ mod test {
     );
 
     test_format!(
-        format_summary_error, format_result_summary,
+        format_summary_error, format_test_result_summary,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>ERRORED<reset> ---
@@ -398,7 +674,7 @@ mod test {
     );
 
     test_format!(
-        format_summary_pending, format_result_summary,
+        format_summary_pending, format_test_result_summary,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>pending<reset> ---
@@ -408,7 +684,7 @@ mod test {
     );
 
     test_format!(
-        format_summary_skipped, format_result_summary,
+        format_summary_skipped, format_test_result_summary,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>skipped<reset> ---
@@ -418,7 +694,7 @@ mod test {
     );
 
     test_format!(
-        format_summary_multiline, format_result_summary,
+        format_summary_multiline, format_test_result_summary,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
@@ -431,7 +707,7 @@ mod test {
     );
 
     test_format!(
-        format_summary_no_output, format_result_summary,
+        format_summary_no_output, format_test_result_summary,
         &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
