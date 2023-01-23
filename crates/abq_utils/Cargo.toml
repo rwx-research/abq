@@ -25,6 +25,7 @@ async-trait.workspace = true
 
 static_assertions.workspace = true
 derive_more.workspace = true
+flate2 = "1.0.25"
 
 [dev-dependencies]
 insta.workspace = true

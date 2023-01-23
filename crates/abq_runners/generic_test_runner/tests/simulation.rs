@@ -9,8 +9,9 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::AssociatedTestResults;
 use abq_utils::net_protocol::runners::{
-    CapturedOutput, InitSuccessMessage, NativeRunnerSpecification, ProtocolWitness,
-    RawNativeRunnerSpawnedMessage, RawTestResultMessage, TestCase,
+    CapturedOutput, InitSuccessMessage, Manifest, ManifestMessage, NativeRunnerSpecification,
+    ProtocolWitness, RawNativeRunnerSpawnedMessage, RawTestResultMessage, Test, TestCase,
+    TestOrGroup,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -42,13 +43,21 @@ fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessag
     RawNativeRunnerSpawnedMessage::new(proto, protocol_version, runner_specification)
 }
 
-fn run_simulated_runner(
+const NO_GENERATE_MANIFEST: Option<fn(ManifestResult)> = None;
+
+fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     simulation: impl IntoIterator<Item = Msg>,
+    with_manifest: Option<SendManifest>,
     get_next_test: GetNextTests,
 ) -> (Vec<AssociatedTestResults>, CapturedOutput) {
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
     let input = NativeTestRunnerParams {
         cmd: native_runner_simulation_bin(),
-        args: vec![pack_msgs(simulation)],
+        args: vec![simfile_path.display().to_string()],
         extra_env: Default::default(),
     };
 
@@ -78,7 +87,7 @@ fn run_simulated_runner(
         &std::env::current_dir().unwrap(),
         || false,
         5,
-        Option::<fn(ManifestResult)>::None,
+        with_manifest,
         get_init_context,
         get_next_test,
         &*send_test_result,
@@ -161,7 +170,8 @@ fn capture_output_before_and_during_tests() {
     }
     let get_next_tests = &move || async move { work_bundle(proto) }.boxed();
 
-    let (mut results, final_captures) = run_simulated_runner(simulation, get_next_tests);
+    let (mut results, final_captures) =
+        run_simulated_runner(simulation, NO_GENERATE_MANIFEST, get_next_tests);
     results.sort_by_key(|r| r.work_id);
 
     // Unfortunately we cannot force a guarantee that all stdout/stderr in the child ends up in the
@@ -216,4 +226,71 @@ fn capture_output_before_and_during_tests() {
 
     check_bytes!(&all_stdout, b"stdout1stdout-test1stdout-test2stdout-after");
     check_bytes!(&all_stderr, b"stderr1stderr-test1stderr-test2stderr-after");
+}
+
+#[test]
+#[with_protocol_version]
+fn big_manifest() {
+    use Msg::*;
+
+    let test_name = "y".repeat(1_000);
+    let members = std::iter::repeat_with(|| {
+        TestOrGroup::test(Test::new(
+            proto,
+            test_name.clone(),
+            vec![],
+            Default::default(),
+        ))
+    })
+    .take(10_000);
+
+    let huge_manifest = ManifestMessage::new(Manifest::new(members, Default::default()));
+
+    assert!(abq_utils::net_protocol::validate_max_message_size(
+        serde_json::to_vec(&huge_manifest).unwrap().len() as _
+    )
+    .is_err());
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise we should get no requests for tests.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&huge_manifest))],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+            ],
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let manifest: Arc<Mutex<Option<ManifestResult>>> = Default::default();
+    let with_manifest = Box::new({
+        let manifest = manifest.clone();
+        move |manifest_result| {
+            *manifest.lock() = Some(manifest_result);
+        }
+    });
+    let get_next_tests = &move || async move { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
+
+    let (results, _) = run_simulated_runner(simulation, Some(with_manifest), get_next_tests);
+    assert!(results.is_empty());
+
+    let manifest = Arc::try_unwrap(manifest).unwrap().into_inner().unwrap();
+    let manifest = match manifest {
+        ManifestResult::Manifest(man) => man.manifest,
+        ManifestResult::TestRunnerError { .. } => unreachable!(),
+    };
+    let (tests, meta) = manifest.flatten();
+    assert_eq!(tests.len(), 10_000);
+    assert!(meta.is_empty());
 }

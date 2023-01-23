@@ -530,8 +530,10 @@ pub fn publicize_addr(mut socket_addr: SocketAddr, public_ip: IpAddr) -> SocketA
     socket_addr
 }
 
-fn validate_max_message_size(message_size: u32) -> Result<(), std::io::Error> {
-    const MAX_MESSAGE_SIZE: u32 = 1_000_000; // 1MB
+const MAX_MESSAGE_SIZE: u32 = 1_000_000; // 1MB
+const MAX_MESSAGE_SIZE_USIZE: usize = 1_000_000; // 1MB
+
+pub fn validate_max_message_size(message_size: u32) -> Result<(), std::io::Error> {
     if message_size > MAX_MESSAGE_SIZE {
         tracing::warn!("Refusing to read message of size {message_size} bytes");
         return Err(std::io::Error::new(
@@ -544,6 +546,20 @@ fn validate_max_message_size(message_size: u32) -> Result<(), std::io::Error> {
 
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_READ: Duration = Duration::from_micros(10);
+
+fn gz_decode(buf: &[u8]) -> io::Result<Vec<u8>> {
+    let mut result_buf = Vec::with_capacity(buf.len() * 2);
+    flate2::read::GzDecoder::new(buf).read_to_end(&mut result_buf)?;
+    Ok(result_buf)
+}
+
+fn gz_encode(buf: &[u8]) -> io::Result<Vec<u8>> {
+    let result_buf = Vec::with_capacity(buf.len() * 2);
+    // Use the default compression level of 6
+    let mut encoder = flate2::write::GzEncoder::new(result_buf, flate2::Compression::new(6));
+    encoder.write_all(buf)?;
+    encoder.finish()
+}
 
 /// Reads a message from a stream communicating with abq.
 ///
@@ -561,11 +577,17 @@ fn read_help<T: serde::de::DeserializeOwned>(
     let mut msg_size_buf = [0; 4];
     read_exact_help(reader, &mut msg_size_buf, Duration::MAX)?;
 
-    let msg_size = u32::from_be_bytes(msg_size_buf);
+    let msg_size = i32::from_be_bytes(msg_size_buf);
+    let needs_decompression = msg_size.is_negative();
+    let msg_size = msg_size.unsigned_abs();
     validate_max_message_size(msg_size)?;
 
     let mut msg_buf = vec![0; msg_size as usize];
     read_exact_help(reader, &mut msg_buf, timeout)?;
+
+    if needs_decompression {
+        msg_buf = gz_decode(&msg_buf)?;
+    }
 
     let msg = serde_json::from_slice(&msg_buf)?;
     Ok(msg)
@@ -611,14 +633,26 @@ fn read_exact_help(
 
 /// Writes a message to a stream communicating with abq.
 pub fn write<T: serde::Serialize>(writer: &mut impl Write, msg: T) -> Result<(), std::io::Error> {
-    let msg_json = serde_json::to_vec(&msg)?;
+    let (msg_bytes, compressed) = {
+        let msg_json = serde_json::to_vec(&msg)?;
+        if msg_json.len() > MAX_MESSAGE_SIZE_USIZE {
+            (gz_encode(&msg_json)?, true)
+        } else {
+            (msg_json, false)
+        }
+    };
 
-    let msg_size = msg_json.len();
-    let msg_size_buf = u32::to_be_bytes(msg_size as u32);
+    let msg_size_buf = {
+        let mut msg_size = msg_bytes.len() as i32;
+        if compressed {
+            msg_size *= -1
+        };
+        i32::to_be_bytes(msg_size)
+    };
 
     let mut msg_buf = Vec::new();
     msg_buf.extend_from_slice(&msg_size_buf);
-    msg_buf.extend_from_slice(&msg_json);
+    msg_buf.extend_from_slice(&msg_bytes);
 
     // NB: to be safe, always flush after writing.
     // See `async_write` for motivation.
@@ -633,22 +667,35 @@ pub fn write<T: serde::Serialize>(writer: &mut impl Write, msg: T) -> Result<(),
 /// In cases where an async read might be a part of a `select` branch, it's pivotal to use an
 /// AsyncReader rather than [async_read] directly, to ensure that if the reading future is
 /// cancelled, it can be resumed without losing place of where the read stopped.
-pub struct AsyncReader {
+///
+/// If `DOS_PROTECT` is true, denial-of-service protection is enforced:
+/// - a [maximum message size][MAX_MESSAGE_SIZE] is enforced
+/// - a negative message size represents a [compressed][gz_encode] message.
+pub struct AsyncReader<const DOS_PROTECT: bool> {
     size_buf: [u8; 4],
-    msg_size: Option<usize>,
+    msg_size: Option<MsgSize>,
     msg_buf: Vec<u8>,
     read: usize,
     timeout: Duration,
     next_expiration: Option<tokio::time::Instant>,
 }
 
-impl Default for AsyncReader {
+/// An async reader with DOS protection enabled.
+pub type AsyncReaderDos = AsyncReader<true>;
+
+#[derive(Debug)]
+struct MsgSize {
+    size: usize,
+    needs_decompression: bool,
+}
+
+impl Default for AsyncReader<true> {
     fn default() -> Self {
         Self::new(READ_TIMEOUT)
     }
 }
 
-impl AsyncReader {
+impl<const DOS_PROTECT: bool> AsyncReader<DOS_PROTECT> {
     fn new(timeout: Duration) -> Self {
         Self {
             size_buf: [0; 4],
@@ -661,7 +708,7 @@ impl AsyncReader {
     }
 }
 
-impl AsyncReader {
+impl<const DOS_PROTECT: bool> AsyncReader<DOS_PROTECT> {
     /// Reads the next message from a given reader.
     ///
     /// Cancellation-safe, but the same `reader` must be provided between cancellable calls.
@@ -684,13 +731,24 @@ impl AsyncReader {
 
                     self.read += num_bytes_read;
                     if self.read == 4 {
-                        let msg_size = u32::from_be_bytes(self.size_buf);
-                        validate_max_message_size(msg_size)?;
+                        let (msg_size, needs_decompression) = {
+                            let raw_size = i32::from_be_bytes(self.size_buf);
+                            (raw_size.unsigned_abs(), raw_size.is_negative())
+                        };
+                        if DOS_PROTECT {
+                            validate_max_message_size(msg_size)?
+                        }
                         self.read = 0;
-                        self.msg_size = Some(msg_size as _);
+                        self.msg_size = Some(MsgSize {
+                            size: msg_size as _,
+                            needs_decompression,
+                        });
                     }
                 }
-                Some(size) => {
+                Some(MsgSize {
+                    size,
+                    needs_decompression,
+                }) => {
                     // Prime the message buffer with the number of bytes we're looking to read here.
                     if self.read == 0 {
                         self.msg_buf.reserve(size);
@@ -716,12 +774,20 @@ impl AsyncReader {
 
                     self.read += num_bytes_read;
                     if self.read == size {
+                        let msg = if needs_decompression {
+                            debug_assert!(DOS_PROTECT);
+                            let msg_bytes = gz_decode(&self.msg_buf)?;
+                            serde_json::from_slice(&msg_bytes)?
+                        } else {
+                            serde_json::from_slice(&self.msg_buf)?
+                        };
+
                         // Clear for the next read
-                        let msg = serde_json::from_slice(&self.msg_buf)?;
                         self.msg_size = None;
                         self.read = 0;
                         self.msg_buf.clear();
                         self.next_expiration = None;
+
                         return Ok(msg);
                     }
                 }
@@ -739,12 +805,29 @@ pub async fn async_read<R, T: serde::de::DeserializeOwned>(
 where
     R: tokio::io::AsyncReadExt + Unpin,
 {
-    AsyncReader::default().next(reader).await
+    AsyncReader::<true>::new(READ_TIMEOUT).next(reader).await
+}
+
+/// Like [async_read], but for communication over a local network (namely, worker<->native
+/// runner).
+///
+/// Not cancellation-safe. If you need a cancellation-safe read, use an [AsyncReader].
+///
+/// Disables DOS protections.
+pub async fn async_read_local<R, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> Result<T, std::io::Error>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    AsyncReader::<false>::new(READ_TIMEOUT).next(reader).await
 }
 
 /// Like [write], but async.
 ///
 /// Not cancellation-safe. Do not use this in `select!` branches!
+///
+/// Enables DOS protections.
 pub async fn async_write<R, T: serde::Serialize>(
     writer: &mut R,
     msg: &T,
@@ -752,14 +835,49 @@ pub async fn async_write<R, T: serde::Serialize>(
 where
     R: tokio::io::AsyncWriteExt + Unpin,
 {
-    let msg_json = serde_json::to_vec(msg)?;
+    async_write_help::<R, T, true>(writer, msg).await
+}
 
-    let msg_size = msg_json.len();
-    let msg_size_buf = u32::to_be_bytes(msg_size as u32);
+/// Like [async_write], but for communication over a local network (namely, worker<->native
+/// runner).
+/// Disables DOS protections.
+pub async fn async_write_local<R, T: serde::Serialize>(
+    writer: &mut R,
+    msg: &T,
+) -> Result<(), std::io::Error>
+where
+    R: tokio::io::AsyncWriteExt + Unpin,
+{
+    async_write_help::<R, T, false>(writer, msg).await
+}
 
-    let mut msg_buf = Vec::with_capacity(msg_size_buf.len() + msg_json.len());
+async fn async_write_help<R, T: serde::Serialize, const DOS_PROTECT: bool>(
+    writer: &mut R,
+    msg: &T,
+) -> Result<(), std::io::Error>
+where
+    R: tokio::io::AsyncWriteExt + Unpin,
+{
+    let (msg_bytes, compressed) = {
+        let msg_json = serde_json::to_vec(msg)?;
+        if DOS_PROTECT && msg_json.len() > MAX_MESSAGE_SIZE_USIZE {
+            (gz_encode(&msg_json)?, true)
+        } else {
+            (msg_json, false)
+        }
+    };
+
+    let msg_size_buf = {
+        let mut msg_size = msg_bytes.len() as i32;
+        if compressed {
+            msg_size *= -1
+        };
+        i32::to_be_bytes(msg_size)
+    };
+
+    let mut msg_buf = Vec::with_capacity(msg_size_buf.len() + msg_bytes.len());
     msg_buf.extend_from_slice(&msg_size_buf);
-    msg_buf.extend_from_slice(&msg_json);
+    msg_buf.extend_from_slice(&msg_bytes);
 
     // NB: to be safe, always flush after writing. [tokio::io::AsyncWrite::poll_write] makes no
     // guarantee about the behavior after `write_all`, including whether the implementing type must
@@ -785,7 +903,7 @@ mod test {
     use rand::Rng;
     use tokio::io::AsyncWriteExt;
 
-    use crate::net_protocol::{read_help, AsyncReader};
+    use crate::net_protocol::{read_help, AsyncReader, MAX_MESSAGE_SIZE_USIZE};
 
     use super::{async_read, read};
 
@@ -863,7 +981,7 @@ mod test {
         let msg_size = 10_u32.to_be_bytes();
         client_conn.write_all(&msg_size).await.unwrap();
 
-        let read_result: Result<(), _> = AsyncReader::new(Duration::from_secs(0))
+        let read_result: Result<(), _> = AsyncReader::<true>::new(Duration::from_secs(0))
             .next(&mut server_conn)
             .await;
         assert!(read_result.is_err());
@@ -899,7 +1017,7 @@ mod test {
             // we cancel it, which we explicitly do on every iteration, so we can tell rustc to
             // pretend that these things are effectively static relative to the lifetime of the
             // reader job.
-            let async_reader: &'static mut AsyncReader =
+            let async_reader: &'static mut AsyncReader<true> =
                 unsafe { std::mem::transmute(&mut async_reader) };
             let server_conn: &'static mut TcpStream =
                 unsafe { std::mem::transmute(&mut server_conn) };
@@ -984,7 +1102,7 @@ mod test {
                 // we cancel it, which we explicitly do on every iteration, so we can tell rustc to
                 // pretend that these things are effectively static relative to the lifetime of the
                 // reader job.
-                let async_reader: &'static mut AsyncReader =
+                let async_reader: &'static mut AsyncReader<true> =
                     unsafe { std::mem::transmute(&mut async_reader) };
                 let server_conn: &'static mut TcpStream =
                     unsafe { std::mem::transmute(&mut server_conn) };
@@ -1005,5 +1123,69 @@ mod test {
                 }
             }
         }
+    }
+
+    #[test]
+    fn send_read_compressed_message() {
+        use std::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap()).unwrap();
+        let (mut server_conn, _) = server.accept().unwrap();
+        server_conn.set_nonblocking(true).unwrap();
+
+        let msg = "y".repeat(MAX_MESSAGE_SIZE_USIZE * 2);
+        assert!(serde_json::to_vec(&msg).unwrap().len() > MAX_MESSAGE_SIZE_USIZE);
+
+        super::write(&mut client_conn, &msg).unwrap();
+        let read_msg: String = super::read(&mut server_conn).unwrap();
+
+        assert_eq!(msg, read_msg);
+    }
+
+    #[tokio::test]
+    async fn send_read_compressed_message_async() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_conn, _) = server.accept().await.unwrap();
+
+        let msg = "y".repeat(MAX_MESSAGE_SIZE_USIZE * 2);
+        assert!(serde_json::to_vec(&msg).unwrap().len() > MAX_MESSAGE_SIZE_USIZE);
+
+        let (write_res, read_res) = tokio::join!(
+            super::async_write(&mut client_conn, &msg),
+            super::async_read(&mut server_conn),
+        );
+        write_res.unwrap();
+        let read_msg: String = read_res.unwrap();
+
+        assert_eq!(msg, read_msg);
+    }
+
+    #[tokio::test]
+    async fn send_read_large_local_message_async() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_conn, _) = server.accept().await.unwrap();
+
+        let msg = "y".repeat(MAX_MESSAGE_SIZE_USIZE * 2);
+        assert!(serde_json::to_vec(&msg).unwrap().len() > MAX_MESSAGE_SIZE_USIZE);
+
+        let (write_res, read_res) = tokio::join!(
+            super::async_write_local(&mut client_conn, &msg),
+            super::async_read_local(&mut server_conn),
+        );
+        write_res.unwrap();
+        let read_msg: String = read_res.unwrap();
+
+        assert_eq!(msg, read_msg);
     }
 }

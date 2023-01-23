@@ -61,7 +61,22 @@ pub enum ProtocolVersionMessageError {
     Version(#[from] ProtocolVersionError),
 }
 
-type RunnerConnection = TcpStream;
+#[derive(Debug)]
+pub struct RunnerConnection {
+    stream: TcpStream,
+}
+
+impl RunnerConnection {
+    fn new(stream: TcpStream) -> Self {
+        Self { stream }
+    }
+    async fn read<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<T> {
+        net_protocol::async_read_local(&mut self.stream).await
+    }
+    async fn write<T: serde::Serialize>(&mut self, msg: &T) -> io::Result<()> {
+        net_protocol::async_write_local(&mut self.stream, msg).await
+    }
+}
 
 #[derive(Debug)]
 pub struct NativeRunnerInfo {
@@ -106,7 +121,7 @@ pub async fn open_native_runner_connection(
             let concrete_spawned_message: RawNativeRunnerSpawnedMessage = net_protocol::async_read(&mut conn).await?;
             let spawned_message = concrete_spawned_message.into();
 
-            (spawned_message, conn)
+            (spawned_message, RunnerConnection::new(conn))
         }
     };
 
@@ -123,7 +138,7 @@ pub async fn open_native_runner_connection(
 }
 
 pub async fn wait_for_manifest(mut runner_conn: RunnerConnection) -> io::Result<ManifestMessage> {
-    let manifest: ManifestMessage = net_protocol::async_read(&mut runner_conn).await?;
+    let manifest: ManifestMessage = runner_conn.read().await?;
 
     Ok(manifest)
 }
@@ -433,9 +448,8 @@ where
             Ok(InitContext { init_meta }) => {
                 let init_message =
                     net_protocol::runners::InitMessage::new(protocol, init_meta, FastExit(false));
-                net_protocol::async_write(&mut runner_conn, &init_message).await?;
-                let _init_success: InitSuccessMessage =
-                    net_protocol::async_read(&mut runner_conn).await?;
+                runner_conn.write(&init_message).await?;
+                let _init_success: InitSuccessMessage = runner_conn.read().await?;
             }
             Err(RunAlreadyCompleted {}) => {
                 // There is nothing more for the native runner to do, so we tell it to
@@ -445,7 +459,7 @@ where
                     Default::default(),
                     FastExit(true),
                 );
-                net_protocol::async_write(&mut runner_conn, &init_message).await?;
+                runner_conn.write(&init_message).await?;
                 let exit_status = native_runner_handle.wait().await?;
                 let final_captured_output = mux_pipes.finish().await?;
                 return Ok(TestRunnerExit {
@@ -683,8 +697,8 @@ async fn send_and_wait_for_test_results(
     // `Done` message can be considered "after-all-tests" output.
     let mut after_test_captures = None;
 
-    bail!(net_protocol::async_write(runner_conn, &test_case_message).await);
-    let raw_msg: RawTestResultMessage = bail!(net_protocol::async_read(runner_conn).await);
+    bail!(runner_conn.write(&test_case_message).await);
+    let raw_msg: RawTestResultMessage = bail!(runner_conn.read().await);
 
     use net_protocol::runners::{
         IncrementalTestResultStep, RawIncrementalTestResultMessage, TestResultSet,
@@ -712,7 +726,7 @@ async fn send_and_wait_for_test_results(
 
                         // Wait for the next incremental result.
                         let raw_increment: RawIncrementalTestResultMessage =
-                            bail!(net_protocol::async_read(runner_conn).await);
+                            bail!(runner_conn.read().await);
 
                         // Get the captured output for the test result that just completed, in
                         // `raw_increment`.
@@ -1080,7 +1094,7 @@ mod test_validate_protocol_version_message {
         let child = async {
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let spawned_message = legal_spawned_message(proto);
-            net_protocol::async_write(&mut stream, &spawned_message)
+            net_protocol::async_write_local(&mut stream, &spawned_message)
                 .await
                 .unwrap();
         };
@@ -1118,7 +1132,7 @@ mod test_validate_protocol_version_message {
             };
             let spawned_message =
                 RawNativeRunnerSpawnedMessage::new(proto, protocol_version, runner_specification);
-            net_protocol::async_write(&mut stream, &spawned_message)
+            net_protocol::async_write_local(&mut stream, &spawned_message)
                 .await
                 .unwrap();
         };
@@ -1147,7 +1161,7 @@ mod test_validate_protocol_version_message {
         let child = async {
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let message = Manifest::new(vec![], Default::default());
-            net_protocol::async_write(&mut stream, &message)
+            net_protocol::async_write_local(&mut stream, &message)
                 .await
                 .unwrap();
         };
@@ -1198,7 +1212,7 @@ mod test_validate_protocol_version_message {
             sleep(Duration::from_millis(100)).await;
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let spawned_message = legal_spawned_message(proto);
-            net_protocol::async_write(&mut stream, &spawned_message)
+            net_protocol::async_write_local(&mut stream, &spawned_message)
                 .await
                 .unwrap();
         };
@@ -1226,7 +1240,7 @@ mod test_validate_protocol_version_message {
             sleep(Duration::from_millis(100)).await;
             let mut stream = TcpStream::connect(socket_addr).await.unwrap();
             let spawned_message = legal_spawned_message(proto);
-            net_protocol::async_write(&mut stream, &spawned_message)
+            net_protocol::async_write_local(&mut stream, &spawned_message)
                 .await
                 .unwrap();
         };

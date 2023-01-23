@@ -21,4 +21,6 @@ serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
 
+tokio.workspace = true
+
 abq_utils = { path = "../../abq_utils" }
