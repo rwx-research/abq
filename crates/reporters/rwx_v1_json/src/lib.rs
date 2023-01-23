@@ -228,12 +228,19 @@ impl From<&TestResultSpec> for Attempt {
             TestRuntime::Nanoseconds(nanos) => *nanos,
         };
 
+        let stderr = stderr
+            .as_ref()
+            .map(|s| String::from_utf8_lossy(s).to_string());
+        let stdout = stdout
+            .as_ref()
+            .map(|s| String::from_utf8_lossy(s).to_string());
+
         Attempt {
             duration,
             meta: Some(meta.clone()),
             status,
-            stderr: stderr.clone(),
-            stdout: stdout.clone(),
+            stderr,
+            stdout,
             started_at: started_at.as_ref().map(|t| t.0.clone()),
             finished_at: finished_at.as_ref().map(|t| t.0.clone()),
         }

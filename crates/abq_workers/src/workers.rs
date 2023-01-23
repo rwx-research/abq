@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{sync::mpsc, thread};
 
-use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner};
+use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner, TestRunnerExit};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersion, ManifestMessage, NativeRunnerSpecification, OutOfBandError, Status, TestId,
-    TestResult, TestResultSpec, TestRuntime,
+    AbqProtocolVersion, CapturedOutput, ManifestMessage, NativeRunnerSpecification, OutOfBandError,
+    Status, TestId, TestResult, TestResultSpec, TestRuntime,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -426,7 +426,12 @@ fn start_generic_test_runner(
 
     mark_worker_complete();
 
-    opt_runner_err
+    opt_runner_err.map(
+        |TestRunnerExit {
+             exit_code,
+             final_captured_output: _,
+         }| exit_code,
+    )
 }
 
 fn build_test_like_runner_manifest_result(
@@ -593,7 +598,14 @@ fn start_test_like_runner(
                             })
                             .collect();
 
-                        rt.block_on(notify_results(entity, &run_id, vec![(work_id, results)]));
+                        let associated_result = AssociatedTestResults {
+                            work_id,
+                            results,
+                            before_any_test: CapturedOutput::empty(),
+                            after_all_tests: None,
+                        };
+
+                        rt.block_on(notify_results(entity, &run_id, vec![associated_result]));
                         break 'attempts;
                     }
                 }
@@ -699,6 +711,7 @@ mod test {
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol;
+    use abq_utils::net_protocol::queue::AssociatedTestResults;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Test, TestCase, TestOrGroup, TestResult,
     };
@@ -757,8 +770,11 @@ mod test {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
         let notify_results: NotifyResults = Arc::new(move |_, _, results| {
-            for (work_id, result) in results {
-                let old_result = results2.lock().unwrap().insert(work_id, result);
+            for AssociatedTestResults {
+                work_id, results, ..
+            } in results
+            {
+                let old_result = results2.lock().unwrap().insert(work_id, results);
                 debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
             }
             Box::pin(async {})

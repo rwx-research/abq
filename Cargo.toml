@@ -7,6 +7,7 @@ members = [
   "crates/abq_queue",
   "crates/abq_runners/generic_test_runner",
   "crates/abq_test_support/abq_test_utils",
+  "crates/abq_test_support/native_runner_simulator",
   "crates/abq_test_support/with_protocol_version",
   "crates/abq_test_support/write_runner_number",
   "crates/abq_utils",

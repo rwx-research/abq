@@ -256,7 +256,7 @@ pub mod queue {
 
     use super::{
         entity::EntityId,
-        runners::{AbqProtocolVersion, NativeRunnerSpecification, TestResult},
+        runners::{AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestResult},
         workers::{ManifestResult, RunId, RunnerKind, WorkId},
     };
 
@@ -303,7 +303,29 @@ pub mod queue {
     }
 
     /// A set of test results associated with an individual unit of work.
-    pub type AssociatedTestResults = (WorkId, Vec<TestResult>);
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct AssociatedTestResults {
+        pub work_id: WorkId,
+        pub results: Vec<TestResult>,
+        pub before_any_test: CapturedOutput,
+        pub after_all_tests: Option<CapturedOutput>,
+    }
+
+    impl AssociatedTestResults {
+        pub fn has_fail_like_result(&self) -> bool {
+            self.results.iter().any(|r| r.status.is_fail_like())
+        }
+
+        #[cfg(feature = "expose-native-protocols")]
+        pub fn fake(work_id: WorkId, results: Vec<TestResult>) -> Self {
+            Self {
+                work_id,
+                results,
+                before_any_test: CapturedOutput::empty(),
+                after_all_tests: None,
+            }
+        }
+    }
 
     /// An incremental unit of information about the state of a test suite, or its test result.
     #[derive(Serialize, Deserialize, Debug)]

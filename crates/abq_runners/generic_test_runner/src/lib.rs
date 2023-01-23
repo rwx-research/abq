@@ -17,7 +17,7 @@ use tokio::process::{self, ChildStderr, ChildStdout, Command};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
+    CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
     NativeRunnerSpecification, OutOfBandError, ProtocolWitness, RawNativeRunnerSpawnedMessage,
     RawTestResultMessage, Status, TestCase, TestCaseMessage, TestResult, TestResultSpec,
     TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
@@ -249,8 +249,16 @@ impl From<ProtocolVersionMessageError> for GenericRunnerError {
 }
 
 pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>;
+pub type SendTestResultsBoxed<'a> =
+    Box<dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>>;
 
 pub type GetNextTests<'a> = &'a dyn Fn() -> BoxFuture<'static, NextWorkBundle>;
+
+pub struct TestRunnerExit {
+    pub exit_code: ExitCode,
+    /// Captured stdout/stderr after all tests have been run
+    pub final_captured_output: CapturedOutput,
+}
 
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetInitContext>(
@@ -264,7 +272,7 @@ impl GenericTestRunner {
         get_next_test_bundle: GetNextTests,
         send_test_results: SendTestResults,
         debug_native_runner: bool,
-    ) -> Result<ExitCode, GenericRunnerError>
+    ) -> Result<TestRunnerExit, GenericRunnerError>
     where
         ShouldShutdown: Fn() -> bool,
         // TODO: make both of these async!
@@ -302,7 +310,7 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     get_next_test_bundle: GetNextTests<'_>,
     send_test_results: SendTestResults<'_>,
     _debug_native_runner: bool,
-) -> Result<ExitCode, GenericRunnerError>
+) -> Result<TestRunnerExit, GenericRunnerError>
 where
     ShouldShutdown: Fn() -> bool,
     SendManifest: FnMut(ManifestResult),
@@ -439,7 +447,11 @@ where
                 );
                 net_protocol::async_write(&mut runner_conn, &init_message).await?;
                 let exit_status = native_runner_handle.wait().await?;
-                return Ok(exit_status.into());
+                let final_captured_output = mux_pipes.finish().await?;
+                return Ok(TestRunnerExit {
+                    exit_code: exit_status.into(),
+                    final_captured_output,
+                });
             }
         };
     }
@@ -509,11 +521,13 @@ where
 
             if let Err((work_id, native_error)) = handled_test {
                 let remaining_tests = tests_rx.flush().await;
+                let final_output = mux_pipes.finish().await?;
 
                 handle_native_runner_failure(
                     worker_entity,
                     send_test_results,
                     &native_runner,
+                    final_output,
                     native_runner_handle,
                     estimated_runtime,
                     work_id,
@@ -529,18 +543,22 @@ where
         drop(our_listener);
         let exit_status = native_runner_handle.wait().await?;
 
-        // TODO: report unassociated standard output/error.
-        let (_unassoc_stdout, _unassoc_stderr) = mux_pipes.finish().await?;
+        // TODO: write after-all standard output/error to stdout/stderr when we stop piping output
+        // through.
+        let final_captured_output = mux_pipes.finish().await?;
 
-        Ok(ExitCode::from(exit_status))
+        Ok(TestRunnerExit {
+            exit_code: ExitCode::from(exit_status),
+            final_captured_output,
+        })
     };
 
     let ((), run_tests_result, ()) =
         tokio::join!(fetch_tests_task, run_tests_task, send_results_task);
 
-    let exit_code = run_tests_result?;
+    let test_runner_exit = run_tests_result?;
 
-    Ok(exit_code)
+    Ok(test_runner_exit)
 }
 
 #[derive(Debug, Error)]
@@ -566,26 +584,15 @@ impl MuxPipes {
         }
     }
 
-    fn begin_capture(&self) {
-        self.stdout.side_channel.begin_capture();
-        self.stderr.side_channel.begin_capture();
-    }
-
-    fn end_capture(&self) -> (String, String) {
+    fn get_captured(&self) -> (Vec<u8>, Vec<u8>) {
         // NB: if we ever measure this to be compute-expensive, consider making `end_capture` async
-        // and not allocating a new buf for `from_utf8_lossy`
-        let stdout = self.stdout.side_channel.end_capture();
-        let stderr = self.stderr.side_channel.end_capture();
+        let stdout = self.stdout.side_channel.get_captured();
+        let stderr = self.stderr.side_channel.get_captured();
 
-        // Must be lossy here because the capture ordering is not guaranteed, and it very well may
-        // be that we splice off the capture in the middle of writing a UTF-8 word!
-        (
-            String::from_utf8_lossy(&stdout).into_owned(),
-            String::from_utf8_lossy(&stderr).into_owned(),
-        )
+        (stdout, stderr)
     }
 
-    async fn finish(self) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    async fn finish(self) -> io::Result<CapturedOutput> {
         let MuxOutput {
             copied_all_output: copied_stdout,
             side_channel: side_stdout,
@@ -598,13 +605,13 @@ impl MuxPipes {
         } = self.stderr;
         copied_stdout.await.unwrap()?;
         copied_stderr.await.unwrap()?;
-        let unassoc_stdout = side_stdout
+        let stdout = side_stdout
             .finish()
             .expect("channel reference must be unique at this point");
-        let unassoc_stderr = side_stderr
+        let stderr = side_stderr
             .finish()
             .expect("channel reference must be unique at this point");
-        Ok((unassoc_stdout, unassoc_stderr))
+        Ok(CapturedOutput { stderr, stdout })
     }
 }
 
@@ -618,16 +625,21 @@ async fn handle_one_test(
 ) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError> {
     let test_case_message = TestCaseMessage::new(test_case);
 
-    let opt_test_results =
-        send_and_wait_for_test_results(worker_entity, runner_conn, mux_pipes, test_case_message)
-            .await;
+    let opt_test_results = send_and_wait_for_test_results(
+        worker_entity,
+        work_id,
+        runner_conn,
+        mux_pipes,
+        test_case_message,
+    )
+    .await;
 
     match opt_test_results {
         Ok(test_results) => {
-            let send_to_chan_result = results_chan.send((work_id, test_results)).await;
+            let send_to_chan_result = results_chan.send(test_results).await;
 
             if let Err(se) = send_to_chan_result {
-                let (work_id, _) = se.0;
+                let work_id = se.0.work_id;
                 tracing::error!(?work_id, "results channel closed prematurely");
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
@@ -637,28 +649,50 @@ async fn handle_one_test(
 
             Ok(Ok(()))
         }
-        Err(err) => Ok(Err((work_id, err.into()))),
+        Err((work_id, err)) => Ok(Err((work_id, err.into()))),
     }
 }
 
 async fn send_and_wait_for_test_results(
     worker_entity: EntityId,
+    work_id: WorkId,
     runner_conn: &mut RunnerConnection,
     mux_pipes: &MuxPipes,
     test_case_message: TestCaseMessage,
-) -> io::Result<Vec<TestResult>> {
-    // start capturing stdout before we send the test case
-    mux_pipes.begin_capture();
+) -> Result<AssociatedTestResults, (WorkId, io::Error)> {
+    macro_rules! bail {
+        ($e:expr) => {
+            match $e {
+                Ok(r) => r,
+                Err(e) => return Err((work_id, e)),
+            }
+        };
+    }
 
-    net_protocol::async_write(runner_conn, &test_case_message).await?;
-    let raw_msg: RawTestResultMessage = net_protocol::async_read(runner_conn).await?;
+    // Grab the "before-any-test" output.
+    let (before_test_stdout, before_test_stderr) = mux_pipes.get_captured();
+    let before_any_test = CapturedOutput {
+        stderr: before_test_stderr,
+        stdout: before_test_stdout,
+    };
+
+    // Prime the "after-all-tests" output.
+    // Today, this is empty by default, since in general we associate output outside of a test to
+    // the "before" output of the next test to run.
+    // However, when we receive incremental test results, output between the last test and the
+    // `Done` message can be considered "after-all-tests" output.
+    let mut after_test_captures = None;
+
+    bail!(net_protocol::async_write(runner_conn, &test_case_message).await);
+    let raw_msg: RawTestResultMessage = bail!(net_protocol::async_read(runner_conn).await);
 
     use net_protocol::runners::{
         IncrementalTestResultStep, RawIncrementalTestResultMessage, TestResultSet,
     };
 
-    // stop capturing stdout after we receive a
-    let (mut result_stdout, mut result_stderr) = mux_pipes.end_capture();
+    // stop capturing stdout after we receive a test result message, since it necessarily
+    // corresponds to at least one test result notification
+    let (mut result_stdout, mut result_stderr) = mux_pipes.get_captured();
 
     let results = match raw_msg.into_test_results(worker_entity) {
         TestResultSet::All(mut results) => {
@@ -672,19 +706,17 @@ async fn send_and_wait_for_test_results(
                 use IncrementalTestResultStep::*;
                 match step {
                     One(mut res) => {
-                        // If there's a next test case, it's already off; start capturing.
-                        mux_pipes.begin_capture();
-
                         // Add the stdout/stderr for the last incremental result.
                         attach_pipe_output_to_test_result(&mut res, result_stdout, result_stderr);
                         results.push(res);
 
                         // Wait for the next incremental result.
                         let raw_increment: RawIncrementalTestResultMessage =
-                            net_protocol::async_read(runner_conn).await?;
+                            bail!(net_protocol::async_read(runner_conn).await);
 
-                        // Get the captured output for the next result (the one that just completed, not `res`)
-                        (result_stdout, result_stderr) = mux_pipes.end_capture();
+                        // Get the captured output for the test result that just completed, in
+                        // `raw_increment`.
+                        (result_stdout, result_stderr) = mux_pipes.get_captured();
 
                         step = raw_increment.into_step(worker_entity);
                     }
@@ -696,6 +728,11 @@ async fn send_and_wait_for_test_results(
                                 result_stderr,
                             );
                             results.push(result);
+                        } else {
+                            after_test_captures = Some(CapturedOutput {
+                                stderr: result_stderr,
+                                stdout: result_stdout,
+                            });
                         }
                         break;
                     }
@@ -705,13 +742,18 @@ async fn send_and_wait_for_test_results(
         }
     };
 
-    Ok(results)
+    Ok(AssociatedTestResults {
+        work_id,
+        results,
+        before_any_test,
+        after_all_tests: after_test_captures,
+    })
 }
 
 fn attach_pipe_output_to_test_results(
     test_results: &mut [TestResult],
-    stdout: String,
-    stderr: String,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 ) {
     // Happier path: exactly one test result, we can hand over the output uniquely.
     // TODO: can we pass stdout/stderr to `TestResult` as borrowed for the purposes of sending?
@@ -728,7 +770,11 @@ fn attach_pipe_output_to_test_results(
     }
 }
 
-fn attach_pipe_output_to_test_result(test_result: &mut TestResult, stdout: String, stderr: String) {
+fn attach_pipe_output_to_test_result(
+    test_result: &mut TestResult,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) {
     test_result.stdout = Some(stdout);
     test_result.stderr = Some(stderr);
 }
@@ -767,6 +813,7 @@ fn handle_native_runner_failure<I>(
     worker_entity: EntityId,
     send_test_result: SendTestResults,
     native_runner: &Command,
+    mut final_output: CapturedOutput,
     mut native_runner_handle: process::Child,
     estimated_time_to_failure: Duration,
     failed_on: WorkId,
@@ -863,7 +910,12 @@ fn handle_native_runner_failure<I>(
             },
         );
 
-        final_results.push((work_id, vec![error_result]));
+        final_results.push(AssociatedTestResults {
+            work_id,
+            results: vec![error_result],
+            before_any_test: std::mem::replace(&mut final_output, CapturedOutput::empty()),
+            after_all_tests: None,
+        });
     }
 
     send_test_result(final_results);
@@ -950,7 +1002,7 @@ pub fn execute_wrapped_runner(
                 test_results
                     .lock()
                     .unwrap()
-                    .extend(results.into_iter().map(|(_id, result)| result))
+                    .extend(results.into_iter().map(|tr| tr.results))
             })
         }
     };
@@ -1220,8 +1272,9 @@ mod test_abq_jest {
             .join("testdata/jest/npm-jest-project-with-failures")
     }
 
-    fn write_leading_markers(s: &str) -> String {
-        s.lines()
+    fn write_leading_markers(s: &[u8]) -> String {
+        String::from_utf8_lossy(s)
+            .lines()
             .into_iter()
             .map(|s| format!("|{s}"))
             .collect::<Vec<_>>()
@@ -1254,7 +1307,7 @@ mod test_abq_jest {
                     test_results
                         .lock()
                         .unwrap()
-                        .push(results.into_iter().map(|(_, result)| result))
+                        .push(results.into_iter().map(|tr| tr.results))
                 })
             }
         };
@@ -1374,9 +1427,9 @@ mod test_abq_jest {
             assert!(matches!(test_results[1].status, Status::Failure { .. }));
             assert!(test_results[1].id.ends_with("mona + lisa"));
             assert!(
-                matches!(&test_results[1].stderr, Some(s) if s.is_empty()),
+                matches!(&test_results[0].stderr, Some(s) if s.is_empty()),
                 "{:?}",
-                &test_results[1].stderr
+                String::from_utf8_lossy(test_results[1].stderr.as_ref().unwrap())
             );
 
             let stdout = test_results[1].stdout.as_deref().unwrap();
@@ -1431,7 +1484,7 @@ mod test_abq_jest {
 }
 
 #[cfg(test)]
-mod test {
+mod test_invalid_command {
     use crate::{GenericRunnerError, GenericTestRunner, SendTestResults};
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::work_server::InitContext;

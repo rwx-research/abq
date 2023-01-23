@@ -89,7 +89,23 @@ pub enum Status {
     Skipped,
 }
 
-#[derive(Serialize, Deserialize)]
+#[cfg(feature = "expose-native-protocols")]
+impl From<super::Status> for Status {
+    fn from(s: super::Status) -> Self {
+        match s {
+            super::Status::Failure { .. } => Self::Failure,
+            super::Status::Success => Self::Success,
+            super::Status::Error { .. } => Self::Error,
+            super::Status::Pending => Self::Pending,
+            super::Status::Todo => Self::Pending,
+            super::Status::Skipped => Self::Skipped,
+            super::Status::TimedOut => Self::Error,
+            super::Status::PrivateNativeRunnerError => Self::Error,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct TestResultMessage {
     pub test_result: TestResult,
 }
@@ -102,6 +118,30 @@ pub struct TestResult {
     pub output: Option<String>,
     pub runtime: Milliseconds,
     pub meta: MetadataMap,
+}
+
+#[cfg(feature = "expose-native-protocols")]
+impl From<super::TestResult> for TestResult {
+    fn from(r: super::TestResult) -> Self {
+        let super::TestResultSpec {
+            status,
+            id,
+            display_name,
+            output,
+            runtime,
+            meta,
+            ..
+        } = r.result;
+
+        Self {
+            status: status.into(),
+            id,
+            display_name,
+            output,
+            runtime: runtime.duration().as_millis() as _,
+            meta,
+        }
+    }
 }
 
 pub type TestId = String;

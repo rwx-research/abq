@@ -315,8 +315,15 @@ impl Client {
                     break;
                 }
                 Results(results) => {
-                    for (_work_id, test_results_for_id) in results {
-                        for test_result in test_results_for_id {
+                    for AssociatedTestResults {
+                        work_id: _,
+                        results,
+                        // TODO: emit before/after test result output
+                        before_any_test: _,
+                        after_all_tests: _,
+                    } in results
+                    {
+                        for test_result in results {
                             on_result(test_result);
                         }
                     }

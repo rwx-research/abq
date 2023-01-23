@@ -1846,9 +1846,7 @@ impl QueueServer {
         // IFTTT: handle_fired_timeout
 
         let num_results = results.len();
-        let any_result_is_fail_like = results
-            .iter()
-            .any(|(_, results_for_id)| results_for_id.iter().any(|r| r.status.is_fail_like()));
+        let any_result_is_fail_like = results.iter().any(|tr| tr.has_fail_like_result());
 
         {
             // First up, chuck the test result back over to `abq test`. Make sure we don't steal
@@ -2423,7 +2421,7 @@ mod test {
         net_protocol::{
             self,
             entity::EntityId,
-            queue::{InvokeWork, NegotiatorInfo},
+            queue::{AssociatedTestResults, InvokeWork, NegotiatorInfo},
             runners::{Manifest, ManifestMessage, TestResult},
             workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
         },
@@ -2687,6 +2685,7 @@ mod test {
         let buffered_work_id = WorkId::new();
         {
             // Send a test result, will force the responder to go into disconnected mode
+            let result = AssociatedTestResults::fake(buffered_work_id, vec![TestResult::fake()]);
             QueueServer::handle_worker_results(
                 run_queues.clone(),
                 Arc::clone(&active_runs),
@@ -2695,7 +2694,7 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id.clone(),
-                vec![(buffered_work_id, vec![TestResult::fake()])],
+                vec![result],
             )
             .await
             .unwrap();
@@ -2740,7 +2739,7 @@ mod test {
                 run_id.clone(),
             ));
 
-            let (work_id, _) = match client.next().await.unwrap() {
+            let AssociatedTestResults { work_id, .. } = match client.next().await.unwrap() {
                 IncrementalTestData::Results(mut results) => results.pop().unwrap(),
                 _ => panic!(),
             };
@@ -2753,6 +2752,8 @@ mod test {
         {
             // Make sure that new test results also get send to the new client connectiion.
             let second_work_id = WorkId::new();
+            let associated_result =
+                AssociatedTestResults::fake(second_work_id, vec![TestResult::fake()]);
             let worker_result_future = tokio::spawn(QueueServer::handle_worker_results(
                 run_queues,
                 Arc::clone(&active_runs),
@@ -2761,10 +2762,10 @@ mod test {
                 worker_next_tests_tasks.clone(),
                 EntityId::new(),
                 run_id,
-                vec![(second_work_id, vec![TestResult::fake()])],
+                vec![associated_result],
             ));
 
-            let (work_id, _) = match client.next().await.unwrap() {
+            let AssociatedTestResults { work_id, .. } = match client.next().await.unwrap() {
                 IncrementalTestData::Results(mut results) => results.pop().unwrap(),
                 _ => panic!(),
             };
@@ -3341,6 +3342,7 @@ mod test {
 
         let entity = EntityId::new();
 
+        let result = AssociatedTestResults::fake(WorkId::new(), vec![TestResult::fake()]);
         let send_last_result_fut = QueueServer::handle_worker_results(
             queues.clone(),
             Arc::clone(&active_runs),
@@ -3349,7 +3351,7 @@ mod test {
             worker_next_tests_tasks.clone(),
             entity,
             run_id.clone(),
-            vec![(WorkId::new(), vec![TestResult::fake()])],
+            vec![result],
         );
         let cancellation_fut = QueueServer::handle_run_cancellation(
             queues.clone(),
