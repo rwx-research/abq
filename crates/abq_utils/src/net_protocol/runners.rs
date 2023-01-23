@@ -550,6 +550,8 @@ impl std::fmt::Display for Location {
 
 pub use v0_2::OutOfBandError;
 
+use crate::exit::ExitCode;
+
 use super::entity::EntityId;
 
 impl std::fmt::Display for OutOfBandError {
@@ -911,6 +913,12 @@ impl CapturedOutput {
             stdout: Default::default(),
         }
     }
+}
+
+pub struct TestRunnerExit {
+    pub exit_code: ExitCode,
+    /// Captured stdout/stderr after all tests have been run
+    pub final_captured_output: CapturedOutput,
 }
 
 #[cfg(test)]

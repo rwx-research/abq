@@ -1,14 +1,14 @@
 use std::{
     fmt::Display,
-    io,
+    io::{self},
     path::PathBuf,
     str::FromStr,
     time::{Duration, Instant},
 };
 
 use abq_output::{
-    colors::ColorProvider, format_duration_to_partial_seconds, format_interactive_progress,
-    format_non_interactive_progress, format_result_dot, format_result_line, format_summary,
+    colors::ColorProvider, format_interactive_progress, format_non_interactive_progress,
+    format_result_dot, format_result_line, format_short_suite_summary, format_summary,
     format_test_result_summary, format_worker_output, would_write_output, would_write_summary,
     OutputOrdering, SummaryKind,
 };
@@ -188,14 +188,14 @@ impl SuiteResultBuilder {
 }
 
 impl SuiteResult {
-    pub fn write_short_summary_lines(&self, w: &mut impl io::Write) -> io::Result<()> {
-        write!(w, "Finished in ")?;
-        format_duration_to_partial_seconds(w, self.wall_time)?;
-        write!(w, " (")?;
-        let duration = self.test_time.duration();
-        format_duration_to_partial_seconds(w, duration)?;
-        writeln!(w, " spent in test code)")?;
-        writeln!(w, "{} tests, {} failures", self.count, self.count_failed)
+    pub fn write_short_summary_lines(&self, w: &mut impl termcolor::WriteColor) -> io::Result<()> {
+        format_short_suite_summary(
+            w,
+            self.wall_time,
+            self.test_time.duration(),
+            self.count,
+            self.count_failed,
+        )
     }
 
     pub fn suggested_exit_code(&self) -> ExitCode {
@@ -211,6 +211,9 @@ pub(crate) trait Reporter: Send {
     fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError>;
 
     fn tick(&mut self);
+
+    /// Runs after the last call to [Self::push_result] and [Self::tick], but before [Self::finish].
+    fn after_all_results(&mut self);
 
     /// Consume the reporter, and perform any needed finalization steps.
     ///
@@ -279,9 +282,14 @@ impl Reporter for LineReporter {
 
     fn tick(&mut self) {}
 
-    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
-        write_summary_results(&mut self.buffer, self.delayed_summaries)?;
+    fn after_all_results(&mut self) {
+        let _ = write_summary_results(
+            &mut self.buffer,
+            std::mem::take(&mut self.delayed_summaries),
+        );
+    }
 
+    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         self.buffer
             .flush()
             .map_err(|_| ReportingError::FailedToWrite)?;
@@ -358,15 +366,18 @@ impl Reporter for DotReporter {
 
     fn tick(&mut self) {}
 
-    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
-        if !self.delayed_summaries.is_empty() && self.num_results % DOT_REPORTER_LINE_LIMIT != 0 {
-            // We have summaries to print and the last dot would not have printed a newline, so
-            // print one before we display the summaries.
-            write(&mut self.buffer, &[b'\n'])?;
+    fn after_all_results(&mut self) {
+        if self.num_results % DOT_REPORTER_LINE_LIMIT != 0 {
+            let _ = write(&mut self.buffer, &[b'\n']);
         }
 
-        write_summary_results(&mut self.buffer, self.delayed_summaries)?;
+        let _ = write_summary_results(
+            &mut self.buffer,
+            std::mem::take(&mut self.delayed_summaries),
+        );
+    }
 
+    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         self.buffer
             .flush()
             .map_err(|_| ReportingError::FailedToWrite)?;
@@ -526,11 +537,13 @@ impl Reporter for ProgressReporter {
         self.tick_progress(true);
     }
 
-    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
-        if let Some(pb) = self.progress_bar {
+    fn after_all_results(&mut self) {
+        if let Some(pb) = self.progress_bar.as_mut() {
             pb.finish_and_clear();
         }
+    }
 
+    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         self.buffer
             .flush()
             .map_err(|_| ReportingError::FailedToWrite)?;
@@ -552,6 +565,8 @@ impl Reporter for JUnitXmlReporter {
     }
 
     fn tick(&mut self) {}
+
+    fn after_all_results(&mut self) {}
 
     fn finish(self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         if let Some(dir) = self.path.parent() {
@@ -585,6 +600,8 @@ impl Reporter for RwxV1JsonReporter {
 
     fn tick(&mut self) {}
 
+    fn after_all_results(&mut self) {}
+
     fn finish(self: Box<Self>, summary: &CompletedSummary) -> Result<(), ReportingError> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -610,23 +627,39 @@ fn is_ci_color_term() -> bool {
         || std::env::var("CIRCLECI").as_deref() == Ok("true")
 }
 
+#[derive(Clone, Copy)]
+pub struct StdoutPreferences {
+    is_atty: bool,
+    color: ColorChoice,
+}
+
+impl StdoutPreferences {
+    pub fn new(color_preference: ColorPreference) -> Self {
+        let is_atty = atty::is(atty::Stream::Stdout);
+        let color = match color_preference {
+            ColorPreference::Auto => {
+                if is_atty || is_ci_color_term() {
+                    ColorChoice::Auto
+                } else {
+                    ColorChoice::Never
+                }
+            }
+            ColorPreference::Never => ColorChoice::Never,
+        };
+        Self { is_atty, color }
+    }
+
+    pub fn stdout_stream(&self) -> impl termcolor::WriteColor {
+        StandardStream::stdout(self.color)
+    }
+}
+
 fn reporter_from_kind(
     kind: ReporterKind,
-    color_preference: ColorPreference,
+    stdout_preferences: StdoutPreferences,
     test_suite_name: &str,
 ) -> Box<dyn Reporter> {
-    let is_atty = atty::is(atty::Stream::Stdout);
-    let color = match color_preference {
-        ColorPreference::Auto => {
-            if is_atty || is_ci_color_term() {
-                ColorChoice::Auto
-            } else {
-                ColorChoice::Never
-            }
-        }
-        ColorPreference::Never => ColorChoice::Never,
-    };
-    let stdout = StandardStream::stdout(color);
+    let stdout = stdout_preferences.stdout_stream();
 
     match kind {
         ReporterKind::Line => Box::new(LineReporter {
@@ -640,13 +673,13 @@ fn reporter_from_kind(
             delayed_summaries: Default::default(),
         }),
         ReporterKind::Progress => {
-            let color_provider = match color {
+            let color_provider = match stdout_preferences.color {
                 ColorChoice::Always | ColorChoice::AlwaysAnsi | ColorChoice::Auto => {
                     ColorProvider::ANSI
                 }
                 ColorChoice::Never => ColorProvider::NOCOLOR,
             };
-            let opt_target = if is_atty {
+            let opt_target = if stdout_preferences.is_atty {
                 Some(ProgressDrawTarget::stdout())
             } else {
                 None
@@ -676,13 +709,13 @@ pub(crate) struct SuiteReporters {
 impl SuiteReporters {
     pub fn new(
         reporter_kinds: impl IntoIterator<Item = ReporterKind>,
-        color_preference: ColorPreference,
+        stdout_preferences: StdoutPreferences,
         test_suite_name: &str,
     ) -> Self {
         Self {
             reporters: reporter_kinds
                 .into_iter()
-                .map(|kind| reporter_from_kind(kind, color_preference, test_suite_name))
+                .map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
                 .collect(),
             overall_result: SuiteResultBuilder::default(),
         }
@@ -708,6 +741,12 @@ impl SuiteReporters {
         self.reporters
             .iter_mut()
             .for_each(|reporter| reporter.tick());
+    }
+
+    pub fn after_all_results(&mut self) {
+        self.reporters
+            .iter_mut()
+            .for_each(|reporter| reporter.after_all_results());
     }
 
     pub fn finish(self, summary: &CompletedSummary) -> (SuiteResult, Vec<ReportingError>) {
@@ -1077,6 +1116,7 @@ mod test_line_reporter {
                     },
                 )))
                 .unwrap();
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1254,6 +1294,7 @@ mod test_dot_reporter {
                     },
                 )))
                 .unwrap();
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1305,6 +1346,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1331,6 +1373,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1368,6 +1411,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1411,6 +1455,7 @@ mod test_dot_reporter {
                     .unwrap();
             }
 
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1603,6 +1648,7 @@ mod test_progress_reporter {
                     },
                 )))
                 .unwrap();
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1777,6 +1823,7 @@ mod test_progress_reporter {
                 reporter.tick();
             }
 
+            reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
         });
 
@@ -1822,13 +1869,17 @@ mod suite {
     use crate::reporting::ExitCode;
 
     use super::{
-        default_result, mock_summary, ColorPreference, MockWriter, SuiteReporters, SuiteResult,
+        default_result, mock_summary, MockWriter, StdoutPreferences, SuiteReporters, SuiteResult,
     };
 
     fn get_overall_result<'a>(
         results: impl IntoIterator<Item = &'a ReportedResult>,
     ) -> SuiteResult {
-        let mut suite = SuiteReporters::new([], ColorPreference::Auto, "test");
+        let preferences = StdoutPreferences {
+            is_atty: false,
+            color: termcolor::ColorChoice::Auto,
+        };
+        let mut suite = SuiteReporters::new([], preferences, "test");
         results
             .into_iter()
             .for_each(|r| suite.push_result(r).unwrap());
@@ -1897,7 +1948,9 @@ mod suite {
 
     fn get_short_summary_lines(summary: SuiteResult) -> String {
         let mut mock_writer = MockWriter::default();
-        summary.write_short_summary_lines(&mut mock_writer).unwrap();
+        summary
+            .write_short_summary_lines(&mut &mut mock_writer)
+            .unwrap();
         String::from_utf8(mock_writer.buffer).unwrap()
     }
 

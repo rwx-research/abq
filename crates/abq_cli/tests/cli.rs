@@ -269,7 +269,7 @@ test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_auto_workers_without_failure (|name, conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
-        let args = &["test", "--reporter", "dot", "--num-workers", "cpu-cores"];
+        let args = &["test", "--reporter", "dot", "--num-workers", "cpu-cores", "--color=never"];
         let mut args = conf.extend_args_for_in_band_client(args);
         args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
@@ -574,7 +574,7 @@ test_all_network_config_options! {
             true,
         );
         assert!(!exit_status.success());
-        assert!(stderr.contains("Error: Timed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
+        assert!(stderr.contains("--- ERROR ---\nTimed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
 
         // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
         let worker_args = &[
@@ -660,7 +660,7 @@ test_all_network_config_options! {
             true,
         );
         assert!(!exit_status.success());
-        assert!(stderr.contains("Error: Timed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
+        assert!(stderr.contains("--- ERROR ---\nTimed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
 
         // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
         let worker_args = &[

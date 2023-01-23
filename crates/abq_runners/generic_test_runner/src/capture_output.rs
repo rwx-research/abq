@@ -9,23 +9,6 @@ use parking_lot::Mutex;
 use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
 
-struct Muxer<'a, P>
-where
-    P: AsyncWrite + Unpin + ?Sized,
-{
-    pipe: &'a mut P,
-    side_channel: SideChannel,
-}
-
-impl<'a, P> Muxer<'a, P>
-where
-    P: AsyncWrite + Unpin + ?Sized,
-{
-    fn new(pipe: &'a mut P, side_channel: SideChannel) -> Self {
-        Self { pipe, side_channel }
-    }
-}
-
 #[derive(Default, Debug)]
 struct SideChannelInner {
     buf: Vec<u8>,
@@ -46,6 +29,12 @@ impl SideChannel {
         std::mem::replace(&mut channel.buf, new_buf)
     }
 
+    #[cfg(test)]
+    fn read(&self) -> Vec<u8> {
+        let mut channel = self.0.lock();
+        channel.buf.clone()
+    }
+
     /// Consumes the side channel and returns all remaining output.
     /// Returns an error if the side channel is not exclusively referenced.
     pub fn finish(self) -> Result<Vec<u8>, Self> {
@@ -55,69 +44,60 @@ impl SideChannel {
     }
 }
 
-pub struct MuxOutput<C, P> {
-    pub copied_all_output: JoinHandle<io::Result<()>>,
-    pub side_channel: SideChannel,
-    _witness: PhantomData<(C, P)>,
+impl AsyncWrite for SideChannel {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> task::Poll<Result<usize, std::io::Error>> {
+        self.write(buf);
+        task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<Result<(), std::io::Error>> {
+        task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> task::Poll<Result<(), std::io::Error>> {
+        task::Poll::Ready(Ok(()))
+    }
 }
 
-/// Multiplexes outut from `child` to `parent` and into a [SideChannel].
+pub struct OutputCapturer<C> {
+    pub copied_all_output: JoinHandle<io::Result<()>>,
+    pub side_channel: SideChannel,
+    _witness: PhantomData<C>,
+}
+
+/// Captures from `child` into a [SideChannel].
 /// Returns the [SideChannel] being written into, and spawns a tokio task that completes when all
 /// output has been copied from the child to the parent.
-pub fn mux_output<Child, Parent>(mut child: Child, mut parent: Parent) -> MuxOutput<Child, Parent>
+pub fn capture_output<Child>(mut child: Child) -> OutputCapturer<Child>
 where
     Child: AsyncRead + Unpin + Send + Sized + 'static,
-    Parent: AsyncWrite + Unpin + Send + Sized + 'static,
 {
     let side_channel = SideChannel::default();
 
     let copy_all_output_task = {
         let side_channel = side_channel.clone();
         async move {
-            let mut mux_out = Muxer::new(&mut parent, side_channel);
-            let _written_out = io::copy(&mut child, &mut mux_out).await?;
+            let mut side_channel = side_channel;
+            let _written_out = io::copy(&mut child, &mut side_channel).await?;
             io::Result::<()>::Ok(())
         }
     };
     let copy_all_output_handle = tokio::spawn(copy_all_output_task);
 
-    MuxOutput {
+    OutputCapturer {
         copied_all_output: copy_all_output_handle,
         side_channel,
         _witness: Default::default(),
-    }
-}
-
-impl<'a, P> AsyncWrite for Muxer<'a, P>
-where
-    P: AsyncWrite + Unpin + ?Sized,
-{
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        buf: &[u8],
-    ) -> task::Poll<Result<usize, std::io::Error>> {
-        let poll = Pin::new(&mut self.pipe).poll_write(cx, buf);
-        if let task::Poll::Ready(Ok(num_bytes_read)) = poll {
-            // Only read as many bytes as the underlying stream read, since we'll get polled
-            // again for anything missed.
-            self.side_channel.write(&buf[..num_bytes_read]);
-        }
-        poll
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.pipe).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> task::Poll<Result<(), std::io::Error>> {
-        Pin::new(&mut self.pipe).poll_shutdown(cx)
     }
 }
 
@@ -133,7 +113,7 @@ mod test {
     use parking_lot::{Mutex, MutexGuard};
     use tokio::io::{self, AsyncRead, AsyncWrite};
 
-    use super::{mux_output, MuxOutput};
+    use super::{capture_output, OutputCapturer};
 
     #[derive(Default, Clone)]
     struct SharedBuf {
@@ -230,38 +210,18 @@ mod test {
     }
 
     #[tokio::test]
-    async fn writes_to_parent() {
-        let parent = SharedBuf::default();
-        let inc = IncrementalReader::default();
-        let MuxOutput {
-            copied_all_output,
-            side_channel: _,
-            _witness,
-        } = mux_output(inc.clone(), parent.clone());
-
-        inc.push_buf(&[1, 2, 3]);
-        inc.push_buf(&[4, 5, 6]);
-        inc.finish();
-
-        copied_all_output.await.unwrap().unwrap();
-
-        assert_eq!(&*parent.read(), &[1, 2, 3, 4, 5, 6]);
-    }
-
-    #[tokio::test]
     async fn writes_to_capture_buffer() {
-        let parent = SharedBuf::default();
         let inc = IncrementalReader::default();
-        let MuxOutput {
+        let OutputCapturer {
             copied_all_output,
             side_channel,
             _witness,
-        } = mux_output(inc.clone(), parent.clone());
+        } = capture_output(inc.clone());
 
         {
             inc.push_buf(&[1, 2, 3]);
             inc.push_buf(&[4, 5, 6]);
-            wait_until(|| parent.read().ends_with(&[6])).await;
+            wait_until(|| side_channel.read().ends_with(&[6])).await;
 
             assert_eq!(side_channel.get_captured(), &[1, 2, 3, 4, 5, 6]);
         }
@@ -272,24 +232,23 @@ mod test {
 
     #[tokio::test]
     async fn writes_to_unassociated_buffer() {
-        let parent = SharedBuf::default();
         let inc = IncrementalReader::default();
-        let MuxOutput {
+        let OutputCapturer {
             copied_all_output,
             side_channel,
             _witness,
-        } = mux_output(inc.clone(), parent.clone());
+        } = capture_output(inc.clone());
 
         // First write - should end up in Capture 1
         {
             inc.push_buf(&[1, 2, 3]);
-            wait_until(|| parent.read().ends_with(&[3])).await;
+            wait_until(|| side_channel.read().ends_with(&[3])).await;
         }
 
         // Capture 1
         {
             inc.push_buf(&[4, 5, 6]);
-            wait_until(|| parent.read().ends_with(&[6])).await;
+            wait_until(|| side_channel.read().ends_with(&[6])).await;
 
             assert_eq!(side_channel.get_captured(), &[1, 2, 3, 4, 5, 6]);
         }
@@ -297,13 +256,13 @@ mod test {
         // write - should end up in Capture 2
         {
             inc.push_buf(&[7, 8, 9]);
-            wait_until(|| parent.read().ends_with(&[9])).await;
+            wait_until(|| side_channel.read().ends_with(&[9])).await;
         }
 
         // Capture 2
         {
             inc.push_buf(&[10, 11, 12]);
-            wait_until(|| parent.read().ends_with(&[12])).await;
+            wait_until(|| side_channel.read().ends_with(&[12])).await;
 
             assert_eq!(side_channel.get_captured(), &[7, 8, 9, 10, 11, 12]);
         }
@@ -311,7 +270,7 @@ mod test {
         // After all above captures - should be resolved on finish
         {
             inc.push_buf(&[13, 14, 15]);
-            wait_until(|| parent.read().ends_with(&[15])).await;
+            wait_until(|| side_channel.read().ends_with(&[15])).await;
         }
 
         inc.finish();
@@ -319,6 +278,5 @@ mod test {
 
         let rest = side_channel.finish().unwrap();
         assert_eq!(rest, &[13, 14, 15]);
-        assert_eq!(&*parent.read(), &(1..=15).collect::<Vec<_>>());
     }
 }

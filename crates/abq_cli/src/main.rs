@@ -6,7 +6,7 @@ mod workers;
 
 use std::{
     collections::HashMap,
-    io,
+    io::{self, Write},
     net::SocketAddr,
     num::NonZeroU64,
     num::NonZeroUsize,
@@ -28,12 +28,13 @@ use abq_utils::{
         client::ReportedResult,
         entity::EntityId,
         health::Health,
-        runners::TestRuntime,
+        runners::{CapturedOutput, TestRuntime},
         workers::{NativeTestRunnerParams, RunId, RunnerKind},
     },
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
 
+use abq_workers::workers::WorkersExit;
 use args::{
     Cli, Command,
     NumWorkers::{CpuCores, Fixed},
@@ -46,7 +47,10 @@ use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
-use crate::{args::Token, health::HealthCheckKind};
+use crate::{
+    args::Token, health::HealthCheckKind, reporting::StdoutPreferences,
+    workers::print_final_runner_outputs,
+};
 
 #[cfg(all(target_arch = "x86_64", target_env = "musl"))]
 #[global_allocator]
@@ -344,7 +348,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
-            workers::start_workers_forever(
+            workers::start_workers_standalone(
                 num_workers,
                 working_dir,
                 abq.negotiator_handle(),
@@ -570,7 +574,6 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
     Ok(NativeTestRunnerParams {
         cmd,
         args,
-        // TODO: populate this
         extra_env: HashMap::from([
             // TODO: This is a hack to get chalk.js to add color codes
             // We probably should instead supply a PTY to the child process
@@ -644,7 +647,8 @@ fn run_tests(
     start_in_process_workers: bool,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
-    let mut reporters = SuiteReporters::new(reporters, color_choice, test_suite_name);
+    let stdout_preferences = StdoutPreferences::new(color_choice);
+    let mut reporters = SuiteReporters::new(reporters, stdout_preferences, test_suite_name);
 
     let result_handler = {
         // Safety: rustc wants the `collector` to be live for the lifetime of the program because
@@ -676,6 +680,7 @@ fn run_tests(
             abq.negotiator_handle(),
             abq.client_options().clone(),
             run_id.clone(),
+            true, // workers in-band with supervisor
         )?;
         Some(workers)
     } else {
@@ -685,14 +690,27 @@ fn run_tests(
 
     let opt_invoked_error = work_results_thread.join().unwrap();
 
+    reporters.after_all_results();
+
     if let Some(mut workers) = opt_workers {
-        // The exit code will be determined by the test result status.
-        let _exit_code = workers.shutdown();
+        let WorkersExit {
+            // The exit code will be determined by the test result status.
+            status: _,
+            final_captured_outputs,
+        } = workers.shutdown();
+
+        // We need to print the final runner outputs (if any) at this point.
+        // This is safe, as the runners thread is dead by now, so the reporters shouldn't
+        // be writing to output streams.
+        print_final_runner_outputs(workers.entity(), num_workers, final_captured_outputs);
     }
 
     let completed_summary = match opt_invoked_error {
         Ok(summary) => summary,
-        Err(invoke_error) => return Err(elaborate_invocation_error(invoke_error, runner_params)),
+        Err(invoke_error) => {
+            elaborate_invocation_error(invoke_error, runner_params)?;
+            return Ok(ExitCode::FAILURE);
+        }
     };
 
     // NB: right now, this last step of flushing the reporters and sending home the native runner
@@ -717,7 +735,7 @@ fn run_tests(
     }
 
     print!("\n\n");
-    suite_result.write_short_summary_lines(&mut io::stdout())?;
+    suite_result.write_short_summary_lines(&mut stdout_preferences.stdout_stream())?;
 
     Ok(suite_result.suggested_exit_code())
 }
@@ -725,17 +743,18 @@ fn run_tests(
 fn elaborate_invocation_error(
     error: InvocationError,
     runner_params: NativeTestRunnerParams,
-) -> anyhow::Error {
-    match error {
+) -> io::Result<()> {
+    eprintln!("--- ERROR ---");
+    let (err, opt_captured): (anyhow::Error, Option<CapturedOutput>) = match error {
         InvocationError::Io(_)
         | InvocationError::DuplicateRun(_)
         | InvocationError::DuplicateCompletedRun(_) => {
             // The default error message provided is good here.
-            error.into()
+            (error.into(), None)
         }
         InvocationError::TestResultError(error) => match error {
-            TestResultError::Io(error) => error.into(),
-            TestResultError::TestCommandError(opaque_error) => {
+            TestResultError::Io(error) => (error.into(), None),
+            TestResultError::TestCommandError(opaque_error, captured_output) => {
                 let NativeTestRunnerParams {
                     cmd,
                     args,
@@ -758,12 +777,11 @@ fn elaborate_invocation_error(
                         Here's a message we found concerning the failure:
 
                         {}
-
-                        HELP: Test commands run by ABQ must have support for the ABQ protocol."#
+                        "#
                     ),
                     cmd, opaque_error,
                 );
-                anyhow::Error::msg(msg)
+                (anyhow::Error::msg(msg), Some(captured_output))
             }
             TestResultError::TimedOut(after) => {
                 let mut s = Vec::new();
@@ -782,11 +800,28 @@ fn elaborate_invocation_error(
                     ),
                     timeout_s
                 );
-                anyhow::Error::msg(msg)
+                (anyhow::Error::msg(msg), None)
             }
-            TestResultError::Cancelled => anyhow::Error::msg("Test run cancelled!"),
+            TestResultError::Cancelled => (anyhow::Error::msg("Test run cancelled!"), None),
         },
+    };
+
+    eprintln!("{err}");
+    if let Some(CapturedOutput { stderr, stdout }) = opt_captured {
+        if !stderr.is_empty() {
+            eprintln!("Standard error from the worker producing this failure:");
+            std::io::stderr().write_all(&stderr)?;
+            writeln!(std::io::stderr())?;
+        }
+
+        if !stdout.is_empty() {
+            eprintln!("Standard output from the worker producing this failure:");
+            std::io::stdout().write_all(&stdout)?;
+            writeln!(std::io::stdout())?;
+        }
     }
+
+    Ok(())
 }
 
 /// Starts a test result reporter on a new thread.

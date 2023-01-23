@@ -147,7 +147,7 @@ pub fn would_write_output(output: Option<&CapturedOutput>) -> bool {
 }
 
 pub fn format_worker_output(
-    writer: &mut impl WriteColor,
+    writer: &mut impl io::Write,
     worker: EntityId,
     test_name: &str,
     when: OutputOrdering,
@@ -197,7 +197,28 @@ pub fn format_worker_output(
     Ok(())
 }
 
-fn push_newline_if_needed(writer: &mut impl WriteColor, bytes: &[u8]) -> io::Result<usize> {
+pub fn format_final_runner_output(
+    writer: &mut impl io::Write,
+    worker: EntityId,
+    runner_index: Option<usize>,
+    output: &CapturedOutput,
+) -> io::Result<()> {
+    // --- [worker {worker_id}] AFTER completion[ on runner N]? ---
+    let mut after_suffix = "completion".to_string();
+    if let Some(runner) = runner_index {
+        after_suffix.push_str(" on runner ");
+        after_suffix.push_str(&runner.to_string());
+    }
+    format_worker_output(
+        writer,
+        worker,
+        &after_suffix,
+        OutputOrdering::AfterTest,
+        output,
+    )
+}
+
+fn push_newline_if_needed(writer: &mut impl io::Write, bytes: &[u8]) -> io::Result<usize> {
     let mut trailing_newlines = 0;
     for &byte in bytes.iter().rev() {
         if !byte.is_ascii_whitespace() {
@@ -243,29 +264,69 @@ pub fn format_non_interactive_progress(
     // {num_tests} tests run, {num_passed} passed, {num_failing} failing
 
     let num_passed = num_tests - num_failing;
-    let mut spec = ColorSpec::new();
 
     writeln!(writer, "--- [abq progress] {elapsed} ---")?;
-    {
-        spec.clear();
-        spec.set_bold(true);
-        with_color_spec(writer, &spec, |w| write!(w, "{num_tests} tests run"))?;
-        write!(writer, ", ")?;
-    }
-    {
-        spec.clear();
-        spec.set_fg(Some(Color::Green)).set_bold(true);
-        with_color_spec(writer, &spec, |w| write!(w, "{num_passed} passed"))?;
-        write!(writer, ", ")?;
-    }
-    {
-        spec.clear();
-        if num_failing > 0 {
-            spec.set_fg(Some(Color::Red)).set_bold(true);
-        }
-        with_color_spec(writer, &spec, |w| write!(w, "{num_failing} failing"))?;
-    }
+    with_color_spec(writer, &bold_spec(), |w| write!(w, "{num_tests} tests run"))?;
+    write!(writer, ", ")?;
+    with_color_spec(writer, &green_bold_spec(), |w| {
+        write!(w, "{num_passed} passed")
+    })?;
+    write!(writer, ", ")?;
+    with_color_spec(writer, &failing_spec(num_failing), |w| {
+        write!(w, "{num_failing} failing")
+    })?;
     writeln!(writer)
+}
+
+pub fn format_short_suite_summary(
+    writer: &mut impl WriteColor,
+    wall_time: Duration,
+    test_time: Duration,
+    num_tests: u64,
+    num_failing: u64,
+) -> io::Result<()> {
+    // Finished in X seconds (X seconds spent in test code)
+    // M tests, N failures
+
+    with_color_spec(writer, &bold_spec(), |w| {
+        write!(w, "Finished in ")?;
+        format_duration_to_partial_seconds(w, wall_time)
+    })?;
+    write!(writer, " (")?;
+    format_duration_to_partial_seconds(writer, test_time)?;
+    writeln!(writer, " spent in test code)")?;
+    with_color_spec(writer, &green_bold_spec(), |w| {
+        write!(w, "{num_tests} tests")
+    })?;
+    write!(writer, ", ")?;
+    with_color_spec(writer, &failing_spec(num_failing), |w| {
+        write!(w, "{num_failing} failures")
+    })?;
+    writeln!(writer)?;
+    Ok(())
+}
+
+#[inline]
+fn bold_spec() -> ColorSpec {
+    let mut spec = ColorSpec::new();
+    spec.set_bold(true);
+    spec
+}
+
+#[inline]
+fn green_bold_spec() -> ColorSpec {
+    let mut spec = ColorSpec::new();
+    spec.set_fg(Some(Color::Green)).set_bold(true);
+    spec
+}
+
+#[inline]
+fn failing_spec(num_failing: u64) -> ColorSpec {
+    let mut spec = ColorSpec::new();
+    if num_failing > 0 {
+        spec.set_fg(Some(Color::Red)).set_bold(true);
+    }
+    spec
 }
 
 fn status_color(status: &Status) -> Color {
