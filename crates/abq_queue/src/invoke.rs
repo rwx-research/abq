@@ -25,7 +25,7 @@ use abq_utils::{
             self, AssociatedTestResults, InvokeWork, InvokerTestData, Message, NativeRunnerInfo,
         },
         workers::{RunId, RunnerKind},
-        AsyncReader,
+        AsyncReaderDos,
     },
 };
 
@@ -50,7 +50,7 @@ pub struct Client {
     pub(crate) poll_timeout: Duration,
     /// Signal to cancel an active test run.
     pub(crate) cancellation_rx: RunCancellationRx,
-    pub(crate) async_reader: AsyncReader,
+    pub(crate) async_reader: AsyncReaderDos,
 }
 
 #[derive(Debug, Error)]

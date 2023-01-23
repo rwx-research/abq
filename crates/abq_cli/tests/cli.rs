@@ -2,6 +2,9 @@
 
 use abq_test_utils::{artifacts_dir, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
+use abq_utils::net_protocol::runners::{
+    NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
+};
 use serial_test::serial;
 use std::process::{ExitStatus, Output};
 use std::{
@@ -42,6 +45,13 @@ fn abq_binary() -> PathBuf {
 #[cfg(feature = "test-abq-jest")]
 fn testdata_project(subpath: impl AsRef<Path>) -> PathBuf {
     PathBuf::from(WORKSPACE).join("testdata").join(subpath)
+}
+
+fn native_runner_simulation_bin() -> String {
+    artifacts_dir()
+        .join("abqtest_native_runner_simulation")
+        .display()
+        .to_string()
 }
 
 struct CmdOutput {
@@ -1088,4 +1098,89 @@ fn test_with_invalid_command() {
     assert!(!worker_exit_status.success());
 
     term_queue(queue_proc);
+}
+
+fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessage {
+    let protocol_version = proto.get_version();
+    let runner_specification = NativeRunnerSpecification {
+        name: "test".to_string(),
+        version: "0.0.0".to_string(),
+        test_framework: Some("rspec".to_owned()),
+        test_framework_version: Some("3.12.0".to_owned()),
+        language: Some("ruby".to_owned()),
+        language_version: Some("3.1.2p20".to_owned()),
+        host: Some("ruby 3.1.2p20 (2022-04-12 revision 4491bb740a) [x86_64-darwin21]".to_owned()),
+    };
+    RawNativeRunnerSpawnedMessage::new(proto, protocol_version, runner_specification)
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
+    huge_manifest_from_native_runner (|name, conf: CSConfigOptions| {
+        use abq_utils::net_protocol::runners::{ManifestMessage, Manifest, MetadataMap, AbqProtocolVersion, InitSuccessMessage};
+        use abq_native_runner_simulation::{pack, pack_msgs, Msg::*};
+
+        let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+        let mut meta = MetadataMap::default();
+        let value = "y".repeat(1000);
+        for i in 0..1_000 {
+            meta.insert(i.to_string(), value.clone().into());
+        }
+        let huge_manifest = ManifestMessage::new(Manifest::new(vec![], meta));
+
+        assert!(
+            abq_utils::net_protocol::validate_max_message_size(
+                serde_json::to_vec(&huge_manifest).unwrap().len() as _
+            ).is_err()
+        );
+
+        let simulation = [
+            Connect,
+            //
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            //
+            // Write the manifest if we need to.
+            // Otherwise we should get no requests for tests.
+            IfGenerateManifest {
+                then_do: vec![OpaqueWrite(pack(&huge_manifest))],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                ],
+            },
+            //
+            // Finish
+            Exit(0),
+        ];
+
+        let simulation_msg = pack_msgs(simulation);
+        let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let simfile_path = simfile.to_path_buf();
+        std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = simfile_path.display().to_string();
+
+        // abq test --reporter dot (--token ...)? -- simulator
+        let args = &["test", "--reporter", "dot", "--num-workers", "cpu-cores"];
+        let mut args = conf.extend_args_for_in_band_client(args);
+        args.extend(["--", simulator.as_str(), simfile_path.as_str()]);
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = run_abq_in(
+            name,
+            args,
+            &std::env::current_dir().unwrap(),
+            false,
+        );
+
+        assert!(exit_status.success());
+        assert!(stdout.contains("0 tests, 0 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+    })
 }
