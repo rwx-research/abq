@@ -56,7 +56,8 @@ pub mod entity {
 
 pub mod workers {
     use super::runners::{
-        AbqProtocolVersion, Manifest, ManifestMessage, NativeRunnerSpecification, TestCase,
+        AbqProtocolVersion, CapturedOutput, Manifest, ManifestMessage, NativeRunnerSpecification,
+        TestCase,
     };
     use serde_derive::{Deserialize, Serialize};
     use std::{
@@ -243,10 +244,12 @@ pub mod workers {
         TestRunnerError {
             /// Opaque error message from the failing test runner.
             error: String,
+            /// Captured stdout/stderr from the failing runner.
+            output: CapturedOutput,
         },
     }
 
-    static_assertions::assert_eq_size!(ManifestResult, [u8; 72]);
+    static_assertions::assert_eq_size!(ManifestResult, [u8; 80]);
 }
 
 pub mod queue {
@@ -346,6 +349,7 @@ pub mod queue {
         TestCommandError {
             /// Opaque error message related to the failure of the test command.
             error: String,
+            captured: CapturedOutput,
         },
         /// Information about the native test runner being used for the current test suite.
         /// This message is sent exaclty once per test run, and usually received at the start of a

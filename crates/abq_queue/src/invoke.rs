@@ -24,6 +24,7 @@ use abq_utils::{
         queue::{
             self, AssociatedTestResults, InvokeWork, InvokerTestData, Message, NativeRunnerInfo,
         },
+        runners::CapturedOutput,
         workers::{RunId, RunnerKind},
         AsyncReaderDos,
     },
@@ -78,7 +79,7 @@ pub enum TestResultError {
     Io(#[from] io::Error),
 
     #[error("The given test command failed to be executed by all workers. The recorded error message is:\n{0}")]
-    TestCommandError(String),
+    TestCommandError(String, CapturedOutput),
 
     #[error("The given test command timed out.")]
     TimedOut(Duration),
@@ -276,8 +277,8 @@ impl Client {
 
                     return Ok(IncrementalTestData::Finished);
                 }
-                Ok(InvokerTestData::TestCommandError { error }) => {
-                    return Err(TestResultError::TestCommandError(error))
+                Ok(InvokerTestData::TestCommandError { error, captured }) => {
+                    return Err(TestResultError::TestCommandError(error, captured))
                 }
                 Ok(InvokerTestData::TimedOut { after }) => {
                     // Send a final ACK of the test results, so that cancellation signals do not

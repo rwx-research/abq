@@ -37,7 +37,7 @@ use abq_utils::{
 use abq_with_protocol_version::with_protocol_version;
 use abq_workers::{
     negotiate::{NegotiatedWorkers, WorkersConfig, WorkersNegotiator},
-    workers::{WorkerContext, WorkersExit},
+    workers::{WorkerContext, WorkersExit, WorkersExitStatus},
 };
 use futures::FutureExt;
 use ntest::timeout;
@@ -97,6 +97,7 @@ fn default_workers_config() -> WorkersConfig {
     WorkersConfig {
         num_workers: 2.try_into().unwrap(),
         worker_context: WorkerContext::AssumeLocal,
+        supervisor_in_band: false,
         debug_native_runner: false,
     }
 }
@@ -161,7 +162,7 @@ enum Assert<'a> {
     TestResults(Sid, &'a dyn Fn(&[TestResult]) -> bool),
 
     WorkersAreRedundant(Wid),
-    WorkerExit(Wid, &'a dyn Fn(&WorkersExit)),
+    WorkerExitStatus(Wid, &'a dyn Fn(&WorkersExitStatus)),
 }
 
 type Steps<'a> = Vec<(Vec<Action>, Vec<Assert<'a>>)>;
@@ -468,10 +469,10 @@ fn run_test(servers: Servers, steps: Steps) {
                         assert!(workers_redundant.lock().get(&n).unwrap());
                     }
 
-                    WorkerExit(n, workers_exit) => {
+                    WorkerExitStatus(n, workers_exit) => {
                         let exits = worker_exits.lock();
                         let real_exit = exits.get(&n).expect("workers exit not found");
-                        workers_exit(real_exit);
+                        workers_exit(&real_exit.status);
                     }
 
                     CheckSupervisor(n, check) => {
@@ -518,8 +519,8 @@ fn multiple_jobs_complete() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         .test();
@@ -580,8 +581,8 @@ fn multiple_invokers() {
         .step(
             [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
             [
-                WorkerExit(Wid(1), &|e| (assert_eq!(e, &WorkersExit::Success))),
-                WorkerExit(Wid(2), &|e| (assert_eq!(e, &WorkersExit::Success))),
+                WorkerExitStatus(Wid(1), &|e| (assert_eq!(e, &WorkersExitStatus::Success))),
+                WorkerExitStatus(Wid(2), &|e| (assert_eq!(e, &WorkersExitStatus::Success))),
             ],
         )
         .test();
@@ -625,8 +626,8 @@ fn batch_two_requests_at_a_time() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         .test();
@@ -661,10 +662,10 @@ fn worker_exits_with_failure_if_test_fails() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
+            [WorkerExitStatus(Wid(1), &|e| {
                 assert!(matches!(
                     e,
-                    WorkersExit::Failure {
+                    WorkersExitStatus::Failure {
                         exit_code: ExitCode::FAILURE
                     }
                 ))
@@ -720,18 +721,18 @@ fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
         .step(
             [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
             [
-                WorkerExit(Wid(1), &|e| {
+                WorkerExitStatus(Wid(1), &|e| {
                     assert!(matches!(
                         e,
-                        WorkersExit::Failure {
+                        WorkersExitStatus::Failure {
                             exit_code: ExitCode::FAILURE
                         }
                     ))
                 }),
-                WorkerExit(Wid(2), &|e| {
+                WorkerExitStatus(Wid(2), &|e| {
                     assert!(matches!(
                         e,
-                        WorkersExit::Failure {
+                        WorkersExitStatus::Failure {
                             exit_code: ExitCode::FAILURE
                         }
                     ))
@@ -794,8 +795,8 @@ fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         // Start a second, with the same run ID
@@ -826,8 +827,8 @@ fn empty_manifest_exits_gracefully() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         .test();
@@ -983,8 +984,8 @@ fn get_init_context_after_run_already_completed() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         .act([WSRunRequest(
@@ -1036,8 +1037,8 @@ fn getting_run_after_work_is_complete_returns_nothing() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         // Now, simulate a new set of workers connecting again. Negotiation should succeed, but
@@ -1048,8 +1049,8 @@ fn getting_run_after_work_is_complete_returns_nothing() {
         )
         .step(
             [StopWorkers(Wid(2))],
-            [WorkerExit(Wid(2), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(2), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         .test();
@@ -1080,8 +1081,8 @@ fn test_cancellation_drops_remaining_work() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         .test();
@@ -1110,8 +1111,8 @@ fn failure_to_run_worker_command_exits_gracefully() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert!(matches!(e, WorkersExit::Error { .. }))
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert!(matches!(e, WorkersExitStatus::Error { .. }))
             })],
         )
         .test();
@@ -1174,8 +1175,8 @@ fn pending_worker_attachment_does_not_block_other_attachers() {
         )
         .step(
             [StopWorkers(Wid(2))],
-            [WorkerExit(Wid(2), &|e| {
-                assert_eq!(e, &WorkersExit::Success)
+            [WorkerExitStatus(Wid(2), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
             })],
         )
         .test();
@@ -1219,7 +1220,7 @@ fn native_runner_returns_manifest_failure() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| assert!(matches!(e, WorkersExit::Error {..})))],
+            [WorkerExitStatus(Wid(1), &|e| assert!(matches!(e, WorkersExitStatus::Error {..})))],
         )
         .test();
 }
@@ -1258,8 +1259,8 @@ fn multiple_tests_per_work_id_reported() {
         )
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExit(Wid(1), &|e| {
-                assert!(matches!(e, WorkersExit::Success))
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert!(matches!(e, WorkersExitStatus::Success))
             })],
         )
         .test();

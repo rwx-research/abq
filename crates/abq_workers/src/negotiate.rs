@@ -16,7 +16,7 @@ use tracing::{error, instrument};
 use crate::workers::{
     GetInitContext, GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest,
     NotifyResults, RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkerPoolConfig,
-    WorkersExit,
+    WorkersExit, WorkersExitStatus,
 };
 use abq_utils::{
     auth::User,
@@ -101,6 +101,7 @@ pub struct WorkersConfig {
     pub num_workers: NonZeroUsize,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
+    pub supervisor_in_band: bool,
     pub debug_native_runner: bool,
 }
 
@@ -120,6 +121,7 @@ pub struct WorkersNegotiator(Box<dyn net::ClientStream>, WorkerContext);
 pub enum NegotiatedWorkers {
     /// No more workers were created, because there is no more work to be done.
     Redundant {
+        entity: EntityId,
         /// Whether the run was successful when completed.
         success: bool,
     },
@@ -130,13 +132,17 @@ pub enum NegotiatedWorkers {
 impl NegotiatedWorkers {
     pub fn shutdown(&mut self) -> WorkersExit {
         match self {
-            NegotiatedWorkers::Redundant { success } => {
-                if *success {
-                    WorkersExit::Success
+            NegotiatedWorkers::Redundant { success, .. } => {
+                let status = if *success {
+                    WorkersExitStatus::Success
                 } else {
-                    WorkersExit::Failure {
+                    WorkersExitStatus::Failure {
                         exit_code: ExitCode::FAILURE,
                     }
+                };
+                WorkersExit {
+                    status,
+                    final_captured_outputs: Default::default(),
                 }
             }
             NegotiatedWorkers::Pool(pool) => pool.shutdown(),
@@ -147,6 +153,13 @@ impl NegotiatedWorkers {
         match self {
             NegotiatedWorkers::Redundant { .. } => false,
             NegotiatedWorkers::Pool(pool) => pool.workers_alive(),
+        }
+    }
+
+    pub fn entity(&self) -> EntityId {
+        match self {
+            NegotiatedWorkers::Redundant { entity, .. } => *entity,
+            NegotiatedWorkers::Pool(pool) => pool.entity(),
         }
     }
 }
@@ -185,12 +198,17 @@ impl WorkersNegotiator {
         client_options: ClientOptions<User>,
         wanted_run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
+        let worker_entity = EntityId::new();
         let client = client_options.clone().build()?;
         let async_client = client_options.build_async()?;
 
-        let execution_decision =
-            wait_for_execution_context(&*async_client, &wanted_run_id, queue_negotiator_handle.0)
-                .await?;
+        let execution_decision = wait_for_execution_context(
+            &*async_client,
+            worker_entity,
+            &wanted_run_id,
+            queue_negotiator_handle.0,
+        )
+        .await?;
 
         let ExecutionContext {
             run_id,
@@ -213,6 +231,7 @@ impl WorkersNegotiator {
         let WorkersConfig {
             num_workers,
             worker_context,
+            supervisor_in_band,
             debug_native_runner,
         } = workers_config;
 
@@ -347,6 +366,7 @@ impl WorkersNegotiator {
 
         let pool_config = WorkerPoolConfig {
             size: num_workers,
+            entity: worker_entity,
             runner_kind,
             get_next_tests_generator,
             get_init_context,
@@ -356,6 +376,7 @@ impl WorkersNegotiator {
             worker_context,
             run_id,
             notify_manifest,
+            supervisor_in_band,
             debug_native_runner,
         };
 
@@ -375,6 +396,7 @@ impl WorkersNegotiator {
 #[instrument(level = "debug", skip(client))]
 async fn wait_for_execution_context(
     client: &dyn net_async::ConfiguredClient,
+    entity: EntityId,
     wanted_run_id: &RunId,
     queue_negotiator_addr: SocketAddr,
 ) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
@@ -390,7 +412,7 @@ async fn wait_for_execution_context(
         let worker_set_decision = match net_protocol::async_read(&mut conn).await? {
             MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
             MessageFromQueueNegotiator::RunAlreadyCompleted { success } => {
-                Err(NegotiatedWorkers::Redundant { success })
+                Err(NegotiatedWorkers::Redundant { entity, success })
             }
             MessageFromQueueNegotiator::RunUnknown => {
                 // We are still waiting for this run, sleep on the decay and retry.
@@ -882,7 +904,7 @@ mod test {
 
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
-    use crate::workers::{WorkerContext, WorkersExit};
+    use crate::workers::{WorkerContext, WorkersExitStatus};
     use abq_utils::auth::{
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
         UserToken,
@@ -1140,6 +1162,7 @@ mod test {
         let workers_config = WorkersConfig {
             num_workers: NonZeroUsize::new(1).unwrap(),
             worker_context: WorkerContext::AssumeLocal,
+            supervisor_in_band: false,
             debug_native_runner: false,
         };
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
@@ -1160,8 +1183,8 @@ mod test {
             result.status == Status::Success && result.output.as_ref().unwrap() == "hello"
         });
 
-        let status = workers.shutdown();
-        assert!(matches!(status, WorkersExit::Success));
+        let workers_exit = workers.shutdown();
+        assert!(matches!(workers_exit.status, WorkersExitStatus::Success));
 
         shutdown_tx.shutdown_immediately().unwrap();
         queue_negotiator.join();

@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use abq_utils::exit::ExitCode;
 use buffered_results::BufferedResults;
+use capture_output::OutputCapturer;
 use message_buffer::{Completed, RefillStrategy};
-use mux_output::MuxOutput;
-use tokio::io::{Stderr, Stdout};
+
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, ChildStderr, ChildStdout, Command};
 
@@ -20,7 +21,7 @@ use abq_utils::net_protocol::runners::{
     CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
     NativeRunnerSpecification, OutOfBandError, ProtocolWitness, RawNativeRunnerSpawnedMessage,
     RawTestResultMessage, Status, TestCase, TestCaseMessage, TestResult, TestResultSpec,
-    TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    TestRunnerExit, TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -35,11 +36,11 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
-use crate::mux_output::mux_output;
+use crate::capture_output::capture_output;
 
 mod buffered_results;
+mod capture_output;
 mod message_buffer;
-mod mux_output;
 
 pub struct GenericTestRunner;
 
@@ -93,7 +94,7 @@ pub async fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
     native_runner_died: impl Future<Output = ()>,
-) -> Result<(NativeRunnerInfo, RunnerConnection), ProtocolVersionMessageError> {
+) -> Result<(NativeRunnerInfo, RunnerConnection), GenericRunnerErrorKind> {
     let start = Instant::now();
     let (
         NativeRunnerSpawnedMessage {
@@ -137,29 +138,19 @@ pub async fn open_native_runner_connection(
     }
 }
 
+macro_rules! try_setup {
+    ($err:expr) => {
+        $err.map_err(|e| GenericRunnerError {
+            kind: e.into(),
+            output: CapturedOutput::empty(),
+        })?
+    };
+}
+
 pub async fn wait_for_manifest(mut runner_conn: RunnerConnection) -> io::Result<ManifestMessage> {
     let manifest: ManifestMessage = runner_conn.read().await?;
 
     Ok(manifest)
-}
-
-#[derive(Debug, Error)]
-enum RetrieveManifestError {
-    #[error("{0}")]
-    Io(#[from] io::Error),
-    #[error("{0}")]
-    ProtocolVersion(#[from] ProtocolVersionError),
-    #[error("{0}")]
-    OOBError(#[from] OutOfBandError),
-}
-
-impl From<ProtocolVersionMessageError> for RetrieveManifestError {
-    fn from(e: ProtocolVersionMessageError) -> Self {
-        match e {
-            ProtocolVersionMessageError::Io(e) => Self::Io(e),
-            ProtocolVersionMessageError::Version(e) => Self::ProtocolVersion(e),
-        }
-    }
 }
 
 /// Retrieves the test manifest from native test runner.
@@ -170,12 +161,12 @@ async fn retrieve_manifest<'a>(
     additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
     working_dir: &Path,
     protocol_version_timeout: Duration,
-) -> Result<ReportedManifest, RetrieveManifestError> {
+) -> Result<ReportedManifest, GenericRunnerError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
     let (runner_info, manifest) = {
-        let mut our_listener = TcpListener::bind("127.0.0.1:0").await?;
-        let our_addr = our_listener.local_addr()?;
+        let mut our_listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
+        let our_addr = try_setup!(our_listener.local_addr());
 
         let mut native_runner = process::Command::new(cmd);
         native_runner.args(args);
@@ -183,37 +174,37 @@ async fn retrieve_manifest<'a>(
         native_runner.env(ABQ_GENERATE_MANIFEST, "1");
         native_runner.envs(additional_env);
         native_runner.current_dir(working_dir);
-        // NB(130): we'd like to surface native runner output today, but tomorrow
-        // (with https://github.com/rwx-research/abq/issues/130) this should either
-        // be captured or hidden behind a debug flag.
-        native_runner.stdout(Stdio::inherit());
-        native_runner.stderr(Stdio::inherit());
 
-        let mut native_runner_handle = native_runner.spawn()?;
+        native_runner.stdout(Stdio::piped());
+        native_runner.stderr(Stdio::piped());
 
-        let native_runner_died = async {
-            let _ = native_runner_handle.wait().await;
-        };
+        let mut native_runner_handle = try_setup!(native_runner.spawn());
 
-        // Wait for and validate the protocol version message, channel must always come first.
-        let (runner_info, runner_conn) = open_native_runner_connection(
+        let manifest_result = retrieve_manifest_help(
             &mut our_listener,
+            &mut native_runner_handle,
             protocol_version_timeout,
-            native_runner_died,
         )
-        .await?;
+        .await;
 
-        let manifest_message = wait_for_manifest(runner_conn).await?;
-
-        let status = native_runner_handle.wait().await?;
-        debug_assert!(status.success());
-
-        let manifest = match manifest_message {
-            ManifestMessage::Success(manifest) => manifest.manifest,
-            ManifestMessage::Failure(failure) => return Err(failure.error.into()),
-        };
-
-        (runner_info, manifest)
+        match manifest_result {
+            Ok((runner_info, ManifestMessage::Success(manifest))) => {
+                (runner_info, manifest.manifest)
+            }
+            Ok((_, ManifestMessage::Failure(failure))) => {
+                let kind = NativeTestRunnerError::from(failure.error);
+                return Err(GenericRunnerError {
+                    kind: kind.into(),
+                    output: steal_child_output(&mut native_runner_handle).await,
+                });
+            }
+            Err(kind) => {
+                return Err(GenericRunnerError {
+                    kind,
+                    output: steal_child_output(&mut native_runner_handle).await,
+                });
+            }
+        }
     };
 
     Ok(ReportedManifest {
@@ -221,6 +212,40 @@ async fn retrieve_manifest<'a>(
         native_runner_protocol: runner_info.protocol.get_version(),
         native_runner_specification: Box::new(runner_info.specification),
     })
+}
+
+async fn steal_child_output(child: &mut process::Child) -> CapturedOutput {
+    let mut stderr = Default::default();
+    let mut stdout = Default::default();
+    if let Some(mut s) = std::mem::take(&mut child.stderr) {
+        let _ = s.read_to_end(&mut stderr).await;
+    }
+    if let Some(mut s) = std::mem::take(&mut child.stdout) {
+        let _ = s.read_to_end(&mut stdout).await;
+    }
+    CapturedOutput { stderr, stdout }
+}
+
+async fn retrieve_manifest_help(
+    listener: &mut TcpListener,
+    native_runner_handle: &mut process::Child,
+    protocol_version_timeout: Duration,
+) -> Result<(NativeRunnerInfo, ManifestMessage), GenericRunnerErrorKind> {
+    let native_runner_died = async {
+        let _ = native_runner_handle.wait().await;
+    };
+
+    // Wait for and validate the protocol version message, channel must always come first.
+    let (runner_info, runner_conn) =
+        open_native_runner_connection(listener, protocol_version_timeout, native_runner_died)
+            .await?;
+
+    let manifest_message = wait_for_manifest(runner_conn).await?;
+
+    let status = native_runner_handle.wait().await?;
+    debug_assert!(status.success());
+
+    Ok((runner_info, manifest_message))
 }
 
 #[derive(Debug, Error)]
@@ -235,30 +260,32 @@ impl std::fmt::Display for FailureExit {
 }
 
 #[derive(Debug, Error)]
-pub enum GenericRunnerError {
+pub enum GenericRunnerErrorKind {
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("{0}")]
-    ProtocolVersion(ProtocolVersionError),
+    ProtocolVersion(#[from] ProtocolVersionError),
     #[error("{0}")]
     NativeRunner(#[from] NativeTestRunnerError),
 }
 
-impl From<RetrieveManifestError> for GenericRunnerError {
-    fn from(e: RetrieveManifestError) -> Self {
-        match e {
-            RetrieveManifestError::Io(e) => Self::Io(e),
-            RetrieveManifestError::ProtocolVersion(e) => Self::ProtocolVersion(e),
-            RetrieveManifestError::OOBError(e) => Self::NativeRunner(e.into()),
-        }
+#[derive(Debug, Error)]
+pub struct GenericRunnerError {
+    pub kind: GenericRunnerErrorKind,
+    pub output: CapturedOutput,
+}
+
+impl std::fmt::Display for GenericRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.kind.fmt(f)
     }
 }
 
-impl From<ProtocolVersionMessageError> for GenericRunnerError {
-    fn from(e: ProtocolVersionMessageError) -> Self {
-        match e {
-            ProtocolVersionMessageError::Io(e) => Self::Io(e),
-            ProtocolVersionMessageError::Version(e) => Self::ProtocolVersion(e),
+impl GenericRunnerError {
+    pub fn no_captures(kind: GenericRunnerErrorKind) -> Self {
+        Self {
+            kind,
+            output: CapturedOutput::empty(),
         }
     }
 }
@@ -268,12 +295,6 @@ pub type SendTestResultsBoxed<'a> =
     Box<dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>>;
 
 pub type GetNextTests<'a> = &'a dyn Fn() -> BoxFuture<'static, NextWorkBundle>;
-
-pub struct TestRunnerExit {
-    pub exit_code: ExitCode,
-    /// Captured stdout/stderr after all tests have been run
-    pub final_captured_output: CapturedOutput,
-}
 
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetInitContext>(
@@ -294,9 +315,9 @@ impl GenericTestRunner {
         SendManifest: FnMut(ManifestResult),
         GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
     {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?;
+            .build());
         rt.block_on(run(
             worker_entity,
             input,
@@ -357,9 +378,10 @@ where
             }
             Err(err) => {
                 send_manifest(ManifestResult::TestRunnerError {
-                    error: err.to_string(),
+                    error: err.kind.to_string(),
+                    output: err.output.clone(),
                 });
-                return Err(err.into());
+                return Err(err);
             }
         }
     }
@@ -388,8 +410,8 @@ where
     //       | <- send Next-Test -   |             |                              |
     //       | -   recv Done    ->   |             |      <close conn>            |
     // Queue |                       | Worker (us) |                              | Native runner
-    let mut our_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let our_addr = our_listener.local_addr()?;
+    let our_listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
+    let our_addr = try_setup!(our_listener.local_addr());
 
     let mut native_runner = process::Command::new(cmd);
     native_runner.args(args);
@@ -397,7 +419,7 @@ where
     native_runner.envs(additional_env);
     native_runner.current_dir(working_dir);
 
-    // The stdout/stderr will be multiplexed manually below.
+    // The stdout/stderr will be captured manually below.
     native_runner.stdout(Stdio::piped());
     native_runner.stderr(Stdio::piped());
 
@@ -406,17 +428,60 @@ where
     // we do not attempt to handle gracefully). Since the failure during manifest generation
     // will have notified the queue, at this point, failures should just result in the worker
     // exiting silently itself.
-    let mut native_runner_handle = native_runner.spawn()?;
+    let mut native_runner_handle = try_setup!(native_runner.spawn());
 
-    // Set up multiplexing of the native runner's stdout/stderr.
-    // We want both standard pipes of the child to point to our (the parent's) standard pipes, and
-    // to managed buffers we'll extract when an individual test completes.
-    let mux_pipes = {
+    // Set up capturing of the native runner's stdout/stderr.
+    // We want both standard pipes of the child to point to managed buffers from which
+    // we'll extract output when an individual test completes.
+    let capture_pipes = {
         let child_stdout = native_runner_handle.stdout.take().expect("just spawned");
         let child_stderr = native_runner_handle.stderr.take().expect("just spawned");
-        MuxPipes::new(child_stdout, child_stderr)
+        CapturePipes::new(child_stdout, child_stderr)
     };
 
+    let opt_err = run_help(
+        native_runner_handle,
+        our_listener,
+        protocol_version_timeout,
+        get_init_context,
+        &capture_pipes,
+        results_batch_size,
+        get_next_test_bundle,
+        send_test_results,
+        worker_entity,
+        native_runner,
+    )
+    .await;
+
+    let output = capture_pipes
+        .finish()
+        .await
+        .unwrap_or_else(|_| CapturedOutput::empty());
+
+    match opt_err {
+        Ok(exit) => Ok(TestRunnerExit {
+            exit_code: exit,
+            final_captured_output: output,
+        }),
+        Err(err) => Err(GenericRunnerError { kind: err, output }),
+    }
+}
+
+async fn run_help<GetInitContext>(
+    mut native_runner_handle: process::Child,
+    mut our_listener: TcpListener,
+    protocol_version_timeout: Duration,
+    get_init_context: GetInitContext,
+    capture_pipes: &CapturePipes,
+    results_batch_size: u64,
+    get_next_test_bundle: GetNextTests<'_>,
+    send_test_results: SendTestResults<'_>,
+    worker_entity: EntityId,
+    native_runner: Command,
+) -> Result<ExitCode, GenericRunnerErrorKind>
+where
+    GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
+{
     let native_runner_died = async {
         let _ = native_runner_handle.wait().await;
     };
@@ -461,11 +526,7 @@ where
                 );
                 runner_conn.write(&init_message).await?;
                 let exit_status = native_runner_handle.wait().await?;
-                let final_captured_output = mux_pipes.finish().await?;
-                return Ok(TestRunnerExit {
-                    exit_code: exit_status.into(),
-                    final_captured_output,
-                });
+                return Ok(exit_status.into());
             }
         };
     }
@@ -524,7 +585,7 @@ where
             let handled_test = handle_one_test(
                 worker_entity,
                 &mut runner_conn,
-                &mux_pipes,
+                capture_pipes,
                 work_id,
                 test_case,
                 &results_tx,
@@ -535,7 +596,7 @@ where
 
             if let Err((work_id, native_error)) = handled_test {
                 let remaining_tests = tests_rx.flush().await;
-                let final_output = mux_pipes.finish().await?;
+                let final_output = capture_pipes.get_captured();
 
                 handle_native_runner_failure(
                     worker_entity,
@@ -548,7 +609,7 @@ where
                     remaining_tests,
                 );
 
-                return Err(GenericRunnerError::from(native_error));
+                return Err(GenericRunnerErrorKind::from(native_error));
             }
         }
 
@@ -557,14 +618,7 @@ where
         drop(our_listener);
         let exit_status = native_runner_handle.wait().await?;
 
-        // TODO: write after-all standard output/error to stdout/stderr when we stop piping output
-        // through.
-        let final_captured_output = mux_pipes.finish().await?;
-
-        Ok(TestRunnerExit {
-            exit_code: ExitCode::from(exit_status),
-            final_captured_output,
-        })
+        Ok(ExitCode::from(exit_status))
     };
 
     let ((), run_tests_result, ()) =
@@ -583,36 +637,34 @@ pub enum NativeTestRunnerError {
     OOBError(#[from] OutOfBandError),
 }
 
-struct MuxPipes {
-    stdout: MuxOutput<ChildStdout, Stdout>,
-    stderr: MuxOutput<ChildStderr, Stderr>,
+struct CapturePipes {
+    stdout: OutputCapturer<ChildStdout>,
+    stderr: OutputCapturer<ChildStderr>,
 }
 
-impl MuxPipes {
+impl CapturePipes {
     fn new(child_stdout: ChildStdout, child_stderr: ChildStderr) -> Self {
-        let our_stdout: Stdout = tokio::io::stdout();
-        let our_stderr: Stderr = tokio::io::stderr();
         Self {
-            stdout: mux_output(child_stdout, our_stdout),
-            stderr: mux_output(child_stderr, our_stderr),
+            stdout: capture_output(child_stdout),
+            stderr: capture_output(child_stderr),
         }
     }
 
-    fn get_captured(&self) -> (Vec<u8>, Vec<u8>) {
+    fn get_captured(&self) -> CapturedOutput {
         // NB: if we ever measure this to be compute-expensive, consider making `end_capture` async
         let stdout = self.stdout.side_channel.get_captured();
         let stderr = self.stderr.side_channel.get_captured();
 
-        (stdout, stderr)
+        CapturedOutput { stderr, stdout }
     }
 
     async fn finish(self) -> io::Result<CapturedOutput> {
-        let MuxOutput {
+        let OutputCapturer {
             copied_all_output: copied_stdout,
             side_channel: side_stdout,
             ..
         } = self.stdout;
-        let MuxOutput {
+        let OutputCapturer {
             copied_all_output: copied_stderr,
             side_channel: side_stderr,
             ..
@@ -632,18 +684,18 @@ impl MuxPipes {
 async fn handle_one_test(
     worker_entity: EntityId,
     runner_conn: &mut RunnerConnection,
-    mux_pipes: &MuxPipes,
+    capture_pipes: &CapturePipes,
     work_id: WorkId,
     test_case: TestCase,
     results_chan: &ResultsSender,
-) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerError> {
+) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerErrorKind> {
     let test_case_message = TestCaseMessage::new(test_case);
 
     let opt_test_results = send_and_wait_for_test_results(
         worker_entity,
         work_id,
         runner_conn,
-        mux_pipes,
+        capture_pipes,
         test_case_message,
     )
     .await;
@@ -671,7 +723,7 @@ async fn send_and_wait_for_test_results(
     worker_entity: EntityId,
     work_id: WorkId,
     runner_conn: &mut RunnerConnection,
-    mux_pipes: &MuxPipes,
+    capture_pipes: &CapturePipes,
     test_case_message: TestCaseMessage,
 ) -> Result<AssociatedTestResults, (WorkId, io::Error)> {
     macro_rules! bail {
@@ -684,11 +736,7 @@ async fn send_and_wait_for_test_results(
     }
 
     // Grab the "before-any-test" output.
-    let (before_test_stdout, before_test_stderr) = mux_pipes.get_captured();
-    let before_any_test = CapturedOutput {
-        stderr: before_test_stderr,
-        stdout: before_test_stdout,
-    };
+    let before_any_test = capture_pipes.get_captured();
 
     // Prime the "after-all-tests" output.
     // Today, this is empty by default, since in general we associate output outside of a test to
@@ -706,11 +754,11 @@ async fn send_and_wait_for_test_results(
 
     // stop capturing stdout after we receive a test result message, since it necessarily
     // corresponds to at least one test result notification
-    let (mut result_stdout, mut result_stderr) = mux_pipes.get_captured();
+    let mut captured = capture_pipes.get_captured();
 
     let results = match raw_msg.into_test_results(worker_entity) {
         TestResultSet::All(mut results) => {
-            attach_pipe_output_to_test_results(&mut results, result_stdout, result_stderr);
+            attach_pipe_output_to_test_results(&mut results, captured);
             results
         }
         TestResultSet::Incremental(mut step) => {
@@ -721,7 +769,7 @@ async fn send_and_wait_for_test_results(
                 match step {
                     One(mut res) => {
                         // Add the stdout/stderr for the last incremental result.
-                        attach_pipe_output_to_test_result(&mut res, result_stdout, result_stderr);
+                        attach_pipe_output_to_test_result(&mut res, captured);
                         results.push(res);
 
                         // Wait for the next incremental result.
@@ -730,23 +778,16 @@ async fn send_and_wait_for_test_results(
 
                         // Get the captured output for the test result that just completed, in
                         // `raw_increment`.
-                        (result_stdout, result_stderr) = mux_pipes.get_captured();
+                        captured = capture_pipes.get_captured();
 
                         step = raw_increment.into_step(worker_entity);
                     }
                     Done(opt_res) => {
                         if let Some(mut result) = opt_res {
-                            attach_pipe_output_to_test_result(
-                                &mut result,
-                                result_stdout,
-                                result_stderr,
-                            );
+                            attach_pipe_output_to_test_result(&mut result, captured);
                             results.push(result);
                         } else {
-                            after_test_captures = Some(CapturedOutput {
-                                stderr: result_stderr,
-                                stdout: result_stdout,
-                            });
+                            after_test_captures = Some(captured);
                         }
                         break;
                     }
@@ -764,31 +805,24 @@ async fn send_and_wait_for_test_results(
     })
 }
 
-fn attach_pipe_output_to_test_results(
-    test_results: &mut [TestResult],
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-) {
+fn attach_pipe_output_to_test_results(test_results: &mut [TestResult], captured: CapturedOutput) {
     // Happier path: exactly one test result, we can hand over the output uniquely.
     // TODO: can we pass stdout/stderr to `TestResult` as borrowed for the purposes of sending?
     match test_results {
-        [tr] => attach_pipe_output_to_test_result(tr, stdout, stderr),
+        [tr] => attach_pipe_output_to_test_result(tr, captured),
         _ => {
             // NB: when a manifest test returns multiple test results, we currently cannot
             // distinguish what stdout belongs to what test!
             // Consider protocol-level support for this, with aid from native runners.
             for tr in test_results {
-                attach_pipe_output_to_test_result(tr, stdout.clone(), stderr.clone());
+                attach_pipe_output_to_test_result(tr, captured.clone());
             }
         }
     }
 }
 
-fn attach_pipe_output_to_test_result(
-    test_result: &mut TestResult,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-) {
+fn attach_pipe_output_to_test_result(test_result: &mut TestResult, captured: CapturedOutput) {
+    let CapturedOutput { stderr, stdout } = captured;
     test_result.stdout = Some(stdout);
     test_result.stderr = Some(stderr);
 }
@@ -968,7 +1002,7 @@ pub fn execute_wrapped_runner(
                 *manifest_message = Some(real_manifest.clone());
                 *flat_manifest = Some(real_manifest.manifest.flatten());
             }
-            ManifestResult::TestRunnerError { error } => {
+            ManifestResult::TestRunnerError { error, output: _ } => {
                 *opt_error_cell = Some(error);
             }
         }
@@ -1035,10 +1069,10 @@ pub fn execute_wrapped_runner(
     );
 
     if let Some(error) = opt_error_cell {
-        return Err(GenericRunnerError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            error,
-        )));
+        return Err(GenericRunnerError {
+            kind: io::Error::new(io::ErrorKind::InvalidInput, error).into(),
+            output: CapturedOutput::empty(),
+        });
     }
 
     let test_results = test_results.lock();
@@ -1067,7 +1101,9 @@ mod test_validate_protocol_version_message {
         },
     };
 
-    use super::{open_native_runner_connection, ProtocolVersionError, ProtocolVersionMessageError};
+    use crate::GenericRunnerErrorKind;
+
+    use super::{open_native_runner_connection, ProtocolVersionError};
 
     fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessage {
         let protocol_version = proto.get_version();
@@ -1149,7 +1185,7 @@ mod test_validate_protocol_version_message {
         let err = result.unwrap_err();
         assert!(matches!(
             err,
-            ProtocolVersionMessageError::Version(ProtocolVersionError::NotCompatible)
+            GenericRunnerErrorKind::ProtocolVersion(ProtocolVersionError::NotCompatible)
         ));
     }
 
@@ -1176,7 +1212,7 @@ mod test_validate_protocol_version_message {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ProtocolVersionMessageError::Io(_)));
+        assert!(matches!(err, GenericRunnerErrorKind::Io(..)));
     }
 
     #[tokio::test]
@@ -1198,7 +1234,7 @@ mod test_validate_protocol_version_message {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ProtocolVersionMessageError::Io(_)));
+        assert!(matches!(err, GenericRunnerErrorKind::Io(_)));
     }
 
     #[tokio::test]
@@ -1225,7 +1261,7 @@ mod test_validate_protocol_version_message {
         let err = result.unwrap_err();
         assert!(matches!(
             err,
-            ProtocolVersionMessageError::Version(ProtocolVersionError::Timeout)
+            GenericRunnerErrorKind::ProtocolVersion(ProtocolVersionError::Timeout)
         ));
     }
 
@@ -1253,7 +1289,7 @@ mod test_validate_protocol_version_message {
         let err = result.unwrap_err();
         assert!(matches!(
             err,
-            ProtocolVersionMessageError::Version(ProtocolVersionError::WorkerQuit)
+            GenericRunnerErrorKind::ProtocolVersion(ProtocolVersionError::WorkerQuit)
         ));
     }
 }
@@ -1499,7 +1535,7 @@ mod test_abq_jest {
 
 #[cfg(test)]
 mod test_invalid_command {
-    use crate::{GenericRunnerError, GenericTestRunner, SendTestResults};
+    use crate::{GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner, SendTestResults};
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
@@ -1545,6 +1581,12 @@ mod test_invalid_command {
             manifest_result,
             ManifestResult::TestRunnerError { .. }
         ));
-        assert!(matches!(runner_result, Err(GenericRunnerError::Io(..))));
+        assert!(matches!(
+            runner_result,
+            Err(GenericRunnerError {
+                kind: GenericRunnerErrorKind::Io(..),
+                ..
+            })
+        ));
     }
 }

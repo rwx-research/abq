@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use abq_generic_test_runner::{
-    GenericTestRunner, GetNextTests, SendTestResultsBoxed, TestRunnerExit,
-};
+use abq_generic_test_runner::{GenericTestRunner, GetNextTests, SendTestResultsBoxed};
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::artifacts_dir;
 use abq_utils::exit::ExitCode;
@@ -11,7 +9,7 @@ use abq_utils::net_protocol::queue::AssociatedTestResults;
 use abq_utils::net_protocol::runners::{
     CapturedOutput, InitSuccessMessage, Manifest, ManifestMessage, NativeRunnerSpecification,
     ProtocolWitness, RawNativeRunnerSpawnedMessage, RawTestResultMessage, Test, TestCase,
-    TestOrGroup,
+    TestOrGroup, TestRunnerExit,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{

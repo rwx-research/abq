@@ -18,7 +18,7 @@ use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{
     AssociatedTestResults, InvokerTestData, NativeRunnerInfo, NegotiatorInfo, Request,
 };
-use abq_utils::net_protocol::runners::{MetadataMap, TestCase};
+use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
 use abq_utils::net_protocol::workers::{
     ManifestResult, NextWorkBundle, ReportedManifest, RunnerKind, WorkerTest,
@@ -1670,14 +1670,14 @@ impl QueueServer {
                     .await
                 }
             }
-            ManifestResult::TestRunnerError { error } => {
+            ManifestResult::TestRunnerError { error, output } => {
                 Self::handle_manifest_empty_or_failure(
                     queues,
                     active_runs,
                     state_cache,
                     entity,
                     run_id,
-                    Err(error),
+                    Err((error, output)),
                     stream,
                 )
                 .await
@@ -1734,8 +1734,8 @@ impl QueueServer {
         entity: EntityId,
         run_id: RunId,
         manifest_result: Result<
-            NativeRunnerInfo, /* empty manifest */
-            String,           /* error manifest */
+            NativeRunnerInfo,         /* empty manifest */
+            (String, CapturedOutput), /* error manifest */
         >,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), AnyError> {
@@ -1785,9 +1785,12 @@ impl QueueServer {
 
                 InvokerTestData::EndOfResults
             }
-            Err(opaque_manifest_generation_error) => InvokerTestData::TestCommandError {
-                error: opaque_manifest_generation_error,
-            },
+            Err((opaque_manifest_generation_error, captured_output)) => {
+                InvokerTestData::TestCommandError {
+                    error: opaque_manifest_generation_error,
+                    captured: captured_output,
+                }
+            }
         };
 
         match responder {

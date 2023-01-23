@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{sync::mpsc, thread};
 
-use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner, TestRunnerExit};
+use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, CapturedOutput, ManifestMessage, NativeRunnerSpecification, OutOfBandError,
-    Status, TestId, TestResult, TestResultSpec, TestRuntime,
+    Status, TestId, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -64,8 +64,10 @@ pub enum WorkerContext {
 
 /// Configuration for a [WorkerPool].
 pub struct WorkerPoolConfig<'a> {
-    /// Number of workers.
+    /// Number of runners to start in the pool.
     pub size: NonZeroUsize,
+    /// The entity of this worker pool.
+    pub entity: EntityId,
     /// The kind of runners the workers should start.
     pub runner_kind: RunnerKind,
     /// The work run we're working for.
@@ -87,7 +89,10 @@ pub struct WorkerPoolConfig<'a> {
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
 
-    // Whether to allow passthrough of stdout/stderr from the native runner process.
+    /// Whether an ABQ supervisor is running in-band this worker process.
+    pub supervisor_in_band: bool,
+
+    /// Whether to allow passthrough of stdout/stderr from the native runner process.
     pub debug_native_runner: bool,
 }
 
@@ -133,7 +138,7 @@ impl LiveWorkers {
 }
 
 #[derive(PartialEq, Eq, Debug)]
-pub enum WorkersExit {
+pub enum WorkersExitStatus {
     /// This pool of workers was determined to complete successfully.
     /// Corresponds to all workers for a given [run][RunId] having only work that was
     /// successful.
@@ -146,10 +151,18 @@ pub enum WorkersExit {
     Error { errors: Vec<String> },
 }
 
+#[derive(Debug)]
+pub struct WorkersExit {
+    pub status: WorkersExitStatus,
+    /// Final captured output of each runner, after all tests were run on each runner.
+    pub final_captured_outputs: Vec<(usize, CapturedOutput)>,
+}
+
 impl WorkerPool {
     pub fn new(config: WorkerPoolConfig) -> Self {
         let WorkerPoolConfig {
             size,
+            entity,
             runner_kind,
             run_id,
             get_init_context,
@@ -159,10 +172,9 @@ impl WorkerPool {
             notify_manifest,
             run_completed_successfully,
             worker_context,
+            supervisor_in_band,
             debug_native_runner,
         } = config;
-
-        let entity = EntityId::new();
 
         let num_workers = size.get();
         let mut workers = Vec::with_capacity(num_workers);
@@ -202,6 +214,7 @@ impl WorkerPool {
                 context: worker_context.clone(),
                 notify_manifest,
                 mark_worker_complete,
+                supervisor_in_band,
                 debug_native_runner,
             };
 
@@ -232,6 +245,7 @@ impl WorkerPool {
                 context: worker_context.clone(),
                 notify_manifest: None,
                 mark_worker_complete,
+                supervisor_in_band,
                 debug_native_runner,
             };
 
@@ -260,6 +274,10 @@ impl WorkerPool {
         self.live_count.read() > 0
     }
 
+    pub fn entity(&self) -> EntityId {
+        self.entity
+    }
+
     /// Shuts down the worker pool, returning the pool [exit status][WorkersExit].
     #[must_use]
     pub fn shutdown(&mut self) -> WorkersExit {
@@ -275,7 +293,8 @@ impl WorkerPool {
 
         let mut errors = vec![];
         let mut failure_exit_code = ExitCode::new(1);
-        for worker_thead in self.workers.iter_mut() {
+        let mut final_captured_outputs = Vec::with_capacity(self.workers.len());
+        for (worker_idx, worker_thead) in self.workers.iter_mut().enumerate() {
             let opt_err = worker_thead
                 .handle
                 .take()
@@ -283,30 +302,40 @@ impl WorkerPool {
                 .join()
                 .expect("runner thread panicked rather than erroring");
 
-            match opt_err {
-                Ok(ec) => {
+            let final_captured_output = match opt_err {
+                Ok(TestRunnerExit {
+                    exit_code,
+                    final_captured_output,
+                }) => {
                     // Choose the highest exit code of all the test runners this worker started to
                     // be the exit code of the worker.
-                    if ec.get() > failure_exit_code.get() {
-                        failure_exit_code = ec;
+                    if exit_code.get() > failure_exit_code.get() {
+                        failure_exit_code = exit_code;
                     }
+                    final_captured_output
                 }
-                Err(error) => {
-                    tracing::error!(?error, "worker thread exited with error");
-                    eprintln!("{}", error);
-                    errors.push(error.to_string());
+                Err(GenericRunnerError { kind, output }) => {
+                    tracing::error!(?kind, "worker thread exited with error");
+                    errors.push(kind.to_string());
+                    output
                 }
-            }
+            };
+            final_captured_outputs.push((worker_idx, final_captured_output));
         }
 
-        if !errors.is_empty() {
-            WorkersExit::Error { errors }
+        let status = if !errors.is_empty() {
+            WorkersExitStatus::Error { errors }
         } else if (self.run_completed_successfully)(self.entity) {
-            WorkersExit::Success
+            WorkersExitStatus::Success
         } else {
-            WorkersExit::Failure {
+            WorkersExitStatus::Failure {
                 exit_code: failure_exit_code,
             }
+        };
+
+        WorkersExit {
+            final_captured_outputs,
+            status,
         }
     }
 }
@@ -321,7 +350,7 @@ impl Drop for WorkerPool {
 }
 
 struct ThreadWorker {
-    handle: Option<thread::JoinHandle<Result<ExitCode, GenericRunnerError>>>,
+    handle: Option<thread::JoinHandle<Result<TestRunnerExit, GenericRunnerError>>>,
 }
 
 enum AttemptError {
@@ -342,6 +371,8 @@ struct WorkerEnv {
     notify_results: NotifyResults,
     context: WorkerContext,
     mark_worker_complete: MarkWorkerComplete,
+    // Is this running in-band with a supervisor process?
+    supervisor_in_band: bool,
     debug_native_runner: bool,
 }
 
@@ -365,7 +396,7 @@ impl ThreadWorker {
 fn start_generic_test_runner(
     env: WorkerEnv,
     native_runner_params: NativeTestRunnerParams,
-) -> Result<ExitCode, GenericRunnerError> {
+) -> Result<TestRunnerExit, GenericRunnerError> {
     let WorkerEnv {
         entity,
         get_next_tests: get_next_tests_bundle,
@@ -377,14 +408,17 @@ fn start_generic_test_runner(
         context,
         msg_from_pool_rx,
         mark_worker_complete,
+        supervisor_in_band,
         debug_native_runner,
     } = env;
 
     tracing::debug!(?entity, ?run_id, "Starting new generic test runner");
 
-    // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
-    // so that they can correlate failures observed in workers with the workers they've launched.
-    eprintln!("Generic test runner started on worker {:?}", entity);
+    if !supervisor_in_band {
+        // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
+        // so that they can correlate failures observed in workers with the workers they've launched.
+        eprintln!("Generic test runner started on worker {:?}", entity);
+    }
 
     let notify_manifest = notify_manifest.map(|notify_manifest| {
         let run_id = run_id.clone();
@@ -426,12 +460,7 @@ fn start_generic_test_runner(
 
     mark_worker_complete();
 
-    opt_runner_err.map(
-        |TestRunnerExit {
-             exit_code,
-             final_captured_output: _,
-         }| exit_code,
-    )
+    opt_runner_err
 }
 
 fn build_test_like_runner_manifest_result(
@@ -464,7 +493,7 @@ fn start_test_like_runner(
     env: WorkerEnv,
     runner: TestLikeRunner,
     manifest: ManifestMessage,
-) -> Result<ExitCode, GenericRunnerError> {
+) -> Result<TestRunnerExit, GenericRunnerError> {
     let WorkerEnv {
         entity,
         msg_from_pool_rx,
@@ -476,16 +505,22 @@ fn start_test_like_runner(
         context,
         notify_manifest,
         mark_worker_complete,
+        supervisor_in_band: _,
         debug_native_runner: _,
     } = env;
 
     match runner {
         TestLikeRunner::NeverReturnManifest => {
-            return Err(
+            return Err(GenericRunnerError::no_captures(
                 io::Error::new(io::ErrorKind::Unsupported, "will not return manifest").into(),
-            );
+            ));
         }
-        TestLikeRunner::ExitWith(ec) => return Ok(ExitCode::new(ec)),
+        TestLikeRunner::ExitWith(ec) => {
+            return Ok(TestRunnerExit {
+                exit_code: ExitCode::new(ec),
+                final_captured_output: CapturedOutput::empty(),
+            })
+        }
         _ => { /* pass through */ }
     }
 
@@ -501,16 +536,24 @@ fn start_test_like_runner(
                     &run_id,
                     ManifestResult::TestRunnerError {
                         error: oob.to_string(),
+                        output: CapturedOutput::empty(),
                     },
                 );
-                return Err(GenericRunnerError::NativeRunner(oob.into()));
+                return Err(GenericRunnerError::no_captures(
+                    GenericRunnerErrorKind::NativeRunner(oob.into()),
+                ));
             }
         };
     }
 
     let init_context = match get_init_context() {
         Ok(ctx) => ctx,
-        Err(RunAlreadyCompleted {}) => return Ok(ExitCode::SUCCESS),
+        Err(RunAlreadyCompleted {}) => {
+            return Ok(TestRunnerExit {
+                exit_code: ExitCode::SUCCESS,
+                final_captured_output: CapturedOutput::empty(),
+            })
+        }
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -525,9 +568,9 @@ fn start_test_like_runner(
         let bundle = match parent_message {
             Ok(MessageFromPool::Shutdown) => {
                 if matches!(&runner, TestLikeRunner::NeverReturnOnTest(..)) {
-                    return Err(
+                    return Err(GenericRunnerError::no_captures(
                         io::Error::new(io::ErrorKind::Unsupported, "will not return test").into(),
-                    );
+                    ));
                 }
                 break;
             }
@@ -548,11 +591,10 @@ fn start_test_like_runner(
                 NextWork::Work(WorkerTest { test_case, work_id }) => {
                     if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == test_case.id() )
                     {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            "will not return test",
-                        )
-                        .into());
+                        return Err(GenericRunnerError::no_captures(
+                            io::Error::new(io::ErrorKind::Unsupported, "will not return test")
+                                .into(),
+                        ));
                     }
 
                     // Try the test_id once + how ever many retries were requested.
@@ -615,7 +657,10 @@ fn start_test_like_runner(
 
     mark_worker_complete();
 
-    Ok(ExitCode::SUCCESS)
+    Ok(TestRunnerExit {
+        exit_code: ExitCode::SUCCESS,
+        final_captured_output: CapturedOutput::empty(),
+    })
 }
 
 #[inline(always)]
@@ -711,6 +756,7 @@ mod test {
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol;
+    use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::AssociatedTestResults;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Test, TestCase, TestOrGroup, TestResult,
@@ -729,10 +775,10 @@ mod test {
 
     use super::{
         GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest, NotifyResults,
-        RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkersExit,
+        RunCompletedSuccessfully, WorkerContext, WorkerPool,
     };
     use crate::negotiate::QueueNegotiator;
-    use crate::workers::WorkerPoolConfig;
+    use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
     use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkId};
 
     type ResultsCollector = Arc<Mutex<HashMap<WorkId, Vec<TestResult>>>>;
@@ -807,6 +853,7 @@ mod test {
 
         let config = WorkerPoolConfig {
             size: NonZeroUsize::new(1).unwrap(),
+            entity: EntityId::new(),
             get_next_tests_generator,
             get_init_context: Arc::new(empty_init_context),
             results_batch_size_hint: 5,
@@ -816,6 +863,7 @@ mod test {
             notify_results,
             run_completed_successfully,
             worker_context: WorkerContext::AssumeLocal,
+            supervisor_in_band: false,
             debug_native_runner: false,
         };
 
@@ -917,7 +965,7 @@ mod test {
         });
 
         let exit = pool.shutdown();
-        assert!(matches!(exit, WorkersExit::Success));
+        assert!(matches!(exit.status, WorkersExitStatus::Success));
     }
 
     fn abqtest_write_runner_number_path() -> PathBuf {
@@ -1141,7 +1189,7 @@ mod test {
 
         let pool_exit = pool.shutdown();
 
-        assert!(matches!(pool_exit, WorkersExit::Error { .. }));
+        assert!(matches!(pool_exit.status, WorkersExitStatus::Error { .. }));
     }
 
     #[test]
@@ -1201,8 +1249,8 @@ mod test {
 
         assert!(
             matches!(
-                pool_exit,
-                WorkersExit::Failure {
+                pool_exit.status,
+                WorkersExitStatus::Failure {
                     exit_code
                 } if exit_code.get() == 27
             ),
