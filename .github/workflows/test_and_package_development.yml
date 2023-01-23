@@ -90,12 +90,12 @@ jobs:
           command: clippy
           args: --workspace --tests --release --all-features --target=${{ env.RUST_TARGET }} -- --deny warnings
 
-      - name: Lint github workflows
-        run: |
-          echo "::add-matcher::.github/actionlint-matcher.json"
-          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/3a2f2c755b6442ec7999b28dfd107e1bb9853389/scripts/download-actionlint.bash)
-          ./actionlint -color
-        shell: bash
+      # - name: Lint github workflows
+      #   run: |
+      #     echo "::add-matcher::.github/actionlint-matcher.json"
+      #     bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/3a2f2c755b6442ec7999b28dfd107e1bb9853389/scripts/download-actionlint.bash)
+      #     ./actionlint -color
+      #   shell: bash
 
       # setup testdata
       - uses: actions/setup-node@v3

@@ -392,6 +392,7 @@ test_all_network_config_options! {
             &queue_addr,
             "--run-id",
             &run_id,
+            "--color=never",
         ];
         let mut test_args = conf.extend_args_for_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);
@@ -696,7 +697,8 @@ test_all_network_config_options! {
             "--reporter",
             "dot",
             "--num-workers",
-            "cpu-cores"
+            "cpu-cores",
+            "--color=never",
         ];
         let mut test_args = conf.extend_args_for_in_band_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);
@@ -785,6 +787,7 @@ test_all_network_config_options! {
             &queue_addr,
             "--run-id",
             &run_id,
+            "--color=never",
         ];
         let mut test_args = conf.extend_args_for_client(test_args);
         test_args.extend(["--", "yarn", "jest"]);

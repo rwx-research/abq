@@ -7,8 +7,10 @@ use std::{
 };
 
 use abq_output::{
-    format_duration_to_partial_seconds, format_result_dot, format_result_line, format_summary,
-    format_test_result_summary, OutputOrdering, SummaryKind,
+    colors::ColorProvider, format_duration_to_partial_seconds, format_interactive_progress,
+    format_non_interactive_progress, format_result_dot, format_result_line, format_summary,
+    format_test_result_summary, format_worker_output, would_write_output, would_write_summary,
+    OutputOrdering, SummaryKind,
 };
 use abq_queue::invoke::CompletedSummary;
 use abq_utils::{
@@ -18,6 +20,7 @@ use abq_utils::{
         runners::{CapturedOutput, Status, TestResult, TestRuntime},
     },
 };
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use termcolor::{ColorChoice, StandardStream};
 use thiserror::Error;
 
@@ -30,6 +33,8 @@ pub enum ReporterKind {
     Line,
     /// Writes results as dots to stdout
     Dot,
+    /// Writes results to a progress bar and immediately prints output and failures
+    Progress,
     /// Writes JUnit XML to a file
     JUnitXml(PathBuf),
     /// Writes RWX Test Results (https://github.com/rwx-research/test-results-schema/blob/main/v1.json) to a file
@@ -41,6 +46,7 @@ impl Display for ReporterKind {
         match self {
             ReporterKind::Line => write!(f, "line"),
             ReporterKind::Dot => write!(f, "dot"),
+            ReporterKind::Progress => write!(f, "progress"),
             ReporterKind::JUnitXml(path) => write!(f, "junit-xml={}", path.display()),
             ReporterKind::RwxV1Json(path) => write!(f, "rwx-v1-json={}", path.display()),
         }
@@ -54,6 +60,7 @@ impl FromStr for ReporterKind {
         match s {
             "line" => Ok(Self::Line),
             "dot" => Ok(Self::Dot),
+            "progress" => Ok(Self::Progress),
             other => {
                 let mut splits = other.split('=');
                 let reporter = splits.next().filter(|reporter| !reporter.trim().is_empty());
@@ -203,6 +210,8 @@ pub(crate) trait Reporter: Send {
     /// Consume the next test result.
     fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError>;
 
+    fn tick(&mut self);
+
     /// Consume the reporter, and perform any needed finalization steps.
     ///
     /// This method is only called when all test results for a run have been consumed.
@@ -220,7 +229,9 @@ fn write_summary_results(
     summaries: Vec<SummaryKind>,
 ) -> Result<(), ReportingError> {
     for summary in summaries {
-        write(writer, &[b'\n'])?;
+        if would_write_summary(&summary) {
+            write(writer, &[b'\n'])?;
+        }
         format_summary(writer, summary)?;
     }
     Ok(())
@@ -265,6 +276,8 @@ impl Reporter for LineReporter {
 
         Ok(())
     }
+
+    fn tick(&mut self) {}
 
     fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         write_summary_results(&mut self.buffer, self.delayed_summaries)?;
@@ -343,6 +356,8 @@ impl Reporter for DotReporter {
         Ok(())
     }
 
+    fn tick(&mut self) {}
+
     fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         if !self.delayed_summaries.is_empty() && self.num_results % DOT_REPORTER_LINE_LIMIT != 0 {
             // We have summaries to print and the last dot would not have printed a newline, so
@@ -351,6 +366,170 @@ impl Reporter for DotReporter {
         }
 
         write_summary_results(&mut self.buffer, self.delayed_summaries)?;
+
+        self.buffer
+            .flush()
+            .map_err(|_| ReportingError::FailedToWrite)?;
+
+        Ok(())
+    }
+}
+
+/// Streams a progress bar of number of executed tests and any failures so far.
+/// Writes out failures and captured output as soon as it is received.
+struct ProgressReporter {
+    buffer: Box<dyn termcolor::WriteColor + Send>,
+    color_provider: ColorProvider,
+    progress_bar: Option<indicatif::ProgressBar>,
+    started_at: Instant,
+
+    ticks: usize,
+    num_results: u64,
+    num_failing: u64,
+    wrote_first_output: bool,
+}
+impl ProgressReporter {
+    fn new(
+        buffer: Box<dyn termcolor::WriteColor + Send>,
+        color_provider: ColorProvider,
+        // false if non-interactive
+        opt_progress_bar_target: Option<ProgressDrawTarget>,
+    ) -> Self {
+        let progress_bar = opt_progress_bar_target.map(|target| {
+            ProgressBar::with_draw_target(None, target)
+                .with_style(ProgressStyle::with_template("{msg}").unwrap())
+        });
+        Self {
+            buffer,
+            progress_bar,
+            color_provider,
+            started_at: Instant::now(),
+            ticks: 0,
+            num_results: 0,
+            num_failing: 0,
+            wrote_first_output: false,
+        }
+    }
+
+    fn tick_progress(&mut self, timed_tick: bool) {
+        // Only include in the tick count explicit calls to `tick()` based on timed metrics;
+        // exclude ticks we call when writing results.
+        self.ticks += timed_tick as usize;
+
+        if let Some(progress_bar) = &self.progress_bar {
+            self.tick_interactive(progress_bar);
+        } else if timed_tick {
+            // Only tick in a non-interactive context if this is in fact a timed tick.
+            let _opt_err = self.tick_non_interactive();
+        }
+    }
+
+    fn tick_interactive(&self, pb: &ProgressBar) {
+        let elapsed = indicatif::HumanDuration(self.started_at.elapsed());
+        pb.set_message(format_interactive_progress(
+            &self.color_provider,
+            elapsed,
+            self.num_results,
+            self.num_failing,
+        ));
+        pb.tick();
+    }
+
+    fn tick_non_interactive(&mut self) -> io::Result<()> {
+        if (self.ticks - 1) % 10 != 0 {
+            // In non-interactive contexts, only write every 10 ticks to avoid unnecessary writes
+            // to the output.
+            return Ok(());
+        }
+
+        let elapsed = indicatif::HumanDuration(self.started_at.elapsed());
+
+        if self.wrote_first_output {
+            writeln!(&mut self.buffer)?;
+        }
+
+        format_non_interactive_progress(
+            &mut self.buffer,
+            elapsed,
+            self.num_results,
+            self.num_failing,
+        )?;
+
+        self.wrote_first_output = true;
+
+        Ok(())
+    }
+}
+
+impl Reporter for ProgressReporter {
+    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+        let ReportedResult {
+            output_before,
+            output_after,
+            test_result,
+        } = result;
+
+        self.num_results += 1;
+
+        let mut write_result = || {
+            let is_fail_like = test_result.status.is_fail_like();
+            self.num_failing += is_fail_like as u64;
+
+            let something_to_write = is_fail_like
+                || would_write_output(output_before.as_ref())
+                || would_write_output(output_after.as_ref());
+            if something_to_write && self.wrote_first_output {
+                write(&mut self.buffer, &[b'\n'])?;
+            }
+
+            if let Some(output) = output_before {
+                format_worker_output(
+                    &mut self.buffer,
+                    test_result.source,
+                    &test_result.display_name,
+                    OutputOrdering::BeforeTest,
+                    output,
+                )?;
+            }
+
+            if is_fail_like {
+                format_test_result_summary(&mut self.buffer, test_result)?;
+            }
+
+            if let Some(output) = output_after {
+                format_worker_output(
+                    &mut self.buffer,
+                    test_result.source,
+                    &test_result.display_name,
+                    OutputOrdering::AfterTest,
+                    output,
+                )?;
+            }
+
+            self.wrote_first_output = self.wrote_first_output || something_to_write;
+
+            Result::<(), ReportingError>::Ok(())
+        };
+
+        if let Some(pb) = self.progress_bar.as_mut() {
+            pb.suspend(write_result)?;
+        } else {
+            write_result()?;
+        }
+
+        self.tick_progress(false);
+
+        Ok(())
+    }
+
+    fn tick(&mut self) {
+        self.tick_progress(true);
+    }
+
+    fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
+        if let Some(pb) = self.progress_bar {
+            pb.finish_and_clear();
+        }
 
         self.buffer
             .flush()
@@ -371,6 +550,8 @@ impl Reporter for JUnitXmlReporter {
         self.collector.push_result(&result.test_result);
         Ok(())
     }
+
+    fn tick(&mut self) {}
 
     fn finish(self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         if let Some(dir) = self.path.parent() {
@@ -402,6 +583,8 @@ impl Reporter for RwxV1JsonReporter {
         Ok(())
     }
 
+    fn tick(&mut self) {}
+
     fn finish(self: Box<Self>, summary: &CompletedSummary) -> Result<(), ReportingError> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -421,14 +604,21 @@ impl Reporter for RwxV1JsonReporter {
     }
 }
 
+fn is_ci_color_term() -> bool {
+    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
+        || std::env::var("BUILDKITE").as_deref() == Ok("true")
+        || std::env::var("CIRCLECI").as_deref() == Ok("true")
+}
+
 fn reporter_from_kind(
     kind: ReporterKind,
     color_preference: ColorPreference,
     test_suite_name: &str,
 ) -> Box<dyn Reporter> {
+    let is_atty = atty::is(atty::Stream::Stdout);
     let color = match color_preference {
         ColorPreference::Auto => {
-            if atty::is(atty::Stream::Stdout) {
+            if is_atty || is_ci_color_term() {
                 ColorChoice::Auto
             } else {
                 ColorChoice::Never
@@ -449,6 +639,24 @@ fn reporter_from_kind(
             num_results: 0,
             delayed_summaries: Default::default(),
         }),
+        ReporterKind::Progress => {
+            let color_provider = match color {
+                ColorChoice::Always | ColorChoice::AlwaysAnsi | ColorChoice::Auto => {
+                    ColorProvider::ANSI
+                }
+                ColorChoice::Never => ColorProvider::NOCOLOR,
+            };
+            let opt_target = if is_atty {
+                Some(ProgressDrawTarget::stdout())
+            } else {
+                None
+            };
+            Box::new(ProgressReporter::new(
+                Box::new(stdout),
+                color_provider,
+                opt_target,
+            ))
+        }
         ReporterKind::JUnitXml(path) => Box::new(JUnitXmlReporter {
             path,
             collector: abq_junit_xml::Collector::new(test_suite_name),
@@ -494,6 +702,12 @@ impl SuiteReporters {
         } else {
             Err(errors)
         }
+    }
+
+    pub fn tick(&mut self) {
+        self.reporters
+            .iter_mut()
+            .for_each(|reporter| reporter.tick());
     }
 
     pub fn finish(self, summary: &CompletedSummary) -> (SuiteResult, Vec<ReportingError>) {
@@ -550,6 +764,14 @@ mod test_reporter_kind {
     #[test]
     fn parse_dot_reporter() {
         assert_eq!(ReporterKind::from_str("dot"), Ok(ReporterKind::Dot));
+    }
+
+    #[test]
+    fn parse_progress_reporter() {
+        assert_eq!(
+            ReporterKind::from_str("progress"),
+            Ok(ReporterKind::Progress)
+        );
     }
 
     #[test]
@@ -1200,6 +1422,389 @@ mod test_dot_reporter {
         --- default name: FAILED ---
         default output
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        "###);
+    }
+}
+
+#[cfg(test)]
+mod test_progress_reporter {
+    use std::sync::{Arc, Mutex};
+
+    use abq_output::colors::ColorProvider;
+    use abq_utils::net_protocol::{
+        client::ReportedResult,
+        entity::EntityId,
+        runners::{CapturedOutput, Status, TestResult, TestResultSpec},
+    };
+    use indicatif::{ProgressDrawTarget, TermLike};
+
+    use crate::reporting::mock_summary;
+
+    use super::{default_result, MockWriter, ProgressReporter, Reporter};
+
+    #[derive(Default, Debug, Clone)]
+    struct MockProgressBar {
+        cmds: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TermLike for MockProgressBar {
+        fn width(&self) -> u16 {
+            100
+        }
+        fn move_cursor_up(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_down(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_right(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn move_cursor_left(&self, _n: usize) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn write_line(&self, s: &str) -> std::io::Result<()> {
+            self.cmds.lock().unwrap().push(s.to_string());
+            Ok(())
+        }
+        fn write_str(&self, s: &str) -> std::io::Result<()> {
+            self.cmds.lock().unwrap().push(s.to_string());
+            Ok(())
+        }
+        fn clear_line(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn with_interactive_reporter(
+        f: impl FnOnce(Box<ProgressReporter>),
+    ) -> (MockWriter, Vec<String>) {
+        let mut mock_writer = MockWriter::default();
+        let mock_progress_bar = MockProgressBar::default();
+        {
+            // Safety: mock writer only borrowed for duration of `f`, and exists longer than the
+            // reporter.
+            let borrow_writer: &'static mut MockWriter =
+                unsafe { std::mem::transmute(&mut mock_writer) };
+
+            let reporter = ProgressReporter::new(
+                Box::new(borrow_writer),
+                ColorProvider::CMD,
+                Some(ProgressDrawTarget::term_like(Box::new(
+                    mock_progress_bar.clone(),
+                ))),
+            );
+
+            f(Box::new(reporter));
+        }
+        let progress_bar_cmds = Arc::try_unwrap(mock_progress_bar.cmds)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+        (mock_writer, progress_bar_cmds)
+    }
+
+    fn with_non_interactive_reporter(f: impl FnOnce(Box<ProgressReporter>)) -> MockWriter {
+        let mut mock_writer = MockWriter::default();
+        {
+            // Safety: mock writer only borrowed for duration of `f`, and exists longer than the
+            // reporter.
+            let borrow_writer: &'static mut MockWriter =
+                unsafe { std::mem::transmute(&mut mock_writer) };
+
+            let reporter = ProgressReporter::new(Box::new(borrow_writer), ColorProvider::CMD, None);
+
+            f(Box::new(reporter));
+        }
+        mock_writer
+    }
+
+    #[test]
+    fn formats_interactive() {
+        let (
+            MockWriter {
+                buffer,
+                num_writes: _,
+                num_flushes: _,
+            },
+            progress_bar_cmds,
+        ) = with_interactive_reporter(|mut reporter| {
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Success,
+                        display_name: "abq/test1".to_string(),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Failure {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test2".to_string(),
+                        output: Some("Assertion failed: 1 != 2".to_string()),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+            reporter
+                .push_result(&ReportedResult {
+                    test_result: TestResult::new(
+                        EntityId::fake(),
+                        TestResultSpec {
+                            status: Status::Skipped,
+                            display_name: "abq/test3".to_string(),
+                            output: Some(
+                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                            ),
+                            ..default_result()
+                        },
+                    ),
+                    output_before: Some(CapturedOutput {
+                        stderr: b"test3-stderr".to_vec(),
+                        stdout: b"test3-stdout".to_vec(),
+                    }),
+                    output_after: None,
+                })
+                .unwrap();
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Error {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test4".to_string(),
+                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Pending,
+                        display_name: "abq/test5".to_string(),
+                        output: Some(
+                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
+                        ),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+            reporter.finish(&mock_summary()).unwrap();
+        });
+
+        let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
+        insta::assert_snapshot!(output, @r###"
+        --- abq/test2: FAILED ---
+        Assertion failed: 1 != 2
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+
+        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        ----- STDOUT
+        test3-stdout
+        ----- STDERR
+        test3-stderr
+
+
+        --- abq/test4: ERRORED ---
+        Process 28821 terminated early via SIGTERM
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        "###);
+
+        insta::assert_snapshot!(progress_bar_cmds.join("\n"), @r###"
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 1 tests run<reset>, <green-bold>1 passed<reset>, <reset>0 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 1 tests run<reset>, <green-bold>1 passed<reset>, <reset>0 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 1 tests run<reset>, <green-bold>1 passed<reset>, <reset>0 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 2 tests run<reset>, <green-bold>1 passed<reset>, <red-bold>1 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 2 tests run<reset>, <green-bold>1 passed<reset>, <red-bold>1 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 2 tests run<reset>, <green-bold>1 passed<reset>, <red-bold>1 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 3 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>1 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 3 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>1 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 3 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>1 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 4 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>2 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 4 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>2 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 4 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>2 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 5 tests run<reset>, <green-bold>3 passed<reset>, <red-bold>2 failing<reset>
+
+                                                                                                            
+        <bold>> ABQ status<reset>
+        <bold>> [0 seconds] 5 tests run<reset>, <green-bold>3 passed<reset>, <red-bold>2 failing<reset>
+
+                                                                                                            
+        "###);
+    }
+
+    #[test]
+    fn formats_non_interactive() {
+        let MockWriter {
+            buffer,
+            num_writes: _,
+            num_flushes: _,
+        } = with_non_interactive_reporter(|mut reporter| {
+            // Force a first progress bar
+            reporter.tick();
+
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Success,
+                        display_name: "abq/test1".to_string(),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Failure {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test2".to_string(),
+                        output: Some("Assertion failed: 1 != 2".to_string()),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+            reporter
+                .push_result(&ReportedResult {
+                    test_result: TestResult::new(
+                        EntityId::fake(),
+                        TestResultSpec {
+                            status: Status::Skipped,
+                            display_name: "abq/test3".to_string(),
+                            output: Some(
+                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                            ),
+                            ..default_result()
+                        },
+                    ),
+                    output_before: Some(CapturedOutput {
+                        stderr: b"test3-stderr".to_vec(),
+                        stdout: b"test3-stdout".to_vec(),
+                    }),
+                    output_after: None,
+                })
+                .unwrap();
+
+            // Force a progress tick before the next output write
+            for _ in 0..10 {
+                reporter.tick();
+            }
+
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Error {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        display_name: "abq/test4".to_string(),
+                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+            reporter
+                .push_result(&ReportedResult::no_captures(TestResult::new(
+                    EntityId::fake(),
+                    TestResultSpec {
+                        status: Status::Pending,
+                        display_name: "abq/test5".to_string(),
+                        output: Some(
+                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
+                        ),
+                        ..default_result()
+                    },
+                )))
+                .unwrap();
+
+            // Force a final tick
+            for _ in 0..10 {
+                reporter.tick();
+            }
+
+            reporter.finish(&mock_summary()).unwrap();
+        });
+
+        let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
+        insta::assert_snapshot!(output, @r###"
+        --- [abq progress] 0 seconds ---
+        0 tests run, 0 passed, 0 failing
+
+        --- abq/test2: FAILED ---
+        Assertion failed: 1 != 2
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+
+        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        ----- STDOUT
+        test3-stdout
+        ----- STDERR
+        test3-stderr
+
+
+        --- [abq progress] 0 seconds ---
+        3 tests run, 2 passed, 1 failing
+
+        --- abq/test4: ERRORED ---
+        Process 28821 terminated early via SIGTERM
+        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+
+        --- [abq progress] 0 seconds ---
+        5 tests run, 3 passed, 2 failing
         "###);
     }
 }

@@ -2399,6 +2399,7 @@ mod test {
         num::NonZeroU64,
         sync::Arc,
         thread::{self, JoinHandle},
+        time::Duration,
     };
 
     use super::{RunResultState, RunResultStateCache};
@@ -2731,6 +2732,8 @@ mod test {
             cancellation_rx,
             async_reader: Default::default(),
         };
+        let mut interval = tokio::time::interval(Duration::from_secs(100));
+        interval.tick().await;
         {
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
                 Arc::clone(&active_runs),
@@ -2739,10 +2742,11 @@ mod test {
                 run_id.clone(),
             ));
 
-            let AssociatedTestResults { work_id, .. } = match client.next().await.unwrap() {
-                IncrementalTestData::Results(mut results) => results.pop().unwrap(),
-                _ => panic!(),
-            };
+            let AssociatedTestResults { work_id, .. } =
+                match client.next(&mut interval).await.unwrap() {
+                    IncrementalTestData::Results(mut results) => results.pop().unwrap(),
+                    _ => panic!(),
+                };
             assert_eq!(work_id, buffered_work_id);
 
             let reconnection_result = reconnection_future.await.unwrap();
@@ -2765,10 +2769,11 @@ mod test {
                 vec![associated_result],
             ));
 
-            let AssociatedTestResults { work_id, .. } = match client.next().await.unwrap() {
-                IncrementalTestData::Results(mut results) => results.pop().unwrap(),
-                _ => panic!(),
-            };
+            let AssociatedTestResults { work_id, .. } =
+                match client.next(&mut interval).await.unwrap() {
+                    IncrementalTestData::Results(mut results) => results.pop().unwrap(),
+                    _ => panic!(),
+                };
             assert_eq!(work_id, second_work_id);
 
             worker_result_future.await.unwrap().unwrap();

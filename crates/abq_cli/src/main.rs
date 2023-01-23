@@ -17,7 +17,9 @@ use std::{
 
 use abq_hosted::AccessToken;
 use abq_output::format_duration;
-use abq_queue::invoke::{self, Client, CompletedSummary, InvocationError, TestResultError};
+use abq_queue::invoke::{
+    self, Client, CompletedSummary, InvocationError, ResultHandler, TestResultError,
+};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     exit::ExitCode,
@@ -613,6 +615,21 @@ fn find_or_create_abq(
     }
 }
 
+struct ReporterHandlers {
+    reporters: &'static mut SuiteReporters,
+}
+
+impl invoke::ResultHandler for ReporterHandlers {
+    fn on_result(&mut self, result: ReportedResult) {
+        // TODO: is there a reasonable way to surface the error?
+        let _opt_error = self.reporters.push_result(&result);
+    }
+
+    fn tick(&mut self) {
+        self.reporters.tick();
+    }
+}
+
 fn run_tests(
     entity: EntityId,
     access_token: &Option<AccessToken>,
@@ -629,16 +646,13 @@ fn run_tests(
     let test_suite_name = "suite"; // TODO: determine this correctly
     let mut reporters = SuiteReporters::new(reporters, color_choice, test_suite_name);
 
-    let on_result = {
+    let result_handler = {
         // Safety: rustc wants the `collector` to be live for the lifetime of the program because
         // `work_results_thread` might escape. But, we know that `work_results_thread` won't
         // escape; it vanishes at the end of this function, before `collector` is dropped.
         let reporters: &'static mut SuiteReporters = unsafe { std::mem::transmute(&mut reporters) };
 
-        move |test_result| {
-            // TODO: is there a reasonable way to surface the error?
-            let _opt_error = reporters.push_result(&test_result);
-        }
+        ReporterHandlers { reporters }
     };
 
     let runner = RunnerKind::GenericNativeTestRunner(runner_params.clone());
@@ -651,7 +665,7 @@ fn run_tests(
         runner,
         batch_size,
         results_timeout,
-        on_result,
+        result_handler,
     )?;
 
     let opt_workers = if start_in_process_workers {
@@ -788,7 +802,7 @@ fn start_test_result_reporter(
     runner: RunnerKind,
     batch_size: NonZeroU64,
     results_timeout: Duration,
-    on_result: impl FnMut(ReportedResult) + Send + 'static,
+    result_handler: impl ResultHandler + Send + 'static,
 ) -> io::Result<JoinHandle<Result<CompletedSummary, InvocationError>>> {
     let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
 
@@ -818,7 +832,7 @@ fn start_test_result_reporter(
             )
             .await?;
 
-            let completed_summary = abq_test_client.stream_results(on_result).await?;
+            let completed_summary = abq_test_client.stream_results(result_handler).await?;
             Ok(completed_summary)
         });
 

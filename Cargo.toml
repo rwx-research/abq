@@ -55,6 +55,7 @@ clap = { version = "4.1.2", features = ["derive", "env"] }
 atty = "0.2.14"
 num_cpus = "1.15.0"
 termcolor = "1.2.0"
+indicatif = "0.17.3"
 
 async-trait = "0.1.63"
 static_assertions = "1.1.0"

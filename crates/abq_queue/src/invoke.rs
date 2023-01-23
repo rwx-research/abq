@@ -30,11 +30,15 @@ use abq_utils::{
 };
 
 use thiserror::Error;
+use tokio::time::Interval;
 
 /// The default maximum amount of a time a client will wait between consecutive
 /// test results streamed from the queue.
 /// The current default is 1 hour.
 pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
+/// The time to tick the test result handlers, if we are waiting on results in the meantime.
+pub const TICK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
 pub struct Client {
@@ -108,6 +112,7 @@ impl RunCancellationRx {
 }
 
 pub(crate) enum IncrementalTestData {
+    Tick,
     Results(Vec<AssociatedTestResults>),
     Finished,
     NativeRunnerInfo(NativeRunnerInfo),
@@ -123,6 +128,11 @@ pub fn run_cancellation_pair() -> (RunCancellationTx, RunCancellationRx) {
 pub struct CompletedSummary {
     /// The native test runner that was in use for this test run.
     pub native_runner_info: NativeRunnerInfo,
+}
+
+pub trait ResultHandler {
+    fn on_result(&mut self, result: ReportedResult);
+    fn tick(&mut self);
 }
 
 impl Client {
@@ -218,11 +228,17 @@ impl Client {
 
     /// Yields the next test result, as it streams in.
     /// Returns [None] when there are no more test results.
-    pub(crate) async fn next(&mut self) -> Result<IncrementalTestData, TestResultError> {
+    pub(crate) async fn next(
+        &mut self,
+        tick_interval: &mut Interval,
+    ) -> Result<IncrementalTestData, TestResultError> {
         loop {
             let read_result = tokio::select! {
                 read = self.async_reader.next(&mut self.stream) => {
                     read
+                }
+                _ = tick_interval.tick() => {
+                    return Ok(IncrementalTestData::Tick);
                 }
                 _ = tokio::time::sleep(self.poll_timeout) => {
                     tracing::error!(timeout=?self.poll_timeout, entity=?self.entity, run_id=?self.run_id, "timed out waiting for queue message");
@@ -303,14 +319,22 @@ impl Client {
     /// result is received.
     pub async fn stream_results(
         mut self,
-        mut on_result: impl FnMut(ReportedResult),
+        mut handler: impl ResultHandler,
     ) -> Result<CompletedSummary, TestResultError> {
         use IncrementalTestData::*;
 
         let mut native_runner_info = None;
 
+        // The first tick interval will complete immediately and will prime the handler;
+        // all subsequent ticks obey the interval.
+        let mut tick_interval = tokio::time::interval(TICK_TIMEOUT);
+
         loop {
-            match self.next().await? {
+            match self.next(&mut tick_interval).await? {
+                Tick => {
+                    handler.tick();
+                    continue;
+                }
                 Finished => {
                     break;
                 }
@@ -342,7 +366,7 @@ impl Client {
                                 None
                             };
 
-                            on_result(ReportedResult {
+                            handler.on_result(ReportedResult {
                                 output_before,
                                 test_result,
                                 output_after,

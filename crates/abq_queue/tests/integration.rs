@@ -9,7 +9,7 @@ use std::{
 
 use abq_queue::{
     invoke::{
-        run_cancellation_pair, Client, CompletedSummary, InvocationError, RunCancellationTx,
+        self, run_cancellation_pair, Client, CompletedSummary, InvocationError, RunCancellationTx,
         TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT,
     },
     queue::{Abq, QueueConfig},
@@ -212,6 +212,18 @@ type WorkerExits = Arc<Mutex<HashMap<Wid, WorkersExit>>>;
 
 type BgTasks = HashMap<SpawnId, tokio::task::JoinHandle<()>>;
 
+struct Handler {
+    results: Arc<Mutex<Vec<TestResult>>>,
+}
+
+impl invoke::ResultHandler for Handler {
+    fn on_result(&mut self, result: net_protocol::client::ReportedResult) {
+        self.results.lock().push(result.test_result)
+    }
+
+    fn tick(&mut self) {}
+}
+
 fn action_to_fut(
     queue: &Abq,
     run_ids: &mut HashMap<Run, RunId>,
@@ -284,9 +296,11 @@ fn action_to_fut(
 
                 let client = client.unwrap();
 
-                let result = client
-                    .stream_results(move |result| collected_results.lock().push(result.test_result))
-                    .await;
+                let handler = Handler {
+                    results: collected_results.clone(),
+                };
+
+                let result = client.stream_results(handler).await;
 
                 supervisor_results.lock().await.insert(super_id, result);
             }

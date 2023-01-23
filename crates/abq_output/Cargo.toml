@@ -6,7 +6,8 @@ version = "0.1.0"
 [dependencies]
 abq_utils = { path = "../abq_utils" }
 
-termcolor = "1.2.0"
+termcolor.workspace = true
+indoc.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

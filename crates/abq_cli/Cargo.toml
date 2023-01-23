@@ -21,6 +21,7 @@ clap.workspace = true
 num_cpus.workspace = true
 termcolor.workspace = true
 atty.workspace = true
+indicatif.workspace = true
 
 tokio.workspace = true
 
