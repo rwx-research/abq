@@ -81,6 +81,7 @@ function runBenchmark(
   if (!debugReuse) {
     exec(
       `abq test \
+          --worker 0 \
           --reporter dot \
           --run-id bigtest-${crypto.randomUUID()} \
           --batch-size ${BATCH_SIZE} \

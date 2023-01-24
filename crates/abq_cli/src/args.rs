@@ -116,6 +116,9 @@ pub enum Command {
         #[clap(long, requires("tls_cert"))]
         tls_key: Option<PathBuf>,
     },
+    /// NOTICE: `abq work` is deprecated and will be removed in a future version of ABQ.
+    /// Use `abq test --worker` instead.
+    ///
     /// Starts a pool of abq workers in a working directory.
     ///
     /// You should use this to start workers on a remote machine that you'd like to connect to an
@@ -168,15 +171,34 @@ pub enum Command {
         #[clap(long)]
         tls_cert: Option<PathBuf>,
     },
-    /// Starts an instance of `abq test`.
+    /// Starts an instance of an ABQ test suite run, or connects a worker to a test suite run.
     ///
-    /// Examples:
+    /// WORKERS:
     ///
+    ///   NOTICE: If not specified, run without `--worker`, `abq test` will launch a test run but not
+    ///   also launch a worker. This behavior is deprecated; in a future version of ABQ, `--worker`
+    ///   will default to `0`.
+    ///
+    ///   `--worker 0` controls what process will stream test results:
+    ///
+    ///     - `--worker 0` starts a worker, and also streams test results to the configured `--reporter`s.
+    ///     - `--worker N` for any N > 0 starts only a worker, and does not stream test results.
+    ///
+    ///   An ABQ test run must include a process launched with `--worker 0`.
+    ///
+    ///   The executable given to `abq test` must implement the ABQ protocol.
+    ///
+    /// EXAMPLES:
+    ///
+    ///   # Run a test suite with a single worker; `--worker 0` is implicit
     ///   abq test -- yarn jest -t "onboard flow"
-    ///   abq test -- cargo test
     ///
-    /// The given executable must be available on abq workers fulfilling this test request, and must resolve to an executable that implements the ABQ protocol.
+    ///   # Run a test suite with a single worker
+    ///   abq test --worker 0 -- bundle exec rspec
     ///
+    ///   # Run a test suite with two workers
+    ///   abq test --worker 0 --run-id my-test -- bundle exec rspec &
+    ///   abq test --worker 1 --run-id my-test -- bundle exec rspec
     #[clap(verbatim_doc_comment)]
     #[command(group(
         ArgGroup::new("execution") // don't allow both queue_addr and access_token params
@@ -192,6 +214,28 @@ pub enum Command {
         )
     )]
     Test {
+        /// The number of the test worker connecting for a test suite run.
+        ///
+        /// NOTICE: If not specified, will start a supervisor without workers. This behavior is
+        /// deprecated; in a future version of ABQ, the default will be `--worker 0`.
+        ///
+        /// `--worker 0` is the test supervisor, and is responsible both for acting as a worker and
+        /// executing all provided `--reporter`s.
+        ///
+        /// All other `--worker` numbers launch only a worker, and disregard test reporting.
+        ///
+        /// All `--worker`s in a unique test suite run must connect to the `--run-id` configured by
+        /// `--worker 0`.
+        ///
+        /// There may not be duplicate worker numberings in an ABQ test suite run.
+        /// An ABQ test suite run must always include an `abq test` launched with `--worker 0`.
+        #[clap(long, required = false, default_value = None)]
+        worker: Option<usize>,
+
+        /// Working directory of the worker. Defaults to the current directory.
+        #[clap(long, required = false)]
+        working_dir: Option<PathBuf>,
+
         /// Run ID for workers to connect to. If not specified, workers are started in-process.
         /// In CI environments, this can be inferred from CI environment variables.
         #[clap(long, required = false, env("ABQ_RUN_ID"))]
@@ -211,13 +255,22 @@ pub enum Command {
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
-        /// Number of workers to start when running in standalone mode.
+        /// Number of runners to start on the worker.
         ///
-        /// NOTE: If present, will always launch in standalone mode.
         /// Set to "cpu-cores" to use the number of available (physical) CPUs cores - 1.
         ///
-        #[clap(long, short = 'n', required = false)]
-        num_workers: Option<NumWorkers>,
+        /// ALIASES:
+        ///
+        /// - `--num-workers` (deprecated)
+        ///
+        #[clap(
+            long,
+            short = 'n',
+            required = false,
+            default_value = "1",
+            alias = "num-workers"
+        )]
+        num: NumWorkers,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
@@ -248,10 +301,16 @@ pub enum Command {
         ///- line: prints a line for each test{n}
         ///- junit-xml[=path/to/results.xml]: outputs a junit-compatible xml file to specified path. Defaults to ./abq-test-results.xml{n}
         ///- rwx-v1-json[=path/to/results.json]: outputs a rwx-v1-compatible json file to specified path. Defaults to ./abq-test-results.json
+        ///
+        /// Reporters are only actionable for `abq test` processes started with `--worker 0`. On
+        /// all other invocations of `abq test`, reporting is ignored.
         #[clap(long, default_value = "dot")]
         reporter: Vec<ReporterKind>,
 
         /// How many tests to send to a worker a time.
+        ///
+        /// The batch size is obeyed only for `abq test` processes started with `--worker 0`. On
+        /// all other invocations of `abq test`, the configured batch size is that of `--worker 0`.
         #[clap(long, default_value = "7")]
         batch_size: NonZeroU64,
 
@@ -260,6 +319,8 @@ pub enum Command {
         /// When set to `auto`, will try to emit colors unless the output channel is detected
         /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
         /// TERM is set to `dumb`, amongst other heuristics.
+        ///
+        /// Only relevant with `--worker 0`.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
@@ -283,6 +344,8 @@ pub enum Command {
         /// ALIASES:
         ///
         /// - `--test-timeout-seconds` (deprecated)
+        ///
+        /// Only relevant with `--worker 0`.
         #[clap(long, alias = "test-timeout-seconds", default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
         inactivity_timeout_seconds: u64,
 

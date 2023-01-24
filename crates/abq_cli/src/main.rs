@@ -307,6 +307,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             token,
             tls_cert,
         } => {
+            abq_output::deprecation(
+                &mut StdoutPreferences::new(ColorPreference::Auto).stdout_stream(),
+                "`abq work` is deprecated. Use `abq test` with `--worker` instead.",
+            )?;
+
             let mut cmd = Cli::command();
             let cmd = cmd.find_subcommand_mut("work").unwrap();
 
@@ -359,11 +364,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             )
         }
         Command::Test {
+            worker,
             args,
+            working_dir,
             run_id,
             access_token,
             queue_addr,
-            num_workers,
+            num,
             reporter: reporters,
             token,
             tls_cert,
@@ -375,10 +382,15 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let external_run_id = run_id.or(inferred_run_id);
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
 
+            let working_dir =
+                working_dir.unwrap_or_else(|| std::env::current_dir().expect("no current dir"));
+
             // Workers are run in-band only if a queue for `abq test` is not going to be
-            // provided from an external source.
+            // provided from an external source or `worker` is set.
+            //
+            // TODO: workers should always start in-band after `worker` is non-optional.
             let start_in_process_workers =
-                num_workers.is_some() || (access_token.is_none() && queue_addr.is_none());
+                worker.is_some() || (access_token.is_none() && queue_addr.is_none());
 
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
@@ -403,27 +415,43 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             )?;
             let results_timeout = Duration::from_secs(test_timeout_seconds);
 
-            let actual_num_workers = match num_workers {
-                Some(CpuCores) => {
+            let num_runners = match num {
+                CpuCores => {
                     NonZeroUsize::new(std::cmp::Ord::max(num_cpus::get_physical() - 1, 1)).unwrap()
                 }
-                Some(Fixed(num)) => num,
-                None => NonZeroUsize::new(1).unwrap(),
+                Fixed(num) => num,
             };
 
-            run_tests(
-                entity,
-                &access_token,
-                runner_params,
-                abq,
-                run_id,
-                reporters,
-                color,
-                batch_size,
-                results_timeout,
-                actual_num_workers,
-                start_in_process_workers,
-            )
+            match worker {
+                None | Some(0) => {
+                    let num_runners = if start_in_process_workers {
+                        Some(num_runners)
+                    } else {
+                        None
+                    };
+                    run_sentinel_abq_test(
+                        entity,
+                        &access_token,
+                        runner_params,
+                        abq,
+                        run_id,
+                        reporters,
+                        color,
+                        batch_size,
+                        results_timeout,
+                        worker,
+                        num_runners,
+                        working_dir,
+                    )
+                }
+                Some(_) => workers::start_workers_standalone(
+                    num_runners,
+                    working_dir,
+                    abq.negotiator_handle(),
+                    abq.client_options().clone(),
+                    run_id,
+                ),
+            }
         }
         Command::Health {
             queue,
@@ -635,7 +663,7 @@ impl invoke::ResultHandler for ReporterHandlers {
     }
 }
 
-fn run_tests(
+fn run_sentinel_abq_test(
     entity: EntityId,
     access_token: &Option<AccessToken>,
     runner_params: NativeTestRunnerParams,
@@ -645,11 +673,20 @@ fn run_tests(
     color_choice: ColorPreference,
     batch_size: NonZeroU64,
     results_timeout: Duration,
-    num_workers: NonZeroUsize,
-    start_in_process_workers: bool,
+    worker: Option<usize>,
+    in_process_num_runners: Option<NonZeroUsize>,
+    working_dir: PathBuf,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let stdout_preferences = StdoutPreferences::new(color_choice);
+
+    if worker.is_none() {
+        abq_output::deprecation(
+            &mut stdout_preferences.stdout_stream(),
+            "not specifying `--worker` will default to `--worker 0` in a future version of ABQ",
+        )?;
+    }
+
     let mut reporters = SuiteReporters::new(reporters, stdout_preferences, test_suite_name);
 
     let result_handler = {
@@ -674,19 +711,22 @@ fn run_tests(
         result_handler,
     )?;
 
-    let opt_workers = if start_in_process_workers {
-        let working_dir = std::env::current_dir().expect("no working directory");
-        let workers = workers::start_workers(
-            num_workers,
+    writeln!(
+        &mut stdout_preferences.stdout_stream(),
+        "Started test run with ID {run_id}"
+    )?;
+
+    let opt_worker_pool = if let Some(num_runners) = in_process_num_runners {
+        let worker_pool = workers::start_workers(
+            num_runners,
             working_dir,
             abq.negotiator_handle(),
             abq.client_options().clone(),
             run_id.clone(),
             true, // workers in-band with supervisor
         )?;
-        Some(workers)
+        Some((worker_pool, num_runners))
     } else {
-        println!("Starting test run with ID {}", &run_id);
         None
     };
 
@@ -694,21 +734,22 @@ fn run_tests(
 
     reporters.after_all_results();
 
-    if let Some(mut workers) = opt_workers {
+    // Shutdown the localized worker pool
+    if let Some((mut worker_pool, num_runners)) = opt_worker_pool {
         let WorkersExit {
             // The exit code will be determined by the test result status.
             status: _,
             final_captured_outputs,
             manifest_generation_output,
-        } = workers.shutdown();
+        } = worker_pool.shutdown();
 
         // We need to print the final runner outputs (if any) at this point.
         // This is safe, as the runners thread is dead by now, so the reporters shouldn't
         // be writing to output streams.
         if let Some(manifest_output) = manifest_generation_output {
-            print_manifest_generation_output(workers.entity(), manifest_output);
+            print_manifest_generation_output(worker_pool.entity(), manifest_output);
         }
-        print_final_runner_outputs(workers.entity(), num_workers, final_captured_outputs);
+        print_final_runner_outputs(worker_pool.entity(), num_runners, final_captured_outputs);
     }
 
     let completed_summary = match opt_invoked_error {
