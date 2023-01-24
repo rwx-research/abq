@@ -206,6 +206,22 @@ pub enum Command {
             .args(["access_token", "queue_addr"]),
         )
     )]
+    // Don't allow both --num-workers and --num
+    // TODO(1.1): remove
+    #[command(group(
+        ArgGroup::new("num-workers")
+            .multiple(false)
+            .args(["num", "num_workers"]),
+        )
+    )]
+    // Don't allow both --test-timeout-seconds and --inactivity-timeout-seconds
+    // TODO(1.1): remove
+    #[command(group(
+        ArgGroup::new("timeout-seconds")
+            .multiple(false)
+            .args(["test_timeout_seconds", "inactivity_timeout_seconds"]),
+        )
+    )]
     #[command(group(
         ArgGroup::new("server-key-exclusion") // don't allow server-side cert key if running in non-local mode
             .multiple(false)
@@ -255,21 +271,15 @@ pub enum Command {
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
 
+        /// NOTICE: `--num-workers` is deprecated and will be removed in ABQ 1.1.
+        /// Use `--num` instead.
+        #[clap(long, required = false)]
+        num_workers: Option<NumWorkers>,
+
         /// Number of runners to start on the worker.
         ///
         /// Set to "cpu-cores" to use the number of available (physical) CPUs cores - 1.
-        ///
-        /// ALIASES:
-        ///
-        /// - `--num-workers` (deprecated)
-        ///
-        #[clap(
-            long,
-            short = 'n',
-            required = false,
-            default_value = "1",
-            alias = "num-workers"
-        )]
+        #[clap(long, short = 'n', required = false, default_value = "1")]
         num: NumWorkers,
 
         /// Token to authorize messages sent to the queue with.
@@ -324,6 +334,11 @@ pub enum Command {
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
+        /// NOTICE: `--test-timeout-seconds` is deprecated and will be removed in ABQ 1.1.
+        /// Use `--inactivity-timeout-seconds` instead.
+        #[clap(long)]
+        test_timeout_seconds: Option<u64>,
+
         /// A broad measure of inactivity timeout seconds, after which a test run is cancelled.
         ///
         /// The inactivity timeout is applied in the following cases:
@@ -341,12 +356,8 @@ pub enum Command {
         /// Hitting a timeout is typically indicative of a failure in a test suite's setup or
         /// configuration.
         ///
-        /// ALIASES:
-        ///
-        /// - `--test-timeout-seconds` (deprecated)
-        ///
         /// Only relevant with `--worker 0`.
-        #[clap(long, alias = "test-timeout-seconds", default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
+        #[clap(long, default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
         inactivity_timeout_seconds: u64,
 
         /// Arguments to the test executable.

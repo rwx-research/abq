@@ -28,6 +28,7 @@ use abq_utils::{
         client::ReportedResult,
         entity::EntityId,
         health::Health,
+        meta::{Deprecation, DeprecationRecord},
         runners::{CapturedOutput, TestRuntime},
         workers::{NativeTestRunnerParams, RunId, RunnerKind},
     },
@@ -307,9 +308,12 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             token,
             tls_cert,
         } => {
+            let mut deprecations = DeprecationRecord::default();
+
             abq_output::deprecation(
                 &mut StdoutPreferences::new(ColorPreference::Auto).stdout_stream(),
                 "`abq work` is deprecated. Use `abq test` with `--worker` instead.",
+                || deprecations.push(Deprecation::AbqWork),
             )?;
 
             let mut cmd = Cli::command();
@@ -346,9 +350,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             let abq = AbqInstance::from_remote(
                 entity,
+                run_id.clone(),
                 queue_addr,
                 ClientAuthStrategy::from(token),
                 client_tls,
+                deprecations,
             )?;
             let num_workers = match num {
                 CpuCores => NonZeroUsize::new(num_cpus::get_physical()).unwrap(),
@@ -370,15 +376,45 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             run_id,
             access_token,
             queue_addr,
-            num,
+            mut num,
+            num_workers,
             reporter: reporters,
             token,
             tls_cert,
             tls_key,
             color,
             batch_size,
-            inactivity_timeout_seconds: test_timeout_seconds,
+            mut inactivity_timeout_seconds,
+            test_timeout_seconds,
         } => {
+            let stdout_preferences = StdoutPreferences::new(color);
+            let mut deprecations = DeprecationRecord::default();
+
+            if let Some(num_workers) = num_workers {
+                abq_output::deprecation(
+                    &mut stdout_preferences.stdout_stream(),
+                    "`--num-workers` is deprecated. Use `--num` instead.",
+                    || deprecations.push(Deprecation::FlagTestNumWorkers),
+                )?;
+                num = num_workers;
+            }
+            if let Some(inactivity_seconds) = test_timeout_seconds {
+                abq_output::deprecation(
+                    &mut stdout_preferences.stdout_stream(),
+                    "`--test-timeout-seconds` is deprecated. Use `--inactivity-timeout-seconds` instead.",
+                    || deprecations.push(Deprecation::FlagTestTestTimeOutSeconds),
+                )?;
+                inactivity_timeout_seconds = inactivity_seconds;
+            }
+
+            if worker.is_none() {
+                abq_output::deprecation(
+                    &mut stdout_preferences.stdout_stream(),
+                    "not specifying `--worker` will default to `--worker 0` in a future version of ABQ",
+                    || deprecations.push(Deprecation::TestWithoutWorkerFlag),
+                )?;
+            }
+
             let external_run_id = run_id.or(inferred_run_id);
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
 
@@ -408,12 +444,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let runner_params = validate_abq_test_args(args)?;
             let abq = find_or_create_abq(
                 entity,
+                run_id.clone(),
                 queue_addr_or_opt_tls_key,
                 resolved_token,
                 client_auth,
                 resolved_tls,
+                deprecations,
             )?;
-            let results_timeout = Duration::from_secs(test_timeout_seconds);
+            let results_timeout = Duration::from_secs(inactivity_timeout_seconds);
 
             let num_runners = match num {
                 CpuCores => {
@@ -436,10 +474,9 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                         abq,
                         run_id,
                         reporters,
-                        color,
+                        stdout_preferences,
                         batch_size,
                         results_timeout,
-                        worker,
                         num_runners,
                         working_dir,
                     )
@@ -614,10 +651,12 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
 
 fn find_or_create_abq(
     entity: EntityId,
+    run_id: RunId,
     queue_addr_or_opt_tls: Result<SocketAddr, Option<Vec<u8>>>,
     opt_user_token: Option<UserToken>,
     client_auth: ClientAuthStrategy<User>,
     client_tls_cert: Option<Vec<u8>>,
+    deprecations: DeprecationRecord,
 ) -> anyhow::Result<AbqInstance> {
     let client_tls = match &client_tls_cert {
         Some(cert) => ClientTlsStrategy::from_cert(cert)?,
@@ -626,7 +665,14 @@ fn find_or_create_abq(
 
     match queue_addr_or_opt_tls {
         Ok(queue_addr) => {
-            let instance = AbqInstance::from_remote(entity, queue_addr, client_auth, client_tls)?;
+            let instance = AbqInstance::from_remote(
+                entity,
+                run_id,
+                queue_addr,
+                client_auth,
+                client_tls,
+                deprecations,
+            )?;
             Ok(instance)
         }
         Err(opt_tls_key) => {
@@ -670,22 +716,13 @@ fn run_sentinel_abq_test(
     abq: AbqInstance,
     run_id: RunId,
     reporters: Vec<ReporterKind>,
-    color_choice: ColorPreference,
+    stdout_preferences: StdoutPreferences,
     batch_size: NonZeroU64,
     results_timeout: Duration,
-    worker: Option<usize>,
     in_process_num_runners: Option<NonZeroUsize>,
     working_dir: PathBuf,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
-    let stdout_preferences = StdoutPreferences::new(color_choice);
-
-    if worker.is_none() {
-        abq_output::deprecation(
-            &mut stdout_preferences.stdout_stream(),
-            "not specifying `--worker` will default to `--worker 0` in a future version of ABQ",
-        )?;
-    }
 
     let mut reporters = SuiteReporters::new(reporters, stdout_preferences, test_suite_name);
 

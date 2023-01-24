@@ -2,7 +2,9 @@ use abq_queue::timeout::RunTimeoutStrategy;
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::meta::DeprecationRecord;
 use abq_utils::net_protocol::publicize_addr;
+use abq_utils::net_protocol::workers::RunId;
 use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
 use abq_workers::negotiate::{QueueNegotiatorHandle, QueueNegotiatorHandleError};
 use signal_hook::consts::TERM_SIGNALS;
@@ -179,9 +181,11 @@ impl AbqInstance {
 
     pub fn from_remote(
         entity: EntityId,
+        run_id: RunId,
         queue_addr: SocketAddr,
         auth: ClientAuthStrategy,
         client_tls: ClientTlsStrategy,
+        deprecations: DeprecationRecord,
     ) -> Result<Self, AbqInstanceError> {
         tracing::debug!("Creating instance from remote {}", queue_addr);
 
@@ -189,8 +193,13 @@ impl AbqInstance {
 
         // TODO: if we get an error here, there is a reasonable chance it's because the provided
         // client auth is invalid; we should provide a nice error message in such cases.
-        let queue_negotiator =
-            QueueNegotiatorHandle::ask_queue(entity, queue_addr, client_options.clone())?;
+        let queue_negotiator = QueueNegotiatorHandle::ask_queue(
+            entity,
+            run_id,
+            queue_addr,
+            client_options.clone(),
+            deprecations,
+        )?;
 
         let abq = AbqLocator::Remote {
             server_addr: queue_addr,

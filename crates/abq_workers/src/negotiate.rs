@@ -26,6 +26,7 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::EntityId,
+        meta::DeprecationRecord,
         publicize_addr,
         queue::{NegotiatorInfo, RunAlreadyCompleted},
         workers::{RunId, RunnerKind},
@@ -629,8 +630,10 @@ impl QueueNegotiatorHandle {
 
     pub fn ask_queue(
         entity: EntityId,
+        run_id: RunId,
         queue_addr: SocketAddr,
         client_options: ClientOptions<User>,
+        deprecations: DeprecationRecord,
     ) -> Result<Self, QueueNegotiatorHandleError> {
         use QueueNegotiatorHandleError::*;
 
@@ -639,7 +642,10 @@ impl QueueNegotiatorHandle {
 
         let request = net_protocol::queue::Request {
             entity,
-            message: net_protocol::queue::Message::NegotiatorInfo,
+            message: net_protocol::queue::Message::NegotiatorInfo {
+                run_id,
+                deprecations,
+            },
         };
 
         net_protocol::write(&mut conn, request).map_err(|_| CouldNotConnect)?;

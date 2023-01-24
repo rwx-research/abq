@@ -28,7 +28,7 @@ use abq_utils::net_protocol::{
     queue::{InvokeWork, Message},
     workers::{NextWork, RunId, WorkId},
 };
-use abq_utils::net_protocol::{client, publicize_addr};
+use abq_utils::net_protocol::{client, meta, publicize_addr};
 use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_workers::negotiate::{
@@ -1304,7 +1304,11 @@ impl QueueServer {
             Message::ActiveTestRuns => {
                 Self::handle_active_test_runs(ctx.queues, entity, stream).await
             }
-            Message::NegotiatorInfo => {
+            Message::NegotiatorInfo {
+                run_id,
+                deprecations,
+            } => {
+                log_deprecations(entity, run_id, deprecations);
                 Self::handle_negotiator_info(entity, stream, ctx.public_negotiator_addr).await
             }
             Message::InvokeWork(invoke_work) => {
@@ -2188,6 +2192,12 @@ impl QueueServer {
     }
 }
 
+fn log_deprecations(entity: EntityId, run_id: RunId, deprecations: meta::DeprecationRecord) {
+    for deprecation in deprecations.extract() {
+        tracing::warn!(?entity, ?run_id, ?deprecation, "deprecation");
+    }
+}
+
 /// Sends work as workers request it.
 /// This does not schedule work in any interesting way today, but it may in the future.
 struct WorkScheduler {
@@ -2939,7 +2949,10 @@ mod test {
             &mut conn,
             net_protocol::queue::Request {
                 entity: EntityId::new(),
-                message: net_protocol::queue::Message::NegotiatorInfo,
+                message: net_protocol::queue::Message::NegotiatorInfo {
+                    run_id: RunId::unique(),
+                    deprecations: Default::default(),
+                },
             },
         )
         .unwrap();
@@ -2987,7 +3000,10 @@ mod test {
             &mut conn,
             net_protocol::queue::Request {
                 entity: EntityId::new(),
-                message: net_protocol::queue::Message::NegotiatorInfo,
+                message: net_protocol::queue::Message::NegotiatorInfo {
+                    run_id: RunId::unique(),
+                    deprecations: Default::default(),
+                },
             },
         )
         .unwrap();
