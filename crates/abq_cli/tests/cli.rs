@@ -160,6 +160,12 @@ fn port_active(port: u16) -> bool {
 const TEST_USER_AUTH_TOKEN: &str = "abqs_ckoUjQN4ufq1MiUeaNllztfyqjCtuz";
 const TEST_ADMIN_AUTH_TOKEN: &str = "abqadmin_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF";
 
+macro_rules! s {
+    ($s:expr) => {
+        $s.to_string()
+    };
+}
+
 /// Configuration options for how clients and servers in an abq run communicate.
 /// Namely: whether they use an authentication header or not, and eventually, whether they use TLS
 /// or not.
@@ -169,26 +175,24 @@ struct CSConfigOptions {
 }
 
 impl CSConfigOptions {
-    fn extend_args_for_start<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
-        let mut args = args.to_vec();
+    fn extend_args_for_start(&self, mut args: Vec<String>) -> Vec<String> {
         if self.use_auth_token {
-            args.extend(["--user-token", TEST_USER_AUTH_TOKEN]);
-            args.extend(["--admin-token", TEST_ADMIN_AUTH_TOKEN]);
+            args.extend([format!("--user-token={TEST_USER_AUTH_TOKEN}")]);
+            args.extend([format!("--admin-token={TEST_ADMIN_AUTH_TOKEN}")]);
         }
         if self.tls {
-            args.extend(["--tls-cert", TLS_CERT]);
-            args.extend(["--tls-key", TLS_KEY]);
+            args.extend([format!("--tls-cert={TLS_CERT}")]);
+            args.extend([format!("--tls-key={TLS_KEY}")]);
         }
         args
     }
 
-    fn extend_args_for_client<'a>(&self, args: &[&'a str]) -> Vec<&'a str> {
-        let mut args = args.to_vec();
+    fn extend_args_for_client(&self, mut args: Vec<String>) -> Vec<String> {
         if self.use_auth_token {
-            args.extend(["--token", TEST_USER_AUTH_TOKEN]);
+            args.extend([format!("--token={TEST_USER_AUTH_TOKEN}")]);
         }
         if self.tls {
-            args.extend(["--tls-cert", TLS_CERT]);
+            args.extend([format!("--tls-cert={TLS_CERT}")]);
         }
         args
     }
@@ -269,7 +273,34 @@ test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_auto_workers_without_failure (|name, conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
-        let args = &["test", "--reporter", "dot", "--num-workers", "cpu-cores", "--color=never"];
+        let args = &["test", "--reporter", "dot", "-n", "cpu-cores", "--color=never"];
+        let mut args = conf.extend_args_for_in_band_client(args);
+        args.extend(["--", "yarn", "jest"]);
+        let CmdOutput {
+            stdout,
+            stderr: _,
+            exit_status,
+        } = run_abq_in(
+            name,
+            args,
+            &testdata_project("jest/npm-jest-project"),
+            false,
+        );
+
+        assert!(exit_status.success());
+        assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{}", stdout);
+        // TODO(130): add back once https://github.com/rwx-research/abq/issues/130 lands; right now
+        // this prints more than needed because we don't capture worker stdout/stderr
+        // assert_eq!(stdout, "..");
+        // assert!(stderr.is_empty(), "{:?}", stderr);
+    })
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
+    yarn_jest_auto_workers_without_failure_worker_0 (|name, conf: CSConfigOptions| {
+        // abq test --worker 0 --reporter dot (--token ...)? -- yarn jest
+        let args = &["test", "--worker", "0", "--reporter", "dot", "-n", "cpu-cores", "--color=never"];
         let mut args = conf.extend_args_for_in_band_client(args);
         args.extend(["--", "yarn", "jest"]);
         let CmdOutput {
@@ -299,16 +330,12 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -344,16 +371,12 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -368,34 +391,29 @@ test_all_network_config_options! {
             }
         }
 
+        let working_dir = npm_jest_project_path.display();
+
         // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
-        let worker_args = &[
-            "work",
-            "--queue-addr",
-            &queue_addr,
-            "--working-dir",
-            &npm_jest_project_path.display().to_string(),
-            "--run-id",
-            &run_id,
-            "--num",
-            "cpu-cores"
+        let worker_args = vec![
+            format!("work"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--working-dir={working_dir}"),
+            format!("--run-id={run_id}"),
+            format!("--num=cpu-cores"),
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_worker"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
-        let test_args = &[
-            "test",
-            "--reporter",
-            "dot",
-            "--queue-addr",
-            &queue_addr,
-            "--run-id",
-            &run_id,
-            "--color=never",
+        let test_args = vec![
+            format!("test"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--color=never"),
         ];
         let mut test_args = conf.extend_args_for_client(test_args);
-        test_args.extend(["--", "yarn", "jest"]);
+        test_args.extend([s!("--"), s!("yarn"), s!("jest")]);
         let CmdOutput {
             stdout,
             stderr,
@@ -405,7 +423,8 @@ test_all_network_config_options! {
         assert!(exit_status.success(), "{:?}", (stdout, stderr));
 
         let mut lines = stdout.lines();
-        assert!(lines.next().unwrap().contains("Starting test run"));
+        assert!(lines.next().unwrap().contains("DEPRECATION NOTICE: not specifying `--worker` will default to `--worker 0` in a future version of ABQ"));
+        assert!(lines.next().unwrap().contains("Started test run"));
         assert_eq!(lines.next().unwrap(), "..");
         assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{}", stdout);
 
@@ -413,6 +432,84 @@ test_all_network_config_options! {
 
         let worker_exit_status = worker_proc.wait().unwrap();
         assert!(worker_exit_status.success());
+
+        term_queue(queue_proc);
+    })
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
+    yarn_jest_separate_queue_numbered_workers_test_without_failure (|name, conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+        let run_id = RunId::unique().to_string();
+
+        let npm_jest_project_path = testdata_project("jest/npm-jest-project");
+
+        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]));
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start") {
+                    break;
+                }
+            }
+        }
+
+        let working_dir = npm_jest_project_path.display();
+
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        let test_args = |worker: usize| {
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--working-dir={working_dir}"),
+                format!("--run-id={run_id}"),
+                format!("--num=cpu-cores"),
+                format!("--color=never"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), s!("yarn"), s!("jest")]);
+            args
+        };
+
+        // --worker 1
+        let mut test1_proc = spawn_abq(&(name.to_string() + "_test1"), test_args(1));
+
+        // --worker 0
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = run_abq(&(name.to_string() + "_test0"), test_args(0));
+
+        assert!(exit_status.success(), "{:?}", (stdout, stderr));
+
+        let mut lines = stdout.lines();
+        assert!(lines.next().unwrap().contains("Started test run"));
+        assert_eq!(lines.next().unwrap(), "..");
+        assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{}", stdout);
+
+        assert!(stderr.is_empty());
+
+        let test1_exit_status = test1_proc.wait().unwrap();
+        assert!(test1_exit_status.success());
 
         term_queue(queue_proc);
     })
@@ -431,16 +528,12 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -456,17 +549,14 @@ test_all_network_config_options! {
         }
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
-        let test_args = &[
-            "test",
-            "--reporter",
-            "dot",
-            "--queue-addr",
-            &queue_addr,
-            "--run-id",
-            &run_id,
+        let test_args = vec![
+            format!("test"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
         ];
         let mut test_args = conf.extend_args_for_client(test_args);
-        test_args.extend(["--", "yarn", "jest"]);
+        test_args.extend([s!("--"), s!("yarn"), s!("jest")]);
         let mut supervisor = spawn_abq(&(name.to_string() + "_test"), test_args);
 
         let supervisor_stdout = supervisor.stdout.as_mut().unwrap();
@@ -475,7 +565,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = supervisor_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Starting test run") {
+                if line.contains("Started test run") {
                     break;
                 }
             }
@@ -490,17 +580,15 @@ test_all_network_config_options! {
         let supervisor_exit = supervisor.wait().unwrap();
         assert!(!supervisor_exit.success());
 
+        let working_dir = npm_jest_project_path.display();
+
         // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
-        let worker_args = &[
-            "work",
-            "--queue-addr",
-            &queue_addr,
-            "--working-dir",
-            &npm_jest_project_path.display().to_string(),
-            "--run-id",
-            &run_id,
-            "--num",
-            "cpu-cores"
+        let worker_args = vec![
+            format!("work"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--working-dir={working_dir}"),
+            format!("--run-id={run_id}"),
+            format!("--num=cpu-cores"),
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let CmdOutput {
@@ -508,6 +596,94 @@ test_all_network_config_options! {
             stderr,
             exit_status,
         } = run_abq(&(name.to_string() + "_worker"), worker_args);
+
+        // The worker should exit with a failure as well.
+        assert!(!exit_status.success(), "EXIT:\n{:?}\nSTDOUT:\n{}\nSTDERR:\n{}", exit_status, stdout, stderr);
+
+        term_queue(queue_proc);
+    })
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
+    yarn_jest_cancel_run_before_workers_numbered (|name, conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+        let run_id = RunId::unique().to_string();
+
+        let npm_jest_project_path = testdata_project("jest/npm-jest-project");
+
+        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]));
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start") {
+                    break;
+                }
+            }
+        }
+
+        let working_dir = npm_jest_project_path.display();
+
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        let test_args = |worker: usize| {
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--working-dir={working_dir}"),
+                format!("--run-id={run_id}"),
+                format!("--num=cpu-cores"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), s!("yarn"), s!("jest")]);
+            args
+        };
+
+        let mut supervisor = spawn_abq(&(name.to_string() + "_test0"), test_args(0));
+
+        let supervisor_stdout = supervisor.stdout.as_mut().unwrap();
+        let mut supervisor_reader = BufReader::new(supervisor_stdout).lines();
+        // Spin until we know the supervisor is UP
+        loop {
+            if let Some(line) = supervisor_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Started test run") {
+                    break;
+                }
+            }
+        }
+
+        use nix::sys::signal;
+        use nix::unistd::Pid;
+
+        // SIGTERM the supervisor.
+        signal::kill(Pid::from_raw(supervisor.id() as _), signal::Signal::SIGTERM).unwrap();
+
+        let supervisor_exit = supervisor.wait().unwrap();
+        assert!(!supervisor_exit.success());
+
+        // --worker 1
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = run_abq(&(name.to_string() + "_test1"), test_args(1));
 
         // The worker should exit with a failure as well.
         assert!(!exit_status.success(), "EXIT:\n{:?}\nSTDOUT:\n{}\nSTDERR:\n{}", exit_status, stdout, stderr);
@@ -529,16 +705,12 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -554,19 +726,15 @@ test_all_network_config_options! {
         }
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
-        let test_args = &[
-            "test",
-            "--reporter",
-            "dot",
-            "--queue-addr",
-            &queue_addr,
-            "--run-id",
-            &run_id,
-            "--inactivity-timeout-seconds",
-            "0",
+        let test_args = vec![
+            format!("test"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--inactivity-timeout-seconds=0"),
         ];
         let mut test_args = conf.extend_args_for_client(test_args);
-        test_args.extend(["--", "yarn", "jest"]);
+        test_args.extend([s!("--"), s!("yarn"), s!("jest")]);
         let CmdOutput { stdout, stderr, exit_status } = run_abq_in(
             &(name.to_string() + "_test"),
             test_args,
@@ -576,17 +744,15 @@ test_all_network_config_options! {
         assert!(!exit_status.success());
         assert!(stderr.contains("--- ERROR ---\nTimed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
 
+        let working_dir = npm_jest_project_path.display();
+
         // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
-        let worker_args = &[
-            "work",
-            "--queue-addr",
-            &queue_addr,
-            "--working-dir",
-            &npm_jest_project_path.display().to_string(),
-            "--run-id",
-            &run_id,
-            "--num",
-            "cpu-cores",
+        let worker_args = vec![
+            format!("work"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--working-dir={working_dir}"),
+            format!("--run-id={run_id}"),
+            format!("--num=cpu-cores"),
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let CmdOutput {
@@ -615,16 +781,12 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -640,19 +802,15 @@ test_all_network_config_options! {
         }
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
-        let test_args = &[
-            "test",
-            "--reporter",
-            "dot",
-            "--queue-addr",
-            &queue_addr,
-            "--run-id",
-            &run_id,
-            "--test-timeout-seconds",
-            "0",
+        let test_args = vec![
+            format!("test"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--test-timeout-seconds=0"),
         ];
         let mut test_args = conf.extend_args_for_client(test_args);
-        test_args.extend(["--", "yarn", "jest"]);
+        test_args.extend([s!("--"), s!("yarn"), s!("jest")]);
         let CmdOutput { stdout, stderr, exit_status } = run_abq_in(
             &(name.to_string() + "_test"),
             test_args,
@@ -662,17 +820,15 @@ test_all_network_config_options! {
         assert!(!exit_status.success());
         assert!(stderr.contains("--- ERROR ---\nTimed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
 
+        let working_dir = npm_jest_project_path.display();
+
         // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
-        let worker_args = &[
-            "work",
-            "--queue-addr",
-            &queue_addr,
-            "--working-dir",
-            &npm_jest_project_path.display().to_string(),
-            "--run-id",
-            &run_id,
-            "--num",
-            "cpu-cores",
+        let worker_args = vec![
+            format!("work"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--working-dir={working_dir}"),
+            format!("--run-id={run_id}"),
+            format!("--num=cpu-cores"),
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let CmdOutput {
@@ -690,13 +846,87 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
+    yarn_jest_timeout_run_workers_numbered (|name, conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+        let run_id = RunId::unique().to_string();
+
+        let npm_jest_project_path = testdata_project("jest/npm-jest-project");
+
+        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]));
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start") {
+                    break;
+                }
+            }
+        }
+
+        let working_dir = npm_jest_project_path.display();
+
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        let test_args = |worker: usize| {
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--working-dir={working_dir}"),
+                format!("--run-id={run_id}"),
+                format!("--num=cpu-cores"),
+                format!("--inactivity-timeout-seconds=0"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), s!("yarn"), s!("jest")]);
+            args
+        };
+
+        let CmdOutput { stdout, stderr, exit_status } = run_abq_in(
+            &(name.to_string() + "_test0"),
+            test_args(0),
+            &testdata_project("jest/npm-jest-project"),
+            true,
+        );
+        assert!(!exit_status.success());
+        assert!(stderr.contains("--- ERROR ---\nTimed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = run_abq(&(name.to_string() + "_test1"), test_args(1));
+
+        // The worker should exit with a failure as well.
+        assert!(!exit_status.success(), "EXIT:\n{:?}\nSTDOUT:\n{}\nSTDERR:\n{}", exit_status, stdout, stderr);
+
+        term_queue(queue_proc);
+    })
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
     yarn_jest_auto_workers_with_failing_tests (|name, conf: CSConfigOptions| {
         // abq test --reporter dot (--token ...)? -- yarn jest
         let test_args = &[
             "test",
             "--reporter",
             "dot",
-            "--num-workers",
+            "-n",
             "cpu-cores",
             "--color=never",
         ];
@@ -728,6 +958,45 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
+    yarn_jest_auto_workers_with_failing_tests_worker0 (|name, conf: CSConfigOptions| {
+        // abq test --reporter dot (--token ...)? -- yarn jest
+        let test_args = &[
+            "test",
+            "--reporter",
+            "dot",
+            "-n",
+            "cpu-cores",
+            "--color=never",
+            "--worker=0",
+        ];
+        let mut test_args = conf.extend_args_for_in_band_client(test_args);
+        test_args.extend(["--", "yarn", "jest"]);
+        let CmdOutput {
+            stdout,
+            stderr: _,
+            exit_status,
+        } = run_abq_in(
+            name,
+            test_args,
+            &testdata_project("jest/npm-jest-project-with-failures"),
+            false
+        );
+
+        let code = exit_status.code().expect("process killed");
+        assert_eq!(code, 1);
+
+        let stdout_lines = stdout.lines();
+        // TODO(130): add back once https://github.com/rwx-research/abq/issues/130 lands; right now
+        // this prints more than needed because we don't capture worker stdout/stderr
+        // assert_eq!(stdout_lines.next().unwrap(), "F");
+        // assert!(stderr.is_empty(), "{:?}", stderr);
+        assert!(stdout_lines.into_iter().any(|line| line.contains('F')));
+        assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{}", stdout);
+    })
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
     yarn_jest_separate_queue_workers_with_failing_tests (|name, conf: CSConfigOptions| {
         let server_port = find_free_port();
         let worker_port = find_free_port();
@@ -739,16 +1008,12 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-                "start",
-                "--bind",
-                "0.0.0.0",
-                "--port",
-                &server_port.to_string(),
-                "--work-port",
-                &worker_port.to_string(),
-                "--negotiator-port",
-                &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -763,34 +1028,29 @@ test_all_network_config_options! {
             }
         }
 
+        let working_dir = npm_jest_project_path.display();
+
         // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
-        let worker_args = &[
-            "work",
-            "--queue-addr",
-            &queue_addr,
-            "--working-dir",
-            &npm_jest_project_path.display().to_string(),
-            "--run-id",
-            &run_id,
-            "--num",
-            "cpu-cores"
+        let worker_args = vec![
+            format!("work"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--working-dir={working_dir}"),
+            format!("--run-id={run_id}"),
+            format!("--num=cpu-cores"),
         ];
         let worker_args = conf.extend_args_for_client(worker_args);
         let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
 
         // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? -- yarn jest
-        let test_args = &[
-            "test",
-            "--reporter",
-            "dot",
-            "--queue-addr",
-            &queue_addr,
-            "--run-id",
-            &run_id,
-            "--color=never",
+        let test_args = vec![
+            format!("test"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--color=never"),
         ];
         let mut test_args = conf.extend_args_for_client(test_args);
-        test_args.extend(["--", "yarn", "jest"]);
+        test_args.extend([s!("--"), s!("yarn"), s!("jest")]);
         let CmdOutput {
             stdout,
             stderr,
@@ -801,7 +1061,8 @@ test_all_network_config_options! {
         assert!(!exit_status.success(), "{:?}", (stdout, stderr));
 
         let mut lines = stdout.lines();
-        assert!(lines.next().unwrap().contains("Starting test run"));
+        assert!(lines.next().unwrap().contains("DEPRECATION NOTICE: not specifying `--worker` will default to `--worker 0` in a future version of ABQ"));
+        assert!(lines.next().unwrap().contains("Started test run"));
         assert_eq!(lines.next().unwrap(), "FF");
         assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{}", stdout);
 
@@ -810,6 +1071,85 @@ test_all_network_config_options! {
         // The `abq work` process should also exit with a failure, corresponding to having
         // witnessed a test failure in the run.
         let worker_exit_status = worker_proc.wait().unwrap();
+        assert!(!worker_exit_status.success());
+
+        term_queue(queue_proc);
+    })
+}
+
+test_all_network_config_options! {
+    #[cfg(feature = "test-abq-jest")]
+    yarn_jest_separate_queue_numbered_workers_with_failing_tests (|name, conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+        let run_id = RunId::unique().to_string();
+
+        let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
+
+        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]));
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start") {
+                    break;
+                }
+            }
+        }
+
+        let working_dir = npm_jest_project_path.display();
+
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        let test_args = |worker: usize| {
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--working-dir={working_dir}"),
+                format!("--run-id={run_id}"),
+                format!("--num=cpu-cores"),
+                format!("--color=never"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), s!("yarn"), s!("jest")]);
+            args
+        };
+        let mut test1_proc = spawn_abq(&(name.to_string() + "_test1"), test_args(1));
+
+        // --worker 0
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = run_abq(&(name.to_string() + "_test0"), test_args(0));
+
+        // The `abq test` process should exit with a failure
+        assert!(!exit_status.success(), "{:?}", (stdout, stderr));
+
+        let mut lines = stdout.lines();
+        assert!(lines.next().unwrap().contains("Started test run"));
+        assert_eq!(lines.next().unwrap(), "FF");
+        assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{}", stdout);
+
+        assert!(stderr.is_empty());
+
+        // The `abq work` process should also exit with a failure, corresponding to having
+        // witnessed a test failure in the run.
+        let worker_exit_status = test1_proc.wait().unwrap();
         assert!(!worker_exit_status.success());
 
         term_queue(queue_proc);
@@ -827,16 +1167,12 @@ test_all_network_config_options! {
         let negotiator_addr = format!("0.0.0.0:{negotiator_port}");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &work_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={work_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -857,14 +1193,11 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_client(&[
-            "health",
-            "--queue",
-            &queue_addr,
-            "--work-scheduler",
-            &work_scheduler_addr,
-            "--negotiator",
-            &negotiator_addr,
+        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_client(vec![
+            format!("health"),
+            format!("--queue={queue_addr}"),
+            format!("--work-scheduler={work_scheduler_addr}"),
+            format!("--negotiator={negotiator_addr}"),
         ]));
 
         assert!(exit_status.success(), "{}\n{}", stdout, stderr);
@@ -886,16 +1219,12 @@ test_all_network_config_options! {
         let negotiator_addr = format!("0.0.0.0:{negotiator_port}");
 
         // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &work_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        let mut queue_proc = spawn_abq(name, conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={work_port}"),
+            format!("--negotiator-port={negotiator_port}"),
         ]));
 
         queue_proc.kill().expect("queue already dead");
@@ -906,17 +1235,14 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_client(&[
-            "health",
-            "--queue",
-            &queue_addr,
-            "--work-scheduler",
-            &work_scheduler_addr,
-            "--negotiator",
-            &negotiator_addr,
+        } = run_abq(&(name.to_string() + "_health"), conf.extend_args_for_client(vec![
+            format!("health"),
+            format!("--queue={queue_addr}"),
+            format!("--work-scheduler={work_scheduler_addr}"),
+            format!("--negotiator={negotiator_addr}"),
         ]));
 
-        assert_eq!(exit_status.code().unwrap(), 1);
+        assert_eq!(exit_status.code().unwrap(), 1, "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert_eq!(
             stdout,
             format!(
@@ -1032,16 +1358,16 @@ fn test_with_invalid_command() {
     // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
     let mut queue_proc = spawn_abq(
         name,
-        conf.extend_args_for_start(&[
-            "start",
-            "--bind",
-            "0.0.0.0",
-            "--port",
-            &server_port.to_string(),
-            "--work-port",
-            &worker_port.to_string(),
-            "--negotiator-port",
-            &negotiator_port.to_string(),
+        conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind"),
+            format!("0.0.0.0"),
+            format!("--port"),
+            format!("{server_port}"),
+            format!("--work-port"),
+            format!("{worker_port}"),
+            format!("--negotiator-port"),
+            format!("{negotiator_port}"),
         ]),
     );
 
@@ -1058,31 +1384,31 @@ fn test_with_invalid_command() {
     }
 
     // abq work --queue-addr ... --working-dir ... --run-id ... (--token ...)?
-    let worker_args = &[
-        "work",
-        "--queue-addr",
-        &queue_addr,
-        "--working-dir",
-        ".",
-        "--run-id",
-        &run_id,
+    let worker_args = vec![
+        format!("work"),
+        format!("--queue-addr"),
+        format!("{queue_addr}"),
+        format!("--working-dir"),
+        format!("."),
+        format!("--run-id"),
+        format!("{run_id}"),
     ];
     let worker_args = conf.extend_args_for_client(worker_args);
     let mut worker_proc = spawn_abq(&(name.to_string() + "_workers"), worker_args);
 
     // abq test --reporter dot --queue-addr ... --run-id ... (--token ...)? \
     //   -- __zzz_not_a_command__
-    let test_args = &[
-        "test",
-        "--reporter",
-        "dot",
-        "--queue-addr",
-        &queue_addr,
-        "--run-id",
-        &run_id,
+    let test_args = vec![
+        format!("test"),
+        format!("--reporter"),
+        format!("dot"),
+        format!("--queue-addr"),
+        format!("{queue_addr}"),
+        format!("--run-id"),
+        format!("{run_id}"),
     ];
     let mut test_args = conf.extend_args_for_client(test_args);
-    test_args.extend(["--", "__zzz_not_a_command__"]);
+    test_args.extend([s!("--"), s!("__zzz_not_a_command__")]);
 
     let CmdOutput {
         stdout,

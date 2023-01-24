@@ -332,6 +332,15 @@ pub fn format_short_suite_summary(
     Ok(())
 }
 
+pub fn deprecation<W>(writer: &mut W, notice: &str) -> io::Result<()>
+where
+    W: WriteColor,
+{
+    with_color(writer, Color::Yellow, |w| {
+        writeln!(w, "DEPRECATION NOTICE: {notice}")
+    })
+}
+
 #[inline]
 fn bold_spec() -> ColorSpec {
     let mut spec = ColorSpec::new();

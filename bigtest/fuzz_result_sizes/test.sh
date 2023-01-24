@@ -10,6 +10,7 @@ export ABQ_LOG=abq=debug
 
 EXIT=0
 abq test \
+    --worker 0 \
     --reporter dot \
     --run-id "bigtest-$(uuidgen)" \
     --queue-addr "$(cat $IP_FILE)" \
