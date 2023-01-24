@@ -27,6 +27,37 @@ pub mod health {
     }
 }
 
+pub mod meta {
+    use serde_derive::{Deserialize, Serialize};
+
+    /// A record of deprecated ABQ features an entity is using.
+    #[derive(Serialize, Deserialize, Debug)]
+    #[must_use]
+    pub enum Deprecation {
+        /// abq test --test-timeout-seconds
+        FlagTestTestTimeOutSeconds,
+        /// abq test --num-workers
+        FlagTestNumWorkers,
+        /// abq test without --worker set
+        TestWithoutWorkerFlag,
+        /// abq work command
+        AbqWork,
+    }
+
+    /// A record of deprecated ABQ features an entity is using.
+    #[derive(Serialize, Deserialize, Default)]
+    pub struct DeprecationRecord(Vec<Deprecation>);
+
+    impl DeprecationRecord {
+        pub fn push(&mut self, deprecation: Deprecation) {
+            self.0.push(deprecation);
+        }
+        pub fn extract(self) -> Vec<Deprecation> {
+            self.0
+        }
+    }
+}
+
 pub mod entity {
     use serde_derive::{Deserialize, Serialize};
 
@@ -259,6 +290,7 @@ pub mod queue {
 
     use super::{
         entity::EntityId,
+        meta::DeprecationRecord,
         runners::{AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestResult},
         workers::{ManifestResult, RunId, RunnerKind, WorkId},
     };
@@ -424,7 +456,11 @@ pub mod queue {
         // TODO: should this be gated behind additional authz?
         ActiveTestRuns,
         /// An ask to return information needed to begin negotiation with the queue.
-        NegotiatorInfo,
+        NegotiatorInfo {
+            run_id: RunId,
+            /// Deprecations from the ABQ worker/supervisor client.
+            deprecations: DeprecationRecord,
+        },
         /// An ask to run some work by an invoker.
         InvokeWork(InvokeWork),
         /// An ask to mark an active test run as cancelled.

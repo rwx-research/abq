@@ -332,10 +332,15 @@ pub fn format_short_suite_summary(
     Ok(())
 }
 
-pub fn deprecation<W>(writer: &mut W, notice: &str) -> io::Result<()>
+pub fn deprecation<W>(
+    writer: &mut W,
+    notice: &str,
+    set_deprecation: impl FnOnce(),
+) -> io::Result<()>
 where
     W: WriteColor,
 {
+    set_deprecation();
     with_color(writer, Color::Yellow, |w| {
         writeln!(w, "DEPRECATION NOTICE: {notice}")
     })
