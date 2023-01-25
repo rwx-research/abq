@@ -142,6 +142,7 @@ impl NegotiatedWorkers {
                 };
                 WorkersExit {
                     status,
+                    manifest_generation_output: None,
                     final_captured_outputs: Default::default(),
                 }
             }

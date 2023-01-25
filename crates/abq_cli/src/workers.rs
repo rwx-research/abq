@@ -84,11 +84,15 @@ pub fn start_workers_standalone(
         if should_shutdown {
             let WorkersExit {
                 status,
+                manifest_generation_output,
                 final_captured_outputs,
             } = worker_pool.shutdown();
 
             tracing::debug!("Workers shutdown");
 
+            if let Some(manifest_output) = manifest_generation_output {
+                print_manifest_generation_output(worker_entity, manifest_output);
+            }
             print_final_runner_outputs(worker_entity, num_workers, final_captured_outputs);
 
             // We want to exit with an appropriate code if the workers were determined to have run
@@ -108,6 +112,19 @@ pub fn start_workers_standalone(
             std::process::exit(exit_code.get());
         }
     }
+}
+
+pub(crate) fn print_manifest_generation_output(
+    worker_entity: EntityId,
+    manifest_output: CapturedOutput,
+) {
+    // NB: there is no reasonable way to surface the error at this point, since we are
+    // about to shut down.
+    let _opt_err = abq_output::format_manifest_generation_output(
+        &mut std::io::stdout(),
+        worker_entity,
+        &manifest_output,
+    );
 }
 
 pub(crate) fn print_final_runner_outputs(

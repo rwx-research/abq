@@ -917,6 +917,8 @@ impl CapturedOutput {
 
 pub struct TestRunnerExit {
     pub exit_code: ExitCode,
+    /// Output captured during manifest generation, if any.
+    pub manifest_generation_output: Option<CapturedOutput>,
     /// Captured stdout/stderr after all tests have been run
     pub final_captured_output: CapturedOutput,
 }

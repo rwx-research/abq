@@ -154,6 +154,7 @@ pub enum WorkersExitStatus {
 #[derive(Debug)]
 pub struct WorkersExit {
     pub status: WorkersExitStatus,
+    pub manifest_generation_output: Option<CapturedOutput>,
     /// Final captured output of each runner, after all tests were run on each runner.
     pub final_captured_outputs: Vec<(usize, CapturedOutput)>,
 }
@@ -294,6 +295,7 @@ impl WorkerPool {
         let mut errors = vec![];
         let mut failure_exit_code = ExitCode::new(1);
         let mut final_captured_outputs = Vec::with_capacity(self.workers.len());
+        let mut manifest_generation_output = None;
         for (worker_idx, worker_thead) in self.workers.iter_mut().enumerate() {
             let opt_err = worker_thead
                 .handle
@@ -305,8 +307,15 @@ impl WorkerPool {
             let final_captured_output = match opt_err {
                 Ok(TestRunnerExit {
                     exit_code,
+                    manifest_generation_output: this_manifest_output,
                     final_captured_output,
                 }) => {
+                    debug_assert!(
+                        this_manifest_output.is_none() || manifest_generation_output.is_none(),
+                    );
+
+                    manifest_generation_output = this_manifest_output;
+
                     // Choose the highest exit code of all the test runners this worker started to
                     // be the exit code of the worker.
                     if exit_code.get() > failure_exit_code.get() {
@@ -334,6 +343,7 @@ impl WorkerPool {
         };
 
         WorkersExit {
+            manifest_generation_output,
             final_captured_outputs,
             status,
         }
@@ -518,6 +528,7 @@ fn start_test_like_runner(
         TestLikeRunner::ExitWith(ec) => {
             return Ok(TestRunnerExit {
                 exit_code: ExitCode::new(ec),
+                manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
             })
         }
@@ -551,6 +562,7 @@ fn start_test_like_runner(
         Err(RunAlreadyCompleted {}) => {
             return Ok(TestRunnerExit {
                 exit_code: ExitCode::SUCCESS,
+                manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
             })
         }
@@ -659,6 +671,7 @@ fn start_test_like_runner(
 
     Ok(TestRunnerExit {
         exit_code: ExitCode::SUCCESS,
+        manifest_generation_output: None,
         final_captured_output: CapturedOutput::empty(),
     })
 }
