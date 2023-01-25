@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt::Display,
     io::{self},
     path::PathBuf,
@@ -247,7 +248,7 @@ struct LineReporter {
     buffer: Box<dyn termcolor::WriteColor + Send>,
 
     /// Failures and errors for which a longer summary should be printed at the end.
-    delayed_summaries: Vec<SummaryKind>,
+    delayed_summaries: Vec<SummaryKind<'static>>,
 
     seen_first: bool,
 }
@@ -308,20 +309,19 @@ struct DotReporter {
 
     num_results: u64,
 
-    delayed_summaries: Vec<SummaryKind>,
+    delayed_summaries: Vec<SummaryKind<'static>>,
 }
 impl DotReporter {
     fn maybe_push_delayed_output(
         &mut self,
         test_result: &TestResult,
         opt_output: &Option<CapturedOutput>,
-        when: OutputOrdering,
+        when: OutputOrdering<'static>,
     ) {
         if let Some(output) = opt_output.as_ref() {
             self.delayed_summaries.push(SummaryKind::Output {
                 when,
                 worker: test_result.source,
-                test_name: test_result.display_name.clone(),
                 output: output.clone(),
             });
         }
@@ -350,7 +350,11 @@ impl Reporter for DotReporter {
             .flush()
             .map_err(|_| ReportingError::FailedToWrite)?;
 
-        self.maybe_push_delayed_output(test_result, output_before, OutputOrdering::BeforeTest);
+        self.maybe_push_delayed_output(
+            test_result,
+            output_before,
+            OutputOrdering::Before(Cow::Owned(test_result.display_name.clone())),
+        );
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
             format_test_result_summary(&mut self.buffer, test_result)?;
@@ -359,7 +363,11 @@ impl Reporter for DotReporter {
                 .push(SummaryKind::Test(test_result.clone()));
         }
 
-        self.maybe_push_delayed_output(test_result, output_after, OutputOrdering::AfterTest);
+        self.maybe_push_delayed_output(
+            test_result,
+            output_after,
+            OutputOrdering::After(Cow::Owned(test_result.display_name.clone())),
+        );
 
         Ok(())
     }
@@ -497,8 +505,7 @@ impl Reporter for ProgressReporter {
                 format_worker_output(
                     &mut self.buffer,
                     test_result.source,
-                    &test_result.display_name,
-                    OutputOrdering::BeforeTest,
+                    OutputOrdering::Before(Cow::Owned(test_result.display_name.clone())),
                     output,
                 )?;
             }
@@ -511,8 +518,7 @@ impl Reporter for ProgressReporter {
                 format_worker_output(
                     &mut self.buffer,
                     test_result.source,
-                    &test_result.display_name,
-                    OutputOrdering::AfterTest,
+                    OutputOrdering::Before(Cow::Owned(test_result.display_name.clone())),
                     output,
                 )?;
             }
@@ -1137,10 +1143,18 @@ mod test_line_reporter {
 
         --- abq/test2: FAILED ---
         Assertion failed: 1 != 2
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
@@ -1304,6 +1318,10 @@ mod test_dot_reporter {
 
         --- abq/test2: FAILED ---
         Assertion failed: 1 != 2
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
 
         --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
@@ -1315,6 +1333,10 @@ mod test_dot_reporter {
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
@@ -1423,6 +1445,10 @@ mod test_dot_reporter {
 
         --- default name: FAILED ---
         default output
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
@@ -1466,6 +1492,10 @@ mod test_dot_reporter {
 
         --- default name: FAILED ---
         default output
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
     }
@@ -1656,6 +1686,10 @@ mod test_progress_reporter {
         insta::assert_snapshot!(output, @r###"
         --- abq/test2: FAILED ---
         Assertion failed: 1 != 2
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
 
         --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
@@ -1667,6 +1701,10 @@ mod test_progress_reporter {
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
         "###);
 
@@ -1834,6 +1872,10 @@ mod test_progress_reporter {
 
         --- abq/test2: FAILED ---
         Assertion failed: 1 != 2
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
 
         --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
@@ -1848,6 +1890,10 @@ mod test_progress_reporter {
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
         (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
 
         --- [abq progress] 0 seconds ---

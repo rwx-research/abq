@@ -48,8 +48,10 @@ use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
 use crate::{
-    args::Token, health::HealthCheckKind, reporting::StdoutPreferences,
-    workers::print_final_runner_outputs,
+    args::Token,
+    health::HealthCheckKind,
+    reporting::StdoutPreferences,
+    workers::{print_final_runner_outputs, print_manifest_generation_output},
 };
 
 #[cfg(all(target_arch = "x86_64", target_env = "musl"))]
@@ -697,11 +699,15 @@ fn run_tests(
             // The exit code will be determined by the test result status.
             status: _,
             final_captured_outputs,
+            manifest_generation_output,
         } = workers.shutdown();
 
         // We need to print the final runner outputs (if any) at this point.
         // This is safe, as the runners thread is dead by now, so the reporters shouldn't
         // be writing to output streams.
+        if let Some(manifest_output) = manifest_generation_output {
+            print_manifest_generation_output(workers.entity(), manifest_output);
+        }
         print_final_runner_outputs(workers.entity(), num_workers, final_captured_outputs);
     }
 

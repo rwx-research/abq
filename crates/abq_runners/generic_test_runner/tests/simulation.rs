@@ -47,7 +47,11 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     simulation: impl IntoIterator<Item = Msg>,
     with_manifest: Option<SendManifest>,
     get_next_test: GetNextTests,
-) -> (Vec<AssociatedTestResults>, CapturedOutput) {
+) -> (
+    Vec<AssociatedTestResults>,
+    Option<CapturedOutput>,
+    CapturedOutput,
+) {
     let simulation_msg = pack_msgs(simulation);
     let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     let simfile_path = simfile.to_path_buf();
@@ -78,6 +82,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
 
     let TestRunnerExit {
         final_captured_output,
+        manifest_generation_output,
         exit_code,
     } = GenericTestRunner::run(
         EntityId::new(),
@@ -101,6 +106,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
         Arc::try_unwrap(all_results)
             .expect("outstanding refs to all results")
             .into_inner(),
+        manifest_generation_output,
         final_captured_output,
     )
 }
@@ -168,7 +174,7 @@ fn capture_output_before_and_during_tests() {
     }
     let get_next_tests = &move || async move { work_bundle(proto) }.boxed();
 
-    let (mut results, final_captures) =
+    let (mut results, _man_output, final_captures) =
         run_simulated_runner(simulation, NO_GENERATE_MANIFEST, get_next_tests);
     results.sort_by_key(|r| r.work_id);
 
@@ -280,7 +286,8 @@ fn big_manifest() {
     });
     let get_next_tests = &move || async move { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
 
-    let (results, _) = run_simulated_runner(simulation, Some(with_manifest), get_next_tests);
+    let (results, _man_output, _) =
+        run_simulated_runner(simulation, Some(with_manifest), get_next_tests);
     assert!(results.is_empty());
 
     let manifest = Arc::try_unwrap(manifest).unwrap().into_inner().unwrap();
@@ -290,5 +297,79 @@ fn big_manifest() {
     };
     let (tests, meta) = manifest.flatten();
     assert_eq!(tests.len(), 10_000);
+    assert!(meta.is_empty());
+}
+
+#[test]
+#[with_protocol_version]
+fn capture_output_during_manifest_gen() {
+    use Msg::*;
+
+    let test_name = "y".repeat(10);
+    let members = std::iter::repeat_with(|| {
+        TestOrGroup::test(Test::new(
+            proto,
+            test_name.clone(),
+            vec![],
+            Default::default(),
+        ))
+    })
+    .take(10);
+
+    let manifest = ManifestMessage::new(Manifest::new(members, Default::default()));
+
+    let simulation = [
+        Connect,
+        Stdout(b"init stdout".to_vec()),
+        Stderr(b"init stderr".to_vec()),
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise we should get no requests for tests.
+        IfGenerateManifest {
+            then_do: vec![
+                Stdout(b"hello from manifest stdout".to_vec()),
+                Stderr(b"hello from manifest stderr".to_vec()),
+                OpaqueWrite(pack(&manifest)),
+            ],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+            ],
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let manifest: Arc<Mutex<Option<ManifestResult>>> = Default::default();
+    let with_manifest = Box::new({
+        let manifest = manifest.clone();
+        move |manifest_result| {
+            *manifest.lock() = Some(manifest_result);
+        }
+    });
+    let get_next_tests = &move || async move { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
+
+    let (results, man_output, _) =
+        run_simulated_runner(simulation, Some(with_manifest), get_next_tests);
+    assert!(results.is_empty());
+
+    assert!(man_output.is_some());
+    let man_output = man_output.unwrap();
+    assert_eq!(man_output.stdout, b"init stdouthello from manifest stdout");
+    assert_eq!(man_output.stderr, b"init stderrhello from manifest stderr");
+
+    let manifest = Arc::try_unwrap(manifest).unwrap().into_inner().unwrap();
+    let manifest = match manifest {
+        ManifestResult::Manifest(man) => man.manifest,
+        ManifestResult::TestRunnerError { .. } => unreachable!(),
+    };
+    let (tests, meta) = manifest.flatten();
+    assert_eq!(tests.len(), 10);
     assert!(meta.is_empty());
 }

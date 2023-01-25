@@ -11,7 +11,6 @@ use buffered_results::BufferedResults;
 use capture_output::OutputCapturer;
 use message_buffer::{Completed, RefillStrategy};
 
-use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, ChildStderr, ChildStdout, Command};
 
@@ -161,10 +160,10 @@ async fn retrieve_manifest<'a>(
     additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
     working_dir: &Path,
     protocol_version_timeout: Duration,
-) -> Result<ReportedManifest, GenericRunnerError> {
+) -> Result<(ReportedManifest, CapturedOutput), GenericRunnerError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
-    let (runner_info, manifest) = {
+    let (runner_info, manifest, captured_output) = {
         let mut our_listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
         let our_addr = try_setup!(our_listener.local_addr());
 
@@ -180,6 +179,12 @@ async fn retrieve_manifest<'a>(
 
         let mut native_runner_handle = try_setup!(native_runner.spawn());
 
+        let capture_pipes = {
+            let child_stdout = native_runner_handle.stdout.take().expect("just spawned");
+            let child_stderr = native_runner_handle.stderr.take().expect("just spawned");
+            CapturePipes::new(child_stdout, child_stderr)
+        };
+
         let manifest_result = retrieve_manifest_help(
             &mut our_listener,
             &mut native_runner_handle,
@@ -187,43 +192,34 @@ async fn retrieve_manifest<'a>(
         )
         .await;
 
+        let captured_output = try_setup!(capture_pipes.finish().await);
+
         match manifest_result {
             Ok((runner_info, ManifestMessage::Success(manifest))) => {
-                (runner_info, manifest.manifest)
+                (runner_info, manifest.manifest, captured_output)
             }
             Ok((_, ManifestMessage::Failure(failure))) => {
                 let kind = NativeTestRunnerError::from(failure.error);
                 return Err(GenericRunnerError {
                     kind: kind.into(),
-                    output: steal_child_output(&mut native_runner_handle).await,
+                    output: captured_output,
                 });
             }
             Err(kind) => {
                 return Err(GenericRunnerError {
                     kind,
-                    output: steal_child_output(&mut native_runner_handle).await,
+                    output: captured_output,
                 });
             }
         }
     };
 
-    Ok(ReportedManifest {
+    let manifest = ReportedManifest {
         manifest,
         native_runner_protocol: runner_info.protocol.get_version(),
         native_runner_specification: Box::new(runner_info.specification),
-    })
-}
-
-async fn steal_child_output(child: &mut process::Child) -> CapturedOutput {
-    let mut stderr = Default::default();
-    let mut stdout = Default::default();
-    if let Some(mut s) = std::mem::take(&mut child.stderr) {
-        let _ = s.read_to_end(&mut stderr).await;
-    }
-    if let Some(mut s) = std::mem::take(&mut child.stdout) {
-        let _ = s.read_to_end(&mut stdout).await;
-    }
-    CapturedOutput { stderr, stdout }
+    };
+    Ok((manifest, captured_output))
 }
 
 async fn retrieve_manifest_help(
@@ -362,6 +358,7 @@ where
     let protocol_version_timeout = Duration::from_secs(60);
 
     // If we need to retrieve the manifest, do that first.
+    let mut manifest_generation_output = None;
     if let Some(mut send_manifest) = send_manifest {
         let manifest_or_error = retrieve_manifest(
             &cmd,
@@ -373,7 +370,8 @@ where
         .await;
 
         match manifest_or_error {
-            Ok(manifest) => {
+            Ok((manifest, captured_output)) => {
+                manifest_generation_output = Some(captured_output);
                 send_manifest(ManifestResult::Manifest(manifest));
             }
             Err(err) => {
@@ -461,6 +459,7 @@ where
     match opt_err {
         Ok(exit) => Ok(TestRunnerExit {
             exit_code: exit,
+            manifest_generation_output,
             final_captured_output: output,
         }),
         Err(err) => Err(GenericRunnerError { kind: err, output }),

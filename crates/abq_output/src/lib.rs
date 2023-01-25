@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     io::{self},
     ops::Deref,
     time::Duration,
@@ -29,8 +30,7 @@ pub fn format_result_line(
         format_worker_output(
             writer,
             result.source,
-            &result.display_name,
-            OutputOrdering::BeforeTest,
+            OutputOrdering::Before(Cow::Borrowed(&result.display_name)),
             output_before,
         )?;
     }
@@ -46,8 +46,7 @@ pub fn format_result_line(
         format_worker_output(
             writer,
             result.source,
-            &result.display_name,
-            OutputOrdering::AfterTest,
+            OutputOrdering::After(Cow::Borrowed(&result.display_name)),
             output_after,
         )?;
     }
@@ -67,19 +66,19 @@ pub fn format_result_dot(writer: &mut impl WriteColor, result: &TestResult) -> i
     with_color(writer, status_color(&result.status), |w| write!(w, "{dot}"))
 }
 
-pub enum SummaryKind {
+pub enum SummaryKind<'a> {
     Test(TestResult),
     Output {
-        when: OutputOrdering,
+        when: OutputOrdering<'a>,
         worker: EntityId,
-        test_name: String,
         output: CapturedOutput,
     },
 }
 
-pub enum OutputOrdering {
-    BeforeTest,
-    AfterTest,
+pub enum OutputOrdering<'a> {
+    Before(Cow<'a, str>),
+    After(Cow<'a, str>),
+    Custom(Cow<'a, str>),
 }
 
 pub fn format_summary(writer: &mut impl WriteColor, summary: SummaryKind) -> io::Result<()> {
@@ -88,9 +87,8 @@ pub fn format_summary(writer: &mut impl WriteColor, summary: SummaryKind) -> io:
         SummaryKind::Output {
             when,
             worker,
-            test_name,
             output,
-        } => format_worker_output(writer, worker, &test_name, when, &output),
+        } => format_worker_output(writer, worker, when, &output),
     }
 }
 
@@ -108,6 +106,10 @@ pub fn format_test_result_summary(
 ) -> io::Result<()> {
     // --- test/name: {status} ---
     // {output}
+    // ----- STDOUT
+    // {stdout}
+    // ----- STDERR
+    // {stderr}
     // (completed in {runtime}; worker [{worker_id}])
 
     let TestResultSpec {
@@ -124,8 +126,8 @@ pub fn format_test_result_summary(
         lineage: _,
         past_attempts: _,
         other_errors: _,
-        stderr: _,
-        stdout: _,
+        stderr,
+        stdout,
     } = result.deref();
 
     let output = output.as_deref().unwrap_or("<no output>");
@@ -134,6 +136,16 @@ pub fn format_test_result_summary(
     format_status(writer, status)?;
     writeln!(writer, " ---")?;
     writeln!(writer, "{output}")?;
+    for (stdoutput, kind) in [(stdout, "STDOUT"), (stderr, "STDERR")] {
+        if let Some(output) = stdoutput {
+            if !output.is_empty() {
+                // TODO: don't print if captured output is only whitespace
+                writeln!(writer, "----- {kind}")?;
+                writer.write_all(output)?;
+                push_newline_if_needed(writer, output)?;
+            }
+        }
+    }
     write!(writer, "(completed in ")?;
     format_duration(writer, *runtime)?;
     writeln!(writer, "; worker [{:?}])", result.source)
@@ -149,11 +161,10 @@ pub fn would_write_output(output: Option<&CapturedOutput>) -> bool {
 pub fn format_worker_output(
     writer: &mut impl io::Write,
     worker: EntityId,
-    test_name: &str,
     when: OutputOrdering,
     output: &CapturedOutput,
 ) -> io::Result<()> {
-    // --- [worker {worker_id}] BEFORE|AFTER test_name ---
+    // --- [worker {worker_id}] DURING|BEFORE|AFTER test_name ---
     // ----- STDOUT
     // {stdout}
     // ----- STDERR
@@ -166,14 +177,16 @@ pub fn format_worker_output(
 
     let CapturedOutput { stderr, stdout } = output;
 
-    let when = match when {
-        OutputOrdering::BeforeTest => "BEFORE",
-        OutputOrdering::AfterTest => "AFTER",
-    };
+    write!(writer, "--- [worker {worker:?}] ")?;
+    match when {
+        OutputOrdering::Before(test) => write!(writer, "BEFORE {test}"),
+        OutputOrdering::After(test) => write!(writer, "AFTER {test}"),
+        OutputOrdering::Custom(s) => write!(writer, "{s}"),
+    }?;
+
+    writeln!(writer, " ---")?;
 
     let mut trailing_newlines = 0;
-
-    writeln!(writer, "--- [worker {worker:?}] {when} {test_name} ---")?;
 
     if !stdout.is_empty() {
         // TODO: don't print if stdout is only whitespace
@@ -204,16 +217,29 @@ pub fn format_final_runner_output(
     output: &CapturedOutput,
 ) -> io::Result<()> {
     // --- [worker {worker_id}] AFTER completion[ on runner N]? ---
-    let mut after_suffix = "completion".to_string();
+    let mut after = "AFTER completion".to_string();
     if let Some(runner) = runner_index {
-        after_suffix.push_str(" on runner ");
-        after_suffix.push_str(&runner.to_string());
+        after.push_str(" on runner ");
+        after.push_str(&runner.to_string());
     }
     format_worker_output(
         writer,
         worker,
-        &after_suffix,
-        OutputOrdering::AfterTest,
+        OutputOrdering::Custom(Cow::Owned(after)),
+        output,
+    )
+}
+
+pub fn format_manifest_generation_output(
+    writer: &mut impl io::Write,
+    worker: EntityId,
+    output: &CapturedOutput,
+) -> io::Result<()> {
+    // --- [worker {worker_id}] MANIFEST GENERATION ---
+    format_worker_output(
+        writer,
+        worker,
+        OutputOrdering::Custom(Cow::Borrowed("MANIFEST GENERATION")),
         output,
     )
 }
@@ -799,6 +825,10 @@ mod test {
         @r###"
     --- abq/test: <green>ok<reset> ---
     Test passed!
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
     (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
@@ -809,6 +839,10 @@ mod test {
         @r###"
     --- abq/test: <red>FAILED<reset> ---
     Assertion failed: 1 != 2
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
     (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
@@ -819,6 +853,10 @@ mod test {
         @r###"
     --- abq/test: <red>ERRORED<reset> ---
     Process at pid 72818 exited early with SIGTERM
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
     (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
@@ -829,6 +867,10 @@ mod test {
         @r###"
     --- abq/test: <yellow>pending<reset> ---
     Test not implemented yet for reason: "need to implement feature A"
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
     (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
@@ -839,6 +881,10 @@ mod test {
         @r###"
     --- abq/test: <yellow>skipped<reset> ---
     Test skipped for reason: "only enabled on summer Fridays"
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
     (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
@@ -852,6 +898,10 @@ mod test {
     To see rendered webpage, see:
     	https://example.com
 
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
     (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
@@ -862,6 +912,50 @@ mod test {
         @r###"
     --- abq/test: <green>ok<reset> ---
     <no output>
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    "###
+    );
+
+    test_format!(
+        format_summary_only_stdout, format_test_result_summary,
+        &TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()),
+                stdout: Some(b"my stdout1\nmy stdout2".to_vec()),
+                stderr: Some(b"".to_vec()),
+                ..default_result()
+            }),
+        @r###"
+    --- abq/test: <green>ok<reset> ---
+    Test passed!
+    ----- STDOUT
+    my stdout1
+    my stdout2
+    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    "###
+    );
+
+    test_format!(
+        format_summary_only_stderr, format_test_result_summary,
+        &TestResult::new(
+            EntityId::fake(),
+            TestResultSpec {
+                status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()),
+                stdout: Some(b"".to_vec()),
+                stderr: Some(b"my stderr1\nmy stderr2".to_vec()),
+                ..default_result()
+            }),
+        @r###"
+    --- abq/test: <green>ok<reset> ---
+    Test passed!
+    ----- STDERR
+    my stderr1
+    my stderr2
     (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
     "###
     );
