@@ -56,11 +56,11 @@ jobs:
       # in the future we'll want to release against different architectures
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: rwx-ubuntu-latest
             platform: linux_x86-64
             cross-target: 'x86_64-unknown-linux-musl'
             install-musl-tools: true
-          - os: ubuntu-latest
+          - os: rwx-ubuntu-latest
             platform: linux_aarch64
             cross-target: 'aarch64-unknown-linux-musl'
             container: messense/rust-musl-cross:aarch64-musl@sha256:777bd4c61179c38dc213bb8472500584646d28fd4a7c3e0b30b9ef70cb446d58

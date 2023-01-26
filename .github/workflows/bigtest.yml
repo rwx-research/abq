@@ -24,7 +24,7 @@ on:
 
 jobs:
   bigtest:
-    runs-on: ubuntu-latest
+    runs-on: rwx-ubuntu-latest
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
