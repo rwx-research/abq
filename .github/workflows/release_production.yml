@@ -34,7 +34,7 @@ on:
 jobs:
   release:
     name: Release ABQ
-    runs-on: ubuntu-latest
+    runs-on: rwx-ubuntu-latest
     steps:
       - name: Register new release abq api
         run: |
