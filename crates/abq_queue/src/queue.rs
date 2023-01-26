@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use abq_utils::atomic;
 use abq_utils::auth::ServerAuthStrategy;
+use abq_utils::exit::ExitCode;
 use abq_utils::net;
 use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
@@ -92,7 +93,7 @@ enum RunState {
         last_test_timeout: Duration,
     },
     Done {
-        succeeded: bool,
+        exit_code: ExitCode,
     },
     Cancelled {
         #[allow(unused)] // so far
@@ -178,13 +179,13 @@ enum AssignedRunLookup {
     NotFound,
     /// An associated run is known, but it has already completed; a worker should exit immediately.
     AlreadyDone {
-        success: bool,
+        exit_code: ExitCode,
     },
 }
 
 enum RunLive {
     Active,
-    Done { succeeded: bool },
+    Done { exit_code: ExitCode },
     Cancelled,
 }
 
@@ -289,13 +290,15 @@ impl AllRuns {
                 // however, if the run state is known to be complete, the run data will already
                 // have been pruned, and the worker should not be given a run.
                 match &run.state {
-                    RunState::Done { succeeded } => {
+                    RunState::Done { exit_code } => {
                         return AssignedRunLookup::AlreadyDone {
-                            success: *succeeded,
+                            exit_code: *exit_code,
                         }
                     }
                     RunState::Cancelled { .. } => {
-                        return AssignedRunLookup::AlreadyDone { success: false }
+                        return AssignedRunLookup::AlreadyDone {
+                            exit_code: ExitCode::CANCELLED,
+                        }
                     }
                     st => {
                         tracing::error!(
@@ -462,7 +465,7 @@ impl AllRuns {
         }
     }
 
-    pub fn mark_complete(&self, run_id: &RunId, succeeded: bool) {
+    pub fn mark_complete(&self, run_id: &RunId, exit_code: ExitCode) {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").lock();
@@ -482,7 +485,7 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Done { succeeded };
+        run.state = RunState::Done { exit_code };
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -510,7 +513,9 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Done { succeeded: false };
+        run.state = RunState::Done {
+            exit_code: ExitCode::FAILURE,
+        };
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -539,7 +544,10 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Done { succeeded: true };
+        // Trivially successful
+        run.state = RunState::Done {
+            exit_code: ExitCode::SUCCESS,
+        };
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -579,7 +587,7 @@ impl AllRuns {
             RunState::WaitingForFirstWorker
             | RunState::WaitingForManifest
             | RunState::HasWork { .. } => Some(RunLive::Active),
-            RunState::Done { succeeded } => Some(RunLive::Done { succeeded }),
+            RunState::Done { exit_code } => Some(RunLive::Done { exit_code }),
             RunState::Cancelled { .. } => Some(RunLive::Cancelled),
         }
     }
@@ -806,8 +814,8 @@ fn start_queue(config: QueueConfig) -> Abq {
             match opt_assigned {
                 AssignedRunLookup::Some(assigned) => AssignedRunStatus::Run(assigned),
                 AssignedRunLookup::NotFound => AssignedRunStatus::RunUnknown,
-                AssignedRunLookup::AlreadyDone { success } => {
-                    AssignedRunStatus::AlreadyDone { success }
+                AssignedRunLookup::AlreadyDone { exit_code } => {
+                    AssignedRunStatus::AlreadyDone { exit_code }
                 }
             }
         }
@@ -1898,7 +1906,7 @@ impl QueueServer {
             invoker_stream.lock().await.send_test_results(results).await;
         }
 
-        let (no_more_work, is_successful) = {
+        let (no_more_work, exit_code) = {
             // Update the amount of work we have left; again, steal the map of work for only as
             // long is it takes for us to do that.
             let mut state_cache = state_cache.lock();
@@ -1917,8 +1925,13 @@ impl QueueServer {
             run_state.work_left -= num_results;
 
             run_state.is_successful = run_state.is_successful && !any_result_is_fail_like;
+            let exit_code = if run_state.is_successful {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            };
 
-            (run_state.work_left == 0, run_state.is_successful)
+            (run_state.work_left == 0, exit_code)
         };
 
         if !no_more_work {
@@ -2012,7 +2025,7 @@ impl QueueServer {
         }
 
         state_cache.lock().remove(&run_id);
-        queues.mark_complete(&run_id, is_successful);
+        queues.mark_complete(&run_id, exit_code);
         let opt_worker_results_tasks_err = Self::shutdown_persisted_worker_connection_tasks(
             worker_results_tasks,
             &run_id,
@@ -2181,12 +2194,12 @@ impl QueueServer {
 
             match liveness {
                 RunLive::Active => net_protocol::queue::TotalRunResult::Pending,
-                RunLive::Done { succeeded } => {
-                    net_protocol::queue::TotalRunResult::Completed { succeeded }
+                RunLive::Done { exit_code } => {
+                    net_protocol::queue::TotalRunResult::Completed { exit_code }
                 }
-                RunLive::Cancelled => {
-                    net_protocol::queue::TotalRunResult::Completed { succeeded: false }
-                }
+                RunLive::Cancelled => net_protocol::queue::TotalRunResult::Completed {
+                    exit_code: ExitCode::CANCELLED,
+                },
             }
         };
 
@@ -2469,6 +2482,7 @@ mod test {
             build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
             UserToken,
         },
+        exit::ExitCode,
         net_async,
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
@@ -3225,7 +3239,7 @@ mod test {
         queues.get_run_for_worker(&run_id);
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert_eq!(added, AddedManifest::Added);
-        queues.mark_complete(&run_id, true);
+        queues.mark_complete(&run_id, ExitCode::SUCCESS);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
@@ -3260,7 +3274,7 @@ mod test {
         }
 
         for run_id in [run_id1, run_id2] {
-            queues.mark_complete(&run_id, true);
+            queues.mark_complete(&run_id, ExitCode::SUCCESS);
         }
 
         assert_eq!(queues.estimate_num_active_runs(), expected_active);
