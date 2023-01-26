@@ -114,7 +114,6 @@ impl From<NativeRunnerSpecification> for v0_2::AbqNativeRunnerSpecification {
 }
 
 impl NativeRunnerSpecification {
-    #[cfg(feature = "expose-native-protocols")]
     pub fn fake() -> Self {
         Self {
             name: "test-runner".to_owned(),
