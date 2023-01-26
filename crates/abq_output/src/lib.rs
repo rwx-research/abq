@@ -446,7 +446,7 @@ pub fn format_duration(writer: &mut impl io::Write, duration: TestRuntime) -> io
         write!(writer, "{} s", seconds)?;
         written = true;
     }
-    if millis > 0 {
+    if millis > 0 || !written {
         if written {
             write!(writer, ", ")?;
         }
@@ -831,6 +831,18 @@ mod test {
         format_exact_millis_partial_seconds, format_duration_to_partial_seconds,
         Duration::from_millis(35),
         @"0.04 seconds"
+    );
+
+    test_format!(
+        format_zero_ms, format_duration,
+        TestRuntime::Milliseconds(0.),
+        @"0 ms"
+    );
+
+    test_format!(
+        format_zero_ns, format_duration,
+        TestRuntime::Nanoseconds(0),
+        @"0 ms"
     );
 
     test_format!(
