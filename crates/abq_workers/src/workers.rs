@@ -43,8 +43,8 @@ pub type NotifyResults = Arc<
         + Sync
         + 'static,
 >;
-/// Did a given run complete successfully? Returns true if so.
-pub type RunCompletedSuccessfully = Arc<dyn Fn(EntityId) -> bool + Send + Sync + 'static>;
+/// Returns the exit code of the given run for a worker.
+pub type RunExitCode = Arc<dyn Fn(EntityId) -> ExitCode + Send + Sync + 'static>;
 
 type MarkWorkerComplete = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -83,9 +83,9 @@ pub struct WorkerPoolConfig<'a> {
     pub notify_results: NotifyResults,
     /// How many results should be sent back at a time?
     pub results_batch_size_hint: u64,
-    /// Query whether the assigned run completed successfully, without any failure.
-    /// Will block until the result is well-known.
-    pub run_completed_successfully: RunCompletedSuccessfully,
+    /// Query the assigned run's exit code.
+    /// Blocks until the result is well-known.
+    pub run_exit_code: RunExitCode,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
 
@@ -110,8 +110,8 @@ pub struct WorkerPool {
     workers: Vec<ThreadWorker>,
     worker_msg_tx: mpsc::Sender<MessageFromPool>,
     live_count: LiveWorkers,
-    /// Query whether the run assigned for this pool completed successfully.
-    run_completed_successfully: RunCompletedSuccessfully,
+    /// Query the exit code of the run assigned for this pool.
+    run_exit_code: RunExitCode,
     /// The entity of the worker pool itself.
     entity: EntityId,
 }
@@ -171,7 +171,7 @@ impl WorkerPool {
             results_batch_size_hint: results_batch_size,
             notify_results,
             notify_manifest,
-            run_completed_successfully,
+            run_exit_code,
             worker_context,
             supervisor_in_band,
             debug_native_runner,
@@ -264,7 +264,7 @@ impl WorkerPool {
             workers,
             worker_msg_tx,
             live_count,
-            run_completed_successfully,
+            run_exit_code,
             entity,
         }
     }
@@ -318,9 +318,7 @@ impl WorkerPool {
 
                     // Choose the highest exit code of all the test runners this worker started to
                     // be the exit code of the worker.
-                    if exit_code.get() > failure_exit_code.get() {
-                        failure_exit_code = exit_code;
-                    }
+                    failure_exit_code = exit_code.max(failure_exit_code);
                     final_captured_output
                 }
                 Err(GenericRunnerError { kind, output }) => {
@@ -334,11 +332,14 @@ impl WorkerPool {
 
         let status = if !errors.is_empty() {
             WorkersExitStatus::Error { errors }
-        } else if (self.run_completed_successfully)(self.entity) {
-            WorkersExitStatus::Success
         } else {
-            WorkersExitStatus::Failure {
-                exit_code: failure_exit_code,
+            let exit_code = (self.run_exit_code)(self.entity);
+            if exit_code == ExitCode::SUCCESS {
+                WorkersExitStatus::Success
+            } else {
+                WorkersExitStatus::Failure {
+                    exit_code: exit_code.max(failure_exit_code),
+                }
             }
         };
 
@@ -767,6 +768,7 @@ mod test {
 
     use abq_test_utils::artifacts_dir;
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
+    use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol;
     use abq_utils::net_protocol::entity::EntityId;
@@ -788,7 +790,7 @@ mod test {
 
     use super::{
         GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest, NotifyResults,
-        RunCompletedSuccessfully, WorkerContext, WorkerPool,
+        RunExitCode, WorkerContext, WorkerPool,
     };
     use crate::negotiate::QueueNegotiator;
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
@@ -825,7 +827,7 @@ mod test {
         (man, notify_results)
     }
 
-    fn results_collector() -> (ResultsCollector, NotifyResults, RunCompletedSuccessfully) {
+    fn results_collector() -> (ResultsCollector, NotifyResults, RunExitCode) {
         let results: ResultsCollector = Default::default();
         let results2 = Arc::clone(&results);
         let notify_results: NotifyResults = Arc::new(move |_, _, results| {
@@ -839,12 +841,13 @@ mod test {
             Box::pin(async {})
         });
         let results3 = Arc::clone(&results);
-        let get_completed_status: RunCompletedSuccessfully = Arc::new(move |_| {
-            results3
+        let get_completed_status: RunExitCode = Arc::new(move |_| {
+            let any_is_failure = results3
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|(_, results)| !(results.iter().any(|r| r.status.is_fail_like())))
+                .any(|(_, results)| results.iter().any(|r| r.status.is_fail_like()));
+            ExitCode::new(any_is_failure as _)
         });
         (results, notify_results, get_completed_status)
     }
@@ -860,7 +863,7 @@ mod test {
         run_id: RunId,
         get_next_tests_generator: GetNextTestsGenerator,
         notify_results: NotifyResults,
-        run_completed_successfully: RunCompletedSuccessfully,
+        run_exit_code: RunExitCode,
     ) -> (WorkerPoolConfig, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
 
@@ -874,7 +877,7 @@ mod test {
             run_id,
             notify_manifest: Some(notify_manifest),
             notify_results,
-            run_completed_successfully,
+            run_exit_code,
             worker_context: WorkerContext::AssumeLocal,
             supervisor_in_band: false,
             debug_native_runner: false,
@@ -1241,7 +1244,7 @@ mod test {
     fn worker_exits_with_runner_exit() {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, notify_results, _run_completed_successfully) = results_collector();
-        let run_completed_successfully = Arc::new(Box::new(|_| false));
+        let run_exit_code = Arc::new(Box::new(|_| ExitCode::FAILURE));
 
         let manifest = ManifestMessage::new(Manifest::new(
             [echo_test(proto, "test1".to_string())],
@@ -1252,7 +1255,7 @@ mod test {
             RunId::unique(),
             &get_next_tests,
             notify_results,
-            run_completed_successfully,
+            run_exit_code,
         );
 
         config.size = NonZeroUsize::new(1).unwrap();

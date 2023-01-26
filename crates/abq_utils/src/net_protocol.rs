@@ -288,6 +288,8 @@ pub mod queue {
 
     use serde_derive::{Deserialize, Serialize};
 
+    use crate::exit::ExitCode;
+
     use super::{
         entity::EntityId,
         meta::DeprecationRecord,
@@ -406,7 +408,7 @@ pub mod queue {
         /// the result was a success.
         Pending,
         /// The result of the run.
-        Completed { succeeded: bool },
+        Completed { exit_code: ExitCode },
     }
 
     /// Notification of how many active test runs are currently being processed by the queue.

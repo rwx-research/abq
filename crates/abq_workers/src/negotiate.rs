@@ -15,8 +15,8 @@ use tracing::{error, instrument};
 
 use crate::workers::{
     GetInitContext, GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest,
-    NotifyResults, RunCompletedSuccessfully, WorkerContext, WorkerPool, WorkerPoolConfig,
-    WorkersExit, WorkersExitStatus,
+    NotifyResults, RunExitCode, WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
+    WorkersExitStatus,
 };
 use abq_utils::{
     auth::User,
@@ -80,7 +80,7 @@ enum MessageFromQueueNegotiator {
     /// The run a worker set is negotiating for has already completed, and the set should
     /// immediately exit.
     RunAlreadyCompleted {
-        success: bool,
+        exit_code: ExitCode,
     },
     /// The context a worker set should execute a run with.
     ExecutionContext(ExecutionContext),
@@ -123,8 +123,7 @@ pub enum NegotiatedWorkers {
     /// No more workers were created, because there is no more work to be done.
     Redundant {
         entity: EntityId,
-        /// Whether the run was successful when completed.
-        success: bool,
+        exit_code: ExitCode,
     },
     /// A pool of workers were created.
     Pool(WorkerPool),
@@ -133,13 +132,11 @@ pub enum NegotiatedWorkers {
 impl NegotiatedWorkers {
     pub fn shutdown(&mut self) -> WorkersExit {
         match self {
-            NegotiatedWorkers::Redundant { success, .. } => {
-                let status = if *success {
+            &mut NegotiatedWorkers::Redundant { exit_code, .. } => {
+                let status = if exit_code == ExitCode::SUCCESS {
                     WorkersExitStatus::Success
                 } else {
-                    WorkersExitStatus::Failure {
-                        exit_code: ExitCode::FAILURE,
-                    }
+                    WorkersExitStatus::Failure { exit_code }
                 };
                 WorkersExit {
                     status,
@@ -328,7 +325,7 @@ impl WorkersNegotiator {
             None
         };
 
-        let run_completed_successfully: RunCompletedSuccessfully = Arc::new({
+        let run_exit_code: RunExitCode = Arc::new({
             // When our worker finishes and polls the queue for the final status of the run,
             // there still may be active work. So for now, let's poll every second; we can make
             // the strategy here more sophisticated in the future, e.g. with exponential backoffs.
@@ -360,7 +357,7 @@ impl WorkersNegotiator {
                             std::thread::sleep(BACKOFF);
                             continue;
                         }
-                        TotalRunResult::Completed { succeeded } => return succeeded,
+                        TotalRunResult::Completed { exit_code } => return exit_code,
                     }
                 }
             }
@@ -373,7 +370,7 @@ impl WorkersNegotiator {
             get_next_tests_generator,
             get_init_context,
             notify_results,
-            run_completed_successfully,
+            run_exit_code,
             results_batch_size_hint,
             worker_context,
             run_id,
@@ -413,8 +410,8 @@ async fn wait_for_execution_context(
 
         let worker_set_decision = match net_protocol::async_read(&mut conn).await? {
             MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
-            MessageFromQueueNegotiator::RunAlreadyCompleted { success } => {
-                Err(NegotiatedWorkers::Redundant { entity, success })
+            MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code } => {
+                Err(NegotiatedWorkers::Redundant { entity, exit_code })
             }
             MessageFromQueueNegotiator::RunUnknown => {
                 // We are still waiting for this run, sleep on the decay and retry.
@@ -688,7 +685,7 @@ pub struct AssignedRunCompeleted {
 pub enum AssignedRunStatus {
     RunUnknown,
     Run(AssignedRun),
-    AlreadyDone { success: bool },
+    AlreadyDone { exit_code: ExitCode },
 }
 
 /// An error that happens in the construction or execution of the queue negotiation server.
@@ -861,9 +858,9 @@ impl QueueNegotiator {
                             run_id,
                         })
                     }
-                    AlreadyDone { success } => {
+                    AlreadyDone { exit_code } => {
                         tracing::debug!(?wanted_run_id, "run already completed");
-                        MessageFromQueueNegotiator::RunAlreadyCompleted { success }
+                        MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code }
                     }
                     RunUnknown => {
                         tracing::debug!(?wanted_run_id, "run not yet known");
@@ -916,6 +913,7 @@ mod test {
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
         UserToken,
     };
+    use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
@@ -1079,14 +1077,16 @@ mod test {
                     net_protocol::write(&mut client, net_protocol::queue::AckManifest {}).unwrap();
                 }
                 net_protocol::queue::Message::RequestTotalRunResult(_) => {
-                    let succeeded = msgs2
+                    let failed = msgs2
                         .lock()
                         .unwrap()
                         .iter()
-                        .all(|result| !result.status.is_fail_like());
+                        .any(|result| result.status.is_fail_like());
                     net_protocol::write(
                         &mut client,
-                        net_protocol::queue::TotalRunResult::Completed { succeeded },
+                        net_protocol::queue::TotalRunResult::Completed {
+                            exit_code: ExitCode::new(failed as _),
+                        },
                     )
                     .unwrap();
                 }
