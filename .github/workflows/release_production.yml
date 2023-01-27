@@ -39,6 +39,7 @@ jobs:
       - name: Register new release abq api
         run: |
           curl -X "POST" "https://abq.build/api/releases" \
+          --fail-with-body \
           -H 'Authorization: Bearer ${{ secrets.RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN }}' \
           -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
           --data-urlencode "version=${{inputs.version}}" \
