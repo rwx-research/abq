@@ -17,7 +17,8 @@ use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResults, InvokerTestData, NativeRunnerInfo, NegotiatorInfo, Request,
+    AssociatedTestResults, CannotSetOOBExitCodeReason, InvokerTestData, NativeRunnerInfo,
+    NegotiatorInfo, Request,
 };
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
@@ -92,6 +93,7 @@ enum RunState {
         /// The timeout for the last test result.
         last_test_timeout: Duration,
     },
+    WaitingForExitCode,
     Done {
         exit_code: ExitCode,
     },
@@ -185,6 +187,7 @@ enum AssignedRunLookup {
 
 enum RunLive {
     Active,
+    WaitingForExitCode,
     Done { exit_code: ExitCode },
     Cancelled,
 }
@@ -242,7 +245,8 @@ impl AllRuns {
             let err = match &state.lock().state {
                 RunState::WaitingForFirstWorker
                 | RunState::WaitingForManifest
-                | RunState::HasWork { .. } => NewQueueError::RunIdAlreadyInProgress,
+                | RunState::HasWork { .. }
+                | RunState::WaitingForExitCode => NewQueueError::RunIdAlreadyInProgress,
                 RunState::Done { .. } | RunState::Cancelled { .. } => {
                     NewQueueError::RunIdPreviouslyCompleted
                 }
@@ -360,7 +364,10 @@ impl AllRuns {
             RunState::WaitingForManifest => {
                 // expected state, pass through
             }
-            RunState::WaitingForFirstWorker | RunState::HasWork { .. } | RunState::Done { .. } => {
+            RunState::WaitingForFirstWorker
+            | RunState::HasWork { .. }
+            | RunState::Done { .. }
+            | RunState::WaitingForExitCode => {
                 unreachable!(
                     "Invalid state - can only provide manifest while waiting for manifest"
                 );
@@ -411,6 +418,11 @@ impl AllRuns {
                 batch_size_hint: _,
                 last_test_timeout: _,
             } => InitMetadata::Metadata(init_metadata.clone()),
+            RunState::WaitingForExitCode => {
+                // From the perspective of a new connector, this run is already completed, even if
+                // we do not yet know the exit code.
+                InitMetadata::RunAlreadyCompleted
+            }
             RunState::Done { .. } | RunState::Cancelled { .. } => InitMetadata::RunAlreadyCompleted,
         }
     }
@@ -455,7 +467,7 @@ impl AllRuns {
                     NextWorkBundle(bundle), pulled_tests_status
                 )
             }
-            RunState::Done { .. } | RunState::Cancelled {..} => {
+            RunState::WaitingForExitCode | RunState::Done { .. } | RunState::Cancelled {..} => {
                 (
                     NextWorkBundle(vec![NextWork::EndOfWork]), PulledTestsStatus::QueueWasEmpty
                 )
@@ -463,6 +475,34 @@ impl AllRuns {
             RunState::WaitingForFirstWorker |
             RunState::WaitingForManifest => unreachable!("Invalid state - work can only be requested after initialization metadata, at which point the manifest is known.")
         }
+    }
+
+    pub fn mark_waiting_for_exit_code(&self, run_id: &RunId) {
+        let runs = self.runs.read();
+
+        let mut run = runs.get(run_id).expect("no run recorded").lock();
+
+        match &mut run.state {
+            RunState::HasWork { queue, .. } => {
+                assert!(queue.is_empty(), "Invalid state - queue is not complete!");
+            }
+            RunState::Cancelled { .. } => {
+                // Cancellation always takes priority.
+                return;
+            }
+            RunState::WaitingForFirstWorker
+            | RunState::WaitingForManifest
+            | RunState::WaitingForExitCode
+            | RunState::Done { .. } => {
+                unreachable!("Invalid state");
+            }
+        }
+
+        // Drop the run data, since we no longer need it.
+        debug_assert!(run.data.is_some());
+        std::mem::take(&mut run.data);
+
+        run.state = RunState::WaitingForExitCode;
     }
 
     pub fn mark_complete(&self, run_id: &RunId, exit_code: ExitCode) {
@@ -480,6 +520,7 @@ impl AllRuns {
             }
             RunState::WaitingForFirstWorker
             | RunState::WaitingForManifest
+            | RunState::WaitingForExitCode
             | RunState::Done { .. } => {
                 unreachable!("Invalid state");
             }
@@ -495,6 +536,40 @@ impl AllRuns {
         self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
+    pub fn mark_oob_exit_code(
+        &self,
+        run_id: &RunId,
+        exit_code: ExitCode,
+    ) -> Result<(), CannotSetOOBExitCodeReason> {
+        let runs = self.runs.read();
+
+        let mut run = runs.get(run_id).expect("no run recorded").lock();
+
+        match &mut run.state {
+            RunState::WaitingForExitCode => {
+                // pass through, expected state
+            }
+            RunState::WaitingForFirstWorker
+            | RunState::WaitingForManifest
+            | RunState::HasWork { .. } => {
+                return Err(CannotSetOOBExitCodeReason::RunIsActive);
+            }
+            RunState::Done { .. } => {
+                return Err(CannotSetOOBExitCodeReason::ExitCodeAlreadyDetermined);
+            }
+            RunState::Cancelled { .. } => {
+                return Err(CannotSetOOBExitCodeReason::RunWasCancelled);
+            }
+        }
+
+        run.state = RunState::Done { exit_code };
+
+        // NB: Always sub last for conversative estimation.
+        self.num_active.fetch_sub(1, atomic::ORDERING);
+
+        Ok(())
+    }
+
     pub fn mark_failed_to_start(&self, run_id: RunId) {
         let runs = self.runs.read();
 
@@ -508,7 +583,10 @@ impl AllRuns {
                 // No-op, since the run was already cancelled.
                 return;
             }
-            RunState::WaitingForFirstWorker | RunState::HasWork { .. } | RunState::Done { .. } => {
+            RunState::WaitingForFirstWorker
+            | RunState::HasWork { .. }
+            | RunState::WaitingForExitCode
+            | RunState::Done { .. } => {
                 unreachable!("Invalid state - can only fail to start while waiting for manifest");
             }
         }
@@ -539,7 +617,10 @@ impl AllRuns {
                 // No-op, since the run was already cancelled.
                 return;
             }
-            RunState::WaitingForFirstWorker | RunState::HasWork { .. } | RunState::Done { .. } => {
+            RunState::WaitingForFirstWorker
+            | RunState::HasWork { .. }
+            | RunState::WaitingForExitCode
+            | RunState::Done { .. } => {
                 unreachable!("Invalid state - can only mark complete due to manifest while waiting for manifest");
             }
         }
@@ -587,6 +668,7 @@ impl AllRuns {
             RunState::WaitingForFirstWorker
             | RunState::WaitingForManifest
             | RunState::HasWork { .. } => Some(RunLive::Active),
+            RunState::WaitingForExitCode => Some(RunLive::WaitingForExitCode),
             RunState::Done { exit_code } => Some(RunLive::Done { exit_code }),
             RunState::Cancelled { .. } => Some(RunLive::Cancelled),
         }
@@ -594,6 +676,12 @@ impl AllRuns {
 
     fn estimate_num_active_runs(&self) -> u64 {
         self.num_active.load(atomic::ORDERING)
+    }
+
+    #[cfg(test)]
+    fn set_state(&self, run_id: RunId, state: RunState) -> Option<Mutex<Run>> {
+        let mut runs = self.runs.write();
+        runs.insert(run_id, Mutex::new(Run { state, data: None }))
     }
 }
 
@@ -1103,11 +1191,39 @@ type ActiveRunResponders = Arc<
     >,
 >;
 
+#[derive(Copy, Clone)]
+enum RunSuccess {
+    /// So far, has the run been entirely successful?
+    Success(bool),
+    /// The success and exit code of the run will be determined by an external process.
+    // TODO(captain-cli#116): begin creating this
+    #[allow(unused)]
+    DetermineOutOfBand,
+}
+
+impl RunSuccess {
+    fn account(&mut self, partial_result_successful: bool) {
+        match self {
+            RunSuccess::Success(success) => {
+                *success = *success && partial_result_successful;
+            }
+            RunSuccess::DetermineOutOfBand => {}
+        }
+    }
+
+    fn into_opt_exit_code(self) -> Option<ExitCode> {
+        match self {
+            RunSuccess::Success(true) => Some(ExitCode::SUCCESS),
+            RunSuccess::Success(false) => Some(ExitCode::FAILURE),
+            RunSuccess::DetermineOutOfBand => None,
+        }
+    }
+}
+
 struct RunResultState {
     /// Amount of work items left for the run.
     work_left: usize,
-    /// So far, has the run been entirely successful?
-    is_successful: bool,
+    run_success: RunSuccess,
 }
 
 /// Cache of the current state of active runs and their result, so that we don't have to
@@ -1351,6 +1467,13 @@ impl QueueServer {
                     ctx.state_cache,
                     entity,
                     run_id,
+                )
+                .await
+            }
+            Message::SetOutOfBandExitCode(run_id, exit_code) => {
+                // Immediately ACK the cancellation and drop the stream
+                Self::handle_out_of_band_run_exit_code(
+                    ctx.queues, stream, entity, run_id, exit_code,
                 )
                 .await
             }
@@ -1605,6 +1728,44 @@ impl QueueServer {
         Ok(())
     }
 
+    /// A supervisor sets a test run exit code.
+    #[instrument(level = "trace", skip(queues))]
+    async fn handle_out_of_band_run_exit_code(
+        queues: SharedRuns,
+        mut client: Box<dyn net_async::ServerStream>,
+        entity: EntityId,
+        run_id: RunId,
+        exit_code: ExitCode,
+    ) -> Result<(), AnyError> {
+        tracing::info!(
+            ?run_id,
+            ?entity,
+            ?exit_code,
+            "setting OOB exit code for run"
+        );
+
+        use net_protocol::queue::SetOutOfBandExitCodeResponse;
+
+        let opt_err = queues.mark_oob_exit_code(&run_id, exit_code);
+        let response = match opt_err {
+            Ok(()) => SetOutOfBandExitCodeResponse::Success,
+            Err(could_not_set_reason) => {
+                tracing::info!(
+                    ?run_id,
+                    ?entity,
+                    ?exit_code,
+                    ?could_not_set_reason,
+                    "attempted to set exit code at an unexpected time"
+                );
+                SetOutOfBandExitCodeResponse::Failure(could_not_set_reason)
+            }
+        };
+
+        net_protocol::async_write(&mut client, &response).await?;
+
+        Ok(())
+    }
+
     #[instrument(level = "trace", skip(active_runs, new_stream))]
     async fn handle_invoker_reconnection(
         active_runs: ActiveRunResponders,
@@ -1727,7 +1888,7 @@ impl QueueServer {
 
         let run_state = RunResultState {
             work_left: flat_manifest.len(),
-            is_successful: true,
+            run_success: RunSuccess::Success(true),
         };
 
         net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {}).await?;
@@ -1906,7 +2067,7 @@ impl QueueServer {
             invoker_stream.lock().await.send_test_results(results).await;
         }
 
-        let (no_more_work, exit_code) = {
+        let (no_more_work, run_success) = {
             // Update the amount of work we have left; again, steal the map of work for only as
             // long is it takes for us to do that.
             let mut state_cache = state_cache.lock();
@@ -1924,14 +2085,9 @@ impl QueueServer {
             // TODO: hedge against underflow here
             run_state.work_left -= num_results;
 
-            run_state.is_successful = run_state.is_successful && !any_result_is_fail_like;
-            let exit_code = if run_state.is_successful {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            };
+            run_state.run_success.account(!any_result_is_fail_like);
 
-            (run_state.work_left == 0, exit_code)
+            (run_state.work_left == 0, run_state.run_success)
         };
 
         if !no_more_work {
@@ -2025,7 +2181,17 @@ impl QueueServer {
         }
 
         state_cache.lock().remove(&run_id);
-        queues.mark_complete(&run_id, exit_code);
+
+        match run_success.into_opt_exit_code() {
+            Some(exit_code) => {
+                queues.mark_complete(&run_id, exit_code);
+            }
+            None => {
+                // TODO(captain-cli#116): start timeouts for setting exit codes
+                queues.mark_waiting_for_exit_code(&run_id);
+            }
+        }
+
         let opt_worker_results_tasks_err = Self::shutdown_persisted_worker_connection_tasks(
             worker_results_tasks,
             &run_id,
@@ -2095,6 +2261,13 @@ impl QueueServer {
             Some(liveness) => match liveness {
                 RunLive::Active => {
                     // pass through, the run needs to be timed out.
+                }
+                RunLive::WaitingForExitCode => {
+                    // Run is completed from a test-execution perspective. Another timeout will be
+                    // fired if an exit code is failed to be determined in time; as such, disregard
+                    // this timeout.
+                    // TODO(captain-cli#116): start timeouts for setting exit codes
+                    return Ok(());
                 }
                 RunLive::Done { .. } | RunLive::Cancelled => {
                     return Ok(()); // run was already complete, disregard the timeout
@@ -2194,6 +2367,7 @@ impl QueueServer {
 
             match liveness {
                 RunLive::Active => net_protocol::queue::TotalRunResult::Pending,
+                RunLive::WaitingForExitCode => net_protocol::queue::TotalRunResult::Pending,
                 RunLive::Done { exit_code } => {
                     net_protocol::queue::TotalRunResult::Completed { exit_code }
                 }
@@ -2465,7 +2639,7 @@ mod test {
         time::Duration,
     };
 
-    use super::{RunResultState, RunResultStateCache};
+    use super::{RunResultState, RunResultStateCache, RunState, RunSuccess};
     use crate::{
         connections::ConnectedWorkers,
         invoke::{run_cancellation_pair, Client, IncrementalTestData, DEFAULT_CLIENT_POLL_TIMEOUT},
@@ -2716,7 +2890,7 @@ mod test {
             run_id.clone(),
             super::RunResultState {
                 work_left: usize::MAX,
-                is_successful: true,
+                run_success: RunSuccess::Success(true),
             },
         );
 
@@ -3415,7 +3589,7 @@ mod test {
                 run_id.clone(),
                 RunResultState {
                     work_left: 1,
-                    is_successful: true,
+                    run_success: RunSuccess::Success(true),
                 },
             );
             Arc::new(pl::Mutex::new(cache))
@@ -3535,7 +3709,7 @@ mod test {
                 run_id.clone(),
                 RunResultState {
                     work_left: 1,
-                    is_successful: true,
+                    run_success: RunSuccess::Success(true),
                 },
             );
             Arc::new(pl::Mutex::new(cache))
@@ -3667,7 +3841,7 @@ mod test {
                 run_id.clone(),
                 RunResultState {
                     work_left: 1,
-                    is_successful: true,
+                    run_success: RunSuccess::Success(true),
                 },
             );
             Arc::new(pl::Mutex::new(cache))
@@ -3712,6 +3886,88 @@ mod test {
         assert!(!state_cache.lock().contains_key(&run_id));
         assert!(!worker_results_tasks.has_tasks_for(&run_id));
         assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn set_oob_exit_code_outside_of_waiting_time_period_is_error() {
+        use net_protocol::queue::CannotSetOOBExitCodeReason::*;
+
+        let bad_states = [
+            (RunState::WaitingForFirstWorker, RunIsActive),
+            (RunState::WaitingForManifest, RunIsActive),
+            //
+            (
+                RunState::HasWork {
+                    queue: Default::default(),
+                    init_metadata: Default::default(),
+                    batch_size_hint: one_nonzero(),
+                    last_test_timeout: Duration::MAX,
+                },
+                RunIsActive,
+            ),
+            //
+            (
+                RunState::Done {
+                    exit_code: ExitCode::SUCCESS,
+                },
+                ExitCodeAlreadyDetermined,
+            ),
+            //
+            (
+                RunState::Cancelled {
+                    reason: CancelReason::User,
+                },
+                RunWasCancelled,
+            ),
+        ];
+
+        for (state, expected_reason) in bad_states {
+            let server_opts =
+                ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+            let client_opts =
+                ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
+
+            let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
+            let fake_server_addr = fake_server.local_addr().unwrap();
+
+            let client = client_opts.build_async().unwrap();
+
+            // Build up our initial state - run is registered, no manifest yet
+            let run_id = RunId::unique();
+            let queues = {
+                let queues = SharedRuns::default();
+                queues.set_state(run_id.clone(), state);
+                queues
+            };
+
+            // Try to set the exit code.
+            let (client_res, server_res) = futures::join!(
+                client.connect(fake_server_addr),
+                accept_handshake(&*fake_server)
+            );
+            let (mut client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
+            let set_exit_code_fut = QueueServer::handle_out_of_band_run_exit_code(
+                queues.clone(),
+                server_conn,
+                EntityId::new(),
+                run_id,
+                ExitCode::FAILURE,
+            );
+            let response_fut = net_protocol::async_read(&mut client_conn);
+
+            // The request should success, but the response should indicate we failed to set the
+            // exit code.
+            let (set_exit_code_end, client_exit_end) =
+                futures::join!(set_exit_code_fut, response_fut);
+            assert!(set_exit_code_end.is_ok());
+
+            use net_protocol::queue::SetOutOfBandExitCodeResponse;
+            assert!(matches!(
+                client_exit_end.unwrap(),
+                SetOutOfBandExitCodeResponse::Failure(reason) if reason == expected_reason
+            ));
+        }
     }
 
     #[test]
