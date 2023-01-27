@@ -12,8 +12,6 @@ on:
         description: "Released ABQ version"
         value: ${{ jobs.release.outputs.abq_version }}
     secrets:
-      SSH_KEY_ABQ_JEST:
-        required: true
       RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
       AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
@@ -90,12 +88,12 @@ jobs:
           command: clippy
           args: --workspace --tests --release --all-features --target=${{ env.RUST_TARGET }} -- --deny warnings
 
-      # - name: Lint github workflows
-      #   run: |
-      #     echo "::add-matcher::.github/actionlint-matcher.json"
-      #     bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/3a2f2c755b6442ec7999b28dfd107e1bb9853389/scripts/download-actionlint.bash)
-      #     ./actionlint -color
-      #   shell: bash
+      - name: Lint github workflows
+        run: |
+          echo "::add-matcher::.github/actionlint-matcher.json"
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/3a2f2c755b6442ec7999b28dfd107e1bb9853389/scripts/download-actionlint.bash)
+          ./actionlint -color
+        shell: bash
 
       # setup testdata
       - uses: actions/setup-node@v3
