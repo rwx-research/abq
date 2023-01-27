@@ -417,6 +417,28 @@ pub mod queue {
         pub active_runs: u64,
     }
 
+    /// An attempt was made to set an out-of-band exit code for a run, but it failed.
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum CannotSetOOBExitCodeReason {
+        /// The run is still on-going.
+        RunIsActive,
+        /// The exit code of the run was already determined.
+        // TODO(captain-cli#116): there are two cases why this can happen
+        // - the OOB exit code was already set
+        // - the exit code was determined in band
+        // distinguish between the two for better error messages
+        ExitCodeAlreadyDetermined,
+        /// The run was cancelled or terminated before an exit code could be set.
+        RunWasCancelled,
+    }
+
+    /// Whether an out-of-band exit code could be set.
+    #[derive(Debug, Serialize, Deserialize)]
+    pub enum SetOutOfBandExitCodeResponse {
+        Success,
+        Failure(CannotSetOOBExitCodeReason),
+    }
+
     /// A request sent to the queue.
     #[derive(Serialize, Deserialize)]
     pub struct Request {
@@ -467,6 +489,9 @@ pub mod queue {
         InvokeWork(InvokeWork),
         /// An ask to mark an active test run as cancelled.
         CancelRun(RunId),
+        /// An ask to set a test run's exit code.
+        /// Only relevant when a test run is marked as having an exit code determined out-of-band.
+        SetOutOfBandExitCode(RunId, ExitCode),
         /// An invoker of a test run would like to reconnect to the queue for results streaming.
         Reconnect(RunId),
         /// A work manifest for a given run.
