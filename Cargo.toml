@@ -50,7 +50,7 @@ tracing-appender = "0.2.2"
 
 thiserror = "1.0.38"
 anyhow = "1.0.68"
-indoc = "1.0.9"
+indoc = "2.0.0"
 
 clap = { version = "4.1.4", features = ["derive", "env"] }
 atty = "0.2.14"
