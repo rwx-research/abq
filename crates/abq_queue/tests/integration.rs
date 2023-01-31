@@ -23,7 +23,7 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::EntityId,
-        queue::NativeRunnerInfo,
+        queue::{CannotSetOOBExitCodeReason, NativeRunnerInfo, SetOutOfBandExitCodeResponse},
         runners::{
             AbqProtocolVersion, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
             ProtocolWitness, Test, TestOrGroup, TestResult,
@@ -57,6 +57,10 @@ struct Wid(usize);
 /// Supervisor ID
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Sid(usize);
+
+/// External party ID
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ExternId(usize);
 
 /// ID of a spawned action
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -116,6 +120,7 @@ struct SupervisorConfig {
     runner_kind: RunnerKind,
     batch_size: NonZeroU64,
     timeout: Duration,
+    track_exit_code_in_band: bool,
 }
 
 impl SupervisorConfig {
@@ -124,12 +129,20 @@ impl SupervisorConfig {
             runner_kind,
             batch_size: one_nonzero(),
             timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
+            track_exit_code_in_band: true,
         }
     }
 
     fn with_batch_size(self, batch_size: u64) -> Self {
         Self {
             batch_size: batch_size.try_into().unwrap(),
+            ..self
+        }
+    }
+
+    fn with_track_exit_code_in_band(self, track_exit_code_in_band: bool) -> Self {
+        Self {
+            track_exit_code_in_band,
             ..self
         }
     }
@@ -140,11 +153,14 @@ type GetConn<'a> = &'a dyn Fn() -> Box<dyn ClientStream>;
 enum Action {
     RunTest(Run, Sid, SupervisorConfig),
     StartTest(Run, Sid, SupervisorConfig),
+    WaitForLiveSupervisor(Sid),
     CancelTest(Sid),
 
     // TODO: consolidate start/stop workers by making worker pools async by default
     StartWorkers(Run, Wid, WorkersConfig),
     StopWorkers(Wid),
+
+    SendOOBExitCode(ExternId, Run, ExitCode),
 
     /// Make a connection to the work server, the callback will test a request.
     WSRunRequest(Run, Box<dyn Fn(GetConn, RunId) + Send + Sync>),
@@ -160,6 +176,8 @@ enum Assert<'a> {
     TestExit(Sid, &'a dyn Fn(&Result<CompletedSummary, TestResultError>)),
     TestExitWithoutErr(Sid),
     TestResults(Sid, &'a dyn Fn(&[TestResult]) -> bool),
+
+    SetOOBExitCode(ExternId, &'a dyn Fn(&SetOutOfBandExitCodeResponse)),
 
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, &'a dyn Fn(&WorkersExitStatus)),
@@ -211,6 +229,8 @@ type Workers = Arc<Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
 type WorkerExits = Arc<Mutex<HashMap<Wid, WorkersExit>>>;
 
+type SetOOBExitCodes = Arc<Mutex<HashMap<ExternId, SetOutOfBandExitCodeResponse>>>;
+
 type BgTasks = HashMap<SpawnId, tokio::task::JoinHandle<()>>;
 
 struct Handler {
@@ -238,6 +258,8 @@ fn action_to_fut(
     workers: Workers,
     workers_redundant: WorkersRedundant,
     worker_exits: WorkerExits,
+
+    set_oob_exit_codes: SetOOBExitCodes,
 
     background_tasks: &mut BgTasks,
 
@@ -269,6 +291,7 @@ fn action_to_fut(
                 runner_kind,
                 batch_size,
                 timeout,
+                track_exit_code_in_band,
             } = config;
             async move {
                 let client = Client::invoke_work(
@@ -280,6 +303,7 @@ fn action_to_fut(
                     batch_size,
                     timeout,
                     cancellation_rx,
+                    track_exit_code_in_band,
                 )
                 .await;
 
@@ -307,6 +331,36 @@ fn action_to_fut(
             }
             .boxed()
         }
+
+        SendOOBExitCode(extern_id, n, exit_code) => {
+            let run_id = get_run_id!(n);
+
+            let queue_addr = queue.server_addr();
+            async move {
+                let mut conn = client.connect(queue_addr).unwrap();
+                let request = net_protocol::queue::Request {
+                    entity: EntityId::new(),
+                    message: net_protocol::queue::Message::SetOutOfBandExitCode(run_id, exit_code),
+                };
+                // TODO: use async clients here
+                net_protocol::write(&mut conn, &request).unwrap();
+                let resp: net_protocol::queue::SetOutOfBandExitCodeResponse =
+                    net_protocol::read(&mut conn).unwrap();
+
+                set_oob_exit_codes.lock().insert(extern_id, resp);
+            }
+            .boxed()
+        }
+
+        WaitForLiveSupervisor(super_id) => async move {
+            loop {
+                let data = supervisor_data.lock().await;
+                if data.contains_key(&super_id) {
+                    return;
+                }
+            }
+        }
+        .boxed(),
 
         CancelTest(super_id) => async move {
             loop {
@@ -373,6 +427,7 @@ fn action_to_fut(
                 workers,
                 workers_redundant,
                 worker_exits,
+                set_oob_exit_codes,
                 background_tasks,
                 *action,
             );
@@ -410,6 +465,8 @@ fn run_test(servers: Servers, steps: Steps) {
         let workers_redundant = WorkersRedundant::default();
         let worker_exits = WorkerExits::default();
 
+        let set_oob_exit_codes = SetOOBExitCodes::default();
+
         let mut background_tasks = BgTasks::default();
 
         for (action_set, asserts) in steps {
@@ -426,6 +483,7 @@ fn run_test(servers: Servers, steps: Steps) {
                     workers.clone(),
                     workers_redundant.clone(),
                     worker_exits.clone(),
+                    set_oob_exit_codes.clone(),
                     &mut background_tasks,
                     action,
                 );
@@ -442,7 +500,7 @@ fn run_test(servers: Servers, steps: Steps) {
                         let results = supervisor_results.lock().await;
                         if let Some(exit) = results.get(&n) {
                             check(exit);
-                            return;
+                            break;
                         }
                     },
 
@@ -463,6 +521,14 @@ fn run_test(servers: Servers, steps: Steps) {
                         let (_, results) = supervisor_data.get(&n).expect("supervisor not found");
                         let results = results.lock();
                         assert!(check(&results));
+                    }
+
+                    SetOOBExitCode(extern_id, check) => {
+                        let responses = set_oob_exit_codes.lock();
+                        let resp = responses
+                            .get(&extern_id)
+                            .expect("OOB exit code response for extern not found");
+                        check(resp);
                     }
 
                     WorkersAreRedundant(n) => {
@@ -1079,10 +1145,16 @@ fn test_cancellation_drops_remaining_work() {
                 assert!(matches!(result, Err(TestResultError::Cancelled)))
             })],
         )
+        .act([StartWorkers(Run(1), Wid(1), default_workers_config())])
         .step(
             [StopWorkers(Wid(1))],
             [WorkerExitStatus(Wid(1), &|e| {
-                assert_eq!(e, &WorkersExitStatus::Success)
+                assert_eq!(
+                    e,
+                    &WorkersExitStatus::Failure {
+                        exit_code: ExitCode::CANCELLED
+                    }
+                )
             })],
         )
         .test();
@@ -1261,6 +1333,237 @@ fn multiple_tests_per_work_id_reported() {
             [StopWorkers(Wid(1))],
             [WorkerExitStatus(Wid(1), &|e| {
                 assert!(matches!(e, WorkersExitStatus::Success))
+            })],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn set_exit_code_out_of_band() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    let supervisor_config = SupervisorConfig::new(runner).with_track_exit_code_in_band(false);
+
+    TestBuilder::default()
+        .step(
+            [
+                RunTest(Run(1), Sid(1), supervisor_config),
+                StartWorkers(Run(1), Wid(1), default_workers_config()),
+            ],
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results(&mut results);
+                    results == ["echo1"]
+                }),
+            ],
+        )
+        // Send the OOB exit code.
+        .step(
+            [SendOOBExitCode(ExternId(1), Run(1), ExitCode::new(72))],
+            [SetOOBExitCode(ExternId(1), &|resp| {
+                assert!(matches!(resp, SetOutOfBandExitCodeResponse::Success));
+            })],
+        )
+        // Workers should exit with the OOB exit code.
+        .step(
+            [StopWorkers(Wid(1))],
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(
+                    e,
+                    &WorkersExitStatus::Failure {
+                        exit_code: ExitCode::new(72)
+                    }
+                )
+            })],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn trying_to_set_oob_exit_code_during_run_is_error() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+    let runner = RunnerKind::TestLikeRunner(
+        TestLikeRunner::NeverReturnOnTest("echo1".to_owned()),
+        Box::new(manifest),
+    );
+
+    TestBuilder::default()
+        .act([Spawn(
+            SpawnId(1),
+            Box::new(RunTest(Run(1), Sid(1), SupervisorConfig::new(runner))),
+        )])
+        .act([WaitForLiveSupervisor(Sid(1))])
+        .step(
+            [SendOOBExitCode(ExternId(1), Run(1), ExitCode::new(72))],
+            [SetOOBExitCode(ExternId(1), &|resp| {
+                assert!(matches!(
+                    resp,
+                    SetOutOfBandExitCodeResponse::Failure(CannotSetOOBExitCodeReason::RunIsActive)
+                ));
+            })],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn trying_to_set_oob_exit_code_for_cancelled_run_is_error() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+    let runner = RunnerKind::TestLikeRunner(
+        TestLikeRunner::NeverReturnOnTest("echo1".to_owned()),
+        Box::new(manifest),
+    );
+
+    TestBuilder::default()
+        .act([Spawn(
+            SpawnId(1),
+            Box::new(RunTest(Run(1), Sid(1), SupervisorConfig::new(runner))),
+        )])
+        .step(
+            [CancelTest(Sid(1))],
+            [TestExit(Sid(1), &|result| {
+                assert!(matches!(result, Err(TestResultError::Cancelled)))
+            })],
+        )
+        .step(
+            [SendOOBExitCode(ExternId(1), Run(1), ExitCode::new(72))],
+            [SetOOBExitCode(ExternId(1), &|resp| {
+                assert!(matches!(
+                    resp,
+                    SetOutOfBandExitCodeResponse::Failure(
+                        CannotSetOOBExitCodeReason::RunWasCancelled
+                    )
+                ));
+            })],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn trying_to_set_oob_exit_code_for_completed_run_is_error() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    let supervisor_config = SupervisorConfig::new(runner);
+
+    TestBuilder::default()
+        .step(
+            [
+                RunTest(Run(1), Sid(1), supervisor_config),
+                StartWorkers(Run(1), Wid(1), default_workers_config()),
+            ],
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results(&mut results);
+                    results == ["echo1"]
+                }),
+            ],
+        )
+        // Workers should exit successfully thanks to the completed run.
+        .step(
+            [StopWorkers(Wid(1))],
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(e, &WorkersExitStatus::Success)
+            })],
+        )
+        // Send the OOB exit code.
+        .step(
+            [SendOOBExitCode(ExternId(1), Run(1), ExitCode::new(72))],
+            [SetOOBExitCode(ExternId(1), &|resp| {
+                assert!(matches!(
+                    resp,
+                    SetOutOfBandExitCodeResponse::Failure(
+                        CannotSetOOBExitCodeReason::ExitCodeAlreadyDetermined
+                    )
+                ));
+            })],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn trying_to_set_oob_exit_code_twice_is_error() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    let supervisor_config = SupervisorConfig::new(runner).with_track_exit_code_in_band(false);
+
+    TestBuilder::default()
+        .step(
+            [
+                RunTest(Run(1), Sid(1), supervisor_config),
+                StartWorkers(Run(1), Wid(1), default_workers_config()),
+            ],
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results(&mut results);
+                    results == ["echo1"]
+                }),
+            ],
+        )
+        // Send the OOB exit code.
+        .step(
+            [SendOOBExitCode(ExternId(1), Run(1), ExitCode::new(72))],
+            [SetOOBExitCode(ExternId(1), &|resp| {
+                assert!(matches!(resp, SetOutOfBandExitCodeResponse::Success));
+            })],
+        )
+        // Send the OOB exit code again.
+        .step(
+            [SendOOBExitCode(ExternId(1), Run(1), ExitCode::new(91))],
+            [SetOOBExitCode(ExternId(1), &|resp| {
+                assert!(matches!(
+                    resp,
+                    SetOutOfBandExitCodeResponse::Failure(
+                        CannotSetOOBExitCodeReason::ExitCodeAlreadyDetermined
+                    )
+                ));
+            })],
+        )
+        // Workers should exit with the original OOB exit code.
+        .step(
+            [StopWorkers(Wid(1))],
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert_eq!(
+                    e,
+                    &WorkersExitStatus::Failure {
+                        exit_code: ExitCode::new(72)
+                    }
+                )
             })],
         )
         .test();

@@ -147,6 +147,7 @@ impl Client {
         batch_size_hint: NonZeroU64,
         test_results_timeout: Duration,
         cancellation_rx: RunCancellationRx,
+        track_exit_code_in_band: bool,
     ) -> Result<Self, InvocationError> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
@@ -160,6 +161,7 @@ impl Client {
                 runner,
                 batch_size_hint,
                 test_results_timeout,
+                track_exit_code_in_band,
             }),
         };
 
