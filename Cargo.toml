@@ -84,7 +84,7 @@ features = [
 ]
 
 # documentation: https://doc.rust-lang.org/stable/cargo/reference/profiles.html
-# a guide to makign rust binaries smaller: https://github.com/johnthagen/min-sized-rust
+# a guide to making rust binaries smaller: https://github.com/johnthagen/min-sized-rust
 # some minimal experimentation with these flags: https://docs.google.com/spreadsheets/d/1ley23pp_uvSQiy_jbTUc2K1cvoc2dCO_9MptyAue-DA/edit#gid=0
 [profile.release]
 lto = "fat"       # this should create faster & smaller builds at the cost of compile time

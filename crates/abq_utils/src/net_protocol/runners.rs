@@ -923,7 +923,7 @@ pub struct TestRunnerExit {
 }
 
 #[cfg(test)]
-mod dispay {
+mod display {
     use super::{Location, OutOfBandError};
 
     macro_rules! display_test {

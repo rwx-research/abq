@@ -456,7 +456,7 @@ impl AllRuns {
                 batch_size_hint,
                 last_test_timeout,
             } => {
-                // NB: in the future, the batch size is likely to be determined intellegently, i.e.
+                // NB: in the future, the batch size is likely to be determined intelligently, i.e.
                 // from off-line timing data. But for now, we use the hint the client provided.
                 let batch_size = *batch_size_hint;
 
@@ -1261,7 +1261,7 @@ pub enum QueueServerError {
     #[error("{0}")]
     Io(#[from] io::Error),
 
-    /// Any other opaque error that occured.
+    /// Any other opaque error that occurred.
     #[error("{0}")]
     Other(#[from] AnyError),
 }
@@ -1325,7 +1325,7 @@ struct QueueServerCtx {
     worker_next_tests_tasks: ConnectedWorkers,
 
     /// Holds state on whether the queue is retired, and records retirement if the queue is asked
-    /// to retire by a priveleged process.
+    /// to retire by a privileged process.
     retirement: RetirementCell,
 }
 
@@ -2458,7 +2458,7 @@ pub enum WorkSchedulerError {
     #[error("{0}")]
     Io(#[from] io::Error),
 
-    /// Any other opaque error that occured.
+    /// Any other opaque error that occurred.
     #[error("{0}")]
     Other(#[from] AnyError),
 }
@@ -2805,7 +2805,7 @@ mod test {
         let client_opts =
             ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
 
-        // Set up an initial connection for streaming test results targetting the given run ID
+        // Set up an initial connection for streaming test results targeting the given run ID
         let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
         let fake_server_addr = fake_server.local_addr().unwrap();
 

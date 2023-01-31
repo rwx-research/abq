@@ -1310,7 +1310,7 @@ fn multiple_tests_per_work_id_reported() {
     ));
 
     let runner = RunnerKind::TestLikeRunner(
-        TestLikeRunner::EchoMany { seperator: ',' },
+        TestLikeRunner::EchoMany { separator: ',' },
         Box::new(manifest),
     );
 

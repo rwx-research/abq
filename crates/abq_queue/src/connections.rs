@@ -81,7 +81,7 @@ impl ConnectedWorkers {
     ///
     /// Resolves only once all worker connections are stopped, or the timeout for
     /// stopping is reached. If the timeout for stopping is reached, the tasks are
-    /// forcably aborted.
+    /// forcibly aborted.
     pub async fn stop(&self, run_id: &RunId) -> StopResult {
         // NB: take exclusive access over the map only for as long as removal, not shutdown, takes.
         let removed_set = { self.map.lock().remove(run_id) };

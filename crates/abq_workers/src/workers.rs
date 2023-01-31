@@ -697,9 +697,9 @@ fn attempt_test_id_for_test_like_runner(
                 let result = test_like_runner::echo(s);
                 vec![result]
             }
-            (R::EchoMany { seperator }, s) => {
+            (R::EchoMany { separator }, s) => {
                 let split_results = s
-                    .split(seperator)
+                    .split(separator)
                     .map(|s| test_like_runner::echo(s.to_string()));
                 split_results.collect()
             }

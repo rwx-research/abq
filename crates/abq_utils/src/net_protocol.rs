@@ -168,7 +168,7 @@ pub mod workers {
         /// A worker that echos strings given to it.
         Echo,
         /// A worker that echos strings given to it as many test results, given by the separator.
-        EchoMany { seperator: char },
+        EchoMany { separator: char },
         /// A worker that echos initialization context.
         EchoInitContext,
         /// A worker that executes commands given to it.
@@ -206,7 +206,7 @@ pub mod workers {
         TestLikeRunner(TestLikeRunner, Box<ManifestMessage>),
     }
 
-    /// Each native test runner spawned by a worker has the enviornment variable
+    /// Each native test runner spawned by a worker has the environment variable
     /// `ABQ_RUNNER` set to a integer, counting from 1, that is unique to the runners launched by
     /// the worker.
     const ABQ_RUNNER: &str = "ABQ_RUNNER";
@@ -389,7 +389,7 @@ pub mod queue {
             captured: CapturedOutput,
         },
         /// Information about the native test runner being used for the current test suite.
-        /// This message is sent exaclty once per test run, and usually received at the start of a
+        /// This message is sent exactly once per test run, and usually received at the start of a
         /// test run.
         /// Receipt of this message by the supervisor intentionally does not block
         /// - the start of workers for a test run, or
