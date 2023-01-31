@@ -317,6 +317,9 @@ pub mod queue {
         pub runner: RunnerKind,
         pub batch_size_hint: NonZeroU64,
         pub test_results_timeout: Duration,
+        /// If true, the exit code for the test run will be determined in-band by the queue.
+        /// If false, the exit code will be awaited from an external source.
+        pub track_exit_code_in_band: bool,
     }
 
     /// Why an invocation of some work did not succeed.

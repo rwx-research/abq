@@ -737,6 +737,9 @@ fn run_sentinel_abq_test(
 
     let runner = RunnerKind::GenericNativeTestRunner(runner_params.clone());
 
+    // TODO(captain-cli#116): determine this dynamically
+    let track_exit_code_in_band = true;
+
     let work_results_thread = start_test_result_reporter(
         entity,
         abq.server_addr(),
@@ -746,6 +749,7 @@ fn run_sentinel_abq_test(
         batch_size,
         results_timeout,
         result_handler,
+        track_exit_code_in_band,
     )?;
 
     writeln!(
@@ -922,6 +926,7 @@ fn start_test_result_reporter(
     batch_size: NonZeroU64,
     results_timeout: Duration,
     result_handler: impl ResultHandler + Send + 'static,
+    track_exit_code_in_band: bool,
 ) -> io::Result<JoinHandle<Result<CompletedSummary, InvocationError>>> {
     let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
 
@@ -948,6 +953,7 @@ fn start_test_result_reporter(
                 batch_size,
                 results_timeout,
                 run_cancellation_rx,
+                track_exit_code_in_band,
             )
             .await?;
 

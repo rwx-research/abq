@@ -109,10 +109,13 @@ struct RunData {
     batch_size_hint: NonZeroU64,
     /// The timeout for the last test result.
     last_test_timeout: Duration,
+    /// If true, the queue determines the exit code of a run in-band.
+    /// If false, the exit code will be awaited from an external party after run completion.
+    track_exit_code_in_band: bool,
 }
 
 // Just the stack size of the RunData, the closure of RunData may be much larger.
-static_assertions::assert_eq_size!(RunData, (usize, u64, Duration));
+static_assertions::assert_eq_size!(RunData, (usize, u64, Duration, bool));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
@@ -224,7 +227,10 @@ impl PulledTestsStatus {
 #[derive(Debug, PartialEq, Eq)]
 #[must_use]
 enum AddedManifest {
-    Added,
+    Added {
+        /// How the success of the run this manifest was added for should be tracked.
+        starting_run_success_state: RunSuccess,
+    },
     RunCancelled,
 }
 
@@ -237,6 +243,7 @@ impl AllRuns {
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
         last_test_timeout: Duration,
+        track_exit_code_in_band: bool,
     ) -> Result<(), NewQueueError> {
         // Take an exclusive lock over the run state for the entirety of the update.
         let mut runs = self.runs.write();
@@ -265,6 +272,7 @@ impl AllRuns {
                 runner: Box::new(runner),
                 batch_size_hint,
                 last_test_timeout,
+                track_exit_code_in_band,
             }),
         };
         let old_run = runs.insert(run_id, Mutex::new(run));
@@ -287,7 +295,7 @@ impl AllRuns {
             Some(RunData {
                 runner,
                 batch_size_hint,
-                last_test_timeout: _,
+                ..
             }) => ((**runner).clone(), *batch_size_hint),
             None => {
                 // If there is an active run, then the run data exists iff the run state exists;
@@ -393,6 +401,12 @@ impl AllRuns {
             .as_ref()
             .expect("illegal state - run data must exist at this step");
 
+        let starting_run_success_state = if run_data.track_exit_code_in_band {
+            RunSuccess::Success(true)
+        } else {
+            RunSuccess::DetermineOutOfBand
+        };
+
         run.state = RunState::HasWork {
             queue,
             batch_size_hint: run_data.batch_size_hint,
@@ -400,7 +414,9 @@ impl AllRuns {
             last_test_timeout: run_data.last_test_timeout,
         };
 
-        AddedManifest::Added
+        AddedManifest::Added {
+            starting_run_success_state,
+        }
     }
 
     pub fn init_metadata(&self, run_id: RunId) -> InitMetadata {
@@ -1191,13 +1207,11 @@ type ActiveRunResponders = Arc<
     >,
 >;
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum RunSuccess {
     /// So far, has the run been entirely successful?
     Success(bool),
     /// The success and exit code of the run will be determined by an external process.
-    // TODO(captain-cli#116): begin creating this
-    #[allow(unused)]
     DetermineOutOfBand,
 }
 
@@ -1601,6 +1615,7 @@ impl QueueServer {
             runner,
             batch_size_hint,
             test_results_timeout,
+            track_exit_code_in_band,
         } = invoke_work;
 
         tracing::debug!(?run_id, ?batch_size_hint, "new invoked work");
@@ -1622,6 +1637,7 @@ impl QueueServer {
             runner,
             batch_size_hint,
             test_results_timeout,
+            track_exit_code_in_band,
         );
 
         match could_create_queue {
@@ -1886,11 +1902,6 @@ impl QueueServer {
     ) -> Result<(), AnyError> {
         tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
 
-        let run_state = RunResultState {
-            work_left: flat_manifest.len(),
-            run_success: RunSuccess::Success(true),
-        };
-
         net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {}).await?;
 
         // IFTTT: handle_run_cancellation
@@ -1898,14 +1909,23 @@ impl QueueServer {
         // Take a read lock on the active_runs so that no one (including cancellation) can steal it
         // away before the manifest is registered.
         let active_runs = active_runs.read().await;
+
+        let total_work = flat_manifest.len();
         let added_manifest = queues.add_manifest(&run_id, flat_manifest, init_metadata);
 
         // Since the supervisor doesn't need to know about the native runner that'll be running the
         // current test suite as soon as the test run starts, only let it know about the runner
         // after we've unblocked the workers.
         match added_manifest {
-            AddedManifest::Added => {
+            AddedManifest::Added {
+                starting_run_success_state,
+            } => {
+                let run_state = RunResultState {
+                    work_left: total_work,
+                    run_success: starting_run_success_state,
+                };
                 state_cache.lock().insert(run_id.clone(), run_state);
+
                 let mut responder = active_runs
                     .get(&run_id)
                     .expect("illegal state - run is active, but supervisor responder is missing")
@@ -2701,6 +2721,7 @@ mod test {
             runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
             batch_size_hint: one_nonzero(),
             test_results_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
+            track_exit_code_in_band: true,
         }
     }
 
@@ -3344,6 +3365,7 @@ mod test {
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
+                true,
             )
             .unwrap();
 
@@ -3363,6 +3385,7 @@ mod test {
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
+                true,
             )
             .unwrap();
 
@@ -3384,12 +3407,13 @@ mod test {
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
+                true,
             )
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
         let added = queues.add_manifest(&run_id, vec![], Default::default());
-        assert_eq!(added, AddedManifest::Added);
+        assert!(matches!(added, AddedManifest::Added { .. }));
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
     }
@@ -3407,12 +3431,13 @@ mod test {
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
+                true,
             )
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
         let added = queues.add_manifest(&run_id, vec![], Default::default());
-        assert_eq!(added, AddedManifest::Added);
+        assert!(matches!(added, AddedManifest::Added { .. }));
         queues.mark_complete(&run_id, ExitCode::SUCCESS);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
@@ -3436,6 +3461,7 @@ mod test {
                     RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     DEFAULT_CLIENT_POLL_TIMEOUT,
+                    true,
                 )
                 .unwrap();
 
@@ -3444,7 +3470,7 @@ mod test {
 
         for run_id in [&run_id1, &run_id2, &run_id4] {
             let added = queues.add_manifest(run_id, vec![], Default::default());
-            assert_eq!(added, AddedManifest::Added);
+            assert!(matches!(added, AddedManifest::Added { .. }));
         }
 
         for run_id in [run_id1, run_id2] {
@@ -3466,6 +3492,7 @@ mod test {
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
+                true,
             )
             .unwrap();
 
@@ -3493,6 +3520,7 @@ mod test {
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
+                true,
             )
             .unwrap();
 
@@ -3522,12 +3550,13 @@ mod test {
                 RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
+                true,
             )
             .unwrap();
 
         queues.get_run_for_worker(&run_id);
         let added = queues.add_manifest(&run_id, vec![], Default::default());
-        assert_eq!(added, AddedManifest::Added);
+        assert!(matches!(added, AddedManifest::Added { .. }));
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
@@ -3570,6 +3599,7 @@ mod test {
                     RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     DEFAULT_CLIENT_POLL_TIMEOUT,
+                    true,
                 )
                 .unwrap();
             queues.get_run_for_worker(&run_id);
@@ -3690,6 +3720,7 @@ mod test {
                     RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     DEFAULT_CLIENT_POLL_TIMEOUT,
+                    true,
                 )
                 .unwrap();
             queues.get_run_for_worker(&run_id);
@@ -3820,11 +3851,12 @@ mod test {
                     RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     DEFAULT_CLIENT_POLL_TIMEOUT,
+                    true,
                 )
                 .unwrap();
             queues.get_run_for_worker(&run_id);
             let added = queues.add_manifest(&run_id, vec![], Default::default());
-            assert_eq!(added, AddedManifest::Added);
+            assert!(matches!(added, AddedManifest::Added { .. }));
             queues
         };
         let active_runs: ActiveRunResponders = {
