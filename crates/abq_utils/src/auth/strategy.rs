@@ -105,11 +105,11 @@ impl<T> ClientAuthStrategy<T> {
 
 impl From<Option<UserToken>> for ClientAuthStrategy<User> {
     fn from(opt_token: Option<UserToken>) -> Self {
-        let strat = match opt_token {
+        let strategy = match opt_token {
             Some(token) => ClientAuthStrategyInner::Token(token.0),
             None => ClientAuthStrategyInner::NoAuth,
         };
-        Self(strat, Default::default())
+        Self(strategy, Default::default())
     }
 }
 
@@ -150,7 +150,7 @@ struct TokenSet {
     /// Token for a client.
     user_token: UserToken,
 
-    /// Token for an admininstrator.
+    /// Token for an administrator.
     admin_token: AdminToken,
 }
 
@@ -163,8 +163,8 @@ enum ServerAuthStrategyInner {
 }
 
 impl From<ServerAuthStrategyInner> for ServerAuthStrategy {
-    fn from(strat: ServerAuthStrategyInner) -> Self {
-        Self(strat)
+    fn from(strategy: ServerAuthStrategyInner) -> Self {
+        Self(strategy)
     }
 }
 

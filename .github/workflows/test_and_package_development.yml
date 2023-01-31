@@ -51,6 +51,9 @@ jobs:
       - name: re-fetch overwritten tag
         run: git fetch --tags --force
 
+      - name: check for typos
+        uses: crate-ci/typos@master
+
       - name: Install musl libc tools
         run: |
           sudo apt-get install -y musl-tools

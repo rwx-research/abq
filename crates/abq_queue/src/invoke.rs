@@ -388,8 +388,9 @@ impl Client {
             }
         }
 
-        let native_runner_info = native_runner_info
-            .expect("illegal run state - run completed succesfully but runner info never received");
+        let native_runner_info = native_runner_info.expect(
+            "illegal run state - run completed successfully but runner info never received",
+        );
 
         Ok(CompletedSummary { native_runner_info })
     }

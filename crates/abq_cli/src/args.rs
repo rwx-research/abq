@@ -265,7 +265,7 @@ pub enum Command {
 
         /// Address of the queue where the test command will be sent.
         ///
-        /// Requires that abq workers be started as seperate processes connected to the queue.
+        /// Requires that abq workers be started as separate processes connected to the queue.
         ///
         /// Cannot be used with access_token (will fetch address from ABQ API) or num_workers (implies: run locally).
         #[clap(long, required = false)]

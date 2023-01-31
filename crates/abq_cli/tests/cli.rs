@@ -235,7 +235,7 @@ impl CSConfigOptions {
 
 // By default rustc doesn't infer a monomorphic type for our `run` functions in
 // `test_all_network_config_options`, so this forces that.
-fn _force_clos_type_inference<'a, F: Fn(&'a str, CSConfigOptions)>(f: F) -> F {
+fn _force_closure_type_inference<'a, F: Fn(&'a str, CSConfigOptions)>(f: F) -> F {
     f
 }
 
@@ -253,7 +253,7 @@ macro_rules! test_all_network_config_options {
         #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _no_auth_no_tls>]() {
             let _test_name: &'static str = stringify!($test_name);
-            let run = _force_clos_type_inference($run);
+            let run = _force_closure_type_inference($run);
             run(&format!("{}_no_auth_no_tls", _test_name), CSConfigOptions {
                 use_auth_token: false,
                 tls: false,
@@ -266,7 +266,7 @@ macro_rules! test_all_network_config_options {
         #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _no_auth_with_tls>]() {
             let _test_name: &'static str = stringify!($test_name);
-            let run = _force_clos_type_inference($run);
+            let run = _force_closure_type_inference($run);
             run(&format!("{}_no_auth_with_tls", _test_name), CSConfigOptions {
                 use_auth_token: false,
                 tls: true,
@@ -279,7 +279,7 @@ macro_rules! test_all_network_config_options {
         #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _with_auth_no_tls>]() {
             let _test_name: &'static str = stringify!($test_name);
-            let run = _force_clos_type_inference($run);
+            let run = _force_closure_type_inference($run);
             run(&format!("{}_with_auth_no_tls", _test_name), CSConfigOptions {
                 use_auth_token: true,
                 tls: false,
@@ -292,7 +292,7 @@ macro_rules! test_all_network_config_options {
         #[allow(clippy::redundant_closure_call)]
         fn [<$test_name _with_auth_with_tls>]() {
             let _test_name: &'static str = stringify!($test_name);
-            let run = _force_clos_type_inference($run);
+            let run = _force_closure_type_inference($run);
             run(&format!("{}_with_auth_with_tls", _test_name), CSConfigOptions {
                 use_auth_token: true,
                 tls: true,

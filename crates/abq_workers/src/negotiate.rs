@@ -222,7 +222,7 @@ impl WorkersNegotiator {
         };
 
         tracing::debug!(
-            "Recieved execution message. New work addr: {:?}, results addr: {:?}",
+            "Received execution message. New work addr: {:?}, results addr: {:?}",
             work_server_addr,
             queue_results_addr
         );
@@ -698,7 +698,7 @@ pub enum QueueNegotiatorServerError {
     #[error("{0}")]
     Io(#[from] io::Error),
 
-    /// Any other opaque error that occured.
+    /// Any other opaque error that occurred.
     #[error("{0}")]
     Other(#[from] Box<dyn Error + Send + Sync>),
 }
