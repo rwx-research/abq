@@ -25,6 +25,8 @@ dependencies = [
  "nix",
  "num_cpus",
  "paste",
+ "serde",
+ "serde_derive",
  "serde_json",
  "serial_test",
  "signal-hook",
