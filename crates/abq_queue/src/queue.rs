@@ -175,6 +175,9 @@ enum AssignedRunLookup {
     Some(AssignedRun),
     /// There is no associated run yet known.
     NotFound,
+    /// An associated run has completed, but its exit code is not yet known; a worker should poll for
+    /// it.
+    CompleteButExitCodeNotKnown,
     /// An associated run is known, but it has already completed; a worker should exit immediately.
     AlreadyDone {
         exit_code: ExitCode,
@@ -305,6 +308,9 @@ impl AllRuns {
                         return AssignedRunLookup::AlreadyDone {
                             exit_code: ExitCode::CANCELLED,
                         }
+                    }
+                    RunState::WaitingForExitCode => {
+                        return AssignedRunLookup::CompleteButExitCodeNotKnown
                     }
                     st => {
                         tracing::error!(
@@ -911,6 +917,9 @@ fn start_queue(config: QueueConfig) -> Abq {
             match opt_assigned {
                 AssignedRunLookup::Some(assigned) => AssignedRunStatus::Run(assigned),
                 AssignedRunLookup::NotFound => AssignedRunStatus::RunUnknown,
+                AssignedRunLookup::CompleteButExitCodeNotKnown => {
+                    AssignedRunStatus::CompleteButExitCodeNotKnown
+                }
                 AssignedRunLookup::AlreadyDone { exit_code } => {
                     AssignedRunStatus::AlreadyDone { exit_code }
                 }

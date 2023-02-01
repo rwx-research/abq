@@ -1,6 +1,7 @@
 mod args;
 mod health;
 mod instance;
+mod oob;
 mod reporting;
 mod statefile;
 mod workers;
@@ -494,6 +495,51 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 )
             }
         }
+        Command::SetExitCode {
+            run_id,
+            exit_code,
+            access_token,
+            queue_addr,
+            tls_cert,
+            token,
+        } => {
+            let deprecations = DeprecationRecord::default();
+
+            let tls_cert = read_opt_path_bytes(tls_cert)?;
+            let ResolvedConfig {
+                token,
+                queue_addr,
+                tls_cert,
+            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
+
+            let queue_addr = queue_addr.unwrap_or_else(|| {
+                let mut cmd = Cli::command();
+                let cmd = cmd.find_subcommand_mut("set-exit-code").unwrap();
+                let error = cmd.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--access-token <ACCESS_TOKEN> must be provided.",
+                );
+                clap::Error::exit(&error);
+            });
+
+            let client_tls = match tls_cert {
+                Some(cert) => ClientTlsStrategy::from_cert(&cert)?,
+                None => ClientTlsStrategy::no_tls(),
+            };
+
+            let abq = AbqInstance::from_remote(
+                entity,
+                run_id.clone(),
+                queue_addr,
+                ClientAuthStrategy::from(token),
+                client_tls,
+                deprecations,
+            )?;
+
+            oob::set_exit_code(entity, abq, run_id, ExitCode::new(exit_code))?;
+
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Health {
             queue,
             work_scheduler,
@@ -741,8 +787,7 @@ fn run_sentinel_abq_test(
 
     let runner = RunnerKind::GenericNativeTestRunner(runner_params.clone());
 
-    // TODO(captain-cli#116): determine this dynamically
-    let track_exit_code_in_band = true;
+    let track_exit_code_in_band = oob::should_track_exit_code_in_band();
 
     let work_results_thread = start_test_result_reporter(
         entity,

@@ -12,6 +12,11 @@ impl ExitCode {
     pub const CANCELLED: ExitCode = ExitCode(1);
     pub const ABQ_ERROR: ExitCode = ExitCode(CODE_ERROR);
 
+    /// For use when a worker is used in-band with a supervisor,
+    /// and the exit code seen by the worker should be overwritten by the supervisor.
+    /// This code is used to track in case such logic ever goes wrong.
+    pub const WORKER_CEDES_TO_SUPERVISOR: ExitCode = ExitCode(88);
+
     pub const fn get(&self) -> i32 {
         self.0
     }
