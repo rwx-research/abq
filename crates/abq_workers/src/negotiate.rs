@@ -85,6 +85,7 @@ enum MessageFromQueueNegotiator {
     /// The context a worker set should execute a run with.
     ExecutionContext(ExecutionContext),
     RunUnknown,
+    RunCompleteButExitCodeNotKnown,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -413,8 +414,13 @@ async fn wait_for_execution_context(
             MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code } => {
                 Err(NegotiatedWorkers::Redundant { entity, exit_code })
             }
-            MessageFromQueueNegotiator::RunUnknown => {
+            MessageFromQueueNegotiator::RunUnknown
+            | MessageFromQueueNegotiator::RunCompleteButExitCodeNotKnown => {
                 // We are still waiting for this run, sleep on the decay and retry.
+                // Both "unknown run" and "complete, but exit code not known" states are the same
+                // from our perspective - we need to re-poll until the relevant state hits the
+                // queue.
+                //
                 // TODO: timeout if we go too long without finding the run or its execution context.
                 tokio::time::sleep(decay).await;
                 decay *= 2;
@@ -685,6 +691,7 @@ pub struct AssignedRunCompeleted {
 pub enum AssignedRunStatus {
     RunUnknown,
     Run(AssignedRun),
+    CompleteButExitCodeNotKnown,
     AlreadyDone { exit_code: ExitCode },
 }
 
@@ -861,6 +868,13 @@ impl QueueNegotiator {
                     AlreadyDone { exit_code } => {
                         tracing::debug!(?wanted_run_id, "run already completed");
                         MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code }
+                    }
+                    CompleteButExitCodeNotKnown => {
+                        tracing::debug!(
+                            ?wanted_run_id,
+                            "run already completed, but exit code not yet known"
+                        );
+                        MessageFromQueueNegotiator::RunCompleteButExitCodeNotKnown
                     }
                     RunUnknown => {
                         tracing::debug!(?wanted_run_id, "run not yet known");

@@ -364,6 +364,29 @@ pub enum Command {
         #[clap(required = true, num_args = 1.., allow_hyphen_values = true, last = true)]
         args: Vec<String>,
     },
+    /// Sets the exit code of an ABQ run that previously completed, and was started with
+    /// ABQ_SET_EXIT_CODE=false.
+    ///
+    /// NOTE: not intended for direct use.
+    #[clap(hide = true)]
+    SetExitCode {
+        #[clap(long)]
+        run_id: RunId,
+        #[clap(long)]
+        exit_code: i32,
+        #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
+        access_token: Option<AccessToken>,
+
+        // For testing purposes only
+        #[clap(long, required = false, hide = true)]
+        tls_cert: Option<PathBuf>,
+        // For testing purposes only
+        #[clap(long, required = false, hide = true)]
+        queue_addr: Option<SocketAddr>,
+        // For testing purposes only
+        #[clap(long, required = false, hide = true)]
+        token: Option<UserToken>,
+    },
     /// Checks the health of an abq instance.
     ///
     /// Exits with 0 if all provided services to check are health; exits with 1 otherwise.
