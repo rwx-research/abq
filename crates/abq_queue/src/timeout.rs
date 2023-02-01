@@ -95,7 +95,7 @@ pub enum TimeoutReason {
 impl From<TimeoutReason> for CancelReason {
     fn from(reason: TimeoutReason) -> Self {
         match reason {
-            TimeoutReason::ResultNotReceived => CancelReason::TimeoutOnLastTestResult,
+            TimeoutReason::ResultNotReceived => CancelReason::TimeoutOnTestResult,
             TimeoutReason::OOBExitCodeNotReceived => CancelReason::TimeoutOnOutOfBandExitCode,
         }
     }

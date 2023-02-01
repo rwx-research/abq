@@ -425,8 +425,8 @@ pub mod queue {
     pub enum CancelReason {
         /// The test run was cancelled by the supervisor
         User,
-        /// Timeod out waiting for the last test result in a test run.
-        TimeoutOnLastTestResult,
+        /// Timed out waiting for the last test result in a test run.
+        TimeoutOnTestResult,
         /// Timed out waiting for the out-of-band exit code for a test run.
         TimeoutOnOutOfBandExitCode,
     }
