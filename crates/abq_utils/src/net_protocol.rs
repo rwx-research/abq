@@ -420,6 +420,17 @@ pub mod queue {
         pub active_runs: u64,
     }
 
+    /// A reason a test run was cancelled.
+    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
+    pub enum CancelReason {
+        /// The test run was cancelled by the supervisor
+        User,
+        /// Timeod out waiting for the last test result in a test run.
+        TimeoutOnLastTestResult,
+        /// Timed out waiting for the out-of-band exit code for a test run.
+        TimeoutOnOutOfBandExitCode,
+    }
+
     /// An attempt was made to set an out-of-band exit code for a run, but it failed.
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     pub enum CannotSetOOBExitCodeReason {
@@ -432,7 +443,7 @@ pub mod queue {
         // distinguish between the two for better error messages
         ExitCodeAlreadyDetermined,
         /// The run was cancelled or terminated before an exit code could be set.
-        RunWasCancelled,
+        RunWasCancelled { reason: CancelReason },
     }
 
     /// Whether an out-of-band exit code could be set.

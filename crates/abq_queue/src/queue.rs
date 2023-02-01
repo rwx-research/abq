@@ -17,8 +17,8 @@ use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResults, CannotSetOOBExitCodeReason, InvokerTestData, NativeRunnerInfo,
-    NegotiatorInfo, Request,
+    AssociatedTestResults, CancelReason, CannotSetOOBExitCodeReason, InvokerTestData,
+    NativeRunnerInfo, NegotiatorInfo, Request,
 };
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap, TestCase};
 use abq_utils::net_protocol::work_server::WorkServerRequest;
@@ -45,7 +45,7 @@ use tracing::instrument;
 
 use crate::connections::{self, ConnectedWorkers};
 use crate::prelude::{AnyError, OpaqueResult};
-use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun};
+use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
 
 #[derive(Default, Debug)]
 struct JobQueue {
@@ -67,12 +67,6 @@ impl JobQueue {
         let chop_off = std::cmp::min(self.queue.len(), n.get() as usize);
         self.queue.drain(..chop_off)
     }
-}
-
-#[derive(Debug)]
-enum CancelReason {
-    User,
-    Timeout,
 }
 
 #[derive(Debug)]
@@ -98,7 +92,6 @@ enum RunState {
         exit_code: ExitCode,
     },
     Cancelled {
-        #[allow(unused)] // so far
         reason: CancelReason,
     },
 }
@@ -188,6 +181,7 @@ enum AssignedRunLookup {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
 enum RunLive {
     Active,
     WaitingForExitCode,
@@ -573,8 +567,8 @@ impl AllRuns {
             RunState::Done { .. } => {
                 return Err(CannotSetOOBExitCodeReason::ExitCodeAlreadyDetermined);
             }
-            RunState::Cancelled { .. } => {
-                return Err(CannotSetOOBExitCodeReason::RunWasCancelled);
+            RunState::Cancelled { reason } => {
+                return Err(CannotSetOOBExitCodeReason::RunWasCancelled { reason: *reason });
             }
         }
 
@@ -838,7 +832,7 @@ impl Default for QueueConfig {
                 ServerAuthStrategy::no_auth(),
                 ServerTlsStrategy::no_tls(),
             ),
-            timeout_strategy: RunTimeoutStrategy::RunBased,
+            timeout_strategy: RunTimeoutStrategy::RUN_BASED,
         }
     }
 }
@@ -871,7 +865,7 @@ fn start_queue(config: QueueConfig) -> Abq {
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
-    let timeout_manager = RunTimeoutManager::default();
+    let timeout_manager = RunTimeoutManager::new(timeout_strategy);
     let worker_next_tests_tasks = ConnectedWorkers::default();
 
     let server_shutdown_rx = shutdown_manager.add_receiver();
@@ -901,7 +895,6 @@ fn start_queue(config: QueueConfig) -> Abq {
             scheduler.start_on(
                 new_work_server,
                 timeout_manager,
-                timeout_strategy,
                 work_scheduler_shutdown_rx,
                 worker_next_tests_tasks,
             )
@@ -1324,6 +1317,8 @@ struct QueueServerCtx {
     /// test result.
     worker_next_tests_tasks: ConnectedWorkers,
 
+    timeout_manager: RunTimeoutManager,
+
     /// Holds state on whether the queue is retired, and records retirement if the queue is asked
     /// to retire by a privileged process.
     retirement: RetirementCell,
@@ -1368,6 +1363,8 @@ impl QueueServer {
                 state_cache: Default::default(),
                 public_negotiator_addr,
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
+
+                timeout_manager: timeouts.clone(),
 
                 worker_results_tasks: Default::default(),
                 worker_next_tests_tasks,
@@ -1530,6 +1527,7 @@ impl QueueServer {
                     ctx.state_cache,
                     ctx.worker_results_tasks,
                     ctx.worker_next_tests_tasks,
+                    ctx.timeout_manager,
                     entity,
                     run_id,
                     results,
@@ -2050,7 +2048,8 @@ impl QueueServer {
             active_runs,
             state_cache,
             worker_results_tasks,
-            worker_next_tests_tasks
+            worker_next_tests_tasks,
+            timeout_manager
         )
     )]
     async fn handle_worker_results(
@@ -2059,6 +2058,7 @@ impl QueueServer {
         state_cache: RunResultStateCache,
         worker_results_tasks: ConnectedWorkers,
         worker_next_tests_tasks: ConnectedWorkers,
+        timeout_manager: RunTimeoutManager,
         entity: EntityId,
         run_id: RunId,
         results: Vec<AssociatedTestResults>,
@@ -2207,8 +2207,19 @@ impl QueueServer {
                 queues.mark_complete(&run_id, exit_code);
             }
             None => {
-                // TODO(captain-cli#116): start timeouts for setting exit codes
                 queues.mark_waiting_for_exit_code(&run_id);
+
+                let timeout_spec = timeout_manager.strategy().timeout_for_oob_exit_code();
+
+                tracing::info!(
+                    ?run_id,
+                    timeout=?timeout_spec.duration(),
+                    "starting timeout for receipt of out-of-band exit code"
+                );
+
+                timeout_manager
+                    .insert_run(run_id.clone(), timeout_spec)
+                    .await;
             }
         }
 
@@ -2272,25 +2283,36 @@ impl QueueServer {
         // We must keep this lock alive until the end of this function.
         let mut locked_active_runs = active_runs.write().await;
 
-        let TimedOutRun { run_id, after } = timeout;
+        let TimedOutRun {
+            run_id,
+            after,
+            reason,
+        } = timeout;
 
         // NB: taking a persistent lock on the queue or state cache is not necessary,
         // since we've already guarded against other modification above.
         // By not blocking the queue we allow other work to continue freely.
         match queues.get_run_liveness(&run_id) {
-            Some(liveness) => match liveness {
-                RunLive::Active => {
+            Some(liveness) => match (liveness, reason) {
+                (RunLive::Active, TimeoutReason::ResultNotReceived) => {
                     // pass through, the run needs to be timed out.
                 }
-                RunLive::WaitingForExitCode => {
-                    // Run is completed from a test-execution perspective. Another timeout will be
-                    // fired if an exit code is failed to be determined in time; as such, disregard
-                    // this timeout.
-                    // TODO(captain-cli#116): start timeouts for setting exit codes
-                    return Ok(());
+                (RunLive::WaitingForExitCode, TimeoutReason::OOBExitCodeNotReceived) => {
+                    // pass through, the run needs to be timed out.
                 }
-                RunLive::Done { .. } | RunLive::Cancelled => {
+                (RunLive::Done { .. }, _) | (RunLive::Cancelled, _) => {
                     return Ok(()); // run was already complete, disregard the timeout
+                }
+                // Catch bad states
+                (RunLive::WaitingForExitCode, TimeoutReason::ResultNotReceived)
+                | (RunLive::Active, TimeoutReason::OOBExitCodeNotReceived) => {
+                    tracing::error!(
+                        ?run_id,
+                        ?liveness,
+                        ?reason,
+                        "illegal state - product of run liveness and timeout reason is chronologically disjoint"
+                    );
+                    return Err("illegal run liveness state and fired timeout".into());
                 }
             },
             None => {
@@ -2305,51 +2327,54 @@ impl QueueServer {
         tracing::info!(?run_id, timeout=?after, "timing out active test run");
 
         // Remove the responder, and notify the supervisor that this run has timed out.
-        let mut responder = locked_active_runs
-            .remove(&run_id)
-            .expect("invalid state - run is live, but no responder is known")
-            .into_inner();
+        let opt_responder = locked_active_runs.remove(&run_id);
 
-        // Flush all test results still pending prior to the timeout.
-        responder.flush_results().await;
+        Self::check_responder_after_timeout_precondition(&run_id, opt_responder.is_some(), reason);
 
-        match responder {
-            ClientResponder::DirectStream { mut stream, buffer } => {
-                assert!(
-                    buffer.is_empty(),
-                    "no results should be buffered after drainage"
-                );
+        if let Some(responder) = opt_responder {
+            let mut responder = responder.into_inner();
 
-                net_protocol::async_write(&mut stream, &InvokerTestData::TimedOut { after })
-                    .await?;
+            // Flush all test results still pending prior to the timeout.
+            responder.flush_results().await;
 
-                // To avoid a race between perceived cancellation by the supervisor and perceived
-                // timeout by the queue, require an ACK for the induced timeout notification. If
-                // instead the supervisor cancels prior to an ACK, this stream will break before
-                // the ACK is fulfilled, and the cancellation will be recorded.
-                let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
+            match responder {
+                ClientResponder::DirectStream { mut stream, buffer } => {
+                    assert!(
+                        buffer.is_empty(),
+                        "no results should be buffered after drainage"
+                    );
 
-                drop(stream);
+                    net_protocol::async_write(&mut stream, &InvokerTestData::TimedOut { after })
+                        .await?;
 
-                tracing::info!(?run_id, "closed connected results responder");
-            }
-            ClientResponder::Disconnected {
-                results: _,
-                buffer_size: _,
-                pending_runner_info: _,
-            } => {
-                tracing::error!(
-                    ?run_id,
-                    "dropping disconnected results responder after timeout"
-                );
+                    // To avoid a race between perceived cancellation by the supervisor and perceived
+                    // timeout by the queue, require an ACK for the induced timeout notification. If
+                    // instead the supervisor cancels prior to an ACK, this stream will break before
+                    // the ACK is fulfilled, and the cancellation will be recorded.
+                    let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
 
-                // Unfortunately, nothing more we can do at this point, since
-                // the supervisor has been lost!
+                    drop(stream);
+
+                    tracing::info!(?run_id, "closed connected results responder");
+                }
+                ClientResponder::Disconnected {
+                    results: _,
+                    buffer_size: _,
+                    pending_runner_info: _,
+                } => {
+                    tracing::error!(
+                        ?run_id,
+                        "dropping disconnected results responder after timeout"
+                    );
+
+                    // Unfortunately, nothing more we can do at this point, since
+                    // the supervisor has been lost!
+                }
             }
         }
 
         // Store the cancellation state
-        queues.mark_cancelled(&run_id, CancelReason::Timeout);
+        queues.mark_cancelled(&run_id, reason.into());
 
         // Drop the run from the state cache.
         state_cache.lock().remove(&run_id);
@@ -2357,6 +2382,25 @@ impl QueueServer {
         let _ = locked_active_runs; // make sure the lock isn't dropped before here
 
         Ok(())
+    }
+
+    fn check_responder_after_timeout_precondition(
+        run_id: &RunId,
+        responder_present: bool,
+        timeout_reason: TimeoutReason,
+    ) {
+        if matches!(
+            (responder_present, timeout_reason),
+            (true, TimeoutReason::OOBExitCodeNotReceived)
+                | (false, TimeoutReason::ResultNotReceived)
+        ) {
+            tracing::error!(
+                ?run_id,
+                ?timeout_reason,
+                responder_present,
+                "illegal state - run responder not aligned with liveness"
+            );
+        }
     }
 
     async fn handle_new_persistent_worker_results_connection(
@@ -2467,7 +2511,6 @@ pub enum WorkSchedulerError {
 struct SchedulerCtx {
     queues: SharedRuns,
     timeouts: RunTimeoutManager,
-    timeout_strategy: RunTimeoutStrategy,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 
     /// Persisted worker connections yielding requests for new tests to run.
@@ -2482,7 +2525,6 @@ impl WorkScheduler {
         self,
         listener: Box<dyn net::ServerListener>,
         timeouts: RunTimeoutManager,
-        timeout_strategy: RunTimeoutStrategy,
         mut shutdown: ShutdownReceiver,
         worker_next_tests_tasks: ConnectedWorkers,
     ) -> Result<(), WorkSchedulerError> {
@@ -2497,7 +2539,6 @@ impl WorkScheduler {
             let ctx = SchedulerCtx {
                 queues,
                 timeouts,
-                timeout_strategy,
                 handshake_ctx: Arc::new(listener.handshake_ctx()),
 
                 worker_next_tests_tasks,
@@ -2574,7 +2615,6 @@ impl WorkScheduler {
                         Self::start_persistent_next_tests_requests_task(
                             ctx.queues,
                             ctx.timeouts,
-                            ctx.timeout_strategy,
                             run_id,
                             stream,
                             rx_stop,
@@ -2589,7 +2629,6 @@ impl WorkScheduler {
     async fn start_persistent_next_tests_requests_task(
         queues: SharedRuns,
         timeouts: RunTimeoutManager,
-        timeout_strategy: RunTimeoutStrategy,
         run_id: RunId,
         mut conn: Box<dyn net_async::ServerStream>,
         mut rx_stop: oneshot::Receiver<()>,
@@ -2624,15 +2663,15 @@ impl WorkScheduler {
                     if let PulledTestsStatus::PulledLastTest { last_test_timeout } = pulled_tests_status {
                         // This was the last test, so start a timeout for the whole test run to
                         // complete - if it doesn't, we'll fire and timeout the run.
-                        let timeout = timeout_strategy.resolve(last_test_timeout);
+                        let timeout_spec = timeouts.strategy().timeout_for_last_test_result(last_test_timeout);
 
                         tracing::info!(
                             ?run_id,
-                            ?timeout,
+                            timeout=?timeout_spec.duration(),
                             "issued last test in the manifest to a worker"
                         );
 
-                        timeouts.insert_run(run_id, timeout).await;
+                        timeouts.insert_run(run_id, timeout_spec).await;
 
                         return Ok(())
                     }
@@ -2750,7 +2789,7 @@ mod test {
             queue_server
                 .start_on(
                     server,
-                    RunTimeoutManager::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -2778,7 +2817,7 @@ mod test {
             server
                 .start_on(
                     listener,
-                    RunTimeoutManager::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -2956,6 +2995,7 @@ mod test {
                 Arc::clone(&run_state),
                 worker_results_tasks.clone(),
                 worker_next_tests_tasks.clone(),
+                RunTimeoutManager::new(RunTimeoutStrategy::default()),
                 EntityId::new(),
                 run_id.clone(),
                 vec![result],
@@ -3027,6 +3067,7 @@ mod test {
                 run_state,
                 worker_results_tasks.clone(),
                 worker_next_tests_tasks.clone(),
+                RunTimeoutManager::new(RunTimeoutStrategy::default()),
                 EntityId::new(),
                 run_id,
                 vec![associated_result],
@@ -3063,7 +3104,7 @@ mod test {
             queue_server
                 .start_on(
                     server,
-                    RunTimeoutManager::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     server_shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -3108,8 +3149,7 @@ mod test {
             work_scheduler
                 .start_on(
                     server,
-                    RunTimeoutManager::default(),
-                    RunTimeoutStrategy::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     server_shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -3150,8 +3190,7 @@ mod test {
             server
                 .start_on(
                     listener,
-                    RunTimeoutManager::default(),
-                    RunTimeoutStrategy::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -3186,7 +3225,7 @@ mod test {
             server
                 .start_on(
                     listener,
-                    RunTimeoutManager::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -3237,7 +3276,7 @@ mod test {
             server
                 .start_on(
                     listener,
-                    RunTimeoutManager::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -3282,8 +3321,7 @@ mod test {
             server
                 .start_on(
                     listener,
-                    RunTimeoutManager::default(),
-                    RunTimeoutStrategy::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -3325,8 +3363,7 @@ mod test {
             server
                 .start_on(
                     listener,
-                    RunTimeoutManager::default(),
-                    RunTimeoutStrategy::default(),
+                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
                     shutdown_rx,
                     ConnectedWorkers::default(),
                 )
@@ -3890,6 +3927,7 @@ mod test {
             Arc::clone(&state_cache),
             worker_results_tasks.clone(),
             worker_next_tests_tasks.clone(),
+            RunTimeoutManager::new(RunTimeoutStrategy::default()),
             entity,
             run_id.clone(),
             vec![result],
@@ -3950,7 +3988,9 @@ mod test {
                 RunState::Cancelled {
                     reason: CancelReason::User,
                 },
-                RunWasCancelled,
+                RunWasCancelled {
+                    reason: CancelReason::User,
+                },
             ),
         ];
 

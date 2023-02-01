@@ -13,7 +13,7 @@ use abq_queue::{
         TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT,
     },
     queue::{Abq, QueueConfig},
-    timeout::RunTimeoutStrategy,
+    timeout::{RunTimeoutStrategy, TimeoutReason},
 };
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
@@ -23,7 +23,10 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::EntityId,
-        queue::{CannotSetOOBExitCodeReason, NativeRunnerInfo, SetOutOfBandExitCodeResponse},
+        queue::{
+            CancelReason, CannotSetOOBExitCodeReason, NativeRunnerInfo,
+            SetOutOfBandExitCodeResponse,
+        },
         runners::{
             AbqProtocolVersion, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
             ProtocolWitness, Test, TestOrGroup, TestResult,
@@ -1207,8 +1210,12 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
         ..default_workers_config()
     };
 
+    fn zero(_: TimeoutReason) -> Duration {
+        Duration::ZERO
+    }
+
     TestBuilder::new(Servers::from_config(QueueConfig {
-        timeout_strategy: RunTimeoutStrategy::Constant(Duration::ZERO),
+        timeout_strategy: RunTimeoutStrategy::constant(zero),
         ..Default::default()
     }))
     .step(
@@ -1449,7 +1456,9 @@ fn trying_to_set_oob_exit_code_for_cancelled_run_is_error() {
                 assert!(matches!(
                     resp,
                     SetOutOfBandExitCodeResponse::Failure(
-                        CannotSetOOBExitCodeReason::RunWasCancelled
+                        CannotSetOOBExitCodeReason::RunWasCancelled {
+                            reason: CancelReason::User
+                        }
                     )
                 ));
             })],
@@ -1567,4 +1576,49 @@ fn trying_to_set_oob_exit_code_twice_is_error() {
             })],
         )
         .test();
+}
+
+#[test]
+#[with_protocol_version]
+fn cancel_test_run_upon_timeout_for_out_of_band_exit_code() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    let supervisor_config = SupervisorConfig::new(runner).with_track_exit_code_in_band(false);
+
+    fn zero_for_oob_timeout(reason: TimeoutReason) -> Duration {
+        match reason {
+            TimeoutReason::ResultNotReceived => Duration::MAX,
+            TimeoutReason::OOBExitCodeNotReceived => Duration::ZERO,
+        }
+    }
+
+    TestBuilder::new(Servers::from_config(QueueConfig {
+        timeout_strategy: RunTimeoutStrategy::constant(zero_for_oob_timeout),
+        ..Default::default()
+    }))
+    .step(
+        [
+            RunTest(Run(1), Sid(1), supervisor_config),
+            StartWorkers(Run(1), Wid(1), default_workers_config()),
+        ],
+        [TestExitWithoutErr(Sid(1))],
+    )
+    // Workers should exit seeing that the test run was cancelled.
+    .step(
+        [StopWorkers(Wid(1))],
+        [WorkerExitStatus(Wid(1), &|e| {
+            assert_eq!(
+                e,
+                &WorkersExitStatus::Failure {
+                    exit_code: ExitCode::CANCELLED
+                }
+            )
+        })],
+    )
+    .test();
 }
