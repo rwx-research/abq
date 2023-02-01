@@ -1,11 +1,15 @@
 #![cfg(test)]
+// For convenience in tests.
+#![allow(clippy::useless_format)]
 
 use abq_test_utils::{artifacts_dir, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
 use abq_utils::net_protocol::runners::{
     NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
 };
+use serde_json as json;
 use serial_test::serial;
+use std::fs::File;
 use std::process::{ExitStatus, Output};
 use std::{
     io::{BufRead, BufReader},
@@ -86,7 +90,6 @@ impl Abq {
         self
     }
 
-    #[allow(unused)] // for now
     fn env<K, V>(mut self, env: impl IntoIterator<Item = (K, V)>) -> Self
     where
         K: Into<String>,
@@ -1641,4 +1644,128 @@ test_all_network_config_options! {
         assert!(stdout.contains("init stdouthello from manifest stdout"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert!(stdout.contains("init stderrhello from manifest stderr"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
     }
+}
+
+fn verify_and_sanitize_state(state: &mut json::Map<String, json::Value>) {
+    {
+        let exe_cell = state
+            .get_mut("abq_executable")
+            .expect("abq_executable missing");
+        let exe_path = Path::new(exe_cell.as_str().unwrap());
+        assert_eq!(exe_path, abq_binary());
+        *exe_cell = json::json!("<replaced abq.exe>");
+    }
+
+    {
+        let version_cell = state.get_mut("abq_version").expect("abq_version missing");
+        assert_eq!(version_cell.as_str().unwrap(), abq_utils::VERSION);
+        *version_cell = json::json!("<replaced ABQ version>");
+    }
+}
+
+#[test]
+fn write_statefile_for_supervisor() {
+    let statefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let statefile = statefile.to_path_buf();
+
+    let _cmd_output = Abq::new("write_statefile_for_supervisor")
+        .args([
+            "test",
+            "-n",
+            "1",
+            "--run-id=my-test-run-id",
+            "--",
+            "__zzz_not_a_command__",
+        ])
+        .env([("ABQ_STATE_FILE", statefile.display().to_string())])
+        .run();
+
+    let statefile = File::open(&statefile).unwrap();
+    let mut state = serde_json::from_reader(&statefile).unwrap();
+
+    verify_and_sanitize_state(&mut state);
+
+    insta::assert_json_snapshot!(state, @r###"
+    {
+      "abq_executable": "<replaced abq.exe>",
+      "abq_version": "<replaced ABQ version>",
+      "run_id": "my-test-run-id",
+      "supervisor": true
+    }
+    "###);
+}
+
+#[test]
+fn write_statefile_for_worker() {
+    let statefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let statefile = statefile.to_path_buf();
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+
+    let mut queue_proc = Abq::new("write_statefile_for_worker_queue")
+        .args([
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ])
+        .spawn();
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start") {
+                break;
+            }
+        }
+    }
+
+    let test_args = |worker: usize| {
+        vec![
+            format!("test"),
+            format!("--worker={worker}"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--working-dir=."),
+            format!("--run-id=my-test-run-id"),
+            format!("--num=cpu-cores"),
+            format!("--color=never"),
+            format!("--"),
+            format!("__zzz_not_a_command__"),
+        ]
+    };
+
+    let mut worker0 = Abq::new("write_statefile_for_supervisor")
+        .args(test_args(0))
+        .spawn();
+
+    let _worker1 = Abq::new("write_statefile_for_supervisor")
+        .args(test_args(1))
+        .env([("ABQ_STATE_FILE", statefile.display().to_string())])
+        .run();
+
+    worker0.kill().unwrap();
+    queue_proc.kill().unwrap();
+
+    let statefile = File::open(&statefile).unwrap();
+    let mut state = serde_json::from_reader(&statefile).unwrap();
+
+    verify_and_sanitize_state(&mut state);
+
+    insta::assert_json_snapshot!(state, @r###"
+    {
+      "abq_executable": "<replaced abq.exe>",
+      "abq_version": "<replaced ABQ version>",
+      "run_id": "my-test-run-id",
+      "supervisor": false
+    }
+    "###);
 }

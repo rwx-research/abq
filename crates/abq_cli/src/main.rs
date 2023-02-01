@@ -2,6 +2,7 @@ mod args;
 mod health;
 mod instance;
 mod reporting;
+mod statefile;
 mod workers;
 
 use std::{
@@ -460,34 +461,37 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
-            match worker {
-                None | Some(0) => {
-                    let num_runners = if start_in_process_workers {
-                        Some(num_runners)
-                    } else {
-                        None
-                    };
-                    run_sentinel_abq_test(
-                        entity,
-                        &access_token,
-                        runner_params,
-                        abq,
-                        run_id,
-                        reporters,
-                        stdout_preferences,
-                        batch_size,
-                        results_timeout,
-                        num_runners,
-                        working_dir,
-                    )
-                }
-                Some(_) => workers::start_workers_standalone(
+            let is_supervisor = matches!(worker, None | Some(0));
+
+            statefile::optional_write_worker_statefile(&run_id, is_supervisor)?;
+
+            if is_supervisor {
+                let num_runners = if start_in_process_workers {
+                    Some(num_runners)
+                } else {
+                    None
+                };
+                run_sentinel_abq_test(
+                    entity,
+                    &access_token,
+                    runner_params,
+                    abq,
+                    run_id,
+                    reporters,
+                    stdout_preferences,
+                    batch_size,
+                    results_timeout,
+                    num_runners,
+                    working_dir,
+                )
+            } else {
+                workers::start_workers_standalone(
                     num_runners,
                     working_dir,
                     abq.negotiator_handle(),
                     abq.client_options().clone(),
                     run_id,
-                ),
+                )
             }
         }
         Command::Health {
