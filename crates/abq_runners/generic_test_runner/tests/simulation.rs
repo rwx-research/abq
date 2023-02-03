@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use abq_generic_test_runner::{GenericTestRunner, GetNextTests, SendTestResultsBoxed};
+use abq_generic_test_runner::{
+    GenericTestRunner, GetNextTests, SendTestResultsBoxed, TestsFetcher,
+};
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::artifacts_dir;
 use abq_utils::exit::ExitCode;
@@ -17,7 +19,7 @@ use abq_utils::net_protocol::workers::{
 };
 
 use abq_with_protocol_version::with_protocol_version;
-use futures::FutureExt;
+use async_trait::async_trait;
 use parking_lot::Mutex;
 
 fn native_runner_simulation_bin() -> String {
@@ -121,6 +123,17 @@ macro_rules! check_bytes {
     };
 }
 
+struct ImmediateTests {
+    tests: Vec<NextWorkBundle>,
+}
+
+#[async_trait]
+impl TestsFetcher for ImmediateTests {
+    async fn get_next_tests(&mut self) -> NextWorkBundle {
+        self.tests.remove(0)
+    }
+}
+
 #[test]
 #[with_protocol_version]
 fn capture_output_before_and_during_tests() {
@@ -172,10 +185,12 @@ fn capture_output_before_and_during_tests() {
             NextWork::EndOfWork,
         ])
     }
-    let get_next_tests = &move || async move { work_bundle(proto) }.boxed();
+    let get_next_tests = ImmediateTests {
+        tests: vec![work_bundle(proto)],
+    };
 
     let (mut results, _man_output, final_captures) =
-        run_simulated_runner(simulation, NO_GENERATE_MANIFEST, get_next_tests);
+        run_simulated_runner(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
     results.sort_by_key(|r| r.work_id);
 
     // Unfortunately we cannot force a guarantee that all stdout/stderr in the child ends up in the
@@ -284,10 +299,12 @@ fn big_manifest() {
             *manifest.lock() = Some(manifest_result);
         }
     });
-    let get_next_tests = &move || async move { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
+    let get_next_tests = ImmediateTests {
+        tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
+    };
 
     let (results, _man_output, _) =
-        run_simulated_runner(simulation, Some(with_manifest), get_next_tests);
+        run_simulated_runner(simulation, Some(with_manifest), Box::new(get_next_tests));
     assert!(results.is_empty());
 
     let manifest = Arc::try_unwrap(manifest).unwrap().into_inner().unwrap();
@@ -353,10 +370,12 @@ fn capture_output_during_manifest_gen() {
             *manifest.lock() = Some(manifest_result);
         }
     });
-    let get_next_tests = &move || async move { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
+    let get_next_tests = ImmediateTests {
+        tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
+    };
 
     let (results, man_output, _) =
-        run_simulated_runner(simulation, Some(with_manifest), get_next_tests);
+        run_simulated_runner(simulation, Some(with_manifest), Box::new(get_next_tests));
     assert!(results.is_empty());
 
     assert!(man_output.is_some());
