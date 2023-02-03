@@ -1,7 +1,6 @@
 //! Utilities for buffering and acting on messages (from the queue), refilling messages on-demand.
 
-use std::future::IntoFuture;
-
+use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 enum Msg<T> {
@@ -72,23 +71,26 @@ pub(crate) fn channel<T>(
 
 pub(crate) struct Completed(pub bool);
 
+#[async_trait]
+pub(crate) trait FetchMessages {
+    type T;
+    type Iter: ExactSizeIterator<Item = Self::T>;
+
+    async fn fetch(&mut self) -> (Self::Iter, Completed);
+}
+
 impl<T> BatchedProducer<T> {
     /// Returns a future that runs the producer, with a task to fetch messages.
     /// The future completes when the generator indicates that it is complete, or the consumer
     /// exits.
-    pub async fn start<F, Fut, I, Iter>(mut self, fetch_msgs: F)
+    pub async fn start<F>(mut self, mut fetcher: F)
     where
-        F: Fn() -> Fut,
-        Fut: IntoFuture<Output = (I, Completed)>,
-        I: IntoIterator<IntoIter = Iter>,
-        Iter: ExactSizeIterator<Item = T>,
+        F: FetchMessages<T = T>,
     {
         let mut msgs;
         let mut completed;
         loop {
-            (msgs, completed) = fetch_msgs().await;
-
-            let msgs = msgs.into_iter();
+            (msgs, completed) = fetcher.fetch().await;
 
             // If we fail to send the message, the consumer has exited early and we have nothing
             // more to do.
@@ -197,22 +199,20 @@ mod test {
     };
 
     use abq_utils::atomic;
+    use async_trait::async_trait;
 
-    use super::{channel, Completed, RefillStrategy};
+    use super::{channel, Completed, FetchMessages, RefillStrategy};
 
-    async fn run_channels<T, E, P, PFut, I, Iter, C, CFut>(
+    async fn run_channels<F, E, C, CFut>(
         capacity: usize,
         refill_strategy: RefillStrategy,
-        fetch_msgs: P,
+        fetch_msgs: F,
         process_msg: C,
-    ) -> Result<(), (E, Vec<T>)>
+    ) -> Result<(), (E, Vec<F::T>)>
     where
-        P: Fn() -> PFut,
-        PFut: IntoFuture<Output = (I, Completed)>,
-        I: IntoIterator<IntoIter = Iter>,
-        Iter: ExactSizeIterator<Item = T>,
+        F: FetchMessages,
 
-        C: Fn(T) -> CFut,
+        C: Fn(F::T) -> CFut,
         CFut: IntoFuture<Output = Result<(), E>>,
     {
         let (tx, mut rx) = channel(capacity, refill_strategy);
@@ -235,12 +235,23 @@ mod test {
 
     #[tokio::test]
     async fn refill_with_reload_one() {
-        let fetch_count = AtomicU8::new(0);
-        let fetch_msgs = || async {
-            fetch_count.fetch_add(1, atomic::ORDERING);
-            let loaded = fetch_count.load(atomic::ORDERING);
-            ([loaded], Completed(loaded == 5))
-        };
+        struct Fetcher {
+            count: u8,
+        }
+
+        #[async_trait]
+        impl FetchMessages for &mut Fetcher {
+            type T = u8;
+            type Iter = std::array::IntoIter<u8, 1>;
+
+            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+                self.count += 1;
+                let loaded = self.count;
+                ([loaded].into_iter(), Completed(loaded == 5))
+            }
+        }
+
+        let mut fetcher = Fetcher { count: 0 };
 
         let next_expected = Arc::new(AtomicU8::new(1));
         let process_msg = |n| {
@@ -252,24 +263,35 @@ mod test {
             }
         };
 
-        let result = run_channels(2, RefillStrategy::HalfConsumed, fetch_msgs, process_msg).await;
+        let result = run_channels(2, RefillStrategy::HalfConsumed, &mut fetcher, process_msg).await;
         assert!(result.is_ok(), "{:?}", result);
 
-        assert_eq!(fetch_count.load(atomic::ORDERING), 5);
+        assert_eq!(fetcher.count, 5);
     }
 
     #[tokio::test]
     async fn refill_with_reload_three() {
-        let fetch_count = AtomicU8::new(0);
-        let fetch_msgs = || async {
-            let n = fetch_count.fetch_add(1, atomic::ORDERING);
-            match n {
-                0 => (vec![1, 2, 3], Completed(false)),
-                1 => (vec![4, 5, 6], Completed(false)),
-                2 => (vec![7, 8], Completed(true)),
-                _ => unreachable!(),
+        struct Fetcher {
+            count: u8,
+        }
+
+        #[async_trait]
+        impl FetchMessages for &mut Fetcher {
+            type T = u8;
+            type Iter = std::vec::IntoIter<Self::T>;
+
+            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+                self.count += 1;
+                match self.count {
+                    1 => (vec![1, 2, 3].into_iter(), Completed(false)),
+                    2 => (vec![4, 5, 6].into_iter(), Completed(false)),
+                    3 => (vec![7, 8].into_iter(), Completed(true)),
+                    _ => unreachable!(),
+                }
             }
-        };
+        }
+
+        let mut fetcher = Fetcher { count: 0 };
 
         let next_expected = Arc::new(AtomicU8::new(1));
         let process_msg = |n| {
@@ -281,50 +303,72 @@ mod test {
             }
         };
 
-        let result = run_channels(6, RefillStrategy::HalfConsumed, fetch_msgs, process_msg).await;
+        let result = run_channels(6, RefillStrategy::HalfConsumed, &mut fetcher, process_msg).await;
         assert!(result.is_ok(), "{:?}", result);
 
-        assert_eq!(fetch_count.load(atomic::ORDERING), 3);
+        assert_eq!(fetcher.count, 3);
     }
 
     #[tokio::test]
     async fn err_return_pending_msgs() {
-        let fetch_count = AtomicU8::new(0);
-        let fetch_msgs = || async {
-            let n = fetch_count.fetch_add(1, atomic::ORDERING);
-            match n {
-                0 => (vec![1, 2, 3, 4], Completed(false)),
-                1 => (vec![5, 6, 7, 8], Completed(false)),
-                _ => unreachable!(),
+        struct Fetcher {
+            count: u8,
+        }
+
+        #[async_trait]
+        impl FetchMessages for &mut Fetcher {
+            type T = u8;
+            type Iter = std::vec::IntoIter<Self::T>;
+
+            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+                self.count += 1;
+                match self.count {
+                    1 => (vec![1, 2, 3, 4].into_iter(), Completed(false)),
+                    2 => (vec![5, 6, 7, 8].into_iter(), Completed(false)),
+                    _ => unreachable!(),
+                }
             }
-        };
+        }
+
+        let mut fetcher = Fetcher { count: 0 };
 
         let process_msg = |n| async move { Err(n) };
 
-        let result = run_channels(4, RefillStrategy::HalfConsumed, fetch_msgs, process_msg).await;
+        let result = run_channels(4, RefillStrategy::HalfConsumed, &mut fetcher, process_msg).await;
         assert!(result.is_err(), "{:?}", result);
 
         let (n, rem_msgs) = result.unwrap_err();
         assert_eq!(n, 1);
         assert_eq!(rem_msgs, &[2, 3, 4]);
 
-        assert_eq!(fetch_count.load(atomic::ORDERING), 1);
+        assert_eq!(fetcher.count, 1);
     }
 
     #[tokio::test]
     async fn run_channels_with_consumer_early_exit() {
-        let fetch_count = AtomicU8::new(0);
-        let fetch_msgs = || async {
-            let n = fetch_count.fetch_add(1, atomic::ORDERING);
-            match n {
-                0 => (vec![1], Completed(false)),
-                1 => (vec![2], Completed(false)),
-                _ => unreachable!(),
+        struct Fetcher {
+            count: u8,
+        }
+
+        #[async_trait]
+        impl FetchMessages for &mut Fetcher {
+            type T = u8;
+            type Iter = std::vec::IntoIter<Self::T>;
+
+            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+                self.count += 1;
+                match self.count {
+                    1 => (vec![1].into_iter(), Completed(false)),
+                    2 => (vec![2].into_iter(), Completed(false)),
+                    _ => unreachable!(),
+                }
             }
-        };
+        }
+
+        let mut fetcher = Fetcher { count: 0 };
 
         let (tx, mut rx) = channel(2, RefillStrategy::HalfConsumed);
-        let tx = tx.start(fetch_msgs);
+        let tx = tx.start(&mut fetcher);
 
         let run_rx = async {
             // Pull one message and immediately exit - this should force a refill on the producer
@@ -338,6 +382,6 @@ mod test {
         let ((), ()) = tokio::join!(tx, run_rx);
 
         // Initial fetch + fetch after first pull
-        assert_eq!(fetch_count.load(atomic::ORDERING), 2);
+        assert_eq!(fetcher.count, 2);
     }
 }

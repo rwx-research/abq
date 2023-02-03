@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use abq_utils::exit::ExitCode;
+use async_trait::async_trait;
 use buffered_results::BufferedResults;
 use capture_output::OutputCapturer;
 use message_buffer::{Completed, RefillStrategy};
@@ -17,10 +18,10 @@ use tokio::process::{self, ChildStderr, ChildStdout, Command};
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
-    CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, NativeRunnerSpawnedMessage,
-    NativeRunnerSpecification, OutOfBandError, ProtocolWitness, RawNativeRunnerSpawnedMessage,
-    RawTestResultMessage, Status, TestCase, TestCaseMessage, TestResult, TestResultSpec,
-    TestRunnerExit, TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
+    NativeRunnerSpawnedMessage, NativeRunnerSpecification, OutOfBandError, ProtocolWitness,
+    RawNativeRunnerSpawnedMessage, RawTestResultMessage, Status, TestCase, TestCaseMessage,
+    TestResult, TestResultSpec, TestRunnerExit, TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -29,7 +30,7 @@ use abq_utils::net_protocol::workers::{
 };
 use abq_utils::{atomic, net_protocol};
 use futures::future::BoxFuture;
-use futures::{Future, FutureExt};
+use futures::Future;
 use indoc::indoc;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -290,7 +291,13 @@ pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResults>) -> BoxFutu
 pub type SendTestResultsBoxed<'a> =
     Box<dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>>;
 
-pub type GetNextTests<'a> = &'a dyn Fn() -> BoxFuture<'static, NextWorkBundle>;
+/// Asynchronously fetch a bundle of tests.
+#[async_trait]
+pub trait TestsFetcher {
+    async fn get_next_tests(&mut self) -> NextWorkBundle;
+}
+
+pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetInitContext>(
@@ -339,7 +346,7 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     results_batch_size: u64,
     send_manifest: Option<SendManifest>,
     get_init_context: GetInitContext,
-    get_next_test_bundle: GetNextTests<'_>,
+    get_next_test_bundle: GetNextTests,
     send_test_results: SendTestResults<'_>,
     _debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError>
@@ -473,7 +480,7 @@ async fn run_help<GetInitContext>(
     get_init_context: GetInitContext,
     capture_pipes: &CapturePipes,
     results_batch_size: u64,
-    get_next_test_bundle: GetNextTests<'_>,
+    test_fetcher: GetNextTests,
     send_test_results: SendTestResults<'_>,
     worker_entity: EntityId,
     native_runner: Command,
@@ -542,28 +549,7 @@ where
     let (tests_tx, mut tests_rx) =
         message_buffer::channel(results_batch_size, RefillStrategy::HalfConsumed);
 
-    let fetch_tests_task = {
-        let fetch_next_bundle = || async {
-            let NextWorkBundle(bundle) = get_next_test_bundle().await;
-
-            let recv_size = bundle.len();
-
-            // NB: we can get rid of this allocation by returning the filter directly, and a word
-            // for the length of the list after filtering. The allocation doesn't matter though.
-            let filtered_bundle: Vec<_> = bundle
-                .into_iter()
-                .filter_map(|test| test.into_test())
-                .collect();
-
-            // Completed if the bundle contained `EndOfWork` markers, or if there were no tests to
-            // begin with!
-            let completed = filtered_bundle.len() < recv_size || filtered_bundle.is_empty();
-
-            (filtered_bundle, Completed(completed))
-        };
-
-        tests_tx.start(fetch_next_bundle)
-    };
+    let fetch_tests_task = tests_tx.start(NextBundleFetcher { test_fetcher });
 
     let (results_tx, mut results_rx) = mpsc::channel(results_batch_size * 2);
 
@@ -626,6 +612,35 @@ where
     let test_runner_exit = run_tests_result?;
 
     Ok(test_runner_exit)
+}
+
+struct NextBundleFetcher {
+    test_fetcher: GetNextTests,
+}
+
+#[async_trait]
+impl message_buffer::FetchMessages for NextBundleFetcher {
+    type T = WorkerTest;
+    type Iter = std::vec::IntoIter<Self::T>;
+
+    async fn fetch(&mut self) -> (Self::Iter, Completed) {
+        let NextWorkBundle(bundle) = self.test_fetcher.get_next_tests().await;
+
+        let recv_size = bundle.len();
+
+        // NB: we can get rid of this allocation by returning the filter directly, and a word
+        // for the length of the list after filtering. The allocation doesn't matter though.
+        let filtered_bundle: Vec<_> = bundle
+            .into_iter()
+            .filter_map(|test| test.into_test())
+            .collect();
+
+        // Completed if the bundle contained `EndOfWork` markers, or if there were no tests to
+        // begin with!
+        let completed = filtered_bundle.len() < recv_size || filtered_bundle.is_empty();
+
+        (filtered_bundle.into_iter(), Completed(completed))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -1012,15 +1027,21 @@ pub fn execute_wrapped_runner(
         })
     };
 
-    let test_case_index = AtomicUsize::new(0);
+    struct Fetcher {
+        #[allow(clippy::type_complexity)]
+        manifest: Arc<Mutex<Option<(Vec<TestCase>, MetadataMap)>>>,
+        test_case_index: AtomicUsize,
+    }
 
-    let get_next_test: GetNextTests = {
-        let manifest = Arc::clone(&flat_manifest);
-        &move || {
+    #[async_trait]
+    impl TestsFetcher for Fetcher {
+        async fn get_next_tests(&mut self) -> NextWorkBundle {
             loop {
-                let manifest_and_data = manifest.lock().unwrap();
+                let manifest_and_data = self.manifest.lock().unwrap();
                 let next_test = match &(*manifest_and_data) {
-                    Some((manifest, _)) => manifest.get(test_case_index.load(atomic::ORDERING)),
+                    Some((manifest, _)) => {
+                        manifest.get(self.test_case_index.load(atomic::ORDERING))
+                    }
                     None => {
                         // still waiting for the manifest, spin
                         continue;
@@ -1028,7 +1049,7 @@ pub fn execute_wrapped_runner(
                 };
                 let next = match next_test {
                     Some(test_case) => {
-                        test_case_index.fetch_add(1, atomic::ORDERING);
+                        self.test_case_index.fetch_add(1, atomic::ORDERING);
 
                         NextWork::Work(WorkerTest {
                             test_case: test_case.clone(),
@@ -1037,9 +1058,19 @@ pub fn execute_wrapped_runner(
                     }
                     None => NextWork::EndOfWork,
                 };
-                return async { NextWorkBundle(vec![next]) }.boxed();
+                return NextWorkBundle(vec![next]);
             }
         }
+    }
+
+    let test_case_index = AtomicUsize::new(0);
+
+    let get_next_test: GetNextTests = {
+        let manifest = Arc::clone(&flat_manifest);
+        Box::new(Fetcher {
+            manifest,
+            test_case_index,
+        })
     };
     let send_test_result: SendTestResults = {
         let test_results = test_results.clone();
@@ -1294,9 +1325,22 @@ mod test_validate_protocol_version_message {
 }
 
 #[cfg(test)]
+struct ImmediateTests {
+    tests: Vec<NextWorkBundle>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl TestsFetcher for ImmediateTests {
+    async fn get_next_tests(&mut self) -> NextWorkBundle {
+        self.tests.remove(0)
+    }
+}
+
+#[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
-    use crate::{execute_wrapped_runner, GenericTestRunner, SendTestResults};
+    use crate::{execute_wrapped_runner, GenericTestRunner, ImmediateTests, SendTestResults};
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::RunAlreadyCompleted;
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
@@ -1306,7 +1350,6 @@ mod test_abq_jest {
         WorkerTest,
     };
     use abq_with_protocol_version::with_protocol_version;
-    use futures::FutureExt;
 
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -1347,7 +1390,9 @@ mod test_abq_jest {
                 init_meta: Default::default(),
             })
         };
-        let get_next_test = &|| async { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
+        let get_next_test = Box::new(ImmediateTests {
+            tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
+        });
         let send_test_result: SendTestResults = {
             let test_results = test_results.clone();
             &move |results| {
@@ -1504,14 +1549,11 @@ mod test_abq_jest {
         };
 
         let get_init_context = || Err(RunAlreadyCompleted {});
-        let get_next_test = &move || {
-            async move {
-                NextWorkBundle(vec![NextWork::Work(WorkerTest {
-                    test_case: TestCase::new(proto, "unreachable", Default::default()),
-                    work_id: WorkId::new(),
-                })])
-            }
-            .boxed()
+        let get_next_test = ImmediateTests {
+            tests: vec![NextWorkBundle(vec![NextWork::Work(WorkerTest {
+                test_case: TestCase::new(proto, "unreachable", Default::default()),
+                work_id: WorkId::new(),
+            })])],
         };
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
@@ -1523,7 +1565,7 @@ mod test_abq_jest {
             5,
             None,
             get_init_context,
-            get_next_test,
+            Box::new(get_next_test),
             send_test_result,
             false,
         );
@@ -1534,13 +1576,15 @@ mod test_abq_jest {
 
 #[cfg(test)]
 mod test_invalid_command {
-    use crate::{GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner, SendTestResults};
+    use crate::{
+        GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner, ImmediateTests,
+        SendTestResults,
+    };
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle,
     };
-    use futures::FutureExt;
 
     #[test]
     fn invalid_command_yields_error() {
@@ -1558,7 +1602,9 @@ mod test_invalid_command {
                 init_meta: Default::default(),
             })
         };
-        let get_next_test = &|| async { NextWorkBundle(vec![NextWork::EndOfWork]) }.boxed();
+        let get_next_test = ImmediateTests {
+            tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
+        };
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
         let runner_result = GenericTestRunner::run(
@@ -1569,7 +1615,7 @@ mod test_invalid_command {
             5,
             Some(send_manifest),
             get_init_context,
-            get_next_test,
+            Box::new(get_next_test),
             send_test_result,
             false,
         );

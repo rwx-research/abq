@@ -32,7 +32,9 @@ type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 
-pub type GetNextTests = Box<dyn Fn() -> BoxFuture<'static, NextWorkBundle> + Send + 'static>;
+pub use abq_generic_test_runner::TestsFetcher;
+
+pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 pub type GetNextTestsGenerator<'a> = &'a dyn Fn() -> GetNextTests;
 
 pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
@@ -211,7 +213,7 @@ impl WorkerPool {
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                get_next_tests: get_next_tests_generator(),
+                tests_fetcher: get_next_tests_generator(),
                 results_batch_size,
                 notify_results,
                 context: worker_context.clone(),
@@ -242,7 +244,7 @@ impl WorkerPool {
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                get_next_tests: get_next_tests_generator(),
+                tests_fetcher: get_next_tests_generator(),
                 results_batch_size,
                 notify_results,
                 context: worker_context.clone(),
@@ -390,7 +392,7 @@ struct WorkerEnv {
     run_id: RunId,
     notify_manifest: Option<NotifyManifest>,
     get_init_context: GetInitContext,
-    get_next_tests: GetNextTests,
+    tests_fetcher: GetNextTests,
     results_batch_size: u64,
     notify_results: NotifyResults,
     context: WorkerContext,
@@ -423,7 +425,7 @@ fn start_generic_test_runner(
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     let WorkerEnv {
         entity,
-        get_next_tests: get_next_tests_bundle,
+        tests_fetcher,
         run_id,
         get_init_context,
         notify_results,
@@ -451,8 +453,7 @@ fn start_generic_test_runner(
 
     let get_init_context = move || get_init_context();
 
-    let get_next_tests_bundle: abq_generic_test_runner::GetNextTests =
-        &move || get_next_tests_bundle();
+    let get_next_tests_bundle: abq_generic_test_runner::GetNextTests = tests_fetcher;
 
     let send_test_result: abq_generic_test_runner::SendTestResults =
         &move |results| notify_results(entity, &run_id, results);
@@ -521,7 +522,7 @@ fn start_test_like_runner(
     let WorkerEnv {
         entity,
         msg_from_pool_rx,
-        get_next_tests,
+        mut tests_fetcher,
         get_init_context,
         run_id,
         results_batch_size: _,
@@ -603,7 +604,7 @@ fn start_test_like_runner(
             Err(mpsc::TryRecvError::Disconnected) => panic!("Pool died before worker did"),
             Err(mpsc::TryRecvError::Empty) => {
                 // No message from the parent. Wait for the next test_id to come in.
-                let NextWorkBundle(bundle) = rt.block_on(get_next_tests());
+                let NextWorkBundle(bundle) = rt.block_on(tests_fetcher.get_next_tests());
                 bundle
             }
         };
@@ -797,13 +798,13 @@ mod test {
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_with_protocol_version::with_protocol_version;
-    use futures::FutureExt;
+    use async_trait::async_trait;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
     use super::{
         GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest, NotifyResults,
-        RunExitCode, WorkerContext, WorkerPool,
+        RunExitCode, TestsFetcher, WorkerContext, WorkerPool,
     };
     use crate::negotiate::QueueNegotiator;
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
@@ -812,19 +813,31 @@ mod test {
     type ResultsCollector = Arc<Mutex<HashMap<WorkId, Vec<TestResult>>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestResult>>>;
 
+    struct Fetcher {
+        reader: Arc<Mutex<VecDeque<NextWork>>>,
+    }
+
+    #[async_trait]
+    impl TestsFetcher for Fetcher {
+        async fn get_next_tests(&mut self) -> NextWorkBundle {
+            loop {
+                if let Some(work) = self.reader.lock().unwrap().pop_front() {
+                    return NextWorkBundle(vec![work]);
+                }
+            }
+        }
+    }
+
     fn work_writer() -> (impl Fn(NextWork), impl Fn() -> GetNextTests) {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
         let reader = Arc::clone(&writer);
         let write_work = move |work| {
             writer.lock().unwrap().push_back(work);
         };
+
         let get_next_tests = move || {
             let reader = reader.clone();
-            let get_next_tests: GetNextTests = Box::new(move || loop {
-                if let Some(work) = reader.lock().unwrap().pop_front() {
-                    return async { NextWorkBundle(vec![work]) }.boxed();
-                }
-            });
+            let get_next_tests: GetNextTests = Box::new(Fetcher { reader });
             get_next_tests
         };
         (write_work, get_next_tests)
