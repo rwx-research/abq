@@ -116,68 +116,9 @@ pub enum Command {
         #[clap(long, requires("tls_cert"))]
         tls_key: Option<PathBuf>,
     },
-    /// NOTICE: `abq work` is deprecated and will be removed in a future version of ABQ.
-    /// Use `abq test --worker` instead.
-    ///
-    /// Starts a pool of abq workers in a working directory.
-    ///
-    /// You should use this to start workers on a remote machine that you'd like to connect to an
-    /// instance of `abq start`.
-    #[command(group(
-        ArgGroup::new("execution") // don't allow both queue_addr and num_workers params
-            .required(true)
-            .multiple(false)
-            .args(["access_token", "queue_addr"]),
-        ))]
-    Work {
-        /// Working directory of the workers. Defaults to the current directory.
-        #[clap(long, required = true, env("PWD"))]
-        working_dir: PathBuf,
-
-        /// The ID of the test run to pull work for.
-        /// In CI environments, this can be inferred from CI environment variables. Otherwise it is required.
-        #[clap(long, required = false, env("ABQ_RUN_ID"))]
-        run_id: Option<RunId>,
-
-        /// The access token to use when fetching queue config information from the ABQ API.
-        ///
-        /// Cannot be used with queue_addr (implies: not using the ABQ API).
-        #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
-        access_token: Option<AccessToken>,
-
-        /// Address of the queue to work from.
-        ///
-        /// Cannot be used with access_token (will fetch address from ABQ API).
-        #[clap(long, required = false)]
-        queue_addr: Option<SocketAddr>,
-
-        /// Number of workers to start. set to "cpu-cores" to use as many workers as available (physical) CPU cores.
-        #[clap(long, short = 'n', required = false, default_value = "1")]
-        num: NumWorkers,
-
-        /// Token to authorize messages sent to the queue with.
-        /// Usually, this should be the same token that `abq start` initialized with.
-        ///
-        /// If --access-token is specified, the token will be ignored and the token fetched from the ABQ API will be used.
-        #[clap(long, required = false)]
-        token: Option<UserToken>,
-
-        /// If the worker should send messages only with TLS, the path of the TLS cert to
-        /// anticipate from the communicating queue.
-        ///
-        /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
-        ///
-        /// If --access-token is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
-        #[clap(long)]
-        tls_cert: Option<PathBuf>,
-    },
     /// Starts an instance of an ABQ test suite run, or connects a worker to a test suite run.
     ///
     /// WORKERS:
-    ///
-    ///   NOTICE: If not specified, run without `--worker`, `abq test` will launch a test run but not
-    ///   also launch a worker. This behavior is deprecated; in a future version of ABQ, `--worker`
-    ///   will default to `0`.
     ///
     ///   `--worker 0` controls what process will stream test results:
     ///
@@ -206,22 +147,6 @@ pub enum Command {
             .args(["access_token", "queue_addr"]),
         )
     )]
-    // Don't allow both --num-workers and --num
-    // TODO(1.1): remove
-    #[command(group(
-        ArgGroup::new("num-workers")
-            .multiple(false)
-            .args(["num", "num_workers"]),
-        )
-    )]
-    // Don't allow both --test-timeout-seconds and --inactivity-timeout-seconds
-    // TODO(1.1): remove
-    #[command(group(
-        ArgGroup::new("timeout-seconds")
-            .multiple(false)
-            .args(["test_timeout_seconds", "inactivity_timeout_seconds"]),
-        )
-    )]
     #[command(group(
         ArgGroup::new("server-key-exclusion") // don't allow server-side cert key if running in non-local mode
             .multiple(false)
@@ -231,9 +156,6 @@ pub enum Command {
     )]
     Test {
         /// The number of the test worker connecting for a test suite run.
-        ///
-        /// NOTICE: If not specified, will start a supervisor without workers. This behavior is
-        /// deprecated; in a future version of ABQ, the default will be `--worker 0`.
         ///
         /// `--worker 0` is the test supervisor, and is responsible both for acting as a worker and
         /// executing all provided `--reporter`s.
@@ -245,8 +167,8 @@ pub enum Command {
         ///
         /// There may not be duplicate worker numberings in an ABQ test suite run.
         /// An ABQ test suite run must always include an `abq test` launched with `--worker 0`.
-        #[clap(long, required = false, default_value = None)]
-        worker: Option<usize>,
+        #[clap(long, required = false, default_value_t = 0)]
+        worker: usize,
 
         /// Working directory of the worker. Defaults to the current directory.
         #[clap(long, required = false)]
@@ -259,7 +181,7 @@ pub enum Command {
 
         /// The access token to use when fetching queue config information from the ABQ API.
         ///
-        /// Cannot be used with queue_addr (implies: not using the ABQ API) or num_workers (implies: run locally).
+        /// Cannot be used with --queue-addr (implies: not using the ABQ API).
         #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
         access_token: Option<AccessToken>,
 
@@ -267,14 +189,9 @@ pub enum Command {
         ///
         /// Requires that abq workers be started as separate processes connected to the queue.
         ///
-        /// Cannot be used with access_token (will fetch address from ABQ API) or num_workers (implies: run locally).
+        /// Cannot be used with access_token (will fetch address from ABQ API).
         #[clap(long, required = false)]
         queue_addr: Option<SocketAddr>,
-
-        /// NOTICE: `--num-workers` is deprecated and will be removed in ABQ 1.1.
-        /// Use `--num` instead.
-        #[clap(long, required = false)]
-        num_workers: Option<NumWorkers>,
 
         /// Number of runners to start on the worker.
         ///
@@ -333,11 +250,6 @@ pub enum Command {
         /// Only relevant with `--worker 0`.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
-
-        /// NOTICE: `--test-timeout-seconds` is deprecated and will be removed in ABQ 1.1.
-        /// Use `--inactivity-timeout-seconds` instead.
-        #[clap(long)]
-        test_timeout_seconds: Option<u64>,
 
         /// A broad measure of inactivity timeout seconds, after which a test run is cancelled.
         ///

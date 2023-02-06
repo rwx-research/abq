@@ -33,16 +33,7 @@ pub mod meta {
     /// A record of deprecated ABQ features an entity is using.
     #[derive(Serialize, Deserialize, Debug)]
     #[must_use]
-    pub enum Deprecation {
-        /// abq test --test-timeout-seconds
-        FlagTestTestTimeOutSeconds,
-        /// abq test --num-workers
-        FlagTestNumWorkers,
-        /// abq test without --worker set
-        TestWithoutWorkerFlag,
-        /// abq work command
-        AbqWork,
-    }
+    pub enum Deprecation {}
 
     /// A record of deprecated ABQ features an entity is using.
     #[derive(Serialize, Deserialize, Default)]

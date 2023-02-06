@@ -2,10 +2,9 @@
 source: crates/abq_cli/tests/cli.rs
 expression: stderr
 ---
-error: the following required arguments were not provided:
-  <--access-token <ACCESS_TOKEN>|--queue-addr <QUEUE_ADDR>>
+error: --worker=1 must specify --queue-addr or --access-token
 
-Usage: abq work --working-dir <WORKING_DIR> --run-id <RUN_ID> --num <NUM> <--access-token <ACCESS_TOKEN>|--queue-addr <QUEUE_ADDR>>
+Usage: test [OPTIONS] -- <ARGS>...
 
 For more information, try '--help'.
 
