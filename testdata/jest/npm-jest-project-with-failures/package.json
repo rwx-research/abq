@@ -11,10 +11,10 @@
     "jest": "29.4.1"
   },
   "overrides": {
-    "@jest/core": "npm:@rwx-research/jest-core@29.3.100-alpha.9",
-    "jest-config": "npm:@rwx-research/jest-config@29.3.100-alpha.9",
-    "jest-runner": "npm:@rwx-research/jest-runner@29.3.100-alpha.9",
-    "jest-circus": "npm:@rwx-research/jest-circus@29.3.100-alpha.9"
+    "@jest/core": "npm:@rwx-research/jest-core@29.4.100",
+    "jest-config": "npm:@rwx-research/jest-config@29.4.100",
+    "jest-runner": "npm:@rwx-research/jest-runner@29.4.100",
+    "jest-circus": "npm:@rwx-research/jest-circus@29.4.100"
   },
   "jest": {
     "verbose": true
