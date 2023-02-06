@@ -64,7 +64,7 @@ where
         native_runner_specification: RecordTestRunNativeRunnerSpecification {
             name: &native_runner_spec.name,
             version: &native_runner_spec.version,
-            host: native_runner_spec.host.as_deref().unwrap_or("<unknown>"),
+            host: &native_runner_spec.host,
         },
     };
 
@@ -120,11 +120,11 @@ mod test {
         NativeRunnerSpecification {
             name: "abq-runner".to_owned(),
             version: "1.2.3".to_owned(),
-            test_framework: Some("runner-framework".to_owned()),
-            test_framework_version: Some("4.5.6".to_owned()),
-            language: Some("ocaml".to_owned()),
-            language_version: Some("4.14".to_owned()),
-            host: Some("ocaml 4.14 inhd".to_owned()),
+            test_framework: "runner-framework".to_owned(),
+            test_framework_version: "4.5.6".to_owned(),
+            language: "ocaml".to_owned(),
+            language_version: "4.14".to_owned(),
+            host: "ocaml 4.14 inhd".to_owned(),
         }
     }
 

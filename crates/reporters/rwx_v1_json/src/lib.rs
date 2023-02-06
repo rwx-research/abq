@@ -26,12 +26,12 @@ impl From<&NativeRunnerSpecification> for Framework {
         // Normalize kind/language for native runners we know to https://github.com/rwx-research/test-results-schema/blob/main/v1.json
         let mut provided_language = None;
         let mut provided_kind = None;
-        let (language, kind) = match (spec.language.as_deref(), spec.test_framework.as_deref()) {
-            (Some("ruby"), Some("rspec")) => ("Ruby", "RSpec"),
-            (Some("javascript"), Some("jest")) => ("JavaScript", "Jest"),
+        let (language, kind) = match (spec.language.as_str(), spec.test_framework.as_str()) {
+            ("ruby", "rspec") => ("Ruby", "RSpec"),
+            ("javascript", "jest") => ("JavaScript", "Jest"),
             (lang, kind) => {
-                provided_language = lang;
-                provided_kind = kind;
+                provided_language = Some(lang);
+                provided_kind = Some(kind);
                 ("other", "other")
             }
         };
@@ -538,11 +538,11 @@ mod test {
         let runner_spec = NativeRunnerSpecification {
             name: "rspec-abq".to_string(),
             version: "1.0.0".to_string(),
-            test_framework: Some("rspec".to_string()),
-            test_framework_version: Some("4.2.1".to_string()),
-            language: Some("ruby".to_string()),
-            language_version: Some("3.1.0".to_string()),
-            host: Some("abqmachine".to_string()),
+            test_framework: "rspec".to_string(),
+            test_framework_version: "4.2.1".to_string(),
+            language: "ruby".to_string(),
+            language_version: "3.1.0".to_string(),
+            host: "abqmachine".to_string(),
         };
 
         let mut buf = vec![];
@@ -560,11 +560,11 @@ mod test {
         let runner_spec = NativeRunnerSpecification {
             name: "jest-abq".to_string(),
             version: "29.3.100".to_string(),
-            test_framework: Some("jest".to_string()),
-            test_framework_version: Some("29.3.1".to_string()),
-            language: Some("javascript".to_string()),
-            language_version: Some("node-16.0.0".to_string()),
-            host: Some("abqnode-16.0.0".to_string()),
+            test_framework: "jest".to_string(),
+            test_framework_version: "29.3.1".to_string(),
+            language: "javascript".to_string(),
+            language_version: "node-16.0.0".to_string(),
+            host: "abqnode-16.0.0".to_string(),
         };
 
         let mut buf = vec![];

@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::net_protocol::entity::EntityId;
 
-use super::{v0_1, AbqProtocolVersion, MetadataMap};
+use super::{AbqProtocolVersion, MetadataMap};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename = "abq_native_runner_spawned")]
@@ -35,37 +35,12 @@ pub struct Test {
     pub meta: MetadataMap,
 }
 
-impl From<v0_1::Test> for Test {
-    fn from(t: v0_1::Test) -> Self {
-        let v0_1::Test { id, tags, meta } = t;
-        Test { id, tags, meta }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Group {
     pub name: String,
     pub members: Vec<TestOrGroup>,
     pub tags: Vec<String>,
     pub meta: MetadataMap,
-}
-
-impl From<v0_1::Group> for Group {
-    fn from(g: v0_1::Group) -> Self {
-        let v0_1::Group {
-            name,
-            members,
-            tags,
-            meta,
-        } = g;
-        let members = members.into_iter().map(Into::into).collect();
-        Group {
-            name,
-            members,
-            tags,
-            meta,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -77,28 +52,10 @@ pub enum TestOrGroup {
     Group(Group),
 }
 
-impl From<v0_1::TestOrGroup> for TestOrGroup {
-    fn from(tg: v0_1::TestOrGroup) -> Self {
-        use v0_1::TestOrGroup::*;
-        match tg {
-            Test(t) => Self::Test(t.into()),
-            Group(g) => Self::Group(g.into()),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Manifest {
     pub members: Vec<TestOrGroup>,
     pub init_meta: MetadataMap,
-}
-
-impl From<v0_1::Manifest> for Manifest {
-    fn from(man: v0_1::Manifest) -> Self {
-        let v0_1::Manifest { members, init_meta } = man;
-        let members = members.into_iter().map(Into::into).collect();
-        Manifest { members, init_meta }
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -122,16 +79,6 @@ pub struct ManifestFailureMessage {
 pub enum ManifestMessage {
     Success(ManifestSuccessMessage),
     Failure(ManifestFailureMessage),
-}
-
-impl From<v0_1::ManifestMessage> for ManifestMessage {
-    fn from(msg: v0_1::ManifestMessage) -> Self {
-        let v0_1::ManifestMessage { manifest } = msg;
-        ManifestMessage::Success(ManifestSuccessMessage {
-            manifest: manifest.into(),
-            other_errors: None,
-        })
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
