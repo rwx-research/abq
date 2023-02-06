@@ -30,7 +30,7 @@ use abq_utils::{
         client::ReportedResult,
         entity::EntityId,
         health::Health,
-        meta::{Deprecation, DeprecationRecord},
+        meta::DeprecationRecord,
         runners::{CapturedOutput, TestRuntime},
         workers::{NativeTestRunnerParams, RunId, RunnerKind},
     },
@@ -45,7 +45,7 @@ use args::{
 use clap::Parser;
 
 use instance::AbqInstance;
-use reporting::{ColorPreference, ReporterKind, SuiteReporters};
+use reporting::{ReporterKind, SuiteReporters};
 use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
@@ -301,76 +301,6 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 ServerOptions::new(server_auth, server_tls),
             )
         }
-        Command::Work {
-            working_dir,
-            run_id,
-            access_token,
-            queue_addr,
-            num,
-            token,
-            tls_cert,
-        } => {
-            let mut deprecations = DeprecationRecord::default();
-
-            abq_output::deprecation(
-                &mut StdoutPreferences::new(ColorPreference::Auto).stdout_stream(),
-                "`abq work` is deprecated. Use `abq test` with `--worker` instead.",
-                || deprecations.push(Deprecation::AbqWork),
-            )?;
-
-            let mut cmd = Cli::command();
-            let cmd = cmd.find_subcommand_mut("work").unwrap();
-
-            let run_id = run_id.or(inferred_run_id).unwrap_or_else(|| {
-                let error = cmd.error(
-                    ErrorKind::MissingRequiredArgument,
-                    "The following required arguments were not provided: --run-id <RUN_ID>",
-                );
-                clap::Error::exit(&error);
-            });
-
-            let tls_cert = read_opt_path_bytes(tls_cert)?;
-
-            let ResolvedConfig {
-                token,
-                queue_addr,
-                tls_cert,
-            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
-
-            let queue_addr = queue_addr.unwrap_or_else(|| {
-                let error = cmd.error(
-                    ErrorKind::MissingRequiredArgument,
-                    "One of --access-token <ACCESS_TOKEN> or --queue-addr <QUEUE_ADDR> must be provided.",
-                );
-                clap::Error::exit(&error);
-            });
-
-            let client_tls = match tls_cert {
-                Some(cert) => ClientTlsStrategy::from_cert(&cert)?,
-                None => ClientTlsStrategy::no_tls(),
-            };
-
-            let abq = AbqInstance::from_remote(
-                entity,
-                run_id.clone(),
-                queue_addr,
-                ClientAuthStrategy::from(token),
-                client_tls,
-                deprecations,
-            )?;
-            let num_workers = match num {
-                CpuCores => NonZeroUsize::new(num_cpus::get_physical()).unwrap(),
-                Fixed(num) => num,
-            };
-
-            workers::start_workers_standalone(
-                num_workers,
-                working_dir,
-                abq.negotiator_handle(),
-                abq.take_client_options(),
-                run_id,
-            )
-        }
         Command::Test {
             worker,
             args,
@@ -378,44 +308,17 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             run_id,
             access_token,
             queue_addr,
-            mut num,
-            num_workers,
+            num,
             reporter: reporters,
             token,
             tls_cert,
             tls_key,
             color,
             batch_size,
-            mut inactivity_timeout_seconds,
-            test_timeout_seconds,
+            inactivity_timeout_seconds,
         } => {
+            let deprecations = DeprecationRecord::default();
             let stdout_preferences = StdoutPreferences::new(color);
-            let mut deprecations = DeprecationRecord::default();
-
-            if let Some(num_workers) = num_workers {
-                abq_output::deprecation(
-                    &mut stdout_preferences.stdout_stream(),
-                    "`--num-workers` is deprecated. Use `--num` instead.",
-                    || deprecations.push(Deprecation::FlagTestNumWorkers),
-                )?;
-                num = num_workers;
-            }
-            if let Some(inactivity_seconds) = test_timeout_seconds {
-                abq_output::deprecation(
-                    &mut stdout_preferences.stdout_stream(),
-                    "`--test-timeout-seconds` is deprecated. Use `--inactivity-timeout-seconds` instead.",
-                    || deprecations.push(Deprecation::FlagTestTestTimeOutSeconds),
-                )?;
-                inactivity_timeout_seconds = inactivity_seconds;
-            }
-
-            if worker.is_none() {
-                abq_output::deprecation(
-                    &mut stdout_preferences.stdout_stream(),
-                    "not specifying `--worker` will default to `--worker 0` in a future version of ABQ",
-                    || deprecations.push(Deprecation::TestWithoutWorkerFlag),
-                )?;
-            }
 
             let external_run_id = run_id.or(inferred_run_id);
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
@@ -423,21 +326,26 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let working_dir =
                 working_dir.unwrap_or_else(|| std::env::current_dir().expect("no current dir"));
 
-            // Workers are run in-band only if a queue for `abq test` is not going to be
-            // provided from an external source or `worker` is set.
-            //
-            // TODO: workers should always start in-band after `worker` is non-optional.
-            let start_in_process_workers =
-                worker.is_some() || (access_token.is_none() && queue_addr.is_none());
-
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
+
+            let is_supervisor = worker == 0;
 
             let ResolvedConfig {
                 queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
             } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
+
+            if !is_supervisor && resolved_queue_addr.is_none() {
+                let mut cmd = Cli::command();
+                let cmd = cmd.find_subcommand_mut("test").unwrap();
+                let error = cmd.error(
+                    ErrorKind::MissingRequiredArgument,
+                    format!("--worker={worker} must specify --queue-addr or --access-token"),
+                );
+                clap::Error::exit(&error);
+            }
 
             let client_auth = resolved_token.into();
 
@@ -462,16 +370,9 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
-            let is_supervisor = matches!(worker, None | Some(0));
-
             statefile::optional_write_worker_statefile(&run_id, is_supervisor)?;
 
             if is_supervisor {
-                let num_runners = if start_in_process_workers {
-                    Some(num_runners)
-                } else {
-                    None
-                };
                 run_sentinel_abq_test(
                     entity,
                     &access_token,
@@ -769,7 +670,7 @@ fn run_sentinel_abq_test(
     stdout_preferences: StdoutPreferences,
     batch_size: NonZeroU64,
     results_timeout: Duration,
-    in_process_num_runners: Option<NonZeroUsize>,
+    num_runners: NonZeroUsize,
     working_dir: PathBuf,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
@@ -806,26 +707,21 @@ fn run_sentinel_abq_test(
         "Started test run with ID {run_id}"
     )?;
 
-    let opt_worker_pool = if let Some(num_runners) = in_process_num_runners {
-        let worker_pool = workers::start_workers(
-            num_runners,
-            working_dir,
-            abq.negotiator_handle(),
-            abq.client_options().clone(),
-            run_id.clone(),
-            true, // workers in-band with supervisor
-        )?;
-        Some((worker_pool, num_runners))
-    } else {
-        None
-    };
+    let mut worker_pool = workers::start_workers(
+        num_runners,
+        working_dir,
+        abq.negotiator_handle(),
+        abq.client_options().clone(),
+        run_id.clone(),
+        true, // workers in-band with supervisor
+    )?;
 
     let opt_invoked_error = work_results_thread.join().unwrap();
 
     reporters.after_all_results();
 
     // Shutdown the localized worker pool
-    if let Some((mut worker_pool, num_runners)) = opt_worker_pool {
+    {
         let WorkersExit {
             // The exit code will be determined by the test result status.
             status: _,
