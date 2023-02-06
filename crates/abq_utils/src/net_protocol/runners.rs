@@ -5,7 +5,7 @@
 //! # Compatibility strategy
 //!
 //! ABQ needs to support multiple protocol versions at a time.
-//! Each protocol version is entirely stored in a sub-module; for example, see [v0_1].
+//! Each protocol version is entirely stored in a sub-module; for example, see [v0_2].
 //!
 //! Each such protocol version **describes entirely** the interface between a worker and native
 //! runner. As such, once data is read into an ABQ worker, it will not escape back into a native
@@ -30,7 +30,6 @@ use serde_derive::{Deserialize, Serialize};
 pub static ABQ_SOCKET: &str = "ABQ_SOCKET";
 pub static ABQ_GENERATE_MANIFEST: &str = "ABQ_GENERATE_MANIFEST";
 
-mod v0_1;
 mod v0_2;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,9 +51,6 @@ impl AbqProtocolVersion {
     pub fn get_supported_witness(&self) -> Option<ProtocolWitness> {
         use PrivProtocolWitness::*;
 
-        if self == &Self::V0_1 {
-            return Some(ProtocolWitness(V0_1));
-        }
         if self == &Self::V0_2 {
             return Some(ProtocolWitness(V0_2));
         }
@@ -64,7 +60,6 @@ impl AbqProtocolVersion {
 
 #[derive(Clone, Copy, Debug)]
 enum PrivProtocolWitness {
-    V0_1,
     V0_2,
 }
 #[derive(Clone, Copy, Debug)]
@@ -74,7 +69,6 @@ impl ProtocolWitness {
     pub const fn get_version(&self) -> AbqProtocolVersion {
         use PrivProtocolWitness::*;
         match self.0 {
-            V0_1 => AbqProtocolVersion::V0_1,
             V0_2 => AbqProtocolVersion::V0_2,
         }
     }
@@ -82,65 +76,40 @@ impl ProtocolWitness {
     pub fn iter_all() -> impl Iterator<Item = ProtocolWitness> {
         use PrivProtocolWitness::*;
 
-        [Self(V0_1), Self(V0_2)].into_iter()
+        [Self(V0_2)].into_iter()
     }
 }
 
-// NORMALIZE: runner specification 0.1
-pub use v0_1::AbqNativeRunnerSpecification as NativeRunnerSpecification;
-
-#[cfg(feature = "expose-native-protocols")]
-impl From<NativeRunnerSpecification> for v0_2::AbqNativeRunnerSpecification {
-    fn from(spec: NativeRunnerSpecification) -> v0_2::AbqNativeRunnerSpecification {
-        let NativeRunnerSpecification {
-            name,
-            version,
-            test_framework,
-            test_framework_version,
-            language,
-            language_version,
-            host,
-        } = spec;
-        v0_2::AbqNativeRunnerSpecification {
-            name,
-            version,
-            test_framework: test_framework.unwrap(),
-            test_framework_version: test_framework_version.unwrap(),
-            language: language.unwrap(),
-            language_version: language_version.unwrap(),
-            host: host.unwrap(),
-        }
-    }
-}
+// NORMALIZE: runner specification 0.2
+pub use v0_2::AbqNativeRunnerSpecification as NativeRunnerSpecification;
 
 impl NativeRunnerSpecification {
     pub fn fake() -> Self {
         Self {
             name: "test-runner".to_owned(),
             version: "1.2.3".to_owned(),
-            test_framework: Some("zframework".to_owned()),
-            test_framework_version: Some("4.5.6".to_owned()),
-            language: Some("zlang".to_owned()),
-            language_version: Some("7.8.9".to_owned()),
-            host: Some("zmachine".to_owned()),
+            test_framework: "zframework".to_owned(),
+            test_framework_version: "4.5.6".to_owned(),
+            language: "zlang".to_owned(),
+            language_version: "7.8.9".to_owned(),
+            host: "zmachine".to_owned(),
         }
     }
 }
 
-// NORMALIZE: runner specification 0.1
-pub use v0_1::AbqNativeRunnerSpawnedMessage as NativeRunnerSpawnedMessage;
+// NORMALIZE: runner specification 0.2
+pub use v0_2::AbqNativeRunnerSpawnedMessage as NativeRunnerSpawnedMessage;
 
 impl From<RawNativeRunnerSpawnedMessage> for NativeRunnerSpawnedMessage {
     fn from(msg: RawNativeRunnerSpawnedMessage) -> Self {
         use PrivAbqNativeRunnerSpawnedMessage::*;
         match msg.0 {
-            V0_1(msg) => msg,
             V0_2(v0_2::AbqNativeRunnerSpawnedMessage {
                 protocol_version,
                 runner_specification,
             }) => Self {
                 protocol_version,
-                runner_specification: runner_specification.into(),
+                runner_specification,
             },
         }
     }
@@ -152,7 +121,6 @@ pub struct RawNativeRunnerSpawnedMessage(PrivAbqNativeRunnerSpawnedMessage);
 #[derive(Serialize, Deserialize, Debug, Clone, derive_more::From)]
 #[serde(untagged)]
 enum PrivAbqNativeRunnerSpawnedMessage {
-    V0_1(v0_1::AbqNativeRunnerSpawnedMessage),
     V0_2(v0_2::AbqNativeRunnerSpawnedMessage),
 }
 
@@ -165,14 +133,9 @@ impl RawNativeRunnerSpawnedMessage {
     ) -> Self {
         use PrivProtocolWitness::*;
         Self(match protocol.0 {
-            V0_1 => v0_1::AbqNativeRunnerSpawnedMessage {
-                protocol_version,
-                runner_specification: spec,
-            }
-            .into(),
             V0_2 => v0_2::AbqNativeRunnerSpawnedMessage {
                 protocol_version,
-                runner_specification: spec.into(),
+                runner_specification: spec,
             }
             .into(),
         })
@@ -184,7 +147,6 @@ pub struct TestCase(PrivTestCase);
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, derive_more::From)]
 #[serde(untagged)]
 enum PrivTestCase {
-    V0_1(v0_1::TestCase),
     V0_2(v0_2::TestCase),
 }
 
@@ -192,7 +154,6 @@ impl TestCase {
     pub fn id(&self) -> &TestId {
         use PrivTestCase::*;
         match &self.0 {
-            V0_1(tc) => &tc.id,
             V0_2(tc) => &tc.id,
         }
     }
@@ -201,13 +162,6 @@ impl TestCase {
     pub fn new(protocol: ProtocolWitness, id: impl Into<TestId>, meta: MetadataMap) -> Self {
         use PrivProtocolWitness::*;
         match protocol.0 {
-            V0_1 => Self(
-                v0_1::TestCase {
-                    id: id.into(),
-                    meta,
-                }
-                .into(),
-            ),
             V0_2 => Self(
                 v0_2::TestCase {
                     id: id.into(),
@@ -224,7 +178,6 @@ pub struct TestCaseMessage(PrivTestCaseMessage);
 #[derive(Serialize, Deserialize, Debug, derive_more::From)]
 #[serde(untagged)]
 enum PrivTestCaseMessage {
-    V0_1(v0_1::TestCaseMessage),
     V0_2(v0_2::TestCaseMessage),
 }
 
@@ -232,7 +185,6 @@ impl TestCaseMessage {
     pub fn new(test_case: TestCase) -> Self {
         use PrivTestCase::*;
         match test_case.0 {
-            V0_1(test_case) => Self((v0_1::TestCaseMessage { test_case }).into()),
             V0_2(test_case) => Self(v0_2::TestCaseMessage { test_case }.into()),
         }
     }
@@ -241,7 +193,6 @@ impl TestCaseMessage {
 pub struct TestOrGroup(PrivTestOrGroup);
 #[derive(derive_more::From)]
 enum PrivTestOrGroup {
-    V0_1(v0_1::TestOrGroup),
     V0_2(v0_2::TestOrGroup),
 }
 
@@ -250,7 +201,6 @@ impl TestOrGroup {
     pub fn test(test: Test) -> Self {
         use PrivTest::*;
         match test.0 {
-            V0_1(test) => Self(v0_1::TestOrGroup::Test(test).into()),
             V0_2(test) => Self(v0_2::TestOrGroup::Test(test).into()),
         }
     }
@@ -259,7 +209,6 @@ impl TestOrGroup {
 pub struct Test(PrivTest);
 #[derive(derive_more::From)]
 enum PrivTest {
-    V0_1(v0_1::Test),
     V0_2(v0_2::Test),
 }
 
@@ -274,14 +223,6 @@ impl Test {
         use PrivProtocolWitness::*;
 
         match protocol.0 {
-            V0_1 => Self(
-                v0_1::Test {
-                    id: id.into(),
-                    tags: tags.into(),
-                    meta,
-                }
-                .into(),
-            ),
             V0_2 => Self(
                 v0_2::Test {
                     id: id.into(),
@@ -299,7 +240,6 @@ pub struct RawManifest(PrivManifest);
 #[derive(Serialize, Deserialize, Debug, Clone, derive_more::From)]
 #[serde(untagged)]
 enum PrivManifest {
-    V0_1(v0_1::Manifest),
     V0_2(v0_2::Manifest),
 }
 
@@ -310,7 +250,6 @@ impl From<RawManifest> for Manifest {
     fn from(man: RawManifest) -> Self {
         use PrivManifest::*;
         match man.0 {
-            V0_1(man) => man.into(),
             V0_2(man) => man,
         }
     }
@@ -355,7 +294,6 @@ impl Manifest {
             .into_iter()
             .map(|tg| match tg.0 {
                 PrivTestOrGroup::V0_2(tg) => tg,
-                PrivTestOrGroup::V0_1(tg) => tg.into(),
             })
             .collect();
         Self { members, init_meta }
@@ -367,7 +305,6 @@ pub struct RawManifestMessage(PrivManifestMessage);
 #[derive(Serialize, Deserialize, Debug, Clone, derive_more::From)]
 #[serde(untagged)]
 enum PrivManifestMessage {
-    V0_1(v0_1::ManifestMessage),
     V0_2(v0_2::ManifestMessage),
 }
 
@@ -378,7 +315,6 @@ impl From<RawManifestMessage> for ManifestMessage {
     fn from(msg: RawManifestMessage) -> Self {
         use PrivManifestMessage::*;
         match msg.0 {
-            V0_1(msg) => msg.into(),
             V0_2(msg) => msg,
         }
     }
@@ -478,26 +414,6 @@ impl Status {
                 | Status::TimedOut
                 | Status::PrivateNativeRunnerError
         )
-    }
-}
-
-impl From<v0_1::Status> for Status {
-    fn from(ts: v0_1::Status) -> Self {
-        use v0_1::Status as VStatus;
-        use Status::*;
-        match ts {
-            VStatus::Failure => Failure {
-                exception: None,
-                backtrace: None,
-            },
-            VStatus::Success => Success,
-            VStatus::Error => Error {
-                exception: None,
-                backtrace: None,
-            },
-            VStatus::Pending => Pending,
-            VStatus::Skipped => Skipped,
-        }
     }
 }
 
@@ -634,39 +550,6 @@ impl TestResultSpec {
     }
 }
 
-impl From<v0_1::TestResult> for TestResultSpec {
-    fn from(tr: v0_1::TestResult) -> Self {
-        let v0_1::TestResult {
-            status,
-            id,
-            display_name,
-            output,
-            runtime,
-            meta,
-        } = tr;
-
-        let status = status.into();
-        let runtime = TestRuntime::Milliseconds(runtime as _);
-
-        TestResultSpec {
-            status,
-            id,
-            display_name,
-            output,
-            runtime,
-            meta,
-            location: None,
-            started_at: None,
-            finished_at: None,
-            lineage: None,
-            past_attempts: None,
-            other_errors: None,
-            stderr: None,
-            stdout: None,
-        }
-    }
-}
-
 impl From<v0_2::TestResult> for TestResultSpec {
     fn from(tr: v0_2::TestResult) -> Self {
         let v0_2::TestResult {
@@ -714,11 +597,10 @@ pub struct RawNativeTestResult(PrivNativeTestResult);
 #[derive(Serialize, Deserialize, Debug, derive_more::From)]
 #[serde(untagged)]
 enum PrivNativeTestResult {
-    V0_1(v0_1::TestResult),
     V0_2(Box<v0_2::TestResult>),
 }
 
-static_assertions::assert_eq_size!(RawNativeTestResult, [u8; 112]);
+static_assertions::assert_eq_size!(RawNativeTestResult, [u8; 8]);
 
 /// Test result reported to ABQ, normalizing from a native runner.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -760,14 +642,6 @@ impl TestResult {
     }
 }
 
-impl v0_1::TestResult {
-    fn reify(self, source: EntityId) -> TestResult {
-        TestResult {
-            source,
-            result: self.into(),
-        }
-    }
-}
 impl v0_2::TestResult {
     fn reify(self, source: EntityId) -> TestResult {
         TestResult {
@@ -781,7 +655,6 @@ impl RawNativeTestResult {
         use PrivNativeTestResult::*;
 
         match self.0 {
-            V0_1(tr) => tr.reify(source),
             V0_2(tr) => (*tr).reify(source),
         }
     }
@@ -792,18 +665,14 @@ pub struct RawTestResultMessage(PrivTestResultMessage);
 #[derive(Serialize, Deserialize, Debug, derive_more::From)]
 #[serde(untagged)]
 enum PrivTestResultMessage {
-    V0_2(Box<v0_2::TestResultMessage>),
-    V0_1(v0_1::TestResultMessage),
+    V0_2(v0_2::TestResultMessage),
 }
-
-static_assertions::assert_eq_size!(RawTestResultMessage, [u8; 112]);
 
 impl RawTestResultMessage {
     /// Extract the [test result][TestResult] from the message.
     pub fn into_test_results(self, source: EntityId) -> TestResultSet {
         use PrivTestResultMessage::*;
         match self.0 {
-            V0_1(msg) => TestResultSet::All(vec![msg.test_result.reify(source)]),
             V0_2(msg) => msg.into_test_results(source),
         }
     }
@@ -812,15 +681,11 @@ impl RawTestResultMessage {
     pub fn fake(witness: ProtocolWitness) -> Self {
         use PrivProtocolWitness::*;
         match witness.0 {
-            V0_1 => Self(PrivTestResultMessage::V0_1(v0_1::TestResultMessage {
-                test_result: TestResult::fake().into(),
-            })),
-
-            V0_2 => Self(PrivTestResultMessage::V0_2(Box::new(
+            V0_2 => Self(PrivTestResultMessage::V0_2(
                 v0_2::TestResultMessage::Single(v0_2::SingleTestResultMessage {
                     test_result: TestResult::fake().into(),
                 }),
-            ))),
+            )),
         }
     }
 }
@@ -862,7 +727,6 @@ pub struct InitMessage(PrivInitMessage);
 #[derive(Serialize, Deserialize, Debug, derive_more::From)]
 #[serde(untagged)]
 enum PrivInitMessage {
-    V0_1(v0_1::InitMessage),
     V0_2(v0_2::InitMessage),
 }
 
@@ -870,13 +734,6 @@ impl InitMessage {
     pub fn new(witness: ProtocolWitness, init_meta: MetadataMap, fast_exit: FastExit) -> Self {
         use PrivProtocolWitness::*;
         match witness.0 {
-            V0_1 => Self(
-                v0_1::InitMessage {
-                    init_meta,
-                    fast_exit: fast_exit.0,
-                }
-                .into(),
-            ),
             V0_2 => Self(
                 v0_2::InitMessage {
                     init_meta,
@@ -888,14 +745,14 @@ impl InitMessage {
     }
 }
 
-type PrivInitSuccessMessage = v0_1::InitSuccessMessage;
+type PrivInitSuccessMessage = v0_2::InitSuccessMessage;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct InitSuccessMessage(PrivInitSuccessMessage);
 
 impl InitSuccessMessage {
     #[cfg(feature = "expose-native-protocols")]
     pub fn new(_witness: ProtocolWitness) -> Self {
-        InitSuccessMessage(v0_1::InitSuccessMessage {})
+        InitSuccessMessage(v0_2::InitSuccessMessage {})
     }
 }
 

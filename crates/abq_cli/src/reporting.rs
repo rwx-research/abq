@@ -950,11 +950,11 @@ fn mock_summary() -> CompletedSummary {
             specification: NativeRunnerSpecification {
                 name: "test-runner".to_owned(),
                 version: "1.2.3".to_owned(),
-                test_framework: Some("zframework".to_owned()),
-                test_framework_version: Some("4.5.6".to_owned()),
-                language: Some("zlang".to_owned()),
-                language_version: Some("7.8.9".to_owned()),
-                host: Some("zmachine".to_owned()),
+                test_framework: "zframework".to_owned(),
+                test_framework_version: "4.5.6".to_owned(),
+                language: "zlang".to_owned(),
+                language_version: "7.8.9".to_owned(),
+                host: "zmachine".to_owned(),
             },
         },
     }
