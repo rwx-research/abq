@@ -29,7 +29,6 @@ jobs:
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
-      PLATFORM: linux_x86-64
       RUST_TARGET: x86_64-unknown-linux-musl
       ABQ_DEVELOPMENT_BUILD: 1
       ABQ_NO_REBUILD: true
@@ -135,42 +134,31 @@ jobs:
       - name: Prepare release environment
         run: |
           ABQ_VERSION="$(cat build_artifact/abq_version.txt)"
-          RELEASE_NAME="abq_${ABQ_VERSION}_linux_x86-64"
-          RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
-          RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
+          RELEASE_DIR="abq_${ABQ_VERSION}_linux_x86-64"
+          RELEASE_ARCHIVE="${RELEASE_DIR}.tar.gz"
           {
             echo "ABQ_VERSION=$ABQ_VERSION"
-            echo "RELEASE_NAME=$RELEASE_NAME"
+            echo "RELEASE_DIR=$RELEASE_DIR"
             echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE"
-            echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT"
+            echo "RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
+            echo "RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/abq_nightly_linux_x86-64"
+            echo "NEW_RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/linux/x86_64/abq"
+            echo "NEW_RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/linux/x86_64/abq"
           } >> "$GITHUB_ENV"
 
       - name: Prepare release
         id: prepare_release
         run: |
-          mkdir "${RELEASE_NAME}"
-          cp "target/$RUST_TARGET/release/abq" "${RELEASE_NAME}"
-          tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
+          mkdir "${RELEASE_DIR}"
+          cp "target/$RUST_TARGET/release/abq" "${RELEASE_DIR}"
+          tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
           echo "filesize=$(wc -c "$RELEASE_ARCHIVE" | awk '{ print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Push release to staging S3
         env:
           RELEASE_BUCKET: abq-releases-staging
         run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
-
-          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile staging
-          aws s3api put-object-tagging \
-            --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_S3_OBJECT" \
-            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
-            --profile staging
-
-          aws s3 cp \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/${RELEASE_S3_OBJECT//$ABQ_VERSION/nightly}" \
-            --profile staging
+          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} staging
 
       - name: export abq version
         id: abq_version

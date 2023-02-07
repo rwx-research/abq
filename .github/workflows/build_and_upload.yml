@@ -56,21 +56,30 @@ jobs:
       # in the future we'll want to release against different architectures
       matrix:
         include:
-          - os: rwx-ubuntu-latest
-            platform: linux_x86-64
+          - runs-on: rwx-ubuntu-latest
+            # todo: deprecate plaform key when we move to RFC 20 style abq uploads
+            deprecated-platform: linux_x86-64
+            os: linux
+            architecture: x86_64
             cross-target: 'x86_64-unknown-linux-musl'
             install-musl-tools: true
-          - os: rwx-ubuntu-latest
-            platform: linux_aarch64
+          - runs-on: rwx-ubuntu-latest
+            deprecated-platform: linux_aarch64
+            os: linux
+            architecture: aarch64
             cross-target: 'aarch64-unknown-linux-musl'
             container: messense/rust-musl-cross:aarch64-musl@sha256:777bd4c61179c38dc213bb8472500584646d28fd4a7c3e0b30b9ef70cb446d58
-          - os: macos-10.15 # use an older version for broader osx support
-            platform: darwin_x86-64
+          - runs-on: macos-10.15 # use an older version for broader osx support
+            deprecated-platform: darwin_x86-64
+            os: darwin
+            architecture: x86_64
             cross-target: ''
-          - os: macos-11 # first OS X to support arm64 -- so the first os for cross compilation
-            platform: darwin_aarch64
+          - runs-on: macos-11 # first OS X to support arm64 -- so the first os for cross compilation
+            deprecated-platform: darwin_aarch64
+            os: darwin
+            architecture: aarch64
             cross-target: 'aarch64-apple-darwin'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
@@ -106,9 +115,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-release-${{ matrix.platform }}-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-${{ matrix.os }}-${{ matrix.architecture }}-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-${{ matrix.platform }}-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-${{ matrix.os }}-${{ matrix.architecture }}-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
@@ -132,36 +141,37 @@ jobs:
       - name: Prepare release environment
         run: |
           ABQ_VERSION="$(cat build_artifact/abq_version.txt)"
-          RELEASE_NAME="abq_${ABQ_VERSION}_${{ matrix.platform }}"
-          RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
-          RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
-          RELEASE_S3_NIGHTLY_OBJECT="abq/nightly/abq_nightly_${{ matrix.platform }}"
+          RELEASE_DIR="abq_${ABQ_VERSION}_${{ matrix.deprecated-platform }}"
+          # deprecated, remove these when we fully migrate to RFC-20 style storage
+          RELEASE_ARCHIVE="${RELEASE_DIR}.tar.gz"
+          # drop `NEW_` when we migrate to RFC-20 style storage
           {
           echo "ABQ_VERSION=$ABQ_VERSION"
-          echo "RELEASE_NAME=$RELEASE_NAME"
+          echo "RELEASE_DIR=$RELEASE_DIR"
           echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE"
-          echo "RELEASE_S3_OBJECT=$RELEASE_S3_OBJECT"
-          echo "RELEASE_S3_NIGHTLY_OBJECT=$RELEASE_S3_NIGHTLY_OBJECT"
+          echo "RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
+          echo "RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/abq_nightly_${{ matrix.deprecated-platform }}"
+          echo "NEW_RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/${{ matrix.os }}/${{ matrix.architecture }}/abq"
+          echo "NEW_RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/${{ matrix.os }}/${{ matrix.architecture }}/abq"
           } >> "$GITHUB_ENV"
 
       - name: Move release to consistent directory
         run: |
-          mkdir "${RELEASE_NAME}"
+          mkdir "${RELEASE_DIR}"
           if [ -z "${{ matrix.cross-target }}" ]; then
-            cp target/release/abq "${RELEASE_NAME}/"
+            cp target/release/abq "${RELEASE_DIR}/"
           else
-            cp target/${{ matrix.cross-target }}/release/abq "${RELEASE_NAME}/"
+            cp target/${{ matrix.cross-target }}/release/abq "${RELEASE_DIR}/"
           fi
 
       - name: Sign & Notarize Release
-        id: sign_and_notarize
-        if: contains(matrix.platform, 'darwin')
+        if: matrix.os == 'darwin'
         run: |
           (rcodesign --version | grep "$CODESIGN_VERSION")  || cargo install apple-codesign --force --version "$CODESIGN_VERSION"
           echo "$RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT" > rwx-developer-id-application-cert.pem
           # first we sign the binary. This happens locally.
-          rcodesign sign --pem-source rwx-developer-id-application-cert.pem --code-signature-flags runtime "$RELEASE_NAME/abq"
-          zip -r abq.zip "$RELEASE_NAME"
+          rcodesign sign --pem-source rwx-developer-id-application-cert.pem --code-signature-flags runtime "$RELEASE_DIR/abq"
+          zip -r abq.zip "$RELEASE_DIR"
           echo "$RWX_APPLE_APP_STORE_CONNECT_API_KEY" > rwx-apple-app-store-connect-api-key.json
           submission_id="$(rcodesign notary-submit --wait --api-key-path rwx-apple-app-store-connect-api-key.json abq.zip 2>&1 | tee /dev/fd/2 | grep "created submission ID:" | awk '{print $4}')"
           echo "Submission ID: $submission_id"
@@ -171,18 +181,19 @@ jobs:
           RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT: ${{ secrets.RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT }}
           RWX_APPLE_APP_STORE_CONNECT_API_KEY: ${{ secrets.RWX_APPLE_APP_STORE_CONNECT_API_KEY }}
       - name: ensure sign & notary cleanup happens
-        if: contains(matrix.platform, 'darwin') && always()
+        if: matrix.os == 'darwin' && always()
         run: rm -f rwx-apple-app-store-connect-api-key.json rwx-developer-id-application-cert.pem
 
-      - name: Archive release
+      # Deprecated. Remove archiving release when we fully migrate to RFC-20 style storage
+      - name: (Deprecated) Archive release
         # we do this in its own step so that for darwin, abq is already signed
-        run: tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_NAME}"
+        run: tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
 
       - name: Install tools to container that are baked into default image
         if: matrix.container
         # we need to install aws tools if we use a container. The default images have the tools baked in.
-        # AWS bit is approximately copied from the native image, https://github.com/actions/runner-images/blob/4aeccc7b5b5a63058b2d8a9a29072708e1f267bf/images/linux/scripts/installers/aws.sh#L11
-        # perhasp we should fork the musl container
+        # The AWS code is approximately copied from the native image, https://github.com/actions/runner-images/blob/4aeccc7b5b5a63058b2d8a9a29072708e1f267bf/images/linux/scripts/installers/aws.sh#L11
+        # perhaps we should fork the musl container
         run: |
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip -qq awscliv2.zip
@@ -203,57 +214,18 @@ jobs:
         env:
           RELEASE_BUCKET: abq-releases-development
         run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_ACCESS_KEY_ID }} --profile development
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_SECRET_ACCESS_KEY }} --profile development
-
-          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile development
-          aws s3api put-object-tagging \
-            --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_S3_OBJECT" \
-            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
-            --profile development
-
-          aws s3 cp \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_NIGHTLY_OBJECT" \
-            --profile development
+          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_SECRET_ACCESS_KEY }} development
 
       - name: Push release to staging S3
         env:
           RELEASE_BUCKET: abq-releases-staging
         run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
-
-          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile staging
-          aws s3api put-object-tagging \
-            --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_S3_OBJECT" \
-            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
-            --profile staging
-
-          aws s3 cp \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_NIGHTLY_OBJECT" \
-            --profile staging
+          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} staging
       - name: Push release to production S3
         env:
           RELEASE_BUCKET: abq-releases
         run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID }} --profile production
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY }} --profile production
-
-          aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile production
-          aws s3api put-object-tagging \
-            --bucket "$RELEASE_BUCKET" \
-            --key "$RELEASE_S3_OBJECT" \
-            --tagging "$(jq -n --arg commit "$(git rev-parse HEAD)" '{"TagSet": [{"Key":"commit", "Value": $commit}]}')" \
-            --profile production
-
-          aws s3 cp \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" \
-            "s3://$RELEASE_BUCKET/$RELEASE_S3_NIGHTLY_OBJECT" \
-            --profile production
+          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY }} production
       - name: export abq version
         id: abq_version
         run: |

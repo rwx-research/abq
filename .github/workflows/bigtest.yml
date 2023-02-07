@@ -28,10 +28,6 @@ jobs:
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
-      PLATFORM: linux_x86-64
-
-      RELEASE_BUCKET: abq-releases-staging
-
       ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
     steps:
       - name: Checkout code
@@ -54,19 +50,12 @@ jobs:
           aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
           aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
 
-          ABQ_VERSION="${{ inputs.version }}"
-          RELEASE_NAME="abq_${ABQ_VERSION}_${PLATFORM}"
-          RELEASE_ARCHIVE="${RELEASE_NAME}.tar.gz"
-          RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
-
           ABQ_BIN="$PWD/abq-bin"
           mkdir -p "$ABQ_BIN"
 
-          aws s3 cp "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" "$ABQ_BIN/abq.tar.gz" --profile staging
+          aws s3 cp "s3://abq-releases-staging/abq/${{ inputs.version }}/linux/x86_64/abq" "$ABQ_BIN/abq" --profile staging
 
-          pushd abq-bin
-          tar -xf abq.tar.gz --strip-components=1
-          popd
+          chmod 755 "$ABQ_BIN/abq"
 
           echo "$ABQ_BIN" >> "$GITHUB_PATH"
 
