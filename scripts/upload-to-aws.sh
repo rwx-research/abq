@@ -15,7 +15,7 @@ aws configure set aws_access_key_id "$ACCESS_KEY_ID" --profile "$PROFILE"
 aws configure set aws_secret_access_key "$SECRET_ACCESS_KEY" --profile "$PROFILE"
 
 # deprecated format, remove after we're fully migrated to rfc-20 style binaries
-aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile staging
+aws s3 cp "$RELEASE_ARCHIVE" "s3://$RELEASE_BUCKET/$RELEASE_S3_OBJECT" --profile "$PROFILE"
 aws s3api put-object-tagging \
   --bucket "$RELEASE_BUCKET" \
   --key "$RELEASE_S3_OBJECT" \
@@ -28,7 +28,7 @@ aws s3 cp \
   --profile "$PROFILE"
 
 # rfc-20 style binaries
-aws s3 cp "$RELEASE_DIR/abq" "s3://$RELEASE_BUCKET/$NEW_RELEASE_S3_OBJECT" --profile staging
+aws s3 cp "$RELEASE_DIR/abq" "s3://$RELEASE_BUCKET/$NEW_RELEASE_S3_OBJECT" --profile "$PROFILE"
 aws s3api put-object-tagging \
   --bucket "$RELEASE_BUCKET" \
   --key "$NEW_RELEASE_S3_OBJECT" \
