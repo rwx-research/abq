@@ -48,12 +48,14 @@ impl HostedQueueConfig {
             })?;
 
         let client = reqwest::blocking::Client::new();
-        let request = client
-            .get(queue_api)
-            .bearer_auth(access_token)
-            .header("User-Agent", format!("abq/{}", abq_utils::VERSION))
-            .query(&[("run_id", run_id.to_string())]);
-        let resp: HostedQueueResponse = send_request_with_decay(request)?
+        let build_request = move || {
+            client
+                .get(queue_api.clone())
+                .bearer_auth(access_token)
+                .header("User-Agent", format!("abq/{}", abq_utils::VERSION))
+                .query(&[("run_id", run_id.to_string())])
+        };
+        let resp: HostedQueueResponse = send_request_with_decay(build_request)?
             .error_for_status()?
             .json()?;
 
@@ -125,10 +127,10 @@ fn build_retrier(
 /// Attempts a request a number of times, retrying with an exponential decay if the server was
 /// determined to have errored or notified a rate-limit.
 fn send_request_with_decay(
-    request: RequestBuilder,
+    build_request: impl Fn() -> RequestBuilder,
 ) -> reqwest::Result<reqwest::blocking::Response> {
     send_request_with_decay_help(
-        request,
+        build_request,
         build_retrier(
             DEFAULT_REQUEST_ATTEMPTS,
             DEFAULT_REQUEST_DECAY,
@@ -138,17 +140,14 @@ fn send_request_with_decay(
 }
 
 fn send_request_with_decay_help(
-    request: RequestBuilder,
+    build_request: impl Fn() -> RequestBuilder,
     mut wait_for_retry: impl FnMut(usize) -> bool,
 ) -> reqwest::Result<reqwest::blocking::Response> {
     let mut last_attempt = 0;
     loop {
         last_attempt += 1;
 
-        let response = request
-            .try_clone()
-            .expect("bodies provided in the hosted API should never be streams")
-            .send()?;
+        let response = build_request().send()?;
 
         let status = response.status();
         if status.is_success() {
@@ -370,7 +369,7 @@ mod test {
 
         let client = reqwest::blocking::Client::new();
         let resp =
-            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(last_seen_attempt, 1);
@@ -400,7 +399,7 @@ mod test {
 
         let client = reqwest::blocking::Client::new();
         let resp =
-            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(last_seen_attempt, 1);
@@ -430,7 +429,7 @@ mod test {
 
         let client = reqwest::blocking::Client::new();
         let resp =
-            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(last_seen_attempt, 0);
@@ -452,7 +451,7 @@ mod test {
 
         let client = reqwest::blocking::Client::new();
         let resp =
-            send_request_with_decay_help(client.get(mockito::server_url()), retrier).unwrap();
+            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
 
         assert_eq!(resp.status().as_u16(), 500);
         assert_eq!(last_seen_attempt, 3);
