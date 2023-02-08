@@ -47,7 +47,7 @@ aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN
 or if you're using direnv, write ABQ_CREATE_MANUAL_ACCESS to your .envrc
 
 ```bash
-aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN --with-decryption --profile staging --output json | jq .Parameter.Value | xargs -n 1 -I {} echo "ABQ_CREATE_MANUAL_ACCESS_TOKEN={}" > .envrc
+aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN --with-decryption --profile staging --output json | jq .Parameter.Value | xargs -n 1 -I {} echo "export ABQ_CREATE_MANUAL_ACCESS_TOKEN={}" > .envrc
 ```
 
 - `bin/manage_dev_queue start <version>` - start the dev queue instance. If no
