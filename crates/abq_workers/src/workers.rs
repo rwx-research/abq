@@ -1,5 +1,6 @@
 use std::io;
 use std::num::NonZeroUsize;
+use std::panic;
 use std::path::PathBuf;
 use std::sync::atomic::{self, AtomicUsize};
 use std::sync::{Arc, Mutex};
@@ -218,7 +219,6 @@ impl WorkerPool {
                 notify_results,
                 context: worker_context.clone(),
                 notify_manifest,
-                mark_worker_complete,
                 supervisor_in_band,
                 debug_native_runner,
             };
@@ -229,7 +229,11 @@ impl WorkerPool {
                 runner
             };
 
-            workers.push(ThreadWorker::new(runner_kind, worker_env));
+            workers.push(ThreadWorker::new(
+                runner_kind,
+                worker_env,
+                mark_worker_complete,
+            ));
         }
 
         // Provision the rest of the workers.
@@ -249,7 +253,6 @@ impl WorkerPool {
                 notify_results,
                 context: worker_context.clone(),
                 notify_manifest: None,
-                mark_worker_complete,
                 supervisor_in_band,
                 debug_native_runner,
             };
@@ -260,7 +263,11 @@ impl WorkerPool {
                 runner
             };
 
-            workers.push(ThreadWorker::new(runner_kind, worker_env));
+            workers.push(ThreadWorker::new(
+                runner_kind,
+                worker_env,
+                mark_worker_complete,
+            ));
         }
 
         Self {
@@ -396,21 +403,31 @@ struct WorkerEnv {
     results_batch_size: u64,
     notify_results: NotifyResults,
     context: WorkerContext,
-    mark_worker_complete: MarkWorkerComplete,
     // Is this running in-band with a supervisor process?
     supervisor_in_band: bool,
     debug_native_runner: bool,
 }
 
 impl ThreadWorker {
-    pub fn new(runner_kind: RunnerKind, worker_env: WorkerEnv) -> Self {
-        let handle = thread::spawn(move || match runner_kind {
-            RunnerKind::GenericNativeTestRunner(params) => {
-                start_generic_test_runner(worker_env, params)
-            }
-            RunnerKind::TestLikeRunner(runner, manifest) => {
-                start_test_like_runner(worker_env, runner, *manifest)
-            }
+    pub fn new(
+        runner_kind: RunnerKind,
+        worker_env: WorkerEnv,
+        mark_worker_complete: MarkWorkerComplete,
+    ) -> Self {
+        let handle = thread::spawn(move || {
+            let result_wrapper =
+                panic::catch_unwind(panic::AssertUnwindSafe(|| match runner_kind {
+                    RunnerKind::GenericNativeTestRunner(params) => {
+                        start_generic_test_runner(worker_env, params)
+                    }
+                    RunnerKind::TestLikeRunner(runner, manifest) => {
+                        start_test_like_runner(worker_env, runner, *manifest)
+                    }
+                }));
+
+            mark_worker_complete();
+
+            result_wrapper.unwrap()
         });
 
         Self {
@@ -433,7 +450,6 @@ fn start_generic_test_runner(
         results_batch_size,
         context,
         msg_from_pool_rx,
-        mark_worker_complete,
         supervisor_in_band,
         debug_native_runner,
     } = env;
@@ -470,7 +486,7 @@ fn start_generic_test_runner(
         WorkerContext::AlwaysWorkIn { working_dir } => working_dir,
     };
 
-    let opt_runner_err = GenericTestRunner::run(
+    GenericTestRunner::run(
         entity,
         native_runner_params,
         &working_dir,
@@ -481,11 +497,7 @@ fn start_generic_test_runner(
         get_next_tests_bundle,
         send_test_result,
         debug_native_runner,
-    );
-
-    mark_worker_complete();
-
-    opt_runner_err
+    )
 }
 
 fn build_test_like_runner_manifest_result(
@@ -529,7 +541,6 @@ fn start_test_like_runner(
         notify_results,
         context,
         notify_manifest,
-        mark_worker_complete,
         supervisor_in_band: _,
         debug_native_runner: _,
     } = env;
@@ -546,6 +557,9 @@ fn start_test_like_runner(
                 manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
             })
+        }
+        TestLikeRunner::Panic => {
+            panic!("forced TestLikeRunner::Panic")
         }
         _ => { /* pass through */ }
     }
@@ -681,8 +695,6 @@ fn start_test_like_runner(
             }
         }
     }
-
-    mark_worker_complete();
 
     Ok(TestRunnerExit {
         exit_code: ExitCode::SUCCESS,
