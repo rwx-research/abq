@@ -386,12 +386,13 @@ impl WorkersNegotiator {
 
                 use net_protocol::queue::{Message, Request, TotalRunResult};
                 loop {
-                    // TODO: error handling, here and below.
-                    // In particular, the work server may have shut down and we can't connect. In that
-                    // case the worker should shutdown too.
-                    let mut stream = client
-                        .connect(queue_results_addr)
-                        .expect("work server not available");
+                    let mut stream = retry_n(5, Duration::from_secs(3), |attempt| {
+                        if attempt > 1 {
+                            tracing::info!("reattempting connection to work server {}", attempt);
+                        }
+                        client.connect(queue_results_addr)
+                    })
+                    .expect("work server not available");
 
                     let request = Request {
                         entity,
