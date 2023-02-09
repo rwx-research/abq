@@ -5,6 +5,7 @@ pub mod net;
 pub mod net_async;
 pub mod net_opt;
 pub mod net_protocol;
+pub mod retry;
 pub mod shutdown;
 pub mod tls;
 
