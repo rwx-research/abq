@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use abq_generic_test_runner::{
@@ -5,6 +6,7 @@ use abq_generic_test_runner::{
 };
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::artifacts_dir;
+use abq_utils::atomic;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::AssociatedTestResults;
@@ -20,6 +22,7 @@ use abq_utils::net_protocol::workers::{
 
 use abq_with_protocol_version::with_protocol_version;
 use async_trait::async_trait;
+use futures::FutureExt;
 use parking_lot::Mutex;
 
 fn native_runner_simulation_bin() -> String {
@@ -53,6 +56,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     Vec<AssociatedTestResults>,
     Option<CapturedOutput>,
     CapturedOutput,
+    bool,
 ) {
     let simulation_msg = pack_msgs(simulation);
     let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -82,6 +86,17 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
         })
     };
 
+    let all_test_run = Arc::new(AtomicBool::new(false));
+    let notify_all_tests_run = {
+        let all_run = all_test_run.clone();
+        move |_| {
+            async move {
+                all_run.store(true, atomic::ORDERING);
+            }
+            .boxed()
+        }
+    };
+
     let TestRunnerExit {
         final_captured_output,
         manifest_generation_output,
@@ -96,6 +111,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
         get_init_context,
         get_next_test,
         &*send_test_result,
+        Box::new(notify_all_tests_run),
         false,
     )
     .unwrap();
@@ -110,6 +126,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
             .into_inner(),
         manifest_generation_output,
         final_captured_output,
+        all_test_run.load(atomic::ORDERING),
     )
 }
 
@@ -189,8 +206,11 @@ fn capture_output_before_and_during_tests() {
         tests: vec![work_bundle(proto)],
     };
 
-    let (mut results, _man_output, final_captures) =
+    let (mut results, _man_output, final_captures, notified_all_run) =
         run_simulated_runner(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
+
+    assert!(notified_all_run);
+
     results.sort_by_key(|r| r.work_id);
 
     // Unfortunately we cannot force a guarantee that all stdout/stderr in the child ends up in the
@@ -303,8 +323,11 @@ fn big_manifest() {
         tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
     };
 
-    let (results, _man_output, _) =
+    let (results, _man_output, _, notified_all_ran) =
         run_simulated_runner(simulation, Some(with_manifest), Box::new(get_next_tests));
+
+    assert!(notified_all_ran);
+
     assert!(results.is_empty());
 
     let manifest = Arc::try_unwrap(manifest).unwrap().into_inner().unwrap();
@@ -374,8 +397,11 @@ fn capture_output_during_manifest_gen() {
         tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
     };
 
-    let (results, man_output, _) =
+    let (results, man_output, _, notified_all_ran) =
         run_simulated_runner(simulation, Some(with_manifest), Box::new(get_next_tests));
+
+    assert!(notified_all_ran);
+
     assert!(results.is_empty());
 
     assert!(man_output.is_some());

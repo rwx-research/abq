@@ -54,7 +54,7 @@ pub mod entity {
 
     /// Identifies a unique instance of an entity participating in the ABQ network ecosystem.
     /// The queue, workers, and abq test clients are all entities.
-    #[derive(Serialize, Deserialize, Clone, Copy)]
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub struct EntityId(pub [u8; 16]);
 
     impl EntityId {
@@ -464,6 +464,12 @@ pub mod queue {
     #[serde(tag = "type")]
     pub struct AckTestResults {}
 
+    /// An acknowledgement of receiving a notification that a worker ran all tests.
+    /// Sent by the queue.
+    #[derive(Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub struct AckWorkerRanAllTests {}
+
     /// An acknowledgement of receiving a test cancellation request from a supervisor
     /// Sent by the queue.
     #[derive(Serialize, Deserialize)]
@@ -505,6 +511,9 @@ pub mod queue {
         ManifestResult(RunId, ManifestResult),
         /// The result of some work from the queue.
         WorkerResult(RunId, Vec<AssociatedTestResults>),
+        /// Notification from a worker to the queue that it finished running all scheduled tests
+        /// for a suite run.
+        WorkerRanAllTests(RunId),
         /// An ask to return information about whether a given test run failed or not.
         /// A worker issues this request before exiting to determine whether they should exit
         /// cleanly, or fail.

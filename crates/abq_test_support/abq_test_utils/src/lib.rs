@@ -13,3 +13,24 @@ pub fn artifacts_dir() -> PathBuf {
     };
     PathBuf::from(WORKSPACE).join(path)
 }
+
+/// Only relevant with [traced_test][tracing_test::traced_test].
+#[track_caller]
+pub fn assert_scoped_log(scope: &str, log: &str) {
+    assert_scoped_logs(scope, |logs| logs.iter().any(|l| l.contains(log)));
+}
+
+/// Only relevant with [traced_test][tracing_test::traced_test].
+#[track_caller]
+pub fn assert_scoped_logs(scope: &str, f: impl Fn(&[&str]) -> bool) {
+    match tracing_test::internal::logs_assert(scope, |logs| {
+        if f(logs) {
+            Ok(())
+        } else {
+            Err("logs not found".to_owned())
+        }
+    }) {
+        Ok(()) => (),
+        Err(e) => panic!("{e}"),
+    }
+}

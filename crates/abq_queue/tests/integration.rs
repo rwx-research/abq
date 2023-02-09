@@ -17,6 +17,7 @@ use abq_queue::{
     queue::{Abq, QueueConfig},
     timeout::{RunTimeoutStrategy, TimeoutReason},
 };
+use abq_test_utils::assert_scoped_log;
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
     exit::ExitCode,
@@ -598,6 +599,7 @@ fn run_test(servers: Servers, steps: Steps) {
 #[test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
+#[traced_test]
 fn multiple_jobs_complete() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
@@ -631,6 +633,9 @@ fn multiple_jobs_complete() {
             })],
         )
         .test();
+
+    // Should log how long this worker took
+    assert_scoped_log("abq_queue::queue", "worker post completion idle seconds");
 }
 
 #[test]
