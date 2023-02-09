@@ -1,4 +1,4 @@
-#!/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # set -u will fail this script if $RELEASE_ARCHIVE, $RELEASE_BUCKET, $RELEASE_S3_OBJECT, $RELEASE_S3_NIGHTLY_OBJECT, $RELEASE_DIR, $NEW_RELEASE_S3_OBJECT, or $NEW_RELEASE_S3_NIGHTLY_OBJECT are not set
