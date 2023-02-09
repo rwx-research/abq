@@ -70,9 +70,9 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     };
 
     let get_init_context = || {
-        Ok(InitContext {
+        Ok(Ok(InitContext {
             init_meta: Default::default(),
-        })
+        }))
     };
     let all_results: Arc<Mutex<Vec<AssociatedTestResults>>> = Default::default();
 

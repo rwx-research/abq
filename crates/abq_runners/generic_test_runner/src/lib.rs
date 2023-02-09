@@ -323,7 +323,7 @@ impl GenericTestRunner {
         ShouldShutdown: Fn() -> bool,
         // TODO: make both of these async!
         SendManifest: FnMut(ManifestResult),
-        GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
+        GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
     {
         let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -362,7 +362,7 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
 where
     ShouldShutdown: Fn() -> bool,
     SendManifest: FnMut(ManifestResult),
-    GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
+    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
 {
     let NativeTestRunnerParams {
         cmd,
@@ -497,7 +497,7 @@ async fn run_help<'a, GetInitContext>(
     native_runner: Command,
 ) -> Result<ExitCode, GenericRunnerErrorKind>
 where
-    GetInitContext: Fn() -> Result<InitContext, RunAlreadyCompleted>,
+    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
 {
     let native_runner_died = async {
         let _ = native_runner_handle.wait().await;
@@ -526,7 +526,7 @@ where
     // the initialization context; that way we can pay the price of startup and
     // context-fetching in parallel.
     {
-        match get_init_context() {
+        match get_init_context()? {
             Ok(InitContext { init_meta }) => {
                 let init_message =
                     net_protocol::runners::InitMessage::new(protocol, init_meta, FastExit(false));
@@ -1039,9 +1039,9 @@ pub fn execute_wrapped_runner(
         }
     };
     let get_init_context = || {
-        Ok(InitContext {
+        Ok(Ok(InitContext {
             init_meta: Default::default(),
-        })
+        }))
     };
 
     struct Fetcher {
@@ -1425,9 +1425,9 @@ mod test_abq_jest {
 
         let send_manifest = |real_manifest| manifest = Some(real_manifest);
         let get_init_context = || {
-            Ok(InitContext {
+            Ok(Ok(InitContext {
                 init_meta: Default::default(),
-            })
+            }))
         };
         let get_next_test = Box::new(ImmediateTests {
             tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
@@ -1591,7 +1591,7 @@ mod test_abq_jest {
             extra_env: Default::default(),
         };
 
-        let get_init_context = || Err(RunAlreadyCompleted {});
+        let get_init_context = || Ok(Err(RunAlreadyCompleted {}));
         let get_next_test = ImmediateTests {
             tests: vec![NextWorkBundle(vec![NextWork::Work(WorkerTest {
                 test_case: TestCase::new(proto, "unreachable", Default::default()),
@@ -1650,9 +1650,9 @@ mod test_invalid_command {
 
         let send_manifest = |result| manifest_result = Some(result);
         let get_init_context = || {
-            Ok(InitContext {
+            Ok(Ok(InitContext {
                 init_meta: Default::default(),
-            })
+            }))
         };
         let get_next_test = ImmediateTests {
             tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
