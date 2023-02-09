@@ -289,8 +289,7 @@ impl WorkersNegotiator {
                 let span = tracing::trace_span!("get_init_context", run_id=?run_id, new_work_server=?work_server_addr);
                 let _get_next_work = span.enter();
 
-                // TODO: error handling
-                wait_for_init_context(&*client, work_server_addr, run_id.clone()).unwrap()
+                wait_for_init_context(&*client, work_server_addr, run_id.clone())
             }
         });
 
@@ -491,7 +490,7 @@ fn wait_for_init_context(
     client: &dyn net::ConfiguredClient,
     work_server_addr: SocketAddr,
     run_id: RunId,
-) -> Result<InitContextResult, io::Error> {
+) -> io::Result<InitContextResult> {
     use net_protocol::work_server::{InitContextResponse, WorkServerRequest};
 
     let next_test_request = WorkServerRequest::InitContext { run_id };

@@ -38,7 +38,7 @@ pub use abq_generic_test_runner::TestsFetcher;
 pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 pub type GetNextTestsGenerator<'a> = &'a dyn Fn() -> GetNextTests;
 
-pub type GetInitContext = Arc<dyn Fn() -> InitContextResult + Send + Sync + 'static>;
+pub type GetInitContext = Arc<dyn Fn() -> io::Result<InitContextResult> + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResults = Arc<
     dyn Fn(EntityId, &RunId, Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>
@@ -599,10 +599,20 @@ fn start_test_like_runner(
     }
 
     let init_context = match get_init_context() {
-        Ok(ctx) => ctx,
-        Err(RunAlreadyCompleted {}) => {
+        Ok(context_result) => match context_result {
+            Ok(ctx) => ctx,
+            Err(RunAlreadyCompleted {}) => {
+                return Ok(TestRunnerExit {
+                    exit_code: ExitCode::SUCCESS,
+                    manifest_generation_output: None,
+                    final_captured_output: CapturedOutput::empty(),
+                });
+            }
+        },
+        Err(io_err) => {
+            tracing::error!(io_err = io_err.to_string(), "Error getting initial context");
             return Ok(TestRunnerExit {
-                exit_code: ExitCode::SUCCESS,
+                exit_code: ExitCode::ABQ_ERROR,
                 manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
             });
@@ -801,6 +811,7 @@ fn attempt_test_id_for_test_like_runner(
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, VecDeque};
+    use std::io;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
@@ -931,10 +942,10 @@ mod test {
         (all, generator)
     }
 
-    fn empty_init_context() -> InitContextResult {
-        Ok(InitContext {
+    fn empty_init_context() -> io::Result<InitContextResult> {
+        Ok(Ok(InitContext {
             init_meta: Default::default(),
-        })
+        }))
     }
 
     fn setup_pool<'a>(
