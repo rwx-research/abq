@@ -2,8 +2,10 @@ use std::{
     collections::HashMap,
     future::Future,
     num::{NonZeroU64, NonZeroUsize},
+    panic,
     pin::Pin,
     sync::Arc,
+    thread,
     time::Duration,
 };
 
@@ -182,8 +184,10 @@ enum Assert<'a> {
 
     SetOOBExitCode(ExternId, &'a dyn Fn(&SetOutOfBandExitCodeResponse)),
 
+    WaitForWorkerDead(Wid),
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, &'a dyn Fn(&WorkersExitStatus)),
+    WorkerResultStatus(Wid, &'a dyn Fn(&WorkersResult)),
 }
 
 type Steps<'a> = Vec<(Vec<Action>, Vec<Assert<'a>>)>;
@@ -230,7 +234,11 @@ type SupervisorResults =
 
 type Workers = Arc<Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
-type WorkerExits = Arc<Mutex<HashMap<Wid, WorkersExit>>>;
+enum WorkersResult {
+    Exit(WorkersExit),
+    Panic,
+}
+type WorkersResults = Arc<Mutex<HashMap<Wid, WorkersResult>>>;
 
 type SetOOBExitCodes = Arc<Mutex<HashMap<ExternId, SetOutOfBandExitCodeResponse>>>;
 
@@ -260,7 +268,7 @@ fn action_to_fut(
 
     workers: Workers,
     workers_redundant: WorkersRedundant,
-    worker_exits: WorkerExits,
+    worker_results: WorkersResults,
 
     set_oob_exit_codes: SetOOBExitCodes,
 
@@ -402,9 +410,12 @@ fn action_to_fut(
 
         StopWorkers(n) => async move {
             let mut worker_pool = workers.lock().remove(&n).unwrap();
-            let workers_exit = worker_pool.shutdown();
-
-            worker_exits.lock().insert(n, workers_exit);
+            let workers_result =
+                match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.shutdown())) {
+                    Ok(exit) => WorkersResult::Exit(exit),
+                    Err(_) => WorkersResult::Panic,
+                };
+            worker_results.lock().insert(n, workers_result);
         }
         .boxed(),
 
@@ -429,7 +440,7 @@ fn action_to_fut(
                 supervisor_results,
                 workers,
                 workers_redundant,
-                worker_exits,
+                worker_results,
                 set_oob_exit_codes,
                 background_tasks,
                 *action,
@@ -466,7 +477,7 @@ fn run_test(servers: Servers, steps: Steps) {
 
         let workers = Workers::default();
         let workers_redundant = WorkersRedundant::default();
-        let worker_exits = WorkerExits::default();
+        let worker_results = WorkersResults::default();
 
         let set_oob_exit_codes = SetOOBExitCodes::default();
 
@@ -485,7 +496,7 @@ fn run_test(servers: Servers, steps: Steps) {
                     supervisor_results.clone(),
                     workers.clone(),
                     workers_redundant.clone(),
-                    worker_exits.clone(),
+                    worker_results.clone(),
                     set_oob_exit_codes.clone(),
                     &mut background_tasks,
                     action,
@@ -539,9 +550,36 @@ fn run_test(servers: Servers, steps: Steps) {
                     }
 
                     WorkerExitStatus(n, workers_exit) => {
-                        let exits = worker_exits.lock();
-                        let real_exit = exits.get(&n).expect("workers exit not found");
-                        workers_exit(&real_exit.status);
+                        let results = worker_results.lock();
+                        let real_result = results.get(&n).expect("workers result not found");
+                        match real_result {
+                            WorkersResult::Exit(exit) => workers_exit(&exit.status),
+                            WorkersResult::Panic => panic!("expected exit result, not panic"),
+                        }
+                    }
+
+                    WorkerResultStatus(n, workers_result) => {
+                        let results = worker_results.lock();
+                        let real_result = results.get(&n).expect("workers result not found");
+                        workers_result(real_result)
+                    }
+
+                    WaitForWorkerDead(n) => {
+                        let mut attempts = 0;
+                        loop {
+                            attempts += 1;
+
+                            let workers = workers.lock();
+                            let worker = workers.get(&n).expect("worker not found");
+                            if worker.workers_alive() {
+                                if attempts > 100 {
+                                    panic!("waited too long for worker to be dead");
+                                }
+                                thread::sleep(Duration::from_millis(10))
+                            } else {
+                                break;
+                            }
+                        }
                     }
 
                     CheckSupervisor(n, check) => {
@@ -1621,4 +1659,32 @@ fn cancel_test_run_upon_timeout_for_out_of_band_exit_code() {
         })],
     )
     .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1500)] // 1.5 second
+fn runner_panic_stops_worker() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Panic, Box::new(manifest));
+
+    TestBuilder::default()
+        .step(
+            [
+                StartTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
+                StartWorkers(Run(1), Wid(1), default_workers_config()),
+            ],
+            [WaitForWorkerDead(Wid(1))],
+        )
+        .step(
+            [StopWorkers(Wid(1))],
+            [WorkerResultStatus(Wid(1), &|e| {
+                assert!(matches!(e, WorkersResult::Panic))
+            })],
+        )
+        .test();
 }

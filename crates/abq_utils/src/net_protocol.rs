@@ -172,6 +172,8 @@ pub mod workers {
         NeverReturnManifest,
         /// A worker that errors when a test of a name is received, never returning a result.
         NeverReturnOnTest(String),
+        /// A worker that panics in a section of ABQ code.
+        Panic,
         /// Yields the given exit code.
         ExitWith(i32),
         /// A worker that echos a string given to it after a number of retries.
