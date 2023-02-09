@@ -49,6 +49,9 @@ pub type NotifyResults = Arc<
 /// Returns the exit code of the given run for a worker.
 pub type RunExitCode = Arc<dyn Fn(EntityId) -> ExitCode + Send + Sync + 'static>;
 
+pub type NotifyMaterialTestsAllRun = abq_generic_test_runner::NotifyMaterialTestsAllRun;
+pub type NotifyMaterialTestsAllRunGenerator<'a> = &'a dyn Fn() -> NotifyMaterialTestsAllRun;
+
 type MarkWorkerComplete = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Clone, Debug)]
@@ -84,6 +87,8 @@ pub struct WorkerPoolConfig<'a> {
     pub get_next_tests_generator: GetNextTestsGenerator<'a>,
     /// How should results be communicated back?
     pub notify_results: NotifyResults,
+    /// How should a runner notify the queue it's run all assigned tests.
+    pub notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
     /// How many results should be sent back at a time?
     pub results_batch_size_hint: u64,
     /// Query the assigned run's exit code.
@@ -176,6 +181,7 @@ impl WorkerPool {
             results_batch_size_hint: results_batch_size,
             notify_results,
             notify_manifest,
+            notify_all_tests_run_generator,
             run_exit_code,
             worker_context,
             supervisor_in_band,
@@ -219,6 +225,7 @@ impl WorkerPool {
                 notify_results,
                 context: worker_context.clone(),
                 notify_manifest,
+                notify_all_tests_run: notify_all_tests_run_generator(),
                 supervisor_in_band,
                 debug_native_runner,
             };
@@ -244,13 +251,14 @@ impl WorkerPool {
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
             let worker_env = WorkerEnv {
-                entity,
+                entity: EntityId::new(),
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
                 tests_fetcher: get_next_tests_generator(),
                 results_batch_size,
                 notify_results,
+                notify_all_tests_run: notify_all_tests_run_generator(),
                 context: worker_context.clone(),
                 notify_manifest: None,
                 supervisor_in_band,
@@ -402,6 +410,7 @@ struct WorkerEnv {
     tests_fetcher: GetNextTests,
     results_batch_size: u64,
     notify_results: NotifyResults,
+    notify_all_tests_run: NotifyMaterialTestsAllRun,
     context: WorkerContext,
     // Is this running in-band with a supervisor process?
     supervisor_in_band: bool,
@@ -447,6 +456,7 @@ fn start_generic_test_runner(
         get_init_context,
         notify_results,
         notify_manifest,
+        notify_all_tests_run,
         results_batch_size,
         context,
         msg_from_pool_rx,
@@ -496,6 +506,7 @@ fn start_generic_test_runner(
         get_init_context,
         get_next_tests_bundle,
         send_test_result,
+        notify_all_tests_run,
         debug_native_runner,
     )
 }
@@ -539,6 +550,7 @@ fn start_test_like_runner(
         run_id,
         results_batch_size: _,
         notify_results,
+        notify_all_tests_run,
         context,
         notify_manifest,
         supervisor_in_band: _,
@@ -556,7 +568,7 @@ fn start_test_like_runner(
                 exit_code: ExitCode::new(ec),
                 manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
-            })
+            });
         }
         TestLikeRunner::Panic => {
             panic!("forced TestLikeRunner::Panic")
@@ -593,7 +605,7 @@ fn start_test_like_runner(
                 exit_code: ExitCode::SUCCESS,
                 manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
-            })
+            });
         }
     };
 
@@ -696,6 +708,8 @@ fn start_test_like_runner(
         }
     }
 
+    rt.block_on(notify_all_tests_run(entity));
+
     Ok(TestRunnerExit {
         exit_code: ExitCode::SUCCESS,
         manifest_generation_output: None,
@@ -789,6 +803,7 @@ mod test {
     use std::collections::{HashMap, VecDeque};
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -796,7 +811,6 @@ mod test {
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
-    use abq_utils::net_protocol;
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::AssociatedTestResults;
     use abq_utils::net_protocol::runners::{
@@ -809,14 +823,17 @@ mod test {
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
+    use abq_utils::{atomic, net_protocol};
     use abq_with_protocol_version::with_protocol_version;
     use async_trait::async_trait;
+    use futures::FutureExt;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
     use super::{
-        GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest, NotifyResults,
-        RunExitCode, TestsFetcher, WorkerContext, WorkerPool,
+        GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest,
+        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, NotifyResults, RunExitCode,
+        TestsFetcher, WorkerContext, WorkerPool,
     };
     use crate::negotiate::QueueNegotiator;
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
@@ -890,19 +907,44 @@ mod test {
         (results, notify_results, get_completed_status)
     }
 
+    fn notify_all_tests_run() -> (
+        Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+        impl Fn() -> NotifyMaterialTestsAllRun,
+    ) {
+        let all = Arc::new(Mutex::new(vec![]));
+        let generator = {
+            let all = all.clone();
+            move || {
+                let atomic = Arc::new(AtomicBool::new(false));
+                all.lock().unwrap().push(atomic.clone());
+
+                let notifier = move |_| {
+                    async move {
+                        atomic.store(true, atomic::ORDERING);
+                    }
+                    .boxed()
+                };
+                let notifier: NotifyMaterialTestsAllRun = Box::new(notifier);
+                notifier
+            }
+        };
+        (all, generator)
+    }
+
     fn empty_init_context() -> InitContextResult {
         Ok(InitContext {
             init_meta: Default::default(),
         })
     }
 
-    fn setup_pool(
+    fn setup_pool<'a>(
         runner_kind: RunnerKind,
         run_id: RunId,
-        get_next_tests_generator: GetNextTestsGenerator,
+        get_next_tests_generator: GetNextTestsGenerator<'a>,
         notify_results: NotifyResults,
+        notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
         run_exit_code: RunExitCode,
-    ) -> (WorkerPoolConfig, ManifestCollector) {
+    ) -> (WorkerPoolConfig<'a>, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
 
         let config = WorkerPoolConfig {
@@ -915,6 +957,7 @@ mod test {
             run_id,
             notify_manifest: Some(notify_manifest),
             notify_results,
+            notify_all_tests_run_generator,
             run_exit_code,
             worker_context: WorkerContext::AssumeLocal,
             supervisor_in_band: false,
@@ -965,6 +1008,7 @@ mod test {
     fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
         let (write_work, get_next_tests) = work_writer();
         let (results, notify_results, run_completed_successfully) = results_collector();
+        let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
 
         let run_id = RunId::unique();
         let mut expected_results = HashMap::new();
@@ -981,6 +1025,7 @@ mod test {
             run_id,
             &get_next_tests,
             notify_results,
+            &notify_all_tests_run_generator,
             run_completed_successfully,
         );
 
@@ -1020,6 +1065,10 @@ mod test {
 
         let exit = pool.shutdown();
         assert!(matches!(exit.status, WorkersExitStatus::Success));
+
+        let all_completed = all_completed.lock().unwrap();
+        assert_eq!(all_completed.len(), num_workers);
+        assert!(all_completed.iter().all(|b| b.load(atomic::ORDERING)));
     }
 
     fn abqtest_write_runner_number_path() -> PathBuf {
@@ -1226,6 +1275,7 @@ mod test {
     fn exit_with_error_if_worker_errors() {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, notify_results, run_completed_successfully) = results_collector();
+        let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
         let (default_config, _manifest_collector) = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
                 // This command should cause the worker to error, since it can't even be executed
@@ -1236,6 +1286,7 @@ mod test {
             RunId::unique(),
             &get_next_tests,
             notify_results,
+            &notify_all_tests_run_generator,
             run_completed_successfully,
         );
 
@@ -1244,12 +1295,17 @@ mod test {
         let pool_exit = pool.shutdown();
 
         assert!(matches!(pool_exit.status, WorkersExitStatus::Error { .. }));
+
+        let all_completed = all_completed.lock().unwrap();
+        assert_eq!(all_completed.len(), 1);
+        assert!(!all_completed[0].load(atomic::ORDERING));
     }
 
     #[test]
     fn sets_abq_native_runner_env_vars() {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, notify_results, run_completed_successfully) = results_collector();
+        let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
 
         let writefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let writefile_path = writefile.to_path_buf();
@@ -1263,6 +1319,7 @@ mod test {
             RunId::unique(),
             &get_next_tests,
             notify_results,
+            &notify_all_tests_run_generator,
             run_completed_successfully,
         );
 
@@ -1275,6 +1332,9 @@ mod test {
         let mut worker_ids: Vec<_> = worker_ids.trim().split('\n').collect();
         worker_ids.sort();
         assert_eq!(worker_ids, &["1", "2", "3", "4", "5"]);
+
+        let all_completed = all_completed.lock().unwrap();
+        assert_eq!(all_completed.len(), 5);
     }
 
     #[test]
@@ -1282,6 +1342,7 @@ mod test {
     fn worker_exits_with_runner_exit() {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, notify_results, _run_completed_successfully) = results_collector();
+        let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
         let run_exit_code = Arc::new(Box::new(|_| ExitCode::FAILURE));
 
         let manifest = ManifestMessage::new(Manifest::new(
@@ -1293,6 +1354,7 @@ mod test {
             RunId::unique(),
             &get_next_tests,
             notify_results,
+            &notify_all_tests_run_generator,
             run_exit_code,
         );
 
@@ -1309,6 +1371,9 @@ mod test {
                 } if exit_code.get() == 27
             ),
             "{pool_exit:?}"
-        )
+        );
+
+        let all_completed = all_completed.lock().unwrap();
+        assert_eq!(all_completed.len(), 1);
     }
 }

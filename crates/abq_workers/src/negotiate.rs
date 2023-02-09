@@ -1,5 +1,6 @@
 //! Module negotiate helps worker pools attach to queues.
 
+use futures::FutureExt;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -16,8 +17,9 @@ use tracing::{error, instrument};
 use crate::{
     persistent_test_fetcher,
     workers::{
-        GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyManifest, NotifyResults,
-        RunExitCode, WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
+        GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyManifest,
+        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, NotifyResults, RunExitCode,
+        WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
     },
 };
 use abq_utils::{
@@ -341,6 +343,36 @@ impl WorkersNegotiator {
             None
         };
 
+        let notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator = {
+            let run_id = run_id.clone();
+            &move || {
+                let async_client = async_client.boxed_clone();
+                let run_id = run_id.clone();
+                let notifier: NotifyMaterialTestsAllRun = Box::new(move |entity| {
+                    async move {
+                        // TODO: retry multiple times once async_retry lands.
+                        let mut stream = async_client
+                            .connect(queue_results_addr)
+                            .await
+                            .expect("results server not available");
+                        let message = net_protocol::queue::Request {
+                            entity,
+                            message: net_protocol::queue::Message::WorkerRanAllTests(run_id),
+                        };
+                        // TODO: error handling after Doug's work
+                        net_protocol::async_write(&mut stream, &message)
+                            .await
+                            .unwrap();
+                        let net_protocol::queue::AckWorkerRanAllTests {} =
+                            net_protocol::async_read(&mut stream).await.unwrap();
+                    }
+                    .boxed()
+                });
+
+                notifier
+            }
+        };
+
         let run_exit_code: RunExitCode = Arc::new({
             // When our worker finishes and polls the queue for the final status of the run,
             // there still may be active work. So for now, let's poll every second; we can make
@@ -386,6 +418,7 @@ impl WorkersNegotiator {
             get_next_tests_generator,
             get_init_context,
             notify_results,
+            notify_all_tests_run_generator,
             run_exit_code,
             results_batch_size_hint,
             worker_context,
@@ -716,9 +749,9 @@ impl QueueNegotiator {
                 }
             }
             WantsToAttach { run: wanted_run_id } => {
-                let attach = tracing::debug_span!("Worker set negotiating", ?wanted_run_id);
+                let attach = tracing::debug_span!("Worker set negotiating", run_id=?wanted_run_id);
                 let _attach_span = attach.enter();
-                tracing::debug!(?wanted_run_id, "New worker set negotiating");
+                tracing::debug!(run_id=?wanted_run_id, "New worker set negotiating");
 
                 let assigned_run_result = (ctx.get_assigned_run)(&wanted_run_id);
 
@@ -985,6 +1018,10 @@ mod test {
                         },
                     )
                     .unwrap();
+                }
+                net_protocol::queue::Message::WorkerRanAllTests(_) => {
+                    net_protocol::write(&mut client, net_protocol::queue::AckWorkerRanAllTests {})
+                        .unwrap();
                 }
                 _ => unreachable!(),
             }

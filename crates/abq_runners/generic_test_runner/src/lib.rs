@@ -30,7 +30,7 @@ use abq_utils::net_protocol::workers::{
 };
 use abq_utils::{atomic, net_protocol};
 use futures::future::BoxFuture;
-use futures::Future;
+use futures::{Future, FutureExt};
 use indoc::indoc;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -288,8 +288,14 @@ impl GenericRunnerError {
 }
 
 pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>;
-pub type SendTestResultsBoxed<'a> =
-    Box<dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>>;
+pub type SendTestResultsBoxed = Box<dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>>;
+
+/// Notifies the queue that this runner finished running all assigned tests for a given run_id.
+/// This is only called if the runner actually executed tests, and after all such tests were
+/// executed.
+/// In cases where the runner exits before all assigned tests were completed (due to unrecoverable fault),
+/// or the runner exited early due to a finished test run, this is never called.
+pub type NotifyMaterialTestsAllRun = Box<dyn FnOnce(EntityId) -> BoxFuture<'static, ()> + Send>;
 
 /// Asynchronously fetch a bundle of tests.
 #[async_trait]
@@ -310,6 +316,7 @@ impl GenericTestRunner {
         get_init_context: GetInitContext,
         get_next_test_bundle: GetNextTests,
         send_test_results: SendTestResults,
+        notify_all_tests_run: NotifyMaterialTestsAllRun,
         debug_native_runner: bool,
     ) -> Result<TestRunnerExit, GenericRunnerError>
     where
@@ -331,6 +338,7 @@ impl GenericTestRunner {
             get_init_context,
             get_next_test_bundle,
             send_test_results,
+            notify_all_tests_run,
             debug_native_runner,
         ))
     }
@@ -348,6 +356,7 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     get_init_context: GetInitContext,
     get_next_test_bundle: GetNextTests,
     send_test_results: SendTestResults<'_>,
+    notify_all_tests_run: NotifyMaterialTestsAllRun,
     _debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError>
 where
@@ -453,6 +462,7 @@ where
         results_batch_size,
         get_next_test_bundle,
         send_test_results,
+        notify_all_tests_run,
         worker_entity,
         native_runner,
     )
@@ -473,15 +483,16 @@ where
     }
 }
 
-async fn run_help<GetInitContext>(
+async fn run_help<'a, GetInitContext>(
     mut native_runner_handle: process::Child,
     mut our_listener: TcpListener,
     protocol_version_timeout: Duration,
     get_init_context: GetInitContext,
-    capture_pipes: &CapturePipes,
+    capture_pipes: &'a CapturePipes,
     results_batch_size: u64,
     test_fetcher: GetNextTests,
-    send_test_results: SendTestResults<'_>,
+    send_test_results: SendTestResults<'a>,
+    notify_all_tests_run: NotifyMaterialTestsAllRun,
     worker_entity: EntityId,
     native_runner: Command,
 ) -> Result<ExitCode, GenericRunnerErrorKind>
@@ -601,7 +612,13 @@ where
         drop(results_tx);
         drop(runner_conn);
         drop(our_listener);
-        let exit_status = native_runner_handle.wait().await?;
+
+        let ((), exit_status) = tokio::join!(
+            notify_all_tests_run(worker_entity),
+            native_runner_handle.wait()
+        );
+
+        let exit_status = exit_status?;
 
         Ok(ExitCode::from(exit_status))
     };
@@ -1095,6 +1112,7 @@ pub fn execute_wrapped_runner(
         get_init_context,
         get_next_test,
         send_test_result,
+        Box::new(|_| async {}.boxed()),
         false,
     );
 
@@ -1336,9 +1354,32 @@ impl TestsFetcher for ImmediateTests {
 }
 
 #[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
+#[cfg(test)]
+fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
+    let all_test_run = Arc::new(AtomicBool::new(false));
+    let notify_all_tests_run = {
+        let all_run = all_test_run.clone();
+        move |_| {
+            async move {
+                all_run.store(true, atomic::ORDERING);
+            }
+            .boxed()
+        }
+    };
+
+    (all_test_run, Box::new(notify_all_tests_run))
+}
+
+#[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
-    use crate::{execute_wrapped_runner, GenericTestRunner, ImmediateTests, SendTestResults};
+    use crate::{
+        execute_wrapped_runner, notify_all_tests_run, GenericTestRunner, ImmediateTests,
+        SendTestResults,
+    };
+    use abq_utils::atomic;
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::queue::RunAlreadyCompleted;
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
@@ -1403,6 +1444,7 @@ mod test_abq_jest {
                 })
             }
         };
+        let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
         GenericTestRunner::run(
             EntityId::new(),
@@ -1414,6 +1456,7 @@ mod test_abq_jest {
             get_init_context,
             get_next_test,
             send_test_result,
+            notify_all_tests_run,
             false,
         )
         .unwrap();
@@ -1428,6 +1471,8 @@ mod test_abq_jest {
             ManifestResult::Manifest(man) => man,
             ManifestResult::TestRunnerError { .. } => unreachable!(),
         };
+
+        assert!(all_tests_run.load(atomic::ORDERING));
 
         assert_eq!(native_runner_protocol, AbqProtocolVersion::V0_2);
         assert_eq!(native_runner_specification.name, "jest-abq");
@@ -1555,6 +1600,8 @@ mod test_abq_jest {
         };
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
+        let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
+
         let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _>(
             EntityId::new(),
             input,
@@ -1565,19 +1612,26 @@ mod test_abq_jest {
             get_init_context,
             Box::new(get_next_test),
             send_test_result,
+            notify_all_tests_run,
             false,
         );
 
         assert!(runner_result.is_ok());
+
+        assert!(
+            !all_tests_run.load(atomic::ORDERING),
+            "fast exit should not notify completion"
+        );
     }
 }
 
 #[cfg(test)]
 mod test_invalid_command {
     use crate::{
-        GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner, ImmediateTests,
-        SendTestResults,
+        notify_all_tests_run, GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner,
+        ImmediateTests, SendTestResults,
     };
+    use abq_utils::atomic;
     use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
@@ -1605,6 +1659,8 @@ mod test_invalid_command {
         };
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
 
+        let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
+
         let runner_result = GenericTestRunner::run(
             EntityId::new(),
             input,
@@ -1615,6 +1671,7 @@ mod test_invalid_command {
             get_init_context,
             Box::new(get_next_test),
             send_test_result,
+            notify_all_tests_run,
             false,
         );
 
@@ -1631,5 +1688,9 @@ mod test_invalid_command {
                 ..
             })
         ));
+        assert!(
+            !all_tests_run.load(atomic::ORDERING),
+            "invalid command should not notify completion"
+        );
     }
 }

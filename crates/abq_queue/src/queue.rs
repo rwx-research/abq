@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::ops::Deref;
@@ -8,8 +7,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::{io, time};
 
-use abq_utils::atomic;
 use abq_utils::auth::ServerAuthStrategy;
 use abq_utils::exit::ExitCode;
 use abq_utils::net;
@@ -33,6 +32,8 @@ use abq_utils::net_protocol::{
 use abq_utils::net_protocol::{client, meta, publicize_addr};
 use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
+use abq_utils::vec_map::VecMap;
+use abq_utils::{atomic, log_assert};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
 };
@@ -112,6 +113,7 @@ static_assertions::assert_eq_size!(RunData, (usize, u64, Duration, bool));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
+const ESTIMATED_TYPICAL_NUMBER_OF_WORKERS: usize = 4;
 
 /// A individual test run ever invoked on the queue.
 struct Run {
@@ -1236,16 +1238,25 @@ impl RunSuccess {
     }
 }
 
-struct RunResultState {
+struct ActiveRunState {
     /// Amount of work items left for the run.
     work_left: usize,
     run_success: RunSuccess,
+
+    /// The timestamps at which each worker in the test run completed all tests it was assigned to.
+    /// This data is stored to estimate deltas between when a worker completed its assigned
+    /// test, and when the test run completed overall.
+    ///
+    /// It is most important to estimate deltas that are larger, rather than smaller.
+    // NB: the number of workers is typically very very small (sub-dozens). Keep an associative
+    // list to minimize memory pressure and CPU time.
+    worker_completed_times: VecMap<EntityId, time::Instant>,
 }
 
 /// Cache of the current state of active runs and their result, so that we don't have to
 /// lock the run queue to understand what results we are waiting on.
 // TODO: consider using DashMap or RwLock<Map<RunId, Mutex<RunResultState>>>
-type RunResultStateCache = Arc<Mutex<HashMap<RunId, RunResultState>>>;
+type RunStateCache = Arc<Mutex<HashMap<RunId, ActiveRunState>>>;
 
 /// Central server listening for new test run runs and results.
 struct QueueServer {
@@ -1309,7 +1320,7 @@ struct QueueServerCtx {
     /// When all results for a particular run are communicated, we want to make sure that the
     /// responder thread is closed and that the entry here is dropped.
     active_runs: ActiveRunResponders,
-    state_cache: RunResultStateCache,
+    state_cache: RunStateCache,
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 
@@ -1544,6 +1555,25 @@ impl QueueServer {
                 .await
             }
 
+            Message::WorkerRanAllTests(run_id) => {
+                let notification_time = time::Instant::now();
+
+                net_protocol::async_write(
+                    &mut stream,
+                    &net_protocol::queue::AckWorkerRanAllTests {},
+                )
+                .await?;
+                drop(stream);
+
+                Self::handle_worker_ran_all_tests_notification(
+                    ctx.state_cache,
+                    run_id,
+                    entity,
+                    notification_time,
+                )
+                .await
+            }
+
             Message::PersistentWorkerResultsConnection(run_id) => {
                 Self::handle_new_persistent_worker_results_connection(
                     ctx.worker_results_tasks,
@@ -1555,7 +1585,7 @@ impl QueueServer {
             }
 
             Message::RequestTotalRunResult(run_id) => {
-                Self::handle_total_run_result_request(ctx.queues, run_id, stream).await
+                Self::handle_total_run_result_request(ctx.queues, run_id, entity, stream).await
             }
 
             Message::Retire => Self::handle_retirement(ctx.retirement, entity, stream).await,
@@ -1720,7 +1750,7 @@ impl QueueServer {
     async fn handle_run_cancellation(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunResultStateCache,
+        state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
     ) -> Result<(), AnyError> {
@@ -1832,7 +1862,7 @@ impl QueueServer {
     async fn handle_manifest_result(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunResultStateCache,
+        state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
         manifest_result: ManifestResult,
@@ -1899,7 +1929,7 @@ impl QueueServer {
     async fn handle_manifest_success(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunResultStateCache,
+        state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
         flat_manifest: Vec<TestCase>,
@@ -1927,9 +1957,12 @@ impl QueueServer {
             AddedManifest::Added {
                 starting_run_success_state,
             } => {
-                let run_state = RunResultState {
+                let run_state = ActiveRunState {
                     work_left: total_work,
                     run_success: starting_run_success_state,
+                    worker_completed_times: VecMap::with_capacity(
+                        ESTIMATED_TYPICAL_NUMBER_OF_WORKERS,
+                    ),
                 };
                 state_cache.lock().insert(run_id.clone(), run_state);
 
@@ -1954,7 +1987,7 @@ impl QueueServer {
     async fn handle_manifest_empty_or_failure(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunResultStateCache,
+        state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
         manifest_result: Result<
@@ -2064,7 +2097,7 @@ impl QueueServer {
     async fn handle_worker_results(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunResultStateCache,
+        state_cache: RunStateCache,
         worker_results_tasks: ConnectedWorkers,
         worker_next_tests_tasks: ConnectedWorkers,
         timeout_manager: RunTimeoutManager,
@@ -2124,7 +2157,6 @@ impl QueueServer {
         }
 
         // Now, we need to notify the end of the test run and handle resource cleanup.
-
         let run_complete_span = tracing::info_span!("run completion", ?run_id, ?entity);
         let _run_complete_enter = run_complete_span.enter();
 
@@ -2209,7 +2241,7 @@ impl QueueServer {
             }
         }
 
-        state_cache.lock().remove(&run_id);
+        let run_state = state_cache.lock().remove(&run_id);
 
         match run_success.into_opt_exit_code() {
             Some(exit_code) => {
@@ -2232,18 +2264,27 @@ impl QueueServer {
             }
         }
 
-        let opt_worker_results_tasks_err = Self::shutdown_persisted_worker_connection_tasks(
-            worker_results_tasks,
-            &run_id,
-            "failed to successfully stop worker results connection task",
-        )
-        .await;
-        let opt_worker_next_tests_tasks_err = Self::shutdown_persisted_worker_connection_tasks(
-            worker_next_tests_tasks,
-            &run_id,
-            "failed to successfully stop worker next tests connection task",
-        )
-        .await;
+        let (opt_worker_results_tasks_err, opt_worker_next_tests_tasks_err) = tokio::join!(
+            Self::shutdown_persisted_worker_connection_tasks(
+                worker_results_tasks,
+                &run_id,
+                "failed to successfully stop worker results connection task",
+            ),
+            Self::shutdown_persisted_worker_connection_tasks(
+                worker_next_tests_tasks,
+                &run_id,
+                "failed to successfully stop worker next tests connection task",
+            )
+        );
+
+        match run_state {
+            Some(state) => {
+                log_worker_completion_times(&run_id, state.worker_completed_times, entity);
+            }
+            None => {
+                tracing::error!(?run_id, "run state missing for active run upon completion");
+            }
+        }
 
         opt_worker_results_tasks_err.or(opt_worker_next_tests_tasks_err)
     }
@@ -2281,7 +2322,7 @@ impl QueueServer {
     async fn handle_fired_timeout(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunResultStateCache,
+        state_cache: RunStateCache,
         timeout: TimedOutRun,
     ) -> Result<(), AnyError> {
         // IFTTT: handle_worker_results
@@ -2412,6 +2453,55 @@ impl QueueServer {
         }
     }
 
+    #[instrument(level = "trace", skip(state_cache))]
+    async fn handle_worker_ran_all_tests_notification(
+        state_cache: RunStateCache,
+        run_id: RunId,
+        entity: EntityId,
+        notification_time: time::Instant,
+    ) -> OpaqueResult<()> {
+        let old_notification = {
+            match state_cache.lock().get_mut(&run_id) {
+                Some(active_run) => active_run
+                    .worker_completed_times
+                    .insert(entity, notification_time),
+                None => {
+                    // The active state may be missing in a few reasonable situations:
+                    // - For the worker that sends the ran-all-tests notification after it sends
+                    //   the last test result, since we steal the active state during completion of the
+                    //   test run. Note that in that case, the ran-all-tests notification for the
+                    //   relevant worker is assumed to be at the moment the test result in question is
+                    //   returned.
+                    // - Workers that finish around the same time as the final test result's worker. In
+                    //   this case, their completion notification can race with the completion of the
+                    //   test run.
+                    //
+                    // In both those situations, workers have completed near the time the whole suite
+                    // completed, and we gain little by tracking their time deltas. To avoid slowing
+                    // down the overall test suite, and because we don't know exactly how many workers
+                    // we may need to wait around for, admit notifications that hit such races.
+                    tracing::info!(
+                        ?run_id,
+                        ?entity,
+                        "worker-ran-all-tests notification after test run seen as completed"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+
+        log_assert!(
+            old_notification.is_none(),
+            ?run_id,
+            ?entity,
+            "duplicate worker-ran-all-tests notification received"
+        );
+
+        tracing::debug!(?run_id, ?entity, "worker-ran-all-tests notification");
+
+        Ok(())
+    }
+
     async fn handle_new_persistent_worker_results_connection(
         worker_results_tasks: ConnectedWorkers,
         run_id: RunId,
@@ -2430,6 +2520,7 @@ impl QueueServer {
     async fn handle_total_run_result_request(
         queues: SharedRuns,
         run_id: RunId,
+        entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> Result<(), AnyError> {
         let response = {
@@ -2442,6 +2533,7 @@ impl QueueServer {
                 RunLive::Active => net_protocol::queue::TotalRunResult::Pending,
                 RunLive::WaitingForExitCode => net_protocol::queue::TotalRunResult::Pending,
                 RunLive::Done { exit_code } => {
+                    tracing::info!(?run_id, ?entity, "notifying worker of run exit code");
                     net_protocol::queue::TotalRunResult::Completed { exit_code }
                 }
                 RunLive::Cancelled => net_protocol::queue::TotalRunResult::Completed {
@@ -2486,6 +2578,26 @@ impl QueueServer {
             io::ErrorKind::ConnectionRefused,
             "queue is retiring",
         ))
+    }
+}
+
+fn log_worker_completion_times(
+    run_id: &RunId,
+    mut worker_completed_times: VecMap<EntityId, time::Instant>,
+    worker_with_last_result: EntityId,
+) {
+    let run_completion_time = time::Instant::now();
+    if !worker_completed_times.contains(&worker_with_last_result) {
+        worker_completed_times.insert(worker_with_last_result, run_completion_time);
+    }
+    for (worker, worker_completion_time) in worker_completed_times {
+        let post_completion_idle_seconds = (run_completion_time - worker_completion_time).as_secs();
+        tracing::info!(
+            ?run_id,
+            ?worker,
+            ?post_completion_idle_seconds,
+            "worker post completion idle seconds"
+        );
     }
 }
 
@@ -2707,7 +2819,7 @@ mod test {
         time::Duration,
     };
 
-    use super::{RunResultState, RunResultStateCache, RunState, RunSuccess};
+    use super::{ActiveRunState, RunState, RunStateCache, RunSuccess};
     use crate::{
         connections::ConnectedWorkers,
         invoke::{run_cancellation_pair, Client, IncrementalTestData, DEFAULT_CLIENT_POLL_TIMEOUT},
@@ -2719,6 +2831,7 @@ mod test {
         timeout::{RunTimeoutManager, RunTimeoutStrategy},
     };
     use abq_run_n_times::n_times;
+    use abq_test_utils::assert_scoped_log;
     use abq_utils::{
         auth::{
             build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
@@ -2745,7 +2858,7 @@ mod test {
         io::AsyncWriteExt,
         sync::{Mutex, RwLock},
     };
-    use tracing_test::{internal::logs_with_scope_contain, traced_test};
+    use tracing_test::traced_test;
 
     fn one_nonzero() -> NonZeroU64 {
         1.try_into().unwrap()
@@ -2836,11 +2949,12 @@ mod test {
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
+        let _fail: io::Result<u64> = net_protocol::read(&mut conn);
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
-        logs_with_scope_contain("", "error handling connection");
+        assert_scoped_log("abq_queue::queue", "error handling connection");
     }
 
     #[tokio::test]
@@ -2948,7 +3062,7 @@ mod test {
         let run_id = RunId::unique();
         let active_runs = ActiveRunResponders::default();
         let run_queues = SharedRuns::default();
-        let run_state = RunResultStateCache::default();
+        let run_state = RunStateCache::default();
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
@@ -2957,9 +3071,10 @@ mod test {
         // Pretend we have infinite work so the queue always streams back results to the client.
         run_state.lock().insert(
             run_id.clone(),
-            super::RunResultState {
+            super::ActiveRunState {
                 work_left: usize::MAX,
                 run_success: RunSuccess::Success(true),
+                worker_completed_times: Default::default(),
             },
         );
 
@@ -3209,11 +3324,12 @@ mod test {
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         net_protocol::write(&mut conn, "bad message").unwrap();
+        let _fail: io::Result<u64> = net_protocol::read(&mut conn);
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
-        logs_with_scope_contain("", "error handling connection");
+        assert_scoped_log("abq_queue::queue", "error handling connection");
     }
 
     #[test]
@@ -3305,11 +3421,13 @@ mod test {
             },
         )
         .unwrap();
+        let fail: io::Result<NegotiatorInfo> = net_protocol::read(&mut conn);
+        assert!(fail.is_err());
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
-        logs_with_scope_contain("", "error handling connection");
+        assert_scoped_log("abq_queue::queue", "error handling connection");
     }
 
     #[test]
@@ -3390,7 +3508,7 @@ mod test {
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
 
-        logs_with_scope_contain("", "error handling connection");
+        assert_scoped_log("abq_queue::queue", "error handling connection");
     }
 
     #[test]
@@ -3659,13 +3777,14 @@ mod test {
             );
             Arc::new(RwLock::new(map))
         };
-        let state_cache: RunResultStateCache = {
+        let state_cache: RunStateCache = {
             let mut cache = HashMap::default();
             cache.insert(
                 run_id.clone(),
-                RunResultState {
+                ActiveRunState {
                     work_left: 1,
                     run_success: RunSuccess::Success(true),
+                    worker_completed_times: Default::default(),
                 },
             );
             Arc::new(pl::Mutex::new(cache))
@@ -3780,13 +3899,14 @@ mod test {
             );
             Arc::new(RwLock::new(map))
         };
-        let state_cache: RunResultStateCache = {
+        let state_cache: RunStateCache = {
             let mut cache = HashMap::default();
             cache.insert(
                 run_id.clone(),
-                RunResultState {
+                ActiveRunState {
                     work_left: 1,
                     run_success: RunSuccess::Success(true),
+                    worker_completed_times: Default::default(),
                 },
             );
             Arc::new(pl::Mutex::new(cache))
@@ -3913,13 +4033,14 @@ mod test {
             );
             Arc::new(RwLock::new(map))
         };
-        let state_cache: RunResultStateCache = {
+        let state_cache: RunStateCache = {
             let mut cache = HashMap::default();
             cache.insert(
                 run_id.clone(),
-                RunResultState {
+                ActiveRunState {
                     work_left: 1,
                     run_success: RunSuccess::Success(true),
+                    worker_completed_times: Default::default(),
                 },
             );
             Arc::new(pl::Mutex::new(cache))
