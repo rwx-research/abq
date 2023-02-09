@@ -33,6 +33,7 @@ use abq_utils::{
         queue::{NegotiatorInfo, RunAlreadyCompleted},
         workers::{RunId, RunnerKind},
     },
+    retry::{async_retry_n, retry_n},
     shutdown::ShutdownReceiver,
 };
 
@@ -247,12 +248,6 @@ impl WorkersNegotiator {
                     let span = tracing::trace_span!("notify_results", run_id=?run_id, results=?results.len(), queue_server=?queue_results_addr);
                     let _notify_results = span.enter();
 
-                    // TODO: error handling
-                    let mut stream = client
-                        .connect(queue_results_addr)
-                        .await
-                        .expect("results server not available");
-
                     let request = net_protocol::queue::Request {
                         entity,
                         message: net_protocol::queue::Message::WorkerResult(
@@ -261,7 +256,20 @@ impl WorkersNegotiator {
                         ),
                     };
 
-                    // TODO: error handling
+                    let client = &client;
+                    let mut stream =
+                        async_retry_n(5, Duration::from_secs(3), |attempt| async move {
+                            if attempt > 1 {
+                                tracing::info!(
+                                    "reattempting connection to queue for results {}",
+                                    attempt
+                                );
+                            }
+                            client.connect(queue_results_addr).await
+                        })
+                        .await
+                        .unwrap();
+
                     net_protocol::async_write(&mut stream, &request)
                         .await
                         .unwrap();
@@ -305,11 +313,6 @@ impl WorkersNegotiator {
                     let span = tracing::trace_span!("notify_manifest", ?entity, run_id=?run_id, queue_server=?queue_results_addr);
                     let _notify_manifest = span.enter();
 
-                    // TODO: error handling
-                    let mut stream = client
-                        .connect(queue_results_addr)
-                        .expect("results server not available");
-
                     let message = net_protocol::queue::Request {
                         entity,
                         message: net_protocol::queue::Message::ManifestResult(
@@ -318,8 +321,18 @@ impl WorkersNegotiator {
                         ),
                     };
 
-                    // TODO: error handling
-                    net_protocol::write(&mut stream, message).unwrap();
+                    let mut stream = retry_n(5, Duration::from_secs(3), |attempt| {
+                        if attempt > 1 {
+                            tracing::info!(
+                                "reattempting connection to queue for manifest {}",
+                                attempt
+                            );
+                        }
+                        client.connect(queue_results_addr)
+                    })
+                    .expect("results server not available");
+
+                    net_protocol::write(&mut stream, &message).unwrap();
                     let net_protocol::queue::AckManifest {} =
                         net_protocol::read(&mut stream).unwrap();
                 }
