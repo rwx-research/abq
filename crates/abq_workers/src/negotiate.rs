@@ -291,11 +291,11 @@ impl WorkersNegotiator {
             let client = client.boxed_clone();
             let run_id = run_id.clone();
 
-            move || {
+            move |entity| {
                 let span = tracing::trace_span!("get_init_context", run_id=?run_id, new_work_server=?work_server_addr);
                 let _get_next_work = span.enter();
 
-                wait_for_init_context(&*client, work_server_addr, run_id.clone())
+                wait_for_init_context(entity, &*client, work_server_addr, run_id.clone())
             }
         });
 
@@ -303,8 +303,9 @@ impl WorkersNegotiator {
         let get_next_tests_generator: GetNextTestsGenerator = {
             let async_client = async_client.boxed_clone();
             let run_id = run_id.clone();
-            &move || {
+            &move |entity| {
                 persistent_test_fetcher::start(
+                    entity,
                     work_server_addr,
                     async_client.boxed_clone(),
                     run_id.clone(),
@@ -505,13 +506,12 @@ async fn wait_for_execution_context(
 /// Asks the work server for native runner initialization context.
 /// Blocks on the result, repeatedly pinging the server until work is available.
 fn wait_for_init_context(
+    entity: EntityId,
     client: &dyn net::ConfiguredClient,
     work_server_addr: SocketAddr,
     run_id: RunId,
 ) -> io::Result<InitContextResult> {
-    use net_protocol::work_server::{InitContextResponse, WorkServerRequest};
-
-    let next_test_request = WorkServerRequest::InitContext { run_id };
+    use net_protocol::work_server::{InitContextResponse, Message, Request};
 
     // The work server may be waiting for the manifest, which the initialization context is blocked on;
     // to avoid pinging the server too often, let's decay on the frequency of our requests.
@@ -519,7 +519,15 @@ fn wait_for_init_context(
     let max_decay = Duration::from_secs(3);
     loop {
         let mut stream = client.connect(work_server_addr)?;
-        net_protocol::write(&mut stream, next_test_request.clone())?;
+
+        let next_test_request = Request {
+            entity,
+            message: Message::InitContext {
+                run_id: run_id.clone(),
+            },
+        };
+
+        net_protocol::write(&mut stream, next_test_request)?;
         match net_protocol::read(&mut stream)? {
             InitContextResponse::WaitingForManifest => {
                 thread::sleep(decay);
@@ -867,7 +875,7 @@ mod test {
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::{
-        InitContext, InitContextResponse, NextTestRequest, NextTestResponse, WorkServerRequest,
+        self, InitContext, InitContextResponse, NextTestRequest, NextTestResponse,
     };
     use abq_utils::net_protocol::workers::{
         ManifestResult, NextWork, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
@@ -941,7 +949,7 @@ mod test {
                             )
                             .unwrap();
                         } else {
-                            let _connect_msg: WorkServerRequest =
+                            let _connect_msg: work_server::Request =
                                 net_protocol::read(&mut worker).unwrap();
                             let mut all_done = false;
                             while !all_done {

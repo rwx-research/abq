@@ -533,12 +533,19 @@ pub mod work_server {
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
+        entity::EntityId,
         runners::MetadataMap,
         workers::{self, RunId},
     };
 
+    #[derive(Serialize, Deserialize)]
+    pub struct Request {
+        pub entity: EntityId,
+        pub message: Message,
+    }
+
     #[derive(Serialize, Deserialize, Debug, Clone)]
-    pub enum WorkServerRequest {
+    pub enum Message {
         HealthCheck,
         /// An ask to get the initialization metadata for a
         InitContext {

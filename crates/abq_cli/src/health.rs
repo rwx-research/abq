@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use abq_utils::net_protocol::{self, entity::EntityId, health::Health, queue};
+use abq_utils::net_protocol::{self, entity::EntityId, health::Health, queue, work_server};
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
@@ -64,7 +64,10 @@ impl HealthCheckKind {
             HealthCheckKind::WorkScheduler(_) => {
                 bail!(net_protocol::write(
                     &mut conn,
-                    net_protocol::work_server::WorkServerRequest::HealthCheck,
+                    work_server::Request {
+                        entity,
+                        message: work_server::Message::HealthCheck,
+                    }
                 ));
             }
             HealthCheckKind::Negotiator(_) => {

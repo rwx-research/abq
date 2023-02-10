@@ -19,7 +19,7 @@ use abq_utils::net_protocol::queue::{
     NativeRunnerInfo, NegotiatorInfo, Request,
 };
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap, TestCase};
-use abq_utils::net_protocol::work_server::WorkServerRequest;
+use abq_utils::net_protocol::work_server;
 use abq_utils::net_protocol::workers::{
     ManifestResult, NextWorkBundle, ReportedManifest, RunnerKind, WorkerTest,
 };
@@ -2774,8 +2774,23 @@ impl WorkScheduler {
                     let ctx = ctx.clone();
                     async move {
                         let result = Self::handle_work_conn(ctx, client).await;
-                        if let Err(err) = result {
-                            tracing::error!("error handling connection: {:?}", err);
+                        if let Err(EntityfulError {
+                            entity,
+                            error:
+                                LocatedError {
+                                    error,
+                                    location: Location { file, line, column },
+                                },
+                        }) = result
+                        {
+                            tracing::error!(
+                                ?entity,
+                                file,
+                                line,
+                                column,
+                                "error handling connection to work server: {}",
+                                error
+                            );
                         }
                     }
                 });
@@ -2791,21 +2806,30 @@ impl WorkScheduler {
     async fn handle_work_conn(
         ctx: SchedulerCtx,
         stream: net_async::UnverifiedServerStream,
-    ) -> io::Result<()> {
-        let mut stream = ctx.handshake_ctx.handshake(stream).await?;
+    ) -> Result<(), EntityfulError> {
+        let mut stream = ctx
+            .handshake_ctx
+            .handshake(stream)
+            .await
+            .located(here!())
+            .no_entity()?;
 
         // Get the run this worker wants work for.
-        let request: WorkServerRequest = net_protocol::async_read(&mut stream).await?;
+        let work_server::Request { entity, message } = net_protocol::async_read(&mut stream)
+            .await
+            .located(here!())
+            .no_entity()?;
 
-        match request {
-            WorkServerRequest::HealthCheck => {
+        use work_server::Message::*;
+        match message {
+            HealthCheck => {
                 let write_result =
                     net_protocol::async_write(&mut stream, &net_protocol::health::healthy()).await;
                 if let Err(err) = write_result {
-                    tracing::debug!("error sending health check: {}", err.to_string());
+                    tracing::warn!("error sending health check: {}", err.to_string());
                 }
             }
-            WorkServerRequest::InitContext { run_id } => {
+            InitContext { run_id } => {
                 let init_metadata = { ctx.queues.init_metadata(run_id.clone()) };
 
                 use net_protocol::work_server::{InitContext, InitContextResponse};
@@ -2817,9 +2841,12 @@ impl WorkScheduler {
                     InitMetadata::WaitingForManifest => InitContextResponse::WaitingForManifest,
                 };
 
-                net_protocol::async_write(&mut stream, &response).await?;
+                net_protocol::async_write(&mut stream, &response)
+                    .await
+                    .located(here!())
+                    .entity(entity)?;
             }
-            WorkServerRequest::PersistentWorkerNextTestsConnection(run_id) => {
+            PersistentWorkerNextTestsConnection(run_id) => {
                 ctx.worker_next_tests_tasks
                     .insert(run_id.clone(), move |rx_stop| {
                         Self::start_persistent_next_tests_requests_task(
@@ -2935,6 +2962,7 @@ mod test {
                 AckManifest, AssociatedTestResults, InvokeWork, NativeRunnerInfo, NegotiatorInfo,
             },
             runners::{Manifest, ManifestMessage, NativeRunnerSpecification, TestCase, TestResult},
+            work_server,
             workers::{RunId, RunnerKind, TestLikeRunner, WorkId},
         },
         shutdown::ShutdownManager,
@@ -3369,11 +3397,11 @@ mod test {
 
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(
-            &mut conn,
-            net_protocol::work_server::WorkServerRequest::HealthCheck,
-        )
-        .unwrap();
+        let request = work_server::Request {
+            entity: EntityId::new(),
+            message: work_server::Message::HealthCheck,
+        };
+        net_protocol::write(&mut conn, &request).unwrap();
         let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
         assert_eq!(health_msg, net_protocol::health::healthy());
@@ -3544,11 +3572,11 @@ mod test {
 
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(
-            &mut conn,
-            net_protocol::work_server::WorkServerRequest::HealthCheck,
-        )
-        .unwrap();
+        let request = work_server::Request {
+            entity: EntityId::new(),
+            message: work_server::Message::HealthCheck,
+        };
+        net_protocol::write(&mut conn, &request).unwrap();
 
         let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
@@ -3586,11 +3614,11 @@ mod test {
 
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(
-            &mut conn,
-            net_protocol::work_server::WorkServerRequest::HealthCheck,
-        )
-        .unwrap();
+        let request = work_server::Request {
+            entity: EntityId::new(),
+            message: work_server::Message::HealthCheck,
+        };
+        net_protocol::write(&mut conn, &request).unwrap();
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();

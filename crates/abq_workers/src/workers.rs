@@ -36,9 +36,10 @@ pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 pub use abq_generic_test_runner::TestsFetcher;
 
 pub type GetNextTests = Box<dyn TestsFetcher + Send>;
-pub type GetNextTestsGenerator<'a> = &'a dyn Fn() -> GetNextTests;
+pub type GetNextTestsGenerator<'a> = &'a dyn Fn(EntityId) -> GetNextTests;
 
-pub type GetInitContext = Arc<dyn Fn() -> io::Result<InitContextResult> + Send + Sync + 'static>;
+pub type GetInitContext =
+    Arc<dyn Fn(EntityId) -> io::Result<InitContextResult> + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResults = Arc<
     dyn Fn(EntityId, &RunId, Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>
@@ -220,7 +221,7 @@ impl WorkerPool {
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                tests_fetcher: get_next_tests_generator(),
+                tests_fetcher: get_next_tests_generator(entity),
                 results_batch_size,
                 notify_results,
                 context: worker_context.clone(),
@@ -250,12 +251,14 @@ impl WorkerPool {
             let get_init_context = Arc::clone(&get_init_context);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
+            let entity = EntityId::new();
+
             let worker_env = WorkerEnv {
-                entity: EntityId::new(),
+                entity,
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                tests_fetcher: get_next_tests_generator(),
+                tests_fetcher: get_next_tests_generator(entity),
                 results_batch_size,
                 notify_results,
                 notify_all_tests_run: notify_all_tests_run_generator(),
@@ -477,7 +480,7 @@ fn start_generic_test_runner(
         move |manifest_result| notify_manifest(entity, &run_id, manifest_result)
     });
 
-    let get_init_context = move || get_init_context();
+    let get_init_context = move || get_init_context(entity);
 
     let get_next_tests_bundle: abq_generic_test_runner::GetNextTests = tests_fetcher;
 
@@ -598,7 +601,7 @@ fn start_test_like_runner(
         };
     }
 
-    let init_context = match get_init_context() {
+    let init_context = match get_init_context(entity) {
         Ok(context_result) => match context_result {
             Ok(ctx) => ctx,
             Err(RunAlreadyCompleted {}) => {
@@ -868,14 +871,14 @@ mod test {
         }
     }
 
-    fn work_writer() -> (impl Fn(NextWork), impl Fn() -> GetNextTests) {
+    fn work_writer() -> (impl Fn(NextWork), impl Fn(EntityId) -> GetNextTests) {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
         let reader = Arc::clone(&writer);
         let write_work = move |work| {
             writer.lock().unwrap().push_back(work);
         };
 
-        let get_next_tests = move || {
+        let get_next_tests = move |_| {
             let reader = reader.clone();
             let get_next_tests: GetNextTests = Box::new(Fetcher { reader });
             get_next_tests
@@ -942,7 +945,7 @@ mod test {
         (all, generator)
     }
 
-    fn empty_init_context() -> io::Result<InitContextResult> {
+    fn empty_init_context(_entity: EntityId) -> io::Result<InitContextResult> {
         Ok(Ok(InitContext {
             init_meta: Default::default(),
         }))

@@ -977,12 +977,19 @@ fn get_init_context_from_work_server_waiting_for_first_worker() {
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
-                use net_protocol::work_server::WorkServerRequest;
+                use net_protocol::work_server::{Message, Request};
 
                 let mut conn = get_conn();
 
                 // Ask the server for the next test; we should be told a manifest is still TBD.
-                net_protocol::write(&mut conn, WorkServerRequest::InitContext { run_id }).unwrap();
+                net_protocol::write(
+                    &mut conn,
+                    Request {
+                        entity: EntityId::new(),
+                        message: Message::InitContext { run_id },
+                    },
+                )
+                .unwrap();
 
                 let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
 
@@ -1010,12 +1017,19 @@ fn get_init_context_from_work_server_waiting_for_manifest() {
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
-                use net_protocol::work_server::WorkServerRequest;
+                use net_protocol::work_server::{Message, Request};
 
                 let mut conn = get_conn();
 
                 // Ask the server for the next test; we should be told a manifest is still TBD.
-                net_protocol::write(&mut conn, WorkServerRequest::InitContext { run_id }).unwrap();
+                net_protocol::write(
+                    &mut conn,
+                    Request {
+                        entity: EntityId::new(),
+                        message: Message::InitContext { run_id },
+                    },
+                )
+                .unwrap();
 
                 let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
 
@@ -1060,7 +1074,7 @@ fn get_init_context_from_work_server_active() {
         .act([WSRunRequest(
             Run(1),
             Box::new(move |get_conn, run_id| {
-                use net_protocol::work_server::WorkServerRequest;
+                use net_protocol::work_server::{Message, Request};
 
                 // Ask the server for the work context, it should align with the init_meta we gave
                 // to begin with.
@@ -1069,8 +1083,11 @@ fn get_init_context_from_work_server_active() {
 
                     net_protocol::write(
                         &mut conn,
-                        WorkServerRequest::InitContext {
-                            run_id: run_id.clone(),
+                        Request {
+                            entity: EntityId::new(),
+                            message: Message::InitContext {
+                                run_id: run_id.clone(),
+                            },
                         },
                     )
                     .unwrap();
@@ -1117,12 +1134,19 @@ fn get_init_context_after_run_already_completed() {
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
-                use net_protocol::work_server::WorkServerRequest;
+                use net_protocol::work_server::{Message, Request};
 
                 let mut conn = get_conn();
 
                 // Ask the server for the work context, we should be told the run is already done.
-                net_protocol::write(&mut conn, WorkServerRequest::InitContext { run_id }).unwrap();
+                net_protocol::write(
+                    &mut conn,
+                    Request {
+                        entity: EntityId::new(),
+                        message: Message::InitContext { run_id },
+                    },
+                )
+                .unwrap();
 
                 let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
 

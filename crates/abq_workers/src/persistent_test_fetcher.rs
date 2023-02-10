@@ -7,6 +7,7 @@ use abq_utils::{
     net_async::{ClientStream, ConfiguredClient},
     net_protocol::{
         self,
+        entity::EntityId,
         workers::{NextWorkBundle, RunId},
     },
 };
@@ -15,11 +16,13 @@ use async_trait::async_trait;
 /// Returns a [GetNextTests] implementation which operates by keeping a persistent connection to fetch
 /// next tests open with the work server.
 pub(crate) fn start(
+    entity: EntityId,
     work_server_addr: SocketAddr,
     client: Box<dyn ConfiguredClient>,
     run_id: RunId,
 ) -> GetNextTests {
     Box::new(PersistedTestsFetcher {
+        entity,
         work_server_addr,
         client,
         conn: Default::default(),
@@ -28,6 +31,7 @@ pub(crate) fn start(
 }
 
 pub(crate) struct PersistedTestsFetcher {
+    entity: EntityId,
     work_server_addr: SocketAddr,
     client: Box<dyn ConfiguredClient>,
     conn: PersistedConnection,
@@ -88,17 +92,17 @@ impl PersistedTestsFetcher {
     }
 
     async fn ensure_persistent_conn(&mut self) -> io::Result<&mut Box<dyn ClientStream>> {
-        use net_protocol::work_server::WorkServerRequest;
+        use net_protocol::work_server::{Message, Request};
 
         match &mut self.conn {
             Some(conn) => Ok(conn),
             my_conn @ None => {
                 let mut conn = self.client.connect(self.work_server_addr).await?;
-                net_protocol::async_write(
-                    &mut conn,
-                    &WorkServerRequest::PersistentWorkerNextTestsConnection(self.run_id.clone()),
-                )
-                .await?;
+                let request = Request {
+                    entity: self.entity,
+                    message: Message::PersistentWorkerNextTestsConnection(self.run_id.clone()),
+                };
+                net_protocol::async_write(&mut conn, &request).await?;
 
                 *my_conn = Some(conn);
                 Ok(my_conn.as_mut().unwrap())
