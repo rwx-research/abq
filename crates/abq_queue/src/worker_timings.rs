@@ -28,8 +28,9 @@ pub fn log_workers_idle_after_completion_latency(
     for (worker, worker_completion_time) in worker_completed_times {
         let post_completion_idle_seconds = (run_completion_time - worker_completion_time).as_secs();
         tracing::info!(
-            ?run_id,
-            ?worker,
+            entity_id=%worker.display_id(),
+            entity_tag=%worker.tag,
+            %run_id,
             ?post_completion_idle_seconds,
             "worker post completion idle seconds"
         );
@@ -45,8 +46,9 @@ pub fn log_workers_waited_for_manifest_latency(
     for (worker, worker_connected) in worker_first_connected_times {
         let pre_manifest_idle_seconds = (manifest_received_time - worker_connected).as_secs();
         tracing::info!(
-            ?run_id,
-            ?worker,
+            entity_id=%worker.display_id(),
+            entity_tag=%worker.tag,
+            %run_id,
             ?pre_manifest_idle_seconds,
             "worker pre-manifest idle seconds"
         );
@@ -59,11 +61,13 @@ pub fn log_workers_waited_for_supervisor_latency(
     supervisor_started_run_time: time::Instant,
 ) {
     for (worker, worker_connected) in worker_first_connected_times.iter() {
-        let pre_manifest_idle_seconds = (supervisor_started_run_time - *worker_connected).as_secs();
+        let pre_supervisor_idle_seconds =
+            (supervisor_started_run_time - *worker_connected).as_secs();
         tracing::info!(
-            ?run_id,
-            ?worker,
-            ?pre_manifest_idle_seconds,
+            entity_id=%worker.display_id(),
+            entity_tag=%worker.tag,
+            %run_id,
+            pre_supervisor_idle_seconds,
             "worker pre-supervisor idle seconds"
         );
     }
