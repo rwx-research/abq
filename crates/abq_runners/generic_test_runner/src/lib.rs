@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use abq_utils::error::{here, ErrorLocation, LocatedError, ResultLocation};
 use abq_utils::exit::ExitCode;
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
@@ -140,8 +141,8 @@ pub async fn open_native_runner_connection(
 
 macro_rules! try_setup {
     ($err:expr) => {
-        $err.map_err(|e| GenericRunnerError {
-            kind: e.into(),
+        $err.located(here!()).map_err(|e| GenericRunnerError {
+            error: e,
             output: CapturedOutput::empty(),
         })?
     };
@@ -200,15 +201,15 @@ async fn retrieve_manifest<'a>(
                 (runner_info, manifest.manifest, captured_output)
             }
             Ok((_, ManifestMessage::Failure(failure))) => {
-                let kind = NativeTestRunnerError::from(failure.error);
+                let error = NativeTestRunnerError::from(failure.error).located(here!());
                 return Err(GenericRunnerError {
-                    kind: kind.into(),
+                    error,
                     output: captured_output,
                 });
             }
-            Err(kind) => {
+            Err(error) => {
                 return Err(GenericRunnerError {
-                    kind,
+                    error,
                     output: captured_output,
                 });
             }
@@ -227,7 +228,7 @@ async fn retrieve_manifest_help(
     listener: &mut TcpListener,
     native_runner_handle: &mut process::Child,
     protocol_version_timeout: Duration,
-) -> Result<(NativeRunnerInfo, ManifestMessage), GenericRunnerErrorKind> {
+) -> Result<(NativeRunnerInfo, ManifestMessage), LocatedError> {
     let native_runner_died = async {
         let _ = native_runner_handle.wait().await;
     };
@@ -235,11 +236,12 @@ async fn retrieve_manifest_help(
     // Wait for and validate the protocol version message, channel must always come first.
     let (runner_info, runner_conn) =
         open_native_runner_connection(listener, protocol_version_timeout, native_runner_died)
-            .await?;
+            .await
+            .located(here!())?;
 
-    let manifest_message = wait_for_manifest(runner_conn).await?;
+    let manifest_message = wait_for_manifest(runner_conn).await.located(here!())?;
 
-    let status = native_runner_handle.wait().await?;
+    let status = native_runner_handle.wait().await.located(here!())?;
     debug_assert!(status.success());
 
     Ok((runner_info, manifest_message))
@@ -268,20 +270,20 @@ pub enum GenericRunnerErrorKind {
 
 #[derive(Debug, Error)]
 pub struct GenericRunnerError {
-    pub kind: GenericRunnerErrorKind,
+    pub error: LocatedError,
     pub output: CapturedOutput,
 }
 
 impl std::fmt::Display for GenericRunnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.kind.fmt(f)
+        self.error.fmt(f)
     }
 }
 
 impl GenericRunnerError {
-    pub fn no_captures(kind: GenericRunnerErrorKind) -> Self {
+    pub fn no_captures(kind: LocatedError) -> Self {
         Self {
-            kind,
+            error: kind,
             output: CapturedOutput::empty(),
         }
     }
@@ -328,6 +330,7 @@ impl GenericTestRunner {
         let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build());
+
         rt.block_on(run(
             worker_entity,
             input,
@@ -392,7 +395,7 @@ where
             }
             Err(err) => {
                 send_manifest(ManifestResult::TestRunnerError {
-                    error: err.kind.to_string(),
+                    error: err.error.to_string(),
                     output: err.output.clone(),
                 });
                 return Err(err);
@@ -479,7 +482,7 @@ where
             manifest_generation_output,
             final_captured_output: output,
         }),
-        Err(err) => Err(GenericRunnerError { kind: err, output }),
+        Err(err) => Err(GenericRunnerError { error: err, output }),
     }
 }
 
@@ -495,7 +498,7 @@ async fn run_help<'a, GetInitContext>(
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     worker_entity: EntityId,
     native_runner: Command,
-) -> Result<ExitCode, GenericRunnerErrorKind>
+) -> Result<ExitCode, LocatedError>
 where
     GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
 {
@@ -509,7 +512,8 @@ where
         protocol_version_timeout,
         native_runner_died,
     )
-    .await?;
+    .await
+    .located(here!())?;
 
     let NativeRunnerInfo {
         protocol,
@@ -526,12 +530,13 @@ where
     // the initialization context; that way we can pay the price of startup and
     // context-fetching in parallel.
     {
-        match get_init_context()? {
+        match get_init_context().located(here!())? {
             Ok(InitContext { init_meta }) => {
                 let init_message =
                     net_protocol::runners::InitMessage::new(protocol, init_meta, FastExit(false));
-                runner_conn.write(&init_message).await?;
-                let _init_success: InitSuccessMessage = runner_conn.read().await?;
+                runner_conn.write(&init_message).await.located(here!())?;
+                let _init_success: InitSuccessMessage =
+                    runner_conn.read().await.located(here!())?;
             }
             Err(RunAlreadyCompleted {}) => {
                 // There is nothing more for the native runner to do, so we tell it to
@@ -541,8 +546,8 @@ where
                     Default::default(),
                     FastExit(true),
                 );
-                runner_conn.write(&init_message).await?;
-                let exit_status = native_runner_handle.wait().await?;
+                runner_conn.write(&init_message).await.located(here!())?;
+                let exit_status = native_runner_handle.wait().await.located(here!())?;
                 return Ok(exit_status.into());
             }
         };
@@ -586,7 +591,8 @@ where
                 test_case,
                 &results_tx,
             )
-            .await?;
+            .await
+            .located(here!())?;
 
             let estimated_runtime = estimated_start.elapsed();
 
@@ -605,7 +611,7 @@ where
                     remaining_tests,
                 );
 
-                return Err(GenericRunnerErrorKind::from(native_error));
+                return Err(GenericRunnerErrorKind::from(native_error).located(here!()));
             }
         }
 
@@ -613,10 +619,9 @@ where
         drop(runner_conn);
         drop(our_listener);
 
-        let ((), exit_status) = tokio::join!(
-            notify_all_tests_run(worker_entity),
-            native_runner_handle.wait()
-        );
+        let ((), exit_status) = tokio::join!(notify_all_tests_run(worker_entity), async {
+            native_runner_handle.wait().await.located(here!())
+        });
 
         let exit_status = exit_status?;
 
@@ -1118,7 +1123,7 @@ pub fn execute_wrapped_runner(
 
     if let Some(error) = opt_error_cell {
         return Err(GenericRunnerError {
-            kind: io::Error::new(io::ErrorKind::InvalidInput, error).into(),
+            error: io::Error::new(io::ErrorKind::InvalidInput, error).located(here!()),
             output: CapturedOutput::empty(),
         });
     }
@@ -1628,8 +1633,8 @@ mod test_abq_jest {
 #[cfg(test)]
 mod test_invalid_command {
     use crate::{
-        notify_all_tests_run, GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner,
-        ImmediateTests, SendTestResults,
+        notify_all_tests_run, GenericRunnerError, GenericTestRunner, ImmediateTests,
+        SendTestResults,
     };
     use abq_utils::atomic;
     use abq_utils::net_protocol::entity::EntityId;
@@ -1681,13 +1686,7 @@ mod test_invalid_command {
             manifest_result,
             ManifestResult::TestRunnerError { .. }
         ));
-        assert!(matches!(
-            runner_result,
-            Err(GenericRunnerError {
-                kind: GenericRunnerErrorKind::Io(..),
-                ..
-            })
-        ));
+        assert!(matches!(runner_result, Err(GenericRunnerError { .. })));
         assert!(
             !all_tests_run.load(atomic::ORDERING),
             "invalid command should not notify completion"
