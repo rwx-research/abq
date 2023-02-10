@@ -39,6 +39,10 @@ impl<K: Eq, V> VecMap<K, V> {
     pub fn contains(&self, key: &K) -> bool {
         self.set.iter().any(|(k, _)| k == key)
     }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &(K, V)> {
+        self.set.iter()
+    }
 }
 
 impl<K, V> IntoIterator for VecMap<K, V> {

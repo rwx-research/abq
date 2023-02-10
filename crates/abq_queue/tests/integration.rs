@@ -173,6 +173,8 @@ enum Action {
 
     /// Spawn an action in a new task. Do this if the action is blocking.
     Spawn(SpawnId, Box<Action>),
+    /// Wait for a spawned action to complete.
+    Join(SpawnId),
 }
 
 #[allow(clippy::type_complexity)]
@@ -410,6 +412,7 @@ fn action_to_fut(
         }
 
         StopWorkers(n) => async move {
+            dbg!(n);
             let mut worker_pool = workers.lock().remove(&n).unwrap();
             let workers_result =
                 match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.shutdown())) {
@@ -452,6 +455,14 @@ fn action_to_fut(
             background_tasks.insert(id, handle);
 
             async {}.boxed()
+        }
+
+        Join(id) => {
+            let handle = background_tasks.remove(&id).unwrap();
+            async move {
+                handle.await.unwrap();
+            }
+            .boxed()
         }
     }
 }
@@ -635,7 +646,10 @@ fn multiple_jobs_complete() {
         .test();
 
     // Should log how long this worker took
-    assert_scoped_log("abq_queue::queue", "worker post completion idle seconds");
+    assert_scoped_log(
+        "abq_queue::worker_timings",
+        "worker post completion idle seconds",
+    );
 }
 
 #[test]
@@ -1692,4 +1706,68 @@ fn runner_panic_stops_worker() {
             })],
         )
         .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+#[traced_test]
+fn multiple_workers_start_before_supervisor() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1".to_string()),
+            echo_test(proto, "echo2".to_string()),
+        ],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    TestBuilder::default()
+        .act([
+            Spawn(
+                SpawnId(1),
+                Box::new(StartWorkers(Run(1), Wid(1), default_workers_config())),
+            ),
+            Spawn(
+                SpawnId(2),
+                Box::new(StartWorkers(Run(1), Wid(2), default_workers_config())),
+            ),
+        ])
+        .step(
+            [RunTest(Run(1), Sid(1), SupervisorConfig::new(runner))],
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results(&mut results);
+                    results == ["echo1", "echo2"]
+                }),
+            ],
+        )
+        .act([Join(SpawnId(1)), Join(SpawnId(2))])
+        .step(
+            [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
+            [
+                WorkerExitStatus(Wid(1), &|e| assert_eq!(e, &WorkersExitStatus::Success)),
+                WorkerExitStatus(Wid(2), &|e| assert_eq!(e, &WorkersExitStatus::Success)),
+            ],
+        )
+        .test();
+
+    // Should log how long these workers were idle before supervisor
+    // Should log how long these workers were idle before manifest
+    // Should log how long these worker took
+    assert_scoped_log(
+        "abq_queue::worker_timings",
+        "worker pre-supervisor idle seconds",
+    );
+    assert_scoped_log(
+        "abq_queue::worker_timings",
+        "worker pre-manifest idle seconds",
+    );
+    assert_scoped_log(
+        "abq_queue::worker_timings",
+        "worker post completion idle seconds",
+    );
 }

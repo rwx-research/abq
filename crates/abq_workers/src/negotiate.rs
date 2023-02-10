@@ -15,7 +15,7 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::{
-    persistent_test_fetcher,
+    negotiate, persistent_test_fetcher,
     workers::{
         GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyManifest,
         NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, NotifyResults, RunExitCode,
@@ -91,6 +91,12 @@ enum MessageFromQueueNegotiator {
     ExecutionContext(ExecutionContext),
     RunUnknown,
     RunCompleteButExitCodeNotKnown,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Request {
+    pub entity: EntityId,
+    pub message: MessageToQueueNegotiator,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -461,8 +467,11 @@ async fn wait_for_execution_context(
     let max_decay = Duration::from_secs(3);
     loop {
         let mut conn = client.connect(queue_negotiator_addr).await?;
-        let wants_to_attach = MessageToQueueNegotiator::WantsToAttach {
-            run: wanted_run_id.clone(),
+        let wants_to_attach = negotiate::Request {
+            entity,
+            message: MessageToQueueNegotiator::WantsToAttach {
+                run: wanted_run_id.clone(),
+            },
         };
         net_protocol::async_write(&mut conn, &wants_to_attach).await?;
 
@@ -636,7 +645,7 @@ pub enum QueueNegotiatorServerError {
 
 struct QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
 {
     /// Fetches the status of an assigned run, and yields immediately.
     get_assigned_run: Arc<GetAssignedRun>,
@@ -647,7 +656,7 @@ where
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -672,7 +681,7 @@ impl QueueNegotiator {
         get_assigned_run: GetAssignedRun,
     ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
     {
         let addr = listener.local_addr()?;
 
@@ -743,13 +752,13 @@ impl QueueNegotiator {
         stream: net_async::UnverifiedServerStream,
     ) -> io::Result<()>
     where
-        GetAssignedRun: Fn(&RunId) -> AssignedRunStatus + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
     {
         let mut stream = ctx.handshake_ctx.handshake(stream).await?;
-        let msg: MessageToQueueNegotiator = net_protocol::async_read(&mut stream).await?;
+        let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
 
         use MessageToQueueNegotiator::*;
-        match msg {
+        match message {
             HealthCheck => {
                 let write_result =
                     net_protocol::async_write(&mut stream, &net_protocol::health::healthy()).await;
@@ -762,7 +771,7 @@ impl QueueNegotiator {
                 let _attach_span = attach.enter();
                 tracing::debug!(run_id=?wanted_run_id, "New worker set negotiating");
 
-                let assigned_run_result = (ctx.get_assigned_run)(&wanted_run_id);
+                let assigned_run_result = (ctx.get_assigned_run)(&wanted_run_id, entity);
 
                 use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
@@ -853,6 +862,7 @@ mod test {
     };
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
+    use abq_utils::net_protocol::entity::EntityId;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
     };
@@ -1083,7 +1093,7 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let get_assigned_run = move |run_id: &RunId| {
+        let get_assigned_run = move |run_id: &RunId, _entity| {
             let manifest = ManifestMessage::new(Manifest::new(
                 [echo_test(proto, "hello".to_string())],
                 Default::default(),
@@ -1156,7 +1166,7 @@ mod test {
             // Below parameters are faux because they are unnecessary for healthchecks.
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
-            move |_| {
+            move |_, _| {
                 AssignedRunStatus::Run(AssignedRun {
                     run_id: RunId::unique(),
                     runner_kind: RunnerKind::TestLikeRunner(
@@ -1187,7 +1197,14 @@ mod test {
             .build()
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
+        net_protocol::write(
+            &mut conn,
+            super::Request {
+                entity: EntityId::new(),
+                message: MessageToQueueNegotiator::HealthCheck,
+            },
+        )
+        .unwrap();
         let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
         assert_eq!(health_msg, net_protocol::health::healthy());
@@ -1213,7 +1230,14 @@ mod test {
             .build()
             .unwrap();
         let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
+        net_protocol::write(
+            &mut conn,
+            super::Request {
+                entity: EntityId::new(),
+                message: MessageToQueueNegotiator::HealthCheck,
+            },
+        )
+        .unwrap();
         let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
 
         assert_eq!(health_msg, net_protocol::health::healthy());

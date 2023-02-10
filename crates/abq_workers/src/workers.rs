@@ -1266,7 +1266,7 @@ mod test {
             shutdown_rx,
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
-            |_| panic!("should not ask for assigned run in this test"),
+            |_, _| panic!("should not ask for assigned run in this test"),
         )
         .unwrap();
 
