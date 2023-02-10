@@ -7,7 +7,7 @@ use abq_utils::{
     net_async::{ClientStream, ConfiguredClient},
     net_protocol::{
         self,
-        entity::EntityId,
+        entity::Entity,
         workers::{NextWorkBundle, RunId},
     },
 };
@@ -16,7 +16,7 @@ use async_trait::async_trait;
 /// Returns a [GetNextTests] implementation which operates by keeping a persistent connection to fetch
 /// next tests open with the work server.
 pub(crate) fn start(
-    entity: EntityId,
+    entity: Entity,
     work_server_addr: SocketAddr,
     client: Box<dyn ConfiguredClient>,
     run_id: RunId,
@@ -31,7 +31,7 @@ pub(crate) fn start(
 }
 
 pub(crate) struct PersistedTestsFetcher {
-    entity: EntityId,
+    entity: Entity,
     work_server_addr: SocketAddr,
     client: Box<dyn ConfiguredClient>,
     conn: PersistedConnection,

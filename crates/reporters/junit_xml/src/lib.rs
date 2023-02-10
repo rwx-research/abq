@@ -116,7 +116,7 @@ impl Collector {
 #[cfg(test)]
 mod test {
     use abq_utils::net_protocol::{
-        entity::EntityId,
+        entity::RunnerMeta,
         runners::{Status, TestResult, TestResultSpec, TestRuntime::Milliseconds},
     };
 
@@ -127,7 +127,7 @@ mod test {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[
             TestResult::new(
-                EntityId::fake(),
+                RunnerMeta::fake(),
                 TestResultSpec {
                     status: Status::Success,
                     id: "id1".to_string(),
@@ -139,7 +139,7 @@ mod test {
                 },
             ),
             TestResult::new(
-                EntityId::fake(),
+                RunnerMeta::fake(),
                 TestResultSpec {
                     status: Status::Failure {
                         exception: Some("test-exception".to_string()),
@@ -157,7 +157,7 @@ mod test {
                 },
             ),
             TestResult::new(
-                EntityId::fake(),
+                RunnerMeta::fake(),
                 TestResultSpec {
                     status: Status::Error {
                         exception: None,
@@ -172,7 +172,7 @@ mod test {
                 },
             ),
             TestResult::new(
-                EntityId::fake(),
+                RunnerMeta::fake(),
                 TestResultSpec {
                     status: Status::Pending,
                     id: "id4".to_string(),
@@ -184,7 +184,7 @@ mod test {
                 },
             ),
             TestResult::new(
-                EntityId::fake(),
+                RunnerMeta::fake(),
                 TestResultSpec {
                     status: Status::Skipped,
                     id: "id5".to_string(),
@@ -230,7 +230,7 @@ mod test {
     fn extend_appends_tests() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Success,
                 id: "id1".to_string(),
@@ -243,7 +243,7 @@ mod test {
         )]);
 
         collector.extend_with_results(&[TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Failure {
                     exception: None,
@@ -282,7 +282,7 @@ mod test {
     fn failure_with_empty_output_prints_empty_output() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Failure {
                     exception: None,
@@ -320,7 +320,7 @@ mod test {
     fn error_with_empty_output_prints_empty_output() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Error {
                     exception: None,
@@ -358,7 +358,7 @@ mod test {
     fn strip_ansi_escape_codes() {
         let mut collector = Collector::new("suite");
         collector.extend_with_results(&[TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Error {
                     exception: None,

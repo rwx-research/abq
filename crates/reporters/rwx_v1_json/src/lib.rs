@@ -390,7 +390,7 @@ impl Collector {
 #[cfg(test)]
 mod test {
     use abq_utils::net_protocol::{
-        entity::EntityId,
+        entity::RunnerMeta,
         runners::{NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime},
     };
 
@@ -406,7 +406,7 @@ mod test {
         );
 
         collector.push_result(&TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Success,
                 id: "id1".to_string(),
@@ -418,7 +418,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Failure {
                     exception: Some("test-exception".to_string()),
@@ -433,7 +433,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Error {
                     exception: None,
@@ -448,7 +448,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Pending,
                 id: "id4".to_string(),
@@ -460,7 +460,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Skipped,
                 id: "id5".to_string(),
@@ -498,7 +498,7 @@ mod test {
         let mut collector = Collector::default();
 
         collector.push_result(&TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Success,
                 id: "id1".to_string(),

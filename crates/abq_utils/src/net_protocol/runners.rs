@@ -467,7 +467,7 @@ pub use v0_2::OutOfBandError;
 
 use crate::exit::ExitCode;
 
-use super::entity::EntityId;
+use super::entity::RunnerMeta;
 
 impl std::fmt::Display for OutOfBandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -605,8 +605,8 @@ static_assertions::assert_eq_size!(RawNativeTestResult, [u8; 8]);
 /// Test result reported to ABQ, normalizing from a native runner.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TestResult {
-    /// The worker this test result originated from
-    pub source: EntityId,
+    /// The runner this test result originated from
+    pub source: RunnerMeta,
     pub result: TestResultSpec,
 }
 
@@ -625,7 +625,7 @@ impl DerefMut for TestResult {
 }
 
 impl TestResult {
-    pub fn new(source: EntityId, result: TestResultSpec) -> Self {
+    pub fn new(source: RunnerMeta, result: TestResultSpec) -> Self {
         Self { source, result }
     }
 
@@ -636,14 +636,14 @@ impl TestResult {
     #[cfg(feature = "expose-native-protocols")]
     pub fn fake() -> Self {
         Self {
-            source: EntityId::fake(),
+            source: RunnerMeta::fake(),
             result: TestResultSpec::fake(),
         }
     }
 }
 
 impl v0_2::TestResult {
-    fn reify(self, source: EntityId) -> TestResult {
+    fn reify(self, source: RunnerMeta) -> TestResult {
         TestResult {
             source,
             result: self.into(),
@@ -651,7 +651,7 @@ impl v0_2::TestResult {
     }
 }
 impl RawNativeTestResult {
-    pub fn reify(self, source: EntityId) -> TestResult {
+    pub fn reify(self, source: RunnerMeta) -> TestResult {
         use PrivNativeTestResult::*;
 
         match self.0 {
@@ -670,7 +670,7 @@ enum PrivTestResultMessage {
 
 impl RawTestResultMessage {
     /// Extract the [test result][TestResult] from the message.
-    pub fn into_test_results(self, source: EntityId) -> TestResultSet {
+    pub fn into_test_results(self, source: RunnerMeta) -> TestResultSet {
         use PrivTestResultMessage::*;
         match self.0 {
             V0_2(msg) => msg.into_test_results(source),
@@ -712,7 +712,7 @@ enum PrivIncrementalTestResultMessage {
 }
 
 impl RawIncrementalTestResultMessage {
-    pub fn into_step(self, source: EntityId) -> IncrementalTestResultStep {
+    pub fn into_step(self, source: RunnerMeta) -> IncrementalTestResultStep {
         use PrivIncrementalTestResultMessage::*;
         match self.0 {
             V0_2(msg) => msg.into_step(source),

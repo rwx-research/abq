@@ -16,7 +16,7 @@ use message_buffer::{Completed, RefillStrategy};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, ChildStderr, ChildStdout, Command};
 
-use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
@@ -297,7 +297,7 @@ pub type SendTestResultsBoxed = Box<dyn Fn(Vec<AssociatedTestResults>) -> BoxFut
 /// executed.
 /// In cases where the runner exits before all assigned tests were completed (due to unrecoverable fault),
 /// or the runner exited early due to a finished test run, this is never called.
-pub type NotifyMaterialTestsAllRun = Box<dyn FnOnce(EntityId) -> BoxFuture<'static, ()> + Send>;
+pub type NotifyMaterialTestsAllRun = Box<dyn FnOnce(Entity) -> BoxFuture<'static, ()> + Send>;
 
 /// Asynchronously fetch a bundle of tests.
 #[async_trait]
@@ -309,7 +309,8 @@ pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 
 impl GenericTestRunner {
     pub fn run<ShouldShutdown, SendManifest, GetInitContext>(
-        worker_entity: EntityId,
+        runner_entity: Entity,
+        runner_meta: RunnerMeta,
         input: NativeTestRunnerParams,
         working_dir: &Path,
         polling_should_shutdown: ShouldShutdown,
@@ -332,7 +333,8 @@ impl GenericTestRunner {
             .build());
 
         rt.block_on(run(
-            worker_entity,
+            runner_entity,
+            runner_meta,
             input,
             working_dir,
             polling_should_shutdown,
@@ -350,7 +352,8 @@ impl GenericTestRunner {
 type ResultsSender = mpsc::Sender<AssociatedTestResults>;
 
 async fn run<ShouldShutdown, SendManifest, GetInitContext>(
-    worker_entity: EntityId,
+    runner_entity: Entity,
+    runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
     working_dir: &Path,
     _polling_should_shutdown: ShouldShutdown,
@@ -466,7 +469,8 @@ where
         get_next_test_bundle,
         send_test_results,
         notify_all_tests_run,
-        worker_entity,
+        runner_entity,
+        runner_meta,
         native_runner,
     )
     .await;
@@ -496,7 +500,8 @@ async fn run_help<'a, GetInitContext>(
     test_fetcher: GetNextTests,
     send_test_results: SendTestResults<'a>,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
-    worker_entity: EntityId,
+    runner_entity: Entity,
+    runner_meta: RunnerMeta,
     native_runner: Command,
 ) -> Result<ExitCode, LocatedError>
 where
@@ -584,7 +589,7 @@ where
             let estimated_start = Instant::now();
 
             let handled_test = handle_one_test(
-                worker_entity,
+                runner_meta,
                 &mut runner_conn,
                 capture_pipes,
                 work_id,
@@ -601,7 +606,7 @@ where
                 let final_output = capture_pipes.get_captured();
 
                 handle_native_runner_failure(
-                    worker_entity,
+                    runner_meta,
                     send_test_results,
                     &native_runner,
                     final_output,
@@ -619,7 +624,7 @@ where
         drop(runner_conn);
         drop(our_listener);
 
-        let ((), exit_status) = tokio::join!(notify_all_tests_run(worker_entity), async {
+        let ((), exit_status) = tokio::join!(notify_all_tests_run(runner_entity), async {
             native_runner_handle.wait().await.located(here!())
         });
 
@@ -718,7 +723,7 @@ impl CapturePipes {
 }
 
 async fn handle_one_test(
-    worker_entity: EntityId,
+    runner_meta: RunnerMeta,
     runner_conn: &mut RunnerConnection,
     capture_pipes: &CapturePipes,
     work_id: WorkId,
@@ -728,7 +733,7 @@ async fn handle_one_test(
     let test_case_message = TestCaseMessage::new(test_case);
 
     let opt_test_results = send_and_wait_for_test_results(
-        worker_entity,
+        runner_meta,
         work_id,
         runner_conn,
         capture_pipes,
@@ -756,7 +761,7 @@ async fn handle_one_test(
 }
 
 async fn send_and_wait_for_test_results(
-    worker_entity: EntityId,
+    runner_meta: RunnerMeta,
     work_id: WorkId,
     runner_conn: &mut RunnerConnection,
     capture_pipes: &CapturePipes,
@@ -792,7 +797,7 @@ async fn send_and_wait_for_test_results(
     // corresponds to at least one test result notification
     let mut captured = capture_pipes.get_captured();
 
-    let results = match raw_msg.into_test_results(worker_entity) {
+    let results = match raw_msg.into_test_results(runner_meta) {
         TestResultSet::All(mut results) => {
             attach_pipe_output_to_test_results(&mut results, captured);
             results
@@ -816,7 +821,7 @@ async fn send_and_wait_for_test_results(
                         // `raw_increment`.
                         captured = capture_pipes.get_captured();
 
-                        step = raw_increment.into_step(worker_entity);
+                        step = raw_increment.into_step(runner_meta);
                     }
                     Done(opt_res) => {
                         if let Some(mut result) = opt_res {
@@ -894,7 +899,7 @@ fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
 
 #[allow(clippy::format_push_string)] // write! can fail, push can't
 fn handle_native_runner_failure<I>(
-    worker_entity: EntityId,
+    runner_meta: RunnerMeta,
     send_test_result: SendTestResults,
     native_runner: &Command,
     mut final_output: CapturedOutput,
@@ -974,7 +979,7 @@ fn handle_native_runner_failure<I>(
             to see the native test runner failure.
             "#
         ),
-        INDENT, worker_entity
+        INDENT, runner_meta
     ));
 
     tracing::warn!(?error_message, "native test runner failure");
@@ -982,7 +987,7 @@ fn handle_native_runner_failure<I>(
     let mut final_results = vec![];
     for work_id in remaining_work {
         let error_result = TestResult::new(
-            worker_entity,
+            runner_meta,
             TestResultSpec {
                 status: Status::PrivateNativeRunnerError,
                 id: format!("internal-error-{}", uuid::Uuid::new_v4()),
@@ -1108,7 +1113,8 @@ pub fn execute_wrapped_runner(
     };
 
     let _opt_exit_error = GenericTestRunner::run(
-        EntityId::new(),
+        Entity::runner(0, 1),
+        RunnerMeta::fake(),
         native_runner_params,
         &working_dir,
         || false,
@@ -1385,7 +1391,7 @@ mod test_abq_jest {
         SendTestResults,
     };
     use abq_utils::atomic;
-    use abq_utils::net_protocol::entity::EntityId;
+    use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
     use abq_utils::net_protocol::queue::RunAlreadyCompleted;
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
     use abq_utils::net_protocol::work_server::InitContext;
@@ -1452,7 +1458,8 @@ mod test_abq_jest {
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
         GenericTestRunner::run(
-            EntityId::new(),
+            Entity::runner(0, 1),
+            RunnerMeta::fake(),
             input,
             &npm_jest_project_path(),
             || false,
@@ -1608,7 +1615,8 @@ mod test_abq_jest {
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
         let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _>(
-            EntityId::new(),
+            Entity::runner(0, 1),
+            RunnerMeta::fake(),
             input,
             &npm_jest_project_path(),
             || false,
@@ -1637,7 +1645,7 @@ mod test_invalid_command {
         SendTestResults,
     };
     use abq_utils::atomic;
-    use abq_utils::net_protocol::entity::EntityId;
+    use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle,
@@ -1667,7 +1675,8 @@ mod test_invalid_command {
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
         let runner_result = GenericTestRunner::run(
-            EntityId::new(),
+            Entity::runner(0, 1),
+            RunnerMeta::fake(),
             input,
             &std::env::current_dir().unwrap(),
             || false,

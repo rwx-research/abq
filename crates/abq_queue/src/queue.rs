@@ -13,7 +13,7 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net;
 use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
-use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::entity::Entity;
 use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, CannotSetOOBExitCodeReason, InvokerTestData,
     NativeRunnerInfo, NegotiatorInfo, Request,
@@ -332,11 +332,7 @@ impl AllRuns {
 
     // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
     // found.
-    pub fn find_run_for_worker(
-        &self,
-        run_id: &RunId,
-        worker_entity: EntityId,
-    ) -> AssignedRunLookup {
+    pub fn find_run_for_worker(&self, run_id: &RunId, worker_entity: Entity) -> AssignedRunLookup {
         {
             if self.runs.read().get(run_id).is_none() {
                 let mut runs = self.runs.write();
@@ -1033,7 +1029,7 @@ fn start_queue(config: QueueConfig) -> Abq {
     // queues indefinitely.
     let choose_run_for_worker = {
         let queues = queues.clone();
-        move |wanted_run_id: &RunId, entity: EntityId| {
+        move |wanted_run_id: &RunId, entity: Entity| {
             let opt_assigned = { queues.find_run_for_worker(wanted_run_id, entity) };
             match opt_assigned {
                 AssignedRunLookup::Some(assigned) => AssignedRunStatus::Run(assigned),
@@ -1449,7 +1445,7 @@ impl QueueServer {
                         match conn {
                             Ok((conn, _)) => HandleConn(conn),
                             Err(e) => {
-                                tracing::error!("error accepting connection: {:?}", e);
+                                tracing::error!("error accepting connection to queue: {:?}", e);
                                 continue;
                             }
                         }
@@ -1467,23 +1463,11 @@ impl QueueServer {
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
                             let result = Self::handle(ctx, client).await;
-                            if let Err(EntityfulError {
-                                error:
-                                    LocatedError {
-                                        error,
-                                        location: Location { file, line, column },
-                                    },
-                                entity,
-                            }) = result
-                            {
-                                tracing::error!(
-                                    ?entity,
-                                    file,
-                                    line,
-                                    column,
-                                    "error handling connection to queue: {}",
-                                    error
-                                );
+                            if let Err(error) = result {
+                                log_entityful_error!(
+                                    error,
+                                    "error handling connection to queue: {}"
+                                )
                             }
                         });
                     }
@@ -1677,7 +1661,7 @@ impl QueueServer {
     #[inline(always)]
     #[instrument(level = "trace", skip(stream))]
     async fn handle_healthcheck(
-        entity: EntityId,
+        entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         // Right now nothing interesting is owned by the queue, so nothing extra to check.
@@ -1691,7 +1675,7 @@ impl QueueServer {
     #[instrument(level = "trace", skip(queues, stream))]
     async fn handle_active_test_runs(
         queues: SharedRuns,
-        entity: EntityId,
+        entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         let active_runs = queues.estimate_num_active_runs();
@@ -1705,7 +1689,7 @@ impl QueueServer {
     #[inline(always)]
     #[instrument(level = "trace", skip(stream, public_negotiator_addr))]
     async fn handle_negotiator_info(
-        entity: EntityId,
+        entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
         public_negotiator_addr: SocketAddr,
     ) -> OpaqueResult<()> {
@@ -1724,7 +1708,7 @@ impl QueueServer {
         active_runs: ActiveRunResponders,
         queues: SharedRuns,
         retirement: RetirementCell,
-        entity: EntityId,
+        entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
         invoke_work: InvokeWork,
     ) -> OpaqueResult<()> {
@@ -1837,7 +1821,7 @@ impl QueueServer {
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
     ) -> OpaqueResult<()> {
         tracing::info!(?run_id, ?entity, "test supervisor cancelled a test run");
@@ -1872,7 +1856,7 @@ impl QueueServer {
     async fn handle_out_of_band_run_exit_code(
         queues: SharedRuns,
         mut client: Box<dyn net_async::ServerStream>,
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
         exit_code: ExitCode,
     ) -> OpaqueResult<()> {
@@ -1910,7 +1894,7 @@ impl QueueServer {
     #[instrument(level = "trace", skip(active_runs, new_stream))]
     async fn handle_invoker_reconnection(
         active_runs: ActiveRunResponders,
-        entity: EntityId,
+        entity: Entity,
         new_stream: Box<dyn net_async::ServerStream>,
         run_id: RunId,
     ) -> OpaqueResult<()> {
@@ -1954,7 +1938,7 @@ impl QueueServer {
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
         manifest_result: ManifestResult,
         stream: Box<dyn net_async::ServerStream>,
@@ -2021,7 +2005,7 @@ impl QueueServer {
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
         flat_manifest: Vec<TestCase>,
         init_metadata: MetadataMap,
@@ -2084,7 +2068,7 @@ impl QueueServer {
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
         manifest_result: Result<
             NativeRunnerInfo,         /* empty manifest */
@@ -2201,7 +2185,7 @@ impl QueueServer {
         worker_results_tasks: ConnectedWorkers,
         worker_next_tests_tasks: ConnectedWorkers,
         timeout_manager: RunTimeoutManager,
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
         results: Vec<AssociatedTestResults>,
     ) -> OpaqueResult<()> {
@@ -2563,7 +2547,7 @@ impl QueueServer {
     async fn handle_worker_ran_all_tests_notification(
         state_cache: RunStateCache,
         run_id: RunId,
-        entity: EntityId,
+        entity: Entity,
         notification_time: time::Instant,
     ) -> OpaqueResult<()> {
         let old_notification = {
@@ -2609,7 +2593,7 @@ impl QueueServer {
     async fn handle_new_persistent_worker_results_connection(
         worker_results_tasks: ConnectedWorkers,
         run_id: RunId,
-        _entity: EntityId,
+        _entity: Entity,
         _stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         worker_results_tasks.insert(run_id, |rx_stop| async move {
@@ -2624,7 +2608,7 @@ impl QueueServer {
     async fn handle_total_run_result_request(
         queues: SharedRuns,
         run_id: RunId,
-        entity: EntityId,
+        entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         let response = {
@@ -2657,7 +2641,7 @@ impl QueueServer {
     #[instrument(level = "trace", skip(stream))]
     async fn handle_retirement(
         retirement: RetirementCell,
-        entity: EntityId,
+        entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         if !stream.role().is_admin() {
@@ -2674,7 +2658,7 @@ impl QueueServer {
         Ok(())
     }
 
-    fn reject_if_retired(entity: &EntityId, retirement: RetirementCell) -> io::Result<()> {
+    fn reject_if_retired(entity: &Entity, retirement: RetirementCell) -> io::Result<()> {
         if !retirement.is_retired() {
             return Ok(());
         }
@@ -2690,7 +2674,7 @@ impl QueueServer {
     }
 }
 
-fn log_deprecations(entity: EntityId, run_id: RunId, deprecations: meta::DeprecationRecord) {
+fn log_deprecations(entity: Entity, run_id: RunId, deprecations: meta::DeprecationRecord) {
     for deprecation in deprecations.extract() {
         tracing::warn!(?entity, ?run_id, ?deprecation, "deprecation");
     }
@@ -2760,7 +2744,7 @@ impl WorkScheduler {
                         match conn {
                             Ok(conn) => conn,
                             Err(e) => {
-                                tracing::error!("error accepting connection: {:?}", e);
+                                tracing::error!("error accepting connection to work server: {:?}", e);
                                 continue;
                             }
                         }
@@ -2774,23 +2758,11 @@ impl WorkScheduler {
                     let ctx = ctx.clone();
                     async move {
                         let result = Self::handle_work_conn(ctx, client).await;
-                        if let Err(EntityfulError {
-                            entity,
-                            error:
-                                LocatedError {
-                                    error,
-                                    location: Location { file, line, column },
-                                },
-                        }) = result
-                        {
-                            tracing::error!(
-                                ?entity,
-                                file,
-                                line,
-                                column,
-                                "error handling connection to work server: {}",
-                                error
-                            );
+                        if let Err(error) = result {
+                            log_entityful_error!(
+                                error,
+                                "error handling connection to work server: {}"
+                            )
                         }
                     }
                 });
@@ -2957,7 +2929,7 @@ mod test {
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
             self,
-            entity::EntityId,
+            entity::Entity,
             queue::{
                 AckManifest, AssociatedTestResults, InvokeWork, NativeRunnerInfo, NegotiatorInfo,
             },
@@ -3119,7 +3091,7 @@ mod test {
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
             Arc::clone(&active_runs),
-            EntityId::new(),
+            Entity::supervisor(),
             server_conn,
             run_id.clone(),
         )
@@ -3161,7 +3133,7 @@ mod test {
 
         let reconnection_result = QueueServer::handle_invoker_reconnection(
             Arc::clone(&active_runs),
-            EntityId::new(),
+            Entity::supervisor(),
             server_conn,
             run_id.clone(),
         )
@@ -3185,7 +3157,7 @@ mod test {
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
-        let client_entity = EntityId::new();
+        let client_entity = Entity::supervisor();
 
         // Pretend we have infinite work so the queue always streams back results to the client.
         run_state.lock().insert(
@@ -3235,7 +3207,7 @@ mod test {
                 worker_results_tasks.clone(),
                 worker_next_tests_tasks.clone(),
                 RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                EntityId::new(),
+                Entity::runner(0, 1),
                 run_id.clone(),
                 vec![result],
             )
@@ -3279,7 +3251,7 @@ mod test {
         {
             let reconnection_future = tokio::spawn(QueueServer::handle_invoker_reconnection(
                 Arc::clone(&active_runs),
-                EntityId::new(),
+                Entity::runner(0, 1),
                 server_conn,
                 run_id.clone(),
             ));
@@ -3307,7 +3279,7 @@ mod test {
                 worker_results_tasks.clone(),
                 worker_next_tests_tasks.clone(),
                 RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                EntityId::new(),
+                Entity::runner(0, 1),
                 run_id,
                 vec![associated_result],
             ));
@@ -3356,7 +3328,7 @@ mod test {
         net_protocol::write(
             &mut conn,
             net_protocol::queue::Request {
-                entity: EntityId::new(),
+                entity: Entity::local_client(),
                 message: net_protocol::queue::Message::HealthCheck,
             },
         )
@@ -3398,7 +3370,7 @@ mod test {
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         let request = work_server::Request {
-            entity: EntityId::new(),
+            entity: Entity::local_client(),
             message: work_server::Message::HealthCheck,
         };
         net_protocol::write(&mut conn, &request).unwrap();
@@ -3477,7 +3449,7 @@ mod test {
         net_protocol::write(
             &mut conn,
             net_protocol::queue::Request {
-                entity: EntityId::new(),
+                entity: Entity::local_client(),
                 message: net_protocol::queue::Message::NegotiatorInfo {
                     run_id: RunId::unique(),
                     deprecations: Default::default(),
@@ -3528,7 +3500,7 @@ mod test {
         net_protocol::write(
             &mut conn,
             net_protocol::queue::Request {
-                entity: EntityId::new(),
+                entity: Entity::local_client(),
                 message: net_protocol::queue::Message::NegotiatorInfo {
                     run_id: RunId::unique(),
                     deprecations: Default::default(),
@@ -3573,7 +3545,7 @@ mod test {
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         let request = work_server::Request {
-            entity: EntityId::new(),
+            entity: Entity::local_client(),
             message: work_server::Message::HealthCheck,
         };
         net_protocol::write(&mut conn, &request).unwrap();
@@ -3615,7 +3587,7 @@ mod test {
         let client = client_opts.build().unwrap();
         let mut conn = client.connect(server_addr).unwrap();
         let request = work_server::Request {
-            entity: EntityId::new(),
+            entity: Entity::local_client(),
             message: work_server::Message::HealthCheck,
         };
         net_protocol::write(&mut conn, &request).unwrap();
@@ -3668,7 +3640,7 @@ mod test {
             )
             .unwrap();
 
-        queues.find_run_for_worker(&run_id, EntityId::new());
+        queues.find_run_for_worker(&run_id, Entity::local_client());
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
     }
@@ -3690,7 +3662,7 @@ mod test {
             )
             .unwrap();
 
-        queues.find_run_for_worker(&run_id, EntityId::new());
+        queues.find_run_for_worker(&run_id, Entity::local_client());
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
 
@@ -3714,7 +3686,7 @@ mod test {
             )
             .unwrap();
 
-        queues.find_run_for_worker(&run_id, EntityId::new());
+        queues.find_run_for_worker(&run_id, Entity::local_client());
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
         queues.mark_complete(&run_id, ExitCode::SUCCESS);
@@ -3744,7 +3716,7 @@ mod test {
                 )
                 .unwrap();
 
-            queues.find_run_for_worker(run_id, EntityId::new());
+            queues.find_run_for_worker(run_id, Entity::local_client());
         }
 
         for run_id in [&run_id1, &run_id2, &run_id4] {
@@ -3803,7 +3775,7 @@ mod test {
             )
             .unwrap();
 
-        queues.find_run_for_worker(&run_id, EntityId::new());
+        queues.find_run_for_worker(&run_id, Entity::local_client());
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
@@ -3833,7 +3805,7 @@ mod test {
             )
             .unwrap();
 
-        queues.find_run_for_worker(&run_id, EntityId::new());
+        queues.find_run_for_worker(&run_id, Entity::local_client());
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
 
@@ -3855,7 +3827,7 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let assigned_run = queues.find_run_for_worker(&run_id, EntityId::new());
+        let assigned_run = queues.find_run_for_worker(&run_id, Entity::local_client());
         assert!(matches!(assigned_run, AssignedRunLookup::NotFound));
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
@@ -3893,7 +3865,7 @@ mod test {
             let queues = queues.clone();
             let run_id = run_id.clone();
             move || {
-                queues.find_run_for_worker(&run_id, EntityId::new());
+                queues.find_run_for_worker(&run_id, Entity::local_client());
             }
         };
 
@@ -3951,7 +3923,7 @@ mod test {
                     true,
                 )
                 .unwrap();
-            queues.find_run_for_worker(&run_id, EntityId::new());
+            queues.find_run_for_worker(&run_id, Entity::local_client());
             queues
         };
         let active_runs: ActiveRunResponders = {
@@ -3973,7 +3945,7 @@ mod test {
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
-        let entity = EntityId::new();
+        let entity = Entity::local_client();
 
         // Cancel the run, make sure we exit smoothly
         {
@@ -4069,7 +4041,7 @@ mod test {
                     true,
                 )
                 .unwrap();
-            queues.find_run_for_worker(&run_id, EntityId::new());
+            queues.find_run_for_worker(&run_id, Entity::local_client());
             queues
         };
         let active_runs: ActiveRunResponders = {
@@ -4091,7 +4063,7 @@ mod test {
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
-        let entity = EntityId::new();
+        let entity = Entity::local_client();
 
         // Cancel the run, make sure we exit smoothly
         let do_cancellation_fut = async {
@@ -4197,7 +4169,7 @@ mod test {
                     true,
                 )
                 .unwrap();
-            queues.find_run_for_worker(&run_id, EntityId::new());
+            queues.find_run_for_worker(&run_id, Entity::local_client());
             let added = queues.add_manifest(&run_id, vec![], Default::default());
             assert!(matches!(added, AddedManifest::Added { .. }));
             queues
@@ -4221,7 +4193,7 @@ mod test {
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
-        let entity = EntityId::new();
+        let entity = Entity::local_client();
 
         let result = AssociatedTestResults::fake(WorkId::new(), vec![TestResult::fake()]);
         let send_last_result_fut = QueueServer::handle_worker_results(
@@ -4341,7 +4313,7 @@ mod test {
             let set_exit_code_fut = QueueServer::handle_out_of_band_run_exit_code(
                 queues.clone(),
                 server_conn,
-                EntityId::new(),
+                Entity::local_client(),
                 run_id,
                 ExitCode::FAILURE,
             );
@@ -4379,7 +4351,7 @@ mod test {
             net_protocol::write(
                 &mut conn,
                 queue::Request {
-                    entity: EntityId::new(),
+                    entity: Entity::local_client(),
                     message: net_protocol::queue::Message::Retire,
                 },
             )
@@ -4400,7 +4372,7 @@ mod test {
             net_protocol::write(
                 &mut conn,
                 queue::Request {
-                    entity: EntityId::new(),
+                    entity: Entity::local_client(),
                     message: queue::Message::InvokeWork(faux_invoke_work()),
                 },
             )
@@ -4431,7 +4403,7 @@ mod test {
         net_protocol::write(
             &mut conn,
             queue::Request {
-                entity: EntityId::new(),
+                entity: Entity::local_client(),
                 message: net_protocol::queue::Message::Retire,
             },
         )

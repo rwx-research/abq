@@ -8,7 +8,7 @@ use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::artifacts_dir;
 use abq_utils::atomic;
 use abq_utils::exit::ExitCode;
-use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
 use abq_utils::net_protocol::queue::AssociatedTestResults;
 use abq_utils::net_protocol::runners::{
     CapturedOutput, InitSuccessMessage, Manifest, ManifestMessage, NativeRunnerSpecification,
@@ -102,7 +102,8 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
         manifest_generation_output,
         exit_code,
     } = GenericTestRunner::run(
-        EntityId::new(),
+        Entity::runner(0, 1),
+        RunnerMeta::fake(),
         input,
         &std::env::current_dir().unwrap(),
         || false,

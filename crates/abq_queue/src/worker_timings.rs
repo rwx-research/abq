@@ -3,14 +3,14 @@
 use std::time;
 
 use abq_utils::{
-    net_protocol::{entity::EntityId, workers::RunId},
+    net_protocol::{entity::Entity, workers::RunId},
     vec_map::VecMap,
 };
 
 const ESTIMATED_TYPICAL_NUMBER_OF_WORKERS: usize = 4;
 
 /// Maps a worker's [entity][EntityId] to a moment in time they connected to the queue.
-pub type WorkerTimings = VecMap<EntityId, time::Instant>;
+pub type WorkerTimings = VecMap<Entity, time::Instant>;
 
 pub fn new_worker_timings() -> WorkerTimings {
     WorkerTimings::with_capacity(ESTIMATED_TYPICAL_NUMBER_OF_WORKERS)
@@ -18,8 +18,8 @@ pub fn new_worker_timings() -> WorkerTimings {
 
 pub fn log_workers_idle_after_completion_latency(
     run_id: &RunId,
-    mut worker_completed_times: VecMap<EntityId, time::Instant>,
-    worker_with_last_result: EntityId,
+    mut worker_completed_times: VecMap<Entity, time::Instant>,
+    worker_with_last_result: Entity,
 ) {
     let run_completion_time = time::Instant::now();
     if !worker_completed_times.contains(&worker_with_last_result) {
@@ -39,7 +39,7 @@ pub fn log_workers_idle_after_completion_latency(
 pub fn log_workers_waited_for_manifest_latency(
     run_id: &RunId,
     // The times workers first connected to the queue, for the given run ID.
-    worker_first_connected_times: VecMap<EntityId, time::Instant>,
+    worker_first_connected_times: VecMap<Entity, time::Instant>,
     manifest_received_time: time::Instant,
 ) {
     for (worker, worker_connected) in worker_first_connected_times {
@@ -55,7 +55,7 @@ pub fn log_workers_waited_for_manifest_latency(
 
 pub fn log_workers_waited_for_supervisor_latency(
     run_id: &RunId,
-    worker_first_connected_times: &VecMap<EntityId, time::Instant>,
+    worker_first_connected_times: &VecMap<Entity, time::Instant>,
     supervisor_started_run_time: time::Instant,
 ) {
     for (worker, worker_connected) in worker_first_connected_times.iter() {

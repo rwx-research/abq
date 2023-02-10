@@ -1,7 +1,7 @@
 use abq_queue::timeout::RunTimeoutStrategy;
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::net_opt::ServerOptions;
-use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::entity::Entity;
 use abq_utils::net_protocol::meta::DeprecationRecord;
 use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::workers::RunId;
@@ -180,7 +180,7 @@ impl AbqInstance {
     }
 
     pub fn from_remote(
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
         queue_addr: SocketAddr,
         auth: ClientAuthStrategy,

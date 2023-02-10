@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc, time};
 
 use abq_utils::{
     exit::ExitCode,
-    net_protocol::{entity::EntityId, workers::RunId},
+    net_protocol::{entity::Entity, workers::RunId},
     vec_map::VecMap,
 };
 use parking_lot::Mutex;
@@ -76,14 +76,14 @@ impl ActiveRunState {
 
     pub fn insert_worker_completed(
         &mut self,
-        worker: EntityId,
+        worker: Entity,
         notification_time: time::Instant,
     ) -> Option<time::Instant> {
         self.worker_completed_times
             .insert(worker, notification_time)
     }
 
-    pub fn worker_completed_times(self) -> VecMap<EntityId, time::Instant> {
+    pub fn worker_completed_times(self) -> VecMap<Entity, time::Instant> {
         self.worker_completed_times
     }
 }

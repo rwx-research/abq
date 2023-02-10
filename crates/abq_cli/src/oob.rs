@@ -1,6 +1,6 @@
 use abq_utils::{
     exit::ExitCode,
-    net_protocol::{self, entity::EntityId, queue, workers::RunId},
+    net_protocol::{self, entity::Entity, queue, workers::RunId},
 };
 use anyhow::anyhow;
 
@@ -16,7 +16,7 @@ pub(crate) fn should_track_exit_code_in_band() -> bool {
 }
 
 pub(crate) fn set_exit_code(
-    entity: EntityId,
+    entity: Entity,
     abq: AbqInstance,
     run_id: RunId,
     exit_code: ExitCode,

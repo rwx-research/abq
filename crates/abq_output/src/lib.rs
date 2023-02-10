@@ -8,7 +8,7 @@ use std::{
 pub mod colors;
 
 use abq_utils::net_protocol::{
-    entity::EntityId,
+    entity::RunnerMeta,
     runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
 };
 use colors::ColorProvider;
@@ -27,7 +27,7 @@ pub fn format_result_line(
         if !is_first_result && would_write_output(Some(output_before)) {
             writeln!(writer)?;
         }
-        format_worker_output(
+        format_runner_output(
             writer,
             result.source,
             OutputOrdering::Before(Cow::Borrowed(&result.display_name)),
@@ -43,7 +43,7 @@ pub fn format_result_line(
         if would_write_output(Some(output_after)) {
             writeln!(writer)?;
         }
-        format_worker_output(
+        format_runner_output(
             writer,
             result.source,
             OutputOrdering::After(Cow::Borrowed(&result.display_name)),
@@ -70,7 +70,7 @@ pub enum SummaryKind<'a> {
     Test(TestResult),
     Output {
         when: OutputOrdering<'a>,
-        worker: EntityId,
+        runner: RunnerMeta,
         output: CapturedOutput,
     },
 }
@@ -86,9 +86,9 @@ pub fn format_summary(writer: &mut impl WriteColor, summary: SummaryKind) -> io:
         SummaryKind::Test(result) => format_test_result_summary(writer, &result),
         SummaryKind::Output {
             when,
-            worker,
+            runner,
             output,
-        } => format_worker_output(writer, worker, when, &output),
+        } => format_runner_output(writer, runner, when, &output),
     }
 }
 
@@ -148,7 +148,10 @@ pub fn format_test_result_summary(
     }
     write!(writer, "(completed in ")?;
     format_duration(writer, *runtime)?;
-    writeln!(writer, "; worker [{:?}])", result.source)
+
+    write!(writer, " ")?;
+    format_runner_name(writer, result.source)?;
+    writeln!(writer, ")")
 }
 
 pub fn would_write_output(output: Option<&CapturedOutput>) -> bool {
@@ -158,13 +161,31 @@ pub fn would_write_output(output: Option<&CapturedOutput>) -> bool {
     }
 }
 
-pub fn format_worker_output(
+fn format_runner_name(writer: &mut impl io::Write, runner: RunnerMeta) -> io::Result<()> {
+    let RunnerMeta {
+        runner,
+        is_singleton,
+    } = runner;
+
+    if is_singleton {
+        write!(writer, "[worker {}]", runner.worker())
+    } else {
+        write!(
+            writer,
+            "[worker {}, runner {}]",
+            runner.worker(),
+            runner.runner()
+        )
+    }
+}
+
+pub fn format_runner_output(
     writer: &mut impl io::Write,
-    worker: EntityId,
+    runner: RunnerMeta,
     when: OutputOrdering,
     output: &CapturedOutput,
 ) -> io::Result<()> {
-    // --- [worker {worker_id}] DURING|BEFORE|AFTER test_name ---
+    // --- [worker {worker_id}, runner {runner_id}] DURING|BEFORE|AFTER test_name ---
     // ----- STDOUT
     // {stdout}
     // ----- STDERR
@@ -177,11 +198,13 @@ pub fn format_worker_output(
 
     let CapturedOutput { stderr, stdout } = output;
 
-    write!(writer, "--- [worker {worker:?}] ")?;
+    write!(writer, "--- ")?;
+    format_runner_name(writer, runner)?;
+
     match when {
-        OutputOrdering::Before(test) => write!(writer, "BEFORE {test}"),
-        OutputOrdering::After(test) => write!(writer, "AFTER {test}"),
-        OutputOrdering::Custom(s) => write!(writer, "{s}"),
+        OutputOrdering::Before(test) => write!(writer, " BEFORE {test}"),
+        OutputOrdering::After(test) => write!(writer, " AFTER {test}"),
+        OutputOrdering::Custom(s) => write!(writer, " {s}"),
     }?;
 
     writeln!(writer, " ---")?;
@@ -212,19 +235,14 @@ pub fn format_worker_output(
 
 pub fn format_final_runner_output(
     writer: &mut impl io::Write,
-    worker: EntityId,
-    runner_index: Option<usize>,
+    runner: RunnerMeta,
     output: &CapturedOutput,
 ) -> io::Result<()> {
-    // --- [worker {worker_id}] AFTER completion[ on runner N]? ---
-    let mut after = "AFTER completion".to_string();
-    if let Some(runner) = runner_index {
-        after.push_str(" on runner ");
-        after.push_str(&runner.to_string());
-    }
-    format_worker_output(
+    // --- [worker {worker_id}, runner {runner_id}] AFTER completion ---
+    let after = "AFTER completion".to_string();
+    format_runner_output(
         writer,
-        worker,
+        runner,
         OutputOrdering::Custom(Cow::Owned(after)),
         output,
     )
@@ -232,13 +250,13 @@ pub fn format_final_runner_output(
 
 pub fn format_manifest_generation_output(
     writer: &mut impl io::Write,
-    worker: EntityId,
+    runner: RunnerMeta,
     output: &CapturedOutput,
 ) -> io::Result<()> {
-    // --- [worker {worker_id}] MANIFEST GENERATION ---
-    format_worker_output(
+    // --- [worker {worker_id}, runner {runner_id}] MANIFEST GENERATION ---
+    format_runner_output(
         writer,
-        worker,
+        runner,
         OutputOrdering::Custom(Cow::Borrowed("MANIFEST GENERATION")),
         output,
     )
@@ -468,7 +486,7 @@ pub fn format_duration_to_partial_seconds(
 #[cfg(test)]
 mod test {
     use abq_utils::net_protocol::{
-        entity::EntityId,
+        entity::{RunnerMeta, WorkerRunner},
         runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
     };
 
@@ -562,7 +580,7 @@ mod test {
 
     test_format!(
         format_line_success, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
         &None, &None,
         @r###"
     abq/test: <green>ok<reset>
@@ -571,7 +589,7 @@ mod test {
 
     test_format!(
         format_line_failure, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         &None, &None,
         @r###"
     abq/test: <red>FAILED<reset>
@@ -580,7 +598,7 @@ mod test {
 
     test_format!(
         format_line_error, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         &None, &None,
         @r###"
     abq/test: <red>ERRORED<reset>
@@ -589,7 +607,7 @@ mod test {
 
     test_format!(
         format_line_pending, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
         &None, &None,
         @r###"
     abq/test: <yellow>pending<reset>
@@ -598,7 +616,7 @@ mod test {
 
     test_format!(
         format_line_skipped, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None, &None,
         @r###"
     abq/test: <yellow>skipped<reset>
@@ -607,11 +625,11 @@ mod test {
 
     test_format!(
         format_line_output_before_after, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
         &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
         @r###"
-    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    --- [worker 0] BEFORE abq/test ---
     ----- STDOUT
     stdout
     before
@@ -621,7 +639,7 @@ mod test {
 
     abq/test: <yellow>skipped<reset>
 
-    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    --- [worker 0] AFTER abq/test ---
     ----- STDOUT
     stdout
     after
@@ -634,11 +652,11 @@ mod test {
 
     test_format!(
         format_line_output_only_before, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
         &None,
         @r###"
-    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    --- [worker 0] BEFORE abq/test ---
     ----- STDOUT
     stdout
     before
@@ -652,11 +670,11 @@ mod test {
 
     test_format!(
         format_line_output_only_before_only_stdout, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &Some(CapturedOutput { stderr: b"".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
         &None,
         @r###"
-    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    --- [worker 0] BEFORE abq/test ---
     ----- STDOUT
     stdout
     before
@@ -667,11 +685,11 @@ mod test {
 
     test_format!(
         format_line_output_only_before_only_stderr, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"".to_vec() }),
         &None,
         @r###"
-    --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test ---
+    --- [worker 0] BEFORE abq/test ---
     ----- STDERR
     stderr
     before
@@ -682,13 +700,13 @@ mod test {
 
     test_format!(
         format_line_output_only_after, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
         &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 
-    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    --- [worker 0] AFTER abq/test ---
     ----- STDOUT
     stdout
     after
@@ -701,13 +719,13 @@ mod test {
 
     test_format!(
         format_line_output_only_after_only_stdout, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
         &Some(CapturedOutput { stdout: b"stdout\nafter".to_vec(), stderr: b"".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 
-    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    --- [worker 0] AFTER abq/test ---
     ----- STDOUT
     stdout
     after
@@ -717,13 +735,40 @@ mod test {
 
     test_format!(
         format_line_output_only_after_only_stderr, format_result_line,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
         &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 
-    --- [worker 07070707-0707-0707-0707-070707070707] AFTER abq/test ---
+    --- [worker 0] AFTER abq/test ---
+    ----- STDERR
+    stderr
+    after
+
+    "###
+    );
+
+    test_format!(
+        format_line_output_before_after_non_singleton, format_result_line,
+        &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
+        @r###"
+    --- [worker 5, runner 6] BEFORE abq/test ---
+    ----- STDOUT
+    stdout
+    before
+    ----- STDERR
+    stderr
+    before
+
+    abq/test: <yellow>skipped<reset>
+
+    --- [worker 5, runner 6] AFTER abq/test ---
+    ----- STDOUT
+    stdout
+    after
     ----- STDERR
     stderr
     after
@@ -733,31 +778,31 @@ mod test {
 
     test_format!(
         format_dot_success, format_result_dot,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), ..default_result() }),
         @"<green>.<reset>"
     );
 
     test_format!(
         format_dot_failure, format_result_dot,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         @"<red>F<reset>"
     );
 
     test_format!(
         format_dot_error, format_result_dot,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), ..default_result() }),
         @"<red>E<reset>"
     );
 
     test_format!(
         format_dot_pending, format_result_dot,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), ..default_result() }),
         @"<yellow>P<reset>"
     );
 
     test_format!(
         format_dot_skipped, format_result_dot,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         @"<yellow>S<reset>"
     );
 
@@ -847,7 +892,7 @@ mod test {
 
     test_format!(
         format_summary_success, format_test_result_summary,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
     Test passed!
@@ -855,13 +900,13 @@ mod test {
     my stderr
     ----- STDERR
     my stdout
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_failure, format_test_result_summary,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>FAILED<reset> ---
     Assertion failed: 1 != 2
@@ -869,13 +914,13 @@ mod test {
     my stderr
     ----- STDERR
     my stdout
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_error, format_test_result_summary,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>ERRORED<reset> ---
     Process at pid 72818 exited early with SIGTERM
@@ -883,13 +928,13 @@ mod test {
     my stderr
     ----- STDERR
     my stdout
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_pending, format_test_result_summary,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>pending<reset> ---
     Test not implemented yet for reason: "need to implement feature A"
@@ -897,13 +942,13 @@ mod test {
     my stderr
     ----- STDERR
     my stdout
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_skipped, format_test_result_summary,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>skipped<reset> ---
     Test skipped for reason: "only enabled on summer Fridays"
@@ -911,13 +956,13 @@ mod test {
     my stderr
     ----- STDERR
     my stdout
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_multiline, format_test_result_summary,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
     Test passed!
@@ -928,13 +973,13 @@ mod test {
     my stderr
     ----- STDERR
     my stdout
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_no_output, format_test_result_summary,
-        &TestResult::new(EntityId::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
     <no output>
@@ -942,14 +987,14 @@ mod test {
     my stderr
     ----- STDERR
     my stdout
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_only_stdout, format_test_result_summary,
         &TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()),
                 stdout: Some(b"my stdout1\nmy stdout2".to_vec()),
@@ -962,14 +1007,14 @@ mod test {
     ----- STDOUT
     my stdout1
     my stdout2
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 
     test_format!(
         format_summary_only_stderr, format_test_result_summary,
         &TestResult::new(
-            EntityId::fake(),
+            RunnerMeta::fake(),
             TestResultSpec {
                 status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()),
                 stdout: Some(b"".to_vec()),
@@ -982,7 +1027,21 @@ mod test {
     ----- STDERR
     my stderr1
     my stderr2
-    (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+    (completed in 1 m, 15 s, 3 ms [worker 0])
+    "###
+    );
+
+    test_format!(
+        format_summary_failure_non_singleton_runner, format_test_result_summary,
+        &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <red>FAILED<reset> ---
+    Assertion failed: 1 != 2
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
+    (completed in 1 m, 15 s, 3 ms [worker 5, runner 6])
     "###
     );
 }

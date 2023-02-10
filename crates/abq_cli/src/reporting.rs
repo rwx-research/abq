@@ -9,8 +9,8 @@ use std::{
 
 use abq_output::{
     colors::ColorProvider, format_interactive_progress, format_non_interactive_progress,
-    format_result_dot, format_result_line, format_short_suite_summary, format_summary,
-    format_test_result_summary, format_worker_output, would_write_output, would_write_summary,
+    format_result_dot, format_result_line, format_runner_output, format_short_suite_summary,
+    format_summary, format_test_result_summary, would_write_output, would_write_summary,
     OutputOrdering, SummaryKind,
 };
 use abq_queue::invoke::CompletedSummary;
@@ -321,7 +321,7 @@ impl DotReporter {
         if let Some(output) = opt_output.as_ref() {
             self.delayed_summaries.push(SummaryKind::Output {
                 when,
-                worker: test_result.source,
+                runner: test_result.source,
                 output: output.clone(),
             });
         }
@@ -502,7 +502,7 @@ impl Reporter for ProgressReporter {
             }
 
             if let Some(output) = output_before {
-                format_worker_output(
+                format_runner_output(
                     &mut self.buffer,
                     test_result.source,
                     OutputOrdering::Before(Cow::Owned(test_result.display_name.clone())),
@@ -515,7 +515,7 @@ impl Reporter for ProgressReporter {
             }
 
             if let Some(output) = output_after {
-                format_worker_output(
+                format_runner_output(
                     &mut self.buffer,
                     test_result.source,
                     OutputOrdering::Before(Cow::Owned(test_result.display_name.clone())),
@@ -978,7 +978,7 @@ fn default_result() -> TestResultSpec {
 mod test_line_reporter {
     use abq_utils::net_protocol::{
         client::ReportedResult,
-        entity::EntityId,
+        entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
     };
 
@@ -1014,13 +1014,13 @@ mod test_line_reporter {
         } = with_reporter(|mut reporter| {
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     default_result(),
                 )))
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     default_result(),
                 )))
                 .unwrap();
@@ -1053,7 +1053,7 @@ mod test_line_reporter {
         } = with_reporter(|mut reporter| {
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Success,
                         display_name: "abq/test1".to_string(),
@@ -1063,7 +1063,7 @@ mod test_line_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Failure {
                             exception: None,
@@ -1078,7 +1078,7 @@ mod test_line_reporter {
             reporter
                 .push_result(&ReportedResult {
                     test_result: TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         TestResultSpec {
                             status: Status::Skipped,
                             display_name: "abq/test3".to_string(),
@@ -1097,7 +1097,7 @@ mod test_line_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Error {
                             exception: None,
@@ -1111,7 +1111,7 @@ mod test_line_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Pending,
                         display_name: "abq/test5".to_string(),
@@ -1131,7 +1131,7 @@ mod test_line_reporter {
         abq/test1: ok
         abq/test2: FAILED
 
-        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        --- [worker 0] BEFORE abq/test3 ---
         ----- STDOUT
         test3-stdout
         ----- STDERR
@@ -1147,7 +1147,7 @@ mod test_line_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
 
         --- abq/test4: ERRORED ---
         Process 28821 terminated early via SIGTERM
@@ -1155,7 +1155,7 @@ mod test_line_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 }
@@ -1164,7 +1164,7 @@ mod test_line_reporter {
 mod test_dot_reporter {
     use abq_utils::net_protocol::{
         client::ReportedResult,
-        entity::EntityId,
+        entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
     };
 
@@ -1200,13 +1200,13 @@ mod test_dot_reporter {
         } = with_reporter(|mut reporter| {
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     default_result(),
                 )))
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     default_result(),
                 )))
                 .unwrap();
@@ -1239,7 +1239,7 @@ mod test_dot_reporter {
         } = with_reporter(|mut reporter| {
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Success,
                         display_name: "abq/test1".to_string(),
@@ -1249,7 +1249,7 @@ mod test_dot_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Failure {
                             exception: None,
@@ -1264,7 +1264,7 @@ mod test_dot_reporter {
             reporter
                 .push_result(&ReportedResult {
                     test_result: TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         TestResultSpec {
                             status: Status::Skipped,
                             display_name: "abq/test3".to_string(),
@@ -1283,7 +1283,7 @@ mod test_dot_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Error {
                             exception: None,
@@ -1297,7 +1297,7 @@ mod test_dot_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Pending,
                         display_name: "abq/test5".to_string(),
@@ -1322,9 +1322,9 @@ mod test_dot_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
 
-        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        --- [worker 0] BEFORE abq/test3 ---
         ----- STDOUT
         test3-stdout
         ----- STDERR
@@ -1337,7 +1337,7 @@ mod test_dot_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 
@@ -1359,7 +1359,7 @@ mod test_dot_reporter {
 
                 reporter
                     .push_result(&ReportedResult::no_captures(TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         TestResultSpec {
                             status,
                             ..default_result()
@@ -1389,7 +1389,7 @@ mod test_dot_reporter {
             for _ in 0..DOT_REPORTER_LINE_LIMIT {
                 reporter
                     .push_result(&ReportedResult::no_captures(TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         default_result(),
                     )))
                     .unwrap();
@@ -1424,7 +1424,7 @@ mod test_dot_reporter {
 
                 reporter
                     .push_result(&ReportedResult::no_captures(TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         TestResultSpec {
                             status,
                             ..default_result()
@@ -1449,7 +1449,7 @@ mod test_dot_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 
@@ -1472,7 +1472,7 @@ mod test_dot_reporter {
 
                 reporter
                     .push_result(&ReportedResult::no_captures(TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         TestResultSpec {
                             status,
                             ..default_result()
@@ -1496,7 +1496,7 @@ mod test_dot_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 }
@@ -1508,7 +1508,7 @@ mod test_progress_reporter {
     use abq_output::colors::ColorProvider;
     use abq_utils::net_protocol::{
         client::ReportedResult,
-        entity::EntityId,
+        entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
     };
     use indicatif::{ProgressDrawTarget, TermLike};
@@ -1609,7 +1609,7 @@ mod test_progress_reporter {
         ) = with_interactive_reporter(|mut reporter| {
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Success,
                         display_name: "abq/test1".to_string(),
@@ -1619,7 +1619,7 @@ mod test_progress_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Failure {
                             exception: None,
@@ -1634,7 +1634,7 @@ mod test_progress_reporter {
             reporter
                 .push_result(&ReportedResult {
                     test_result: TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         TestResultSpec {
                             status: Status::Skipped,
                             display_name: "abq/test3".to_string(),
@@ -1653,7 +1653,7 @@ mod test_progress_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Error {
                             exception: None,
@@ -1667,7 +1667,7 @@ mod test_progress_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Pending,
                         display_name: "abq/test5".to_string(),
@@ -1690,9 +1690,9 @@ mod test_progress_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
 
-        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        --- [worker 0] BEFORE abq/test3 ---
         ----- STDOUT
         test3-stdout
         ----- STDERR
@@ -1705,7 +1705,7 @@ mod test_progress_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
 
         insta::assert_snapshot!(progress_bar_cmds.join("\n"), @r###"
@@ -1780,7 +1780,7 @@ mod test_progress_reporter {
 
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Success,
                         display_name: "abq/test1".to_string(),
@@ -1790,7 +1790,7 @@ mod test_progress_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Failure {
                             exception: None,
@@ -1805,7 +1805,7 @@ mod test_progress_reporter {
             reporter
                 .push_result(&ReportedResult {
                     test_result: TestResult::new(
-                        EntityId::fake(),
+                        RunnerMeta::fake(),
                         TestResultSpec {
                             status: Status::Skipped,
                             display_name: "abq/test3".to_string(),
@@ -1830,7 +1830,7 @@ mod test_progress_reporter {
 
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Error {
                             exception: None,
@@ -1844,7 +1844,7 @@ mod test_progress_reporter {
                 .unwrap();
             reporter
                 .push_result(&ReportedResult::no_captures(TestResult::new(
-                    EntityId::fake(),
+                    RunnerMeta::fake(),
                     TestResultSpec {
                         status: Status::Pending,
                         display_name: "abq/test5".to_string(),
@@ -1876,9 +1876,9 @@ mod test_progress_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
 
-        --- [worker 07070707-0707-0707-0707-070707070707] BEFORE abq/test3 ---
+        --- [worker 0] BEFORE abq/test3 ---
         ----- STDOUT
         test3-stdout
         ----- STDERR
@@ -1894,7 +1894,7 @@ mod test_progress_reporter {
         my stderr
         ----- STDERR
         my stdout
-        (completed in 1 m, 15 s, 3 ms; worker [07070707-0707-0707-0707-070707070707])
+        (completed in 1 m, 15 s, 3 ms [worker 0])
 
         --- [abq progress] 0 seconds ---
         5 tests run, 3 passed, 2 failing
@@ -1909,7 +1909,7 @@ mod suite {
     use abq_utils::{
         exit,
         net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime},
-        net_protocol::{client::ReportedResult, entity::EntityId},
+        net_protocol::{client::ReportedResult, entity::RunnerMeta},
     };
 
     use crate::reporting::ExitCode;
@@ -1939,7 +1939,7 @@ mod suite {
             fn $test_name() {
                 use Status::*;
 
-                let results = $status_order.into_iter().map(|status| ReportedResult::no_captures(TestResult::new(EntityId::fake(),TestResultSpec {
+                let results = $status_order.into_iter().map(|status| ReportedResult::no_captures(TestResult::new(RunnerMeta::fake(),TestResultSpec {
                     status,
                     ..default_result()
                 }))).collect::<Vec<_>>();
