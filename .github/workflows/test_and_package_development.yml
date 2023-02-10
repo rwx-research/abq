@@ -171,7 +171,7 @@ jobs:
           {
             echo "formatted_filesize=$(printf "%'d" "$FILESIZE")"
             echo "filesize=$FILESIZE"
-            echo "smaller_than_4mb=${{ steps.prepare_release.outputs.filesize < 4000000 && 'true' || 'false' }}"
+            echo "smaller_than_10mb=${{ steps.prepare_release.outputs.filesize < 10000000 && 'true' || 'false' }}"
           } >> "$GITHUB_OUTPUT"
         env:
           FILESIZE: ${{ steps.prepare_release.outputs.filesize }}
@@ -187,7 +187,7 @@ jobs:
           pr_number: ${{ steps.pr.outputs.number }}
           message: |
             **Zipped Filesize for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
-            ${{ steps.filesize.outputs.smaller_than_4mb == 'true' && ':white_check_mark: smaller than 4MB' || ':x: greater than 4MB' }}
+            ${{ steps.filesize.outputs.smaller_than_10mb == 'true' && ':white_check_mark: smaller than 10MB' || ':x: greater than 10MB' }}
             ${{ steps.filesize.outputs.formatted_filesize }} bytes
 
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

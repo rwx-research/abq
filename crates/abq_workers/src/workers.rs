@@ -10,7 +10,7 @@ use std::{sync::mpsc, thread};
 use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner};
 use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
 use abq_utils::exit::ExitCode;
-use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::entity::{self, Entity, RunnerMeta, WorkerRunner, WorkerTag};
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, CapturedOutput, ManifestMessage, NativeRunnerSpecification, OutOfBandError,
@@ -37,19 +37,19 @@ pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 pub use abq_generic_test_runner::TestsFetcher;
 
 pub type GetNextTests = Box<dyn TestsFetcher + Send>;
-pub type GetNextTestsGenerator<'a> = &'a dyn Fn(EntityId) -> GetNextTests;
+pub type GetNextTestsGenerator<'a> = &'a dyn Fn(Entity) -> GetNextTests;
 
 pub type GetInitContext =
-    Arc<dyn Fn(EntityId) -> io::Result<InitContextResult> + Send + Sync + 'static>;
-pub type NotifyManifest = Box<dyn Fn(EntityId, &RunId, ManifestResult) + Send + Sync + 'static>;
+    Arc<dyn Fn(Entity) -> io::Result<InitContextResult> + Send + Sync + 'static>;
+pub type NotifyManifest = Box<dyn Fn(Entity, &RunId, ManifestResult) + Send + Sync + 'static>;
 pub type NotifyResults = Arc<
-    dyn Fn(EntityId, &RunId, Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>
+    dyn Fn(Entity, &RunId, Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>
         + Send
         + Sync
         + 'static,
 >;
 /// Returns the exit code of the given run for a worker.
-pub type RunExitCode = Arc<dyn Fn(EntityId) -> ExitCode + Send + Sync + 'static>;
+pub type RunExitCode = Arc<dyn Fn(Entity) -> ExitCode + Send + Sync + 'static>;
 
 pub type NotifyMaterialTestsAllRun = abq_generic_test_runner::NotifyMaterialTestsAllRun;
 pub type NotifyMaterialTestsAllRunGenerator<'a> = &'a dyn Fn() -> NotifyMaterialTestsAllRun;
@@ -74,8 +74,10 @@ pub enum WorkerContext {
 pub struct WorkerPoolConfig<'a> {
     /// Number of runners to start in the pool.
     pub size: NonZeroUsize,
-    /// The entity of this worker pool.
-    pub entity: EntityId,
+    /// The tagged number of the worker pool in this test run.
+    pub tag: WorkerTag,
+    /// The entity of the first runner in the pool.
+    pub first_runner_entity: Entity,
     /// The kind of runners the workers should start.
     pub runner_kind: RunnerKind,
     /// The work run we're working for.
@@ -117,13 +119,13 @@ pub struct WorkerPoolConfig<'a> {
 /// worker pool process.
 pub struct WorkerPool {
     active: bool,
-    workers: Vec<ThreadWorker>,
+    runners: Vec<(RunnerMeta, ThreadWorker)>,
     worker_msg_tx: mpsc::Sender<MessageFromPool>,
     live_count: LiveWorkers,
     /// Query the exit code of the run assigned for this pool.
     run_exit_code: RunExitCode,
     /// The entity of the worker pool itself.
-    entity: EntityId,
+    first_runner_entity: Entity,
     /// Whether this pool is running in-band with a supervisor.
     supervisor_in_band: bool,
 }
@@ -166,16 +168,17 @@ pub enum WorkersExitStatus {
 #[derive(Debug)]
 pub struct WorkersExit {
     pub status: WorkersExitStatus,
-    pub manifest_generation_output: Option<CapturedOutput>,
+    pub manifest_generation_output: Option<(RunnerMeta, CapturedOutput)>,
     /// Final captured output of each runner, after all tests were run on each runner.
-    pub final_captured_outputs: Vec<(usize, CapturedOutput)>,
+    pub final_captured_outputs: Vec<(RunnerMeta, CapturedOutput)>,
 }
 
 impl WorkerPool {
     pub fn new(config: WorkerPoolConfig) -> Self {
         let WorkerPoolConfig {
             size,
-            entity,
+            first_runner_entity,
+            tag: workers_tag,
             runner_kind,
             run_id,
             get_init_context,
@@ -191,7 +194,7 @@ impl WorkerPool {
         } = config;
 
         let num_workers = size.get();
-        let mut workers = Vec::with_capacity(num_workers);
+        let mut runners = Vec::with_capacity(num_workers);
 
         let live_count = LiveWorkers::new(num_workers);
         tracing::debug!(live_count=?live_count.read(), ?results_batch_size, ?run_id, "Starting worker pool");
@@ -208,6 +211,8 @@ impl WorkerPool {
         };
         let mark_worker_complete: MarkWorkerComplete = Arc::new(Box::new(mark_worker_complete));
 
+        let is_singleton_runner = num_workers == 1;
+
         {
             // Provision the first worker independently, so that if we need to generate a manifest,
             // only it gets the manifest notifier.
@@ -217,8 +222,15 @@ impl WorkerPool {
             let get_init_context = Arc::clone(&get_init_context);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
-            let worker_env = WorkerEnv {
+            let entity = first_runner_entity;
+            let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(1));
+            let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
+
+            debug_assert_eq!(entity.tag, entity::Tag::Runner(runner));
+
+            let worker_env = RunnerEnv {
                 entity,
+                runner_meta,
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
@@ -238,24 +250,28 @@ impl WorkerPool {
                 runner
             };
 
-            workers.push(ThreadWorker::new(
-                runner_kind,
-                worker_env,
-                mark_worker_complete,
+            runners.push((
+                runner_meta,
+                ThreadWorker::new(runner_kind, worker_env, mark_worker_complete),
             ));
         }
 
         // Provision the rest of the workers.
-        for _id in 1..num_workers {
+        for runner_id in 1..num_workers {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let notify_results = Arc::clone(&notify_results);
             let get_init_context = Arc::clone(&get_init_context);
             let mark_worker_complete = Arc::clone(&mark_worker_complete);
 
-            let entity = EntityId::new();
+            let runner_id = runner_id + 1;
+            let entity = Entity::runner(workers_tag, runner_id as u32);
+            let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(1));
+            let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
+            debug_assert!(!is_singleton_runner);
 
-            let worker_env = WorkerEnv {
+            let worker_env = RunnerEnv {
                 entity,
+                runner_meta,
                 msg_from_pool_rx: msg_rx,
                 run_id: run_id.clone(),
                 get_init_context,
@@ -271,24 +287,23 @@ impl WorkerPool {
 
             let runner_kind = {
                 let mut runner = runner_kind.clone();
-                runner.set_runner_id(_id + 1);
+                runner.set_runner_id(runner_id);
                 runner
             };
 
-            workers.push(ThreadWorker::new(
-                runner_kind,
-                worker_env,
-                mark_worker_complete,
+            runners.push((
+                runner_meta,
+                ThreadWorker::new(runner_kind, worker_env, mark_worker_complete),
             ));
         }
 
         Self {
             active: true,
-            workers,
+            runners,
             worker_msg_tx,
             live_count,
             run_exit_code,
-            entity,
+            first_runner_entity,
             supervisor_in_band,
         }
     }
@@ -299,10 +314,6 @@ impl WorkerPool {
         self.live_count.read() > 0
     }
 
-    pub fn entity(&self) -> EntityId {
-        self.entity
-    }
-
     /// Shuts down the worker pool, returning the pool [exit status][WorkersExit].
     #[must_use]
     pub fn shutdown(&mut self) -> WorkersExit {
@@ -310,7 +321,7 @@ impl WorkerPool {
 
         self.active = false;
 
-        for _ in 0..self.workers.len() {
+        for _ in 0..self.runners.len() {
             // It's possible the worker already exited if it couldn't connect to the queue; in that
             // case, we won't be able to send across the channel, but that's okay.
             let _ = self.worker_msg_tx.send(MessageFromPool::Shutdown);
@@ -318,10 +329,10 @@ impl WorkerPool {
 
         let mut errors = vec![];
         let mut failure_exit_code = ExitCode::new(1);
-        let mut final_captured_outputs = Vec::with_capacity(self.workers.len());
+        let mut final_captured_outputs = Vec::with_capacity(self.runners.len());
         let mut manifest_generation_output = None;
-        for (worker_idx, worker_thead) in self.workers.iter_mut().enumerate() {
-            let opt_err = worker_thead
+        for (runner_meta, runner_thread) in self.runners.iter_mut() {
+            let opt_err = runner_thread
                 .handle
                 .take()
                 .expect("worker thread already stolen")
@@ -338,7 +349,8 @@ impl WorkerPool {
                         this_manifest_output.is_none() || manifest_generation_output.is_none(),
                     );
 
-                    manifest_generation_output = this_manifest_output;
+                    manifest_generation_output =
+                        this_manifest_output.map(|output| (*runner_meta, output));
 
                     // Choose the highest exit code of all the test runners this worker started to
                     // be the exit code of the worker.
@@ -366,7 +378,7 @@ impl WorkerPool {
                     output
                 }
             };
-            final_captured_outputs.push((worker_idx, final_captured_output));
+            final_captured_outputs.push((*runner_meta, final_captured_output));
         }
 
         let status = if !errors.is_empty() {
@@ -382,7 +394,7 @@ impl WorkerPool {
                 exit_code: ExitCode::WORKER_CEDES_TO_SUPERVISOR,
             }
         } else {
-            let exit_code = (self.run_exit_code)(self.entity);
+            let exit_code = (self.run_exit_code)(self.first_runner_entity);
             if exit_code == ExitCode::SUCCESS {
                 WorkersExitStatus::Success
             } else {
@@ -420,8 +432,9 @@ enum AttemptError {
 
 type AttemptResult = Result<Vec<String>, AttemptError>;
 
-struct WorkerEnv {
-    entity: EntityId,
+struct RunnerEnv {
+    entity: Entity,
+    runner_meta: RunnerMeta,
     msg_from_pool_rx: MessageFromPoolRx,
     run_id: RunId,
     notify_manifest: Option<NotifyManifest>,
@@ -439,7 +452,7 @@ struct WorkerEnv {
 impl ThreadWorker {
     pub fn new(
         runner_kind: RunnerKind,
-        worker_env: WorkerEnv,
+        worker_env: RunnerEnv,
         mark_worker_complete: MarkWorkerComplete,
     ) -> Self {
         let handle = thread::spawn(move || {
@@ -465,11 +478,12 @@ impl ThreadWorker {
 }
 
 fn start_generic_test_runner(
-    env: WorkerEnv,
+    env: RunnerEnv,
     native_runner_params: NativeTestRunnerParams,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
-    let WorkerEnv {
+    let RunnerEnv {
         entity,
+        runner_meta,
         tests_fetcher,
         run_id,
         get_init_context,
@@ -517,6 +531,7 @@ fn start_generic_test_runner(
 
     GenericTestRunner::run(
         entity,
+        runner_meta,
         native_runner_params,
         &working_dir,
         polling_should_shutdown,
@@ -557,12 +572,13 @@ fn build_test_like_runner_manifest_result(
 }
 
 fn start_test_like_runner(
-    env: WorkerEnv,
+    env: RunnerEnv,
     runner: TestLikeRunner,
     manifest: ManifestMessage,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
-    let WorkerEnv {
+    let RunnerEnv {
         entity,
+        runner_meta,
         msg_from_pool_rx,
         mut tests_fetcher,
         get_init_context,
@@ -710,7 +726,7 @@ fn start_test_like_runner(
                             .into_iter()
                             .map(|output| {
                                 TestResult::new(
-                                    entity,
+                                    runner_meta,
                                     TestResultSpec {
                                         status: status.clone(),
                                         id: test_case.id().clone(),
@@ -843,7 +859,7 @@ mod test {
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
-    use abq_utils::net_protocol::entity::EntityId;
+    use abq_utils::net_protocol::entity::{Entity, WorkerTag};
     use abq_utils::net_protocol::queue::AssociatedTestResults;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Test, TestCase, TestOrGroup, TestResult,
@@ -889,7 +905,7 @@ mod test {
         }
     }
 
-    fn work_writer() -> (impl Fn(NextWork), impl Fn(EntityId) -> GetNextTests) {
+    fn work_writer() -> (impl Fn(NextWork), impl Fn(Entity) -> GetNextTests) {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
         let reader = Arc::clone(&writer);
         let write_work = move |work| {
@@ -963,7 +979,7 @@ mod test {
         (all, generator)
     }
 
-    fn empty_init_context(_entity: EntityId) -> io::Result<InitContextResult> {
+    fn empty_init_context(_entity: Entity) -> io::Result<InitContextResult> {
         Ok(Ok(InitContext {
             init_meta: Default::default(),
         }))
@@ -971,6 +987,7 @@ mod test {
 
     fn setup_pool<'a>(
         runner_kind: RunnerKind,
+        worker_pool_tag: WorkerTag,
         run_id: RunId,
         get_next_tests_generator: GetNextTestsGenerator<'a>,
         notify_results: NotifyResults,
@@ -981,7 +998,8 @@ mod test {
 
         let config = WorkerPoolConfig {
             size: NonZeroUsize::new(1).unwrap(),
-            entity: EntityId::new(),
+            tag: worker_pool_tag,
+            first_runner_entity: Entity::first_runner(worker_pool_tag),
             get_next_tests_generator,
             get_init_context: Arc::new(empty_init_context),
             results_batch_size_hint: 5,
@@ -1054,6 +1072,7 @@ mod test {
 
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
+            WorkerTag::new(0),
             run_id,
             &get_next_tests,
             notify_results,
@@ -1315,6 +1334,7 @@ mod test {
                 args: Default::default(),
                 extra_env: Default::default(),
             }),
+            WorkerTag::new(0),
             RunId::unique(),
             &get_next_tests,
             notify_results,
@@ -1348,6 +1368,7 @@ mod test {
                 args: vec![writefile_path.display().to_string()],
                 extra_env: Default::default(),
             }),
+            WorkerTag::new(0),
             RunId::unique(),
             &get_next_tests,
             notify_results,
@@ -1383,6 +1404,7 @@ mod test {
         ));
         let (mut config, _manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::ExitWith(27), Box::new(manifest)),
+            WorkerTag::new(0),
             RunId::unique(),
             &get_next_tests,
             notify_results,

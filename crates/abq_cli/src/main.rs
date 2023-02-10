@@ -28,7 +28,7 @@ use abq_utils::{
     net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
         client::ReportedResult,
-        entity::EntityId,
+        entity::{Entity, WorkerTag},
         health::Health,
         meta::DeprecationRecord,
         runners::{CapturedOutput, TestRuntime},
@@ -254,10 +254,6 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
     let Cli { command } = Cli::parse();
 
-    let entity = EntityId::new();
-
-    tracing::debug!(?entity, "new abq client");
-
     match command {
         Command::Start {
             bind: bind_ip,
@@ -352,6 +348,12 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let queue_addr_or_opt_tls_key = resolved_queue_addr.ok_or(tls_key);
 
             let runner_params = validate_abq_test_args(args)?;
+
+            let entity = if is_supervisor {
+                Entity::supervisor()
+            } else {
+                Entity::local_client()
+            };
             let abq = find_or_create_abq(
                 entity,
                 run_id.clone(),
@@ -388,6 +390,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 )
             } else {
                 workers::start_workers_standalone(
+                    WorkerTag::new(worker as _),
                     num_runners,
                     working_dir,
                     abq.negotiator_handle(),
@@ -427,6 +430,8 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 Some(cert) => ClientTlsStrategy::from_cert(&cert)?,
                 None => ClientTlsStrategy::no_tls(),
             };
+
+            let entity = Entity::local_client();
 
             let abq = AbqInstance::from_remote(
                 entity,
@@ -601,7 +606,7 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
 }
 
 fn find_or_create_abq(
-    entity: EntityId,
+    entity: Entity,
     run_id: RunId,
     queue_addr_or_opt_tls: Result<SocketAddr, Option<Vec<u8>>>,
     opt_user_token: Option<UserToken>,
@@ -661,7 +666,7 @@ impl invoke::ResultHandler for ReporterHandlers {
 }
 
 fn run_sentinel_abq_test(
-    entity: EntityId,
+    supervisor_entity: Entity,
     access_token: &Option<AccessToken>,
     runner_params: NativeTestRunnerParams,
     abq: AbqInstance,
@@ -691,7 +696,7 @@ fn run_sentinel_abq_test(
     let track_exit_code_in_band = oob::should_track_exit_code_in_band();
 
     let work_results_thread = start_test_result_reporter(
-        entity,
+        supervisor_entity,
         abq.server_addr(),
         abq.client_options().clone(),
         run_id.clone(),
@@ -708,6 +713,7 @@ fn run_sentinel_abq_test(
     )?;
 
     let mut worker_pool = workers::start_workers(
+        WorkerTag::ZERO,
         num_runners,
         working_dir,
         abq.negotiator_handle(),
@@ -732,10 +738,10 @@ fn run_sentinel_abq_test(
         // We need to print the final runner outputs (if any) at this point.
         // This is safe, as the runners thread is dead by now, so the reporters shouldn't
         // be writing to output streams.
-        if let Some(manifest_output) = manifest_generation_output {
-            print_manifest_generation_output(worker_pool.entity(), manifest_output);
+        if let Some((runner, manifest_output)) = manifest_generation_output {
+            print_manifest_generation_output(runner, manifest_output);
         }
-        print_final_runner_outputs(worker_pool.entity(), num_runners, final_captured_outputs);
+        print_final_runner_outputs(final_captured_outputs);
     }
 
     let completed_summary = match opt_invoked_error {
@@ -863,7 +869,7 @@ fn elaborate_invocation_error(
 /// NOTE: this function takes control of the process's signal handlers! It may not be
 /// composed with other functions that expect control or access to signal handlers.
 fn start_test_result_reporter(
-    entity: EntityId,
+    entity: Entity,
     abq_server_addr: SocketAddr,
     client_opts: ClientOptions<User>,
     test_id: RunId,

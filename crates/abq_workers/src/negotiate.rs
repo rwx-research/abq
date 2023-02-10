@@ -24,12 +24,13 @@ use crate::{
 };
 use abq_utils::{
     auth::User,
+    error::{EntityfulError, ErrorEntity, ResultLocation},
     exit::ExitCode,
-    net, net_async,
+    here, log_entityful_error, net, net_async,
     net_opt::ClientOptions,
     net_protocol::{
         self,
-        entity::EntityId,
+        entity::{Entity, WorkerTag},
         meta::DeprecationRecord,
         publicize_addr,
         queue::{NegotiatorInfo, RunAlreadyCompleted},
@@ -95,7 +96,7 @@ enum MessageFromQueueNegotiator {
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
-    pub entity: EntityId,
+    pub entity: Entity,
     pub message: MessageToQueueNegotiator,
 }
 
@@ -111,6 +112,7 @@ pub enum MessageToQueueNegotiator {
 
 #[derive(Clone, Debug)]
 pub struct WorkersConfig {
+    pub tag: WorkerTag,
     pub num_workers: NonZeroUsize,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
@@ -133,10 +135,7 @@ pub struct WorkersNegotiator(Box<dyn net::ClientStream>, WorkerContext);
 
 pub enum NegotiatedWorkers {
     /// No more workers were created, because there is no more work to be done.
-    Redundant {
-        entity: EntityId,
-        exit_code: ExitCode,
-    },
+    Redundant { exit_code: ExitCode },
     /// A pool of workers were created.
     Pool(WorkerPool),
 }
@@ -164,13 +163,6 @@ impl NegotiatedWorkers {
         match self {
             NegotiatedWorkers::Redundant { .. } => false,
             NegotiatedWorkers::Pool(pool) => pool.workers_alive(),
-        }
-    }
-
-    pub fn entity(&self) -> EntityId {
-        match self {
-            NegotiatedWorkers::Redundant { entity, .. } => *entity,
-            NegotiatedWorkers::Pool(pool) => pool.entity(),
         }
     }
 }
@@ -209,13 +201,13 @@ impl WorkersNegotiator {
         client_options: ClientOptions<User>,
         wanted_run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
-        let worker_entity = EntityId::new();
+        let first_runner_entity = Entity::runner(workers_config.tag, 1);
         let client = client_options.clone().build()?;
         let async_client = client_options.build_async()?;
 
         let execution_decision = wait_for_execution_context(
             &*async_client,
-            worker_entity,
+            first_runner_entity,
             &wanted_run_id,
             queue_negotiator_handle.0,
         )
@@ -240,6 +232,7 @@ impl WorkersNegotiator {
         );
 
         let WorkersConfig {
+            tag,
             num_workers,
             worker_context,
             supervisor_in_band,
@@ -429,7 +422,8 @@ impl WorkersNegotiator {
 
         let pool_config = WorkerPoolConfig {
             size: num_workers,
-            entity: worker_entity,
+            tag,
+            first_runner_entity,
             runner_kind,
             get_next_tests_generator,
             get_init_context,
@@ -460,7 +454,7 @@ impl WorkersNegotiator {
 #[instrument(level = "debug", skip(client))]
 async fn wait_for_execution_context(
     client: &dyn net_async::ConfiguredClient,
-    entity: EntityId,
+    entity: Entity,
     wanted_run_id: &RunId,
     queue_negotiator_addr: SocketAddr,
 ) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
@@ -479,7 +473,7 @@ async fn wait_for_execution_context(
         let worker_set_decision = match net_protocol::async_read(&mut conn).await? {
             MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
             MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code } => {
-                Err(NegotiatedWorkers::Redundant { entity, exit_code })
+                Err(NegotiatedWorkers::Redundant { exit_code })
             }
             MessageFromQueueNegotiator::RunUnknown
             | MessageFromQueueNegotiator::RunCompleteButExitCodeNotKnown => {
@@ -506,7 +500,7 @@ async fn wait_for_execution_context(
 /// Asks the work server for native runner initialization context.
 /// Blocks on the result, repeatedly pinging the server until work is available.
 fn wait_for_init_context(
-    entity: EntityId,
+    entity: Entity,
     client: &dyn net::ConfiguredClient,
     work_server_addr: SocketAddr,
     run_id: RunId,
@@ -573,7 +567,7 @@ impl QueueNegotiatorHandle {
     }
 
     pub fn ask_queue(
-        entity: EntityId,
+        entity: Entity,
         run_id: RunId,
         queue_addr: SocketAddr,
         client_options: ClientOptions<User>,
@@ -653,7 +647,7 @@ pub enum QueueNegotiatorServerError {
 
 struct QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
 {
     /// Fetches the status of an assigned run, and yields immediately.
     get_assigned_run: Arc<GetAssignedRun>,
@@ -664,7 +658,7 @@ where
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
+    GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -689,7 +683,7 @@ impl QueueNegotiator {
         get_assigned_run: GetAssignedRun,
     ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
     {
         let addr = listener.local_addr()?;
 
@@ -722,7 +716,7 @@ impl QueueNegotiator {
                             match conn {
                                 Ok(conn) => conn,
                                 Err(e) => {
-                                    tracing::error!("error accepting connection: {:?}", e);
+                                    tracing::error!("error accepting connection to negotiator: {:?}", e);
                                     continue;
                                 }
                             }
@@ -736,8 +730,8 @@ impl QueueNegotiator {
                         let ctx = ctx.clone();
                         async move {
                             let result = Self::handle_conn(ctx, client).await;
-                            if let Err(err) = result {
-                                tracing::error!("error handling connection: {:?}", err);
+                            if let Err(error) = result {
+                                log_entityful_error!(error, "error handling connection to negotiator: {:?}");
                             }
                         }
                     });
@@ -758,21 +752,32 @@ impl QueueNegotiator {
     async fn handle_conn<GetAssignedRun>(
         ctx: QueueNegotiatorCtx<GetAssignedRun>,
         stream: net_async::UnverifiedServerStream,
-    ) -> io::Result<()>
+    ) -> Result<(), EntityfulError>
     where
-        GetAssignedRun: Fn(&RunId, EntityId) -> AssignedRunStatus + Send + Sync + 'static,
+        GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
     {
-        let mut stream = ctx.handshake_ctx.handshake(stream).await?;
-        let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
+        let mut stream = ctx
+            .handshake_ctx
+            .handshake(stream)
+            .await
+            .located(here!())
+            .no_entity()?;
+        let Request { entity, message } = net_protocol::async_read(&mut stream)
+            .await
+            .located(here!())
+            .no_entity()?;
 
         use MessageToQueueNegotiator::*;
-        match message {
+        let result = match message {
             HealthCheck => {
                 let write_result =
-                    net_protocol::async_write(&mut stream, &net_protocol::health::healthy()).await;
-                if let Err(err) = write_result {
-                    tracing::debug!("error sending health check: {}", err.to_string());
+                    net_protocol::async_write(&mut stream, &net_protocol::health::healthy())
+                        .await
+                        .located(here!());
+                if let Err(err) = &write_result {
+                    tracing::warn!("error sending health check: {}", err.to_string());
                 }
+                write_result
             }
             WantsToAttach { run: wanted_run_id } => {
                 let attach = tracing::debug_span!("Worker set negotiating", run_id=?wanted_run_id);
@@ -823,11 +828,13 @@ impl QueueNegotiator {
                     }
                 };
 
-                net_protocol::async_write(&mut stream, &msg).await?;
+                net_protocol::async_write(&mut stream, &msg)
+                    .await
+                    .located(here!())
             }
-        }
+        };
 
-        Ok(())
+        result.entity(entity)
     }
 
     pub fn get_handle(&self) -> QueueNegotiatorHandle {
@@ -870,7 +877,7 @@ mod test {
     };
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
-    use abq_utils::net_protocol::entity::EntityId;
+    use abq_utils::net_protocol::entity::{Entity, WorkerTag};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
     };
@@ -1127,6 +1134,7 @@ mod test {
         )
         .unwrap();
         let workers_config = WorkersConfig {
+            tag: WorkerTag::new(0),
             num_workers: NonZeroUsize::new(1).unwrap(),
             worker_context: WorkerContext::AssumeLocal,
             supervisor_in_band: false,
@@ -1208,7 +1216,7 @@ mod test {
         net_protocol::write(
             &mut conn,
             super::Request {
-                entity: EntityId::new(),
+                entity: Entity::local_client(),
                 message: MessageToQueueNegotiator::HealthCheck,
             },
         )
@@ -1241,7 +1249,7 @@ mod test {
         net_protocol::write(
             &mut conn,
             super::Request {
-                entity: EntityId::new(),
+                entity: Entity::local_client(),
                 message: MessageToQueueNegotiator::HealthCheck,
             },
         )

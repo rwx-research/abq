@@ -20,7 +20,7 @@ use abq_utils::{
     net_protocol::{
         self,
         client::ReportedResult,
-        entity::EntityId,
+        entity::Entity,
         queue::{
             self, AssociatedTestResults, InvokeWork, InvokerTestData, Message, NativeRunnerInfo,
         },
@@ -43,7 +43,7 @@ pub const TICK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
 pub struct Client {
-    pub(crate) entity: EntityId,
+    pub(crate) entity: Entity,
     pub(crate) abq_server_addr: SocketAddr,
     pub(crate) client: Box<dyn net_async::ConfiguredClient>,
     /// The test run this client is responsible for.
@@ -139,7 +139,7 @@ pub trait ResultHandler {
 impl Client {
     /// Invokes work on an instance of [Abq], returning a [Client].
     pub async fn invoke_work(
-        entity: EntityId,
+        entity: Entity,
         abq_server_addr: SocketAddr,
         client_options: ClientOptions<User>,
         run_id: RunId,

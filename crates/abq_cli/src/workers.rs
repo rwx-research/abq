@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use abq_utils::exit::ExitCode;
-use abq_utils::net_protocol::entity::EntityId;
+use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
 use abq_utils::net_protocol::runners::CapturedOutput;
 use abq_utils::net_protocol::workers::RunId;
 use abq_workers::negotiate::{
@@ -17,6 +17,7 @@ use signal_hook::iterator::Signals;
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
 pub fn start_workers(
+    tag: WorkerTag,
     num_workers: NonZeroUsize,
     working_dir: PathBuf,
     queue_negotiator: QueueNegotiatorHandle,
@@ -27,6 +28,7 @@ pub fn start_workers(
     let context = WorkerContext::AlwaysWorkIn { working_dir };
 
     let workers_config = WorkersConfig {
+        tag,
         num_workers,
         worker_context: context,
         supervisor_in_band,
@@ -51,6 +53,7 @@ pub fn start_workers(
 }
 
 pub fn start_workers_standalone(
+    tag: WorkerTag,
     num_workers: NonZeroUsize,
     working_dir: PathBuf,
     queue_negotiator: QueueNegotiatorHandle,
@@ -58,6 +61,7 @@ pub fn start_workers_standalone(
     run_id: RunId,
 ) -> ! {
     let mut worker_pool = start_workers(
+        tag,
         num_workers,
         working_dir,
         queue_negotiator,
@@ -66,8 +70,6 @@ pub fn start_workers_standalone(
         false, // no supervisor in-band
     )
     .unwrap();
-
-    let worker_entity = worker_pool.entity();
 
     const POLL_WAIT_TIME: Duration = Duration::from_millis(10);
     let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
@@ -90,10 +92,10 @@ pub fn start_workers_standalone(
 
             tracing::debug!("Workers shutdown");
 
-            if let Some(manifest_output) = manifest_generation_output {
-                print_manifest_generation_output(worker_entity, manifest_output);
+            if let Some((runner, manifest_output)) = manifest_generation_output {
+                print_manifest_generation_output(runner, manifest_output);
             }
-            print_final_runner_outputs(worker_entity, num_workers, final_captured_outputs);
+            print_final_runner_outputs(final_captured_outputs);
 
             // We want to exit with an appropriate code if the workers were determined to have run
             // any test that failed. This way, in distributed contexts, failure of test runs induces
@@ -115,37 +117,25 @@ pub fn start_workers_standalone(
 }
 
 pub(crate) fn print_manifest_generation_output(
-    worker_entity: EntityId,
+    runner: RunnerMeta,
     manifest_output: CapturedOutput,
 ) {
     // NB: there is no reasonable way to surface the error at this point, since we are
     // about to shut down.
     let _opt_err = abq_output::format_manifest_generation_output(
         &mut std::io::stdout(),
-        worker_entity,
+        runner,
         &manifest_output,
     );
 }
 
 pub(crate) fn print_final_runner_outputs(
-    worker_entity: EntityId,
-    num_workers: NonZeroUsize,
-    final_captured_runner_outputs: Vec<(usize, CapturedOutput)>,
+    final_captured_runner_outputs: Vec<(RunnerMeta, CapturedOutput)>,
 ) {
-    for (runner_idx, runner_out) in final_captured_runner_outputs {
-        // If we only had one runner, don't display the runner index.
-        let runner_index = if num_workers.get() == 1 {
-            None
-        } else {
-            Some(runner_idx)
-        };
+    for (runner, runner_out) in final_captured_runner_outputs {
         // NB: there is no reasonable way to surface the error at this point, since we are
         // about to shut down.
-        let _opt_err = abq_output::format_final_runner_output(
-            &mut std::io::stdout(),
-            worker_entity,
-            runner_index,
-            &runner_out,
-        );
+        let _opt_err =
+            abq_output::format_final_runner_output(&mut std::io::stdout(), runner, &runner_out);
     }
 }

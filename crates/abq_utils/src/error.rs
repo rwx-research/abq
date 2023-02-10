@@ -1,4 +1,4 @@
-use crate::net_protocol::entity::EntityId;
+use crate::net_protocol::entity::Entity;
 use anyhow::{anyhow, Error, Result};
 
 /// Opaque thread-safe error.
@@ -71,12 +71,12 @@ impl<E: Into<Box<dyn std::error::Error + Send + Sync>>> ErrorLocation for E {
 #[derive(Debug)]
 pub struct EntityfulError {
     pub error: LocatedError,
-    pub entity: Option<EntityId>,
+    pub entity: Option<Entity>,
 }
 
 pub trait ErrorEntity<T> {
     fn no_entity(self) -> Result<T, EntityfulError>;
-    fn entity(self, entity: EntityId) -> Result<T, EntityfulError>;
+    fn entity(self, entity: Entity) -> Result<T, EntityfulError>;
 }
 
 impl<T> ErrorEntity<T> for OpaqueResult<T> {
@@ -91,7 +91,7 @@ impl<T> ErrorEntity<T> for OpaqueResult<T> {
         }
     }
 
-    fn entity(self, entity: EntityId) -> Result<T, EntityfulError> {
+    fn entity(self, entity: Entity) -> Result<T, EntityfulError> {
         match self {
             Ok(v) => Ok(v),
             Err(error) => Err(EntityfulError {
@@ -113,4 +113,44 @@ macro_rules! here {
             column: column!(),
         }
     };
+}
+
+pub use crate::log_entityful_error;
+
+#[macro_export]
+macro_rules! log_entityful_error {
+    ($err:expr, $($field:tt)*) => {{
+        let $crate::error::EntityfulError {
+            error:
+                $crate::error::LocatedError {
+                    error,
+                    location: $crate::error::Location { file, line, column },
+                },
+            entity,
+        } = $err;
+        match entity {
+            Some(entity) => {
+                tracing::error!(
+                    entity_id=%entity.display_id(),
+                    entity_tag=%entity.tag,
+                    file,
+                    line,
+                    column,
+                    $($field)*,
+                    error
+                );
+            }
+            None => {
+                tracing::error!(
+                    entity_id="<unknown>",
+                    entity_tag="<unknown>",
+                    file,
+                    line,
+                    column,
+                    $($field)*,
+                    error
+                );
+            }
+        }
+    }};
 }

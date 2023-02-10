@@ -5,7 +5,7 @@
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::net_protocol::entity::EntityId;
+use crate::net_protocol::entity::RunnerMeta;
 
 use super::{AbqProtocolVersion, MetadataMap};
 
@@ -289,7 +289,7 @@ pub enum IncrementalTestResultMessage {
 }
 
 impl IncrementalTestResultMessage {
-    pub fn into_step(self, source: EntityId) -> super::IncrementalTestResultStep {
+    pub fn into_step(self, source: RunnerMeta) -> super::IncrementalTestResultStep {
         use super::IncrementalTestResultStep::*;
         match self {
             Self::One { one_test_result } => One(one_test_result.reify(source)),
@@ -307,7 +307,7 @@ pub enum TestResultMessage {
 }
 
 impl TestResultMessage {
-    pub fn into_test_results(self, source: EntityId) -> super::TestResultSet {
+    pub fn into_test_results(self, source: RunnerMeta) -> super::TestResultSet {
         use super::TestResultSet::*;
         match self {
             Self::Single(msg) => All(vec![msg.test_result.reify(source)]),

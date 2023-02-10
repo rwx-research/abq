@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use abq_utils::net_protocol::{self, entity::EntityId, health::Health, queue, work_server};
+use abq_utils::net_protocol::{self, entity::Entity, health::Health, queue, work_server};
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
@@ -45,7 +45,7 @@ impl HealthCheckKind {
             };
         }
 
-        let entity = EntityId::new();
+        let entity = Entity::local_client();
 
         tracing::debug!(?entity, "starting healthchecks");
 

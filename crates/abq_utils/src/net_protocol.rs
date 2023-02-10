@@ -52,26 +52,155 @@ pub mod meta {
 pub mod entity {
     use serde_derive::{Deserialize, Serialize};
 
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    #[repr(transparent)]
+    pub struct RunnerTag(u32);
+
+    impl From<u32> for RunnerTag {
+        fn from(runner: u32) -> Self {
+            Self(runner)
+        }
+    }
+
+    impl RunnerTag {
+        pub const fn new(runner: u32) -> Self {
+            Self(runner)
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    #[repr(transparent)]
+    pub struct WorkerTag(u32);
+
+    impl From<u32> for WorkerTag {
+        fn from(runner: u32) -> Self {
+            Self(runner)
+        }
+    }
+
+    impl WorkerTag {
+        pub const ZERO: Self = Self(0);
+        pub const fn new(workers_number: u32) -> Self {
+            Self(workers_number)
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct WorkerRunner(WorkerTag, RunnerTag);
+
+    impl WorkerRunner {
+        pub fn new(worker: impl Into<WorkerTag>, runner: impl Into<RunnerTag>) -> Self {
+            Self(worker.into(), runner.into())
+        }
+
+        pub fn worker(&self) -> u32 {
+            self.0 .0
+        }
+
+        pub fn runner(&self) -> u32 {
+            self.1 .0
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct RunnerMeta {
+        pub runner: WorkerRunner,
+        /// Is this the only runner in the associated worker pool?
+        pub is_singleton: bool,
+    }
+
+    impl RunnerMeta {
+        pub fn new(runner: impl Into<WorkerRunner>, is_singleton: bool) -> Self {
+            Self {
+                runner: runner.into(),
+                is_singleton,
+            }
+        }
+
+        pub fn singleton(worker: impl Into<WorkerTag>) -> Self {
+            Self::new(WorkerRunner::new(worker, 1), true)
+        }
+
+        pub fn fake() -> Self {
+            Self::singleton(0)
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Tag {
+        Supervisor,
+        Runner(WorkerRunner),
+        /// An anonymous client created through the ABQ interface (e.g. CLI)
+        LocalClient,
+        /// An external client created outside ABQ interfaces.
+        ExternalClient,
+    }
+
+    impl std::fmt::Display for Tag {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Tag::Supervisor => write!(f, "supervisor"),
+                Tag::Runner(WorkerRunner(WorkerTag(worker), RunnerTag(runner))) => {
+                    write!(f, "worker {worker}, runner {runner}")
+                }
+                Tag::LocalClient => write!(f, "local client"),
+                Tag::ExternalClient => write!(f, "external client"),
+            }
+        }
+    }
+
     /// Identifies a unique instance of an entity participating in the ABQ network ecosystem.
     /// The queue, workers, and abq test clients are all entities.
     #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-    pub struct EntityId(pub [u8; 16]);
+    pub struct Entity {
+        pub id: [u8; 16],
+        pub tag: Tag,
+    }
 
-    impl EntityId {
-        #[allow(clippy::new_without_default)] // Entity IDs should be fresh, not defaulted
-        pub fn new() -> Self {
-            Self(uuid::Uuid::new_v4().into_bytes())
+    impl Entity {
+        pub fn new(tag: Tag) -> Self {
+            Self {
+                id: uuid::Uuid::new_v4().into_bytes(),
+                tag,
+            }
+        }
+
+        pub fn supervisor() -> Self {
+            Self::new(Tag::Supervisor)
+        }
+
+        pub fn runner(worker: impl Into<WorkerTag>, runner: impl Into<RunnerTag>) -> Self {
+            Self::new(Tag::Runner(WorkerRunner::new(worker, runner)))
+        }
+
+        pub fn first_runner(worker: impl Into<WorkerTag>) -> Self {
+            Self::new(Tag::Runner(WorkerRunner::new(worker, 1)))
+        }
+
+        pub fn local_client() -> Self {
+            Self::new(Tag::LocalClient)
+        }
+
+        pub fn external_client() -> Self {
+            Self::new(Tag::ExternalClient)
+        }
+
+        pub fn display_id(&self) -> impl std::fmt::Display + '_ {
+            uuid::Uuid::from_bytes_ref(&self.id)
         }
 
         #[cfg(feature = "expose-native-protocols")]
         pub fn fake() -> Self {
-            Self([7; 16])
+            Self {
+                id: [7; 16],
+                tag: Tag::LocalClient,
+            }
         }
     }
 
-    impl std::fmt::Debug for EntityId {
+    impl std::fmt::Debug for Entity {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+            write!(f, "{} ({})", self.display_id(), self.tag)
         }
     }
 }
@@ -284,7 +413,7 @@ pub mod queue {
     use crate::exit::ExitCode;
 
     use super::{
-        entity::EntityId,
+        entity::Entity,
         meta::DeprecationRecord,
         runners::{AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestResult},
         workers::{ManifestResult, RunId, RunnerKind, WorkId},
@@ -449,7 +578,7 @@ pub mod queue {
     /// A request sent to the queue.
     #[derive(Serialize, Deserialize)]
     pub struct Request {
-        pub entity: EntityId,
+        pub entity: Entity,
         pub message: Message,
     }
 
@@ -533,14 +662,14 @@ pub mod work_server {
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
-        entity::EntityId,
+        entity::Entity,
         runners::MetadataMap,
         workers::{self, RunId},
     };
 
     #[derive(Serialize, Deserialize)]
     pub struct Request {
-        pub entity: EntityId,
+        pub entity: Entity,
         pub message: Message,
     }
 
