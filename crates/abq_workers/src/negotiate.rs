@@ -350,8 +350,17 @@ impl WorkersNegotiator {
                 let notifier: NotifyMaterialTestsAllRun = Box::new(move |entity| {
                     async move {
                         // TODO: retry multiple times once async_retry lands.
-                        let mut stream = async_client
-                            .connect(queue_results_addr)
+                        let async_client_ref = &async_client;
+                        let mut stream =
+                            async_retry_n(5, Duration::from_secs(3), |attempt| async move {
+                                if attempt > 1 {
+                                    tracing::info!(
+                                        "reattempting connection to results server {}",
+                                        attempt
+                                    );
+                                }
+                                async_client_ref.connect(queue_results_addr).await
+                            })
                             .await
                             .expect("results server not available");
                         let message = net_protocol::queue::Request {
