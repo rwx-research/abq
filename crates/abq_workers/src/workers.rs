@@ -8,6 +8,7 @@ use std::time::Instant;
 use std::{sync::mpsc, thread};
 
 use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner};
+use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::EntityId;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
@@ -344,8 +345,23 @@ impl WorkerPool {
                     failure_exit_code = exit_code.max(failure_exit_code);
                     final_captured_output
                 }
-                Err(GenericRunnerError { kind, output }) => {
-                    tracing::error!(?kind, "worker thread exited with error");
+                Err(GenericRunnerError {
+                    error: kind,
+                    output,
+                }) => {
+                    let LocatedError {
+                        error,
+                        location: Location { file, line, column },
+                    } = &kind;
+
+                    tracing::error!(
+                        ?error,
+                        file,
+                        line,
+                        column,
+                        "worker thread exited with error"
+                    );
+
                     errors.push(kind.to_string());
                     output
                 }
@@ -563,7 +579,8 @@ fn start_test_like_runner(
     match runner {
         TestLikeRunner::NeverReturnManifest => {
             return Err(GenericRunnerError::no_captures(
-                io::Error::new(io::ErrorKind::Unsupported, "will not return manifest").into(),
+                io::Error::new(io::ErrorKind::Unsupported, "will not return manifest")
+                    .located(here!()),
             ));
         }
         TestLikeRunner::ExitWith(ec) => {
@@ -595,7 +612,7 @@ fn start_test_like_runner(
                     },
                 );
                 return Err(GenericRunnerError::no_captures(
-                    GenericRunnerErrorKind::NativeRunner(oob.into()),
+                    GenericRunnerErrorKind::NativeRunner(oob.into()).located(here!()),
                 ));
             }
         };
@@ -635,7 +652,8 @@ fn start_test_like_runner(
             Ok(MessageFromPool::Shutdown) => {
                 if matches!(&runner, TestLikeRunner::NeverReturnOnTest(..)) {
                     return Err(GenericRunnerError::no_captures(
-                        io::Error::new(io::ErrorKind::Unsupported, "will not return test").into(),
+                        io::Error::new(io::ErrorKind::Unsupported, "will not return test")
+                            .located(here!()),
                     ));
                 }
                 break;
@@ -659,7 +677,7 @@ fn start_test_like_runner(
                     {
                         return Err(GenericRunnerError::no_captures(
                             io::Error::new(io::ErrorKind::Unsupported, "will not return test")
-                                .into(),
+                                .located(here!()),
                         ));
                     }
 

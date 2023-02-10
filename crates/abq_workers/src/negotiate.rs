@@ -356,7 +356,6 @@ impl WorkersNegotiator {
                 let run_id = run_id.clone();
                 let notifier: NotifyMaterialTestsAllRun = Box::new(move |entity| {
                     async move {
-                        // TODO: retry multiple times once async_retry lands.
                         let async_client_ref = &async_client;
                         let mut stream =
                             async_retry_n(5, Duration::from_secs(3), |attempt| async move {
@@ -370,11 +369,12 @@ impl WorkersNegotiator {
                             })
                             .await
                             .expect("results server not available");
+
                         let message = net_protocol::queue::Request {
                             entity,
                             message: net_protocol::queue::Message::WorkerRanAllTests(run_id),
                         };
-                        // TODO: error handling after Doug's work
+
                         net_protocol::async_write(&mut stream, &message)
                             .await
                             .unwrap();

@@ -1030,6 +1030,9 @@ fn test_with_invalid_command() {
     // The worker 0 process should exit with a failure
     assert!(!exit_status.success(), "{:?}", (stdout, stderr));
 
+    let re_paths = regex::Regex::new(r"at crates.*").unwrap();
+    let stderr = re_paths.replace_all(&stderr, "at <stripped path>");
+
     insta::assert_snapshot!(stderr);
 
     // The worker 1 process should also exit with a failure, corresponding to having
