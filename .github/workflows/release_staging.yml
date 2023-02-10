@@ -22,13 +22,20 @@ jobs:
     name: Release ABQ
     runs-on: rwx-ubuntu-latest
     steps:
-      - name: Register new release abq api
+      - name: Register a new release with the abq api to a release channel
+        if: inputs.release_channel != ''
         run: |
-          # the release channel data should be expanded into an array, so we disable the check
-          # shellcheck disable=SC2046
           curl -X "POST" "https://staging.abq.build/api/releases" \
           --fail-with-body \
           -H 'Authorization: Bearer ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}' \
           -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
           --data-urlencode "version=${{inputs.version}}" \
-          $(if [ -n "${{inputs.release_channel}}" ]; then echo "--data-urlencode 'release_channel=${{inputs.release_channel}}'"; fi)
+          --data-urlencode "release_channel=${{inputs.release_channel}}"
+      - name: Register a new release with the abq api without a release channel
+        if: inputs.release_channel == ''
+        run: |
+          curl -X "POST" "https://staging.abq.build/api/releases" \
+          --fail-with-body \
+          -H 'Authorization: Bearer ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}' \
+          -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
+          --data-urlencode "version=${{inputs.version}}"
