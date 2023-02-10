@@ -1,12 +1,13 @@
 //! Persisted connections between the queue and workers.
 
+use anyhow::anyhow;
 use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use abq_utils::net_protocol::workers::RunId;
 use parking_lot::Mutex;
 use tokio::{sync::oneshot, task::JoinSet};
 
-use crate::prelude::{AnyError, OpaqueResult};
+use crate::prelude::*;
 
 #[derive(Clone)]
 pub(crate) struct ConnectedWorkers {
@@ -103,7 +104,7 @@ impl ConnectedWorkers {
             while let Some(join_result) = all_tasks.join_next().await {
                 match join_result {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => errors.push(e),
+                    Ok(Err(e)) => errors.push(e.error),
                     Err(e) => errors.push(e.into()),
                 }
             }
@@ -118,7 +119,7 @@ impl ConnectedWorkers {
                 tracing::error!(?run_id, timeout=?self.timeout, "forcing abort for worker connections failing to exit");
                 all_tasks.shutdown().await;
                 StopResult::Stopped(
-                    vec!["Forced abort for worker connections".into()]
+                    vec![anyhow!("Forced abort for worker connections")]
                 )
             }
         }
@@ -137,6 +138,7 @@ mod test {
     use abq_utils::net_protocol::workers::RunId;
     use tokio::sync::Mutex;
 
+    use crate::prelude::*;
     use crate::{connections::StopResult, prelude::AnyError};
 
     use super::ConnectedWorkers;
@@ -204,7 +206,7 @@ mod test {
                         let stopped = stopped.clone();
                         async move {
                             launched.lock().await.push(i);
-                            rx_stop.await?;
+                            rx_stop.await.located(here!())?;
                             stopped.lock().await.push(i);
                             Ok(())
                         }
@@ -257,8 +259,8 @@ mod test {
                         let launched = launched.clone();
                         async move {
                             launched.lock().await.push(i);
-                            rx_stop.await?;
-                            Err(format!("{i}").into())
+                            rx_stop.await.located(here!())?;
+                            Err(format!("{i}")).located(here!())
                         }
                     });
                 }
@@ -292,7 +294,7 @@ mod test {
                     let launched = launched.clone();
                     async move {
                         launched.lock().await.push(1);
-                        Err("i died".into())
+                        Err("i died").located(here!())
                     }
                 });
             },
