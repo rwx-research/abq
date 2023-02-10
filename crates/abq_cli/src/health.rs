@@ -70,7 +70,10 @@ impl HealthCheckKind {
             HealthCheckKind::Negotiator(_) => {
                 bail!(net_protocol::write(
                     &mut conn,
-                    abq_workers::negotiate::MessageToQueueNegotiator::HealthCheck,
+                    abq_workers::negotiate::Request {
+                        entity,
+                        message: abq_workers::negotiate::MessageToQueueNegotiator::HealthCheck,
+                    }
                 ));
             }
         }
