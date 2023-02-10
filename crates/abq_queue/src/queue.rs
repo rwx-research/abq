@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU64;
 use std::ops::Deref;
@@ -45,7 +44,7 @@ use tokio::sync::oneshot;
 use tracing::instrument;
 
 use crate::connections::{self, ConnectedWorkers};
-use crate::prelude::{AnyError, OpaqueResult};
+use crate::prelude::*;
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
 
 #[derive(Default, Debug)]
@@ -1287,33 +1286,6 @@ enum ClientReconnectionError {
     NeverInvoked(RunId),
 }
 
-#[derive(Debug)]
-struct EntityfulError {
-    error: AnyError,
-    entity: Option<EntityId>,
-}
-
-impl From<io::Error> for EntityfulError {
-    fn from(e: io::Error) -> Self {
-        Self {
-            error: e.into(),
-            entity: None,
-        }
-    }
-}
-
-impl std::fmt::Display for EntityfulError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.error.fmt(f)
-    }
-}
-
-impl Error for EntityfulError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.error.source()
-    }
-}
-
 #[derive(Clone)]
 struct QueueServerCtx {
     queues: SharedRuns,
@@ -1422,9 +1394,20 @@ impl QueueServer {
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
                             let result = Self::handle(ctx, client).await;
-                            if let Err(EntityfulError { error, entity }) = result {
+                            if let Err(EntityfulError {
+                                error:
+                                    LocatedError {
+                                        error,
+                                        location: Location { file, line, column },
+                                    },
+                                entity,
+                            }) = result
+                            {
                                 tracing::error!(
                                     ?entity,
+                                    file,
+                                    line,
+                                    column,
                                     "error handling connection to queue: {}",
                                     error
                                 );
@@ -1441,8 +1424,18 @@ impl QueueServer {
                                 timeout,
                             )
                             .await;
-                            if let Err(err) = result {
-                                tracing::error!("error handling timeout of run: {}", err);
+                            if let Err(LocatedError {
+                                error,
+                                location: Location { file, line, column },
+                            }) = result
+                            {
+                                tracing::error!(
+                                    file,
+                                    line,
+                                    column,
+                                    "error handling timeout of run: {}",
+                                    error
+                                );
                             }
                         });
                     }
@@ -1460,10 +1453,18 @@ impl QueueServer {
         ctx: QueueServerCtx,
         stream: net_async::UnverifiedServerStream,
     ) -> Result<(), EntityfulError> {
-        let mut stream = ctx.handshake_ctx.handshake(stream).await?;
-        let Request { entity, message } = net_protocol::async_read(&mut stream).await?;
+        let mut stream = ctx
+            .handshake_ctx
+            .handshake(stream)
+            .await
+            .located(here!())
+            .no_entity()?;
+        let Request { entity, message } = net_protocol::async_read(&mut stream)
+            .await
+            .located(here!())
+            .no_entity()?;
 
-        let result: Result<(), AnyError> = match message {
+        let result: OpaqueResult<()> = match message {
             Message::HealthCheck => Self::handle_healthcheck(entity, stream).await,
             Message::ActiveTestRuns => {
                 Self::handle_active_test_runs(ctx.queues, entity, stream).await
@@ -1489,7 +1490,9 @@ impl QueueServer {
             Message::CancelRun(run_id) => {
                 // Immediately ACK the cancellation and drop the stream
                 net_protocol::async_write(&mut stream, &net_protocol::queue::AckTestResults {})
-                    .await?;
+                    .await
+                    .located(here!())
+                    .entity(entity)?;
                 drop(stream);
 
                 Self::handle_run_cancellation(
@@ -1509,10 +1512,7 @@ impl QueueServer {
                 .await
             }
             Message::Reconnect(run_id) => {
-                Self::handle_invoker_reconnection(ctx.active_runs, entity, stream, run_id)
-                    .await
-                    // Upcast the reconnection error into a generic error
-                    .map_err(|e| Box::new(e) as _)
+                Self::handle_invoker_reconnection(ctx.active_runs, entity, stream, run_id).await
             }
             Message::ManifestResult(run_id, manifest_result) => {
                 Self::handle_manifest_result(
@@ -1537,7 +1537,9 @@ impl QueueServer {
                 // complete (XREF https://github.com/rwx-research/abq/issues/281), so notify them
                 // now and close out our side of the connection.
                 net_protocol::async_write(&mut stream, &net_protocol::queue::AckTestResults {})
-                    .await?;
+                    .await
+                    .located(here!())
+                    .entity(entity)?;
                 drop(stream);
 
                 // Record the test results and notify the test client out-of-band.
@@ -1562,7 +1564,9 @@ impl QueueServer {
                     &mut stream,
                     &net_protocol::queue::AckWorkerRanAllTests {},
                 )
-                .await?;
+                .await
+                .located(here!())
+                .entity(entity)?;
                 drop(stream);
 
                 Self::handle_worker_ran_all_tests_notification(
@@ -1602,9 +1606,11 @@ impl QueueServer {
     async fn handle_healthcheck(
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         // Right now nothing interesting is owned by the queue, so nothing extra to check.
-        net_protocol::async_write(&mut stream, &net_protocol::health::healthy()).await?;
+        net_protocol::async_write(&mut stream, &net_protocol::health::healthy())
+            .await
+            .located(here!())?;
         Ok(())
     }
 
@@ -1614,10 +1620,12 @@ impl QueueServer {
         queues: SharedRuns,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         let active_runs = queues.estimate_num_active_runs();
         let response = net_protocol::queue::ActiveTestRunsResponse { active_runs };
-        net_protocol::async_write(&mut stream, &response).await?;
+        net_protocol::async_write(&mut stream, &response)
+            .await
+            .located(here!())?;
         Ok(())
     }
 
@@ -1627,12 +1635,14 @@ impl QueueServer {
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
         public_negotiator_addr: SocketAddr,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         let negotiator_info = NegotiatorInfo {
             negotiator_address: public_negotiator_addr,
             version: abq_utils::VERSION.to_string(),
         };
-        net_protocol::async_write(&mut stream, &negotiator_info).await?;
+        net_protocol::async_write(&mut stream, &negotiator_info)
+            .await
+            .located(here!())?;
         Ok(())
     }
 
@@ -1644,8 +1654,8 @@ impl QueueServer {
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
         invoke_work: InvokeWork,
-    ) -> Result<(), AnyError> {
-        Self::reject_if_retired(&entity, retirement)?;
+    ) -> OpaqueResult<()> {
+        Self::reject_if_retired(&entity, retirement).located(here!())?;
 
         let InvokeWork {
             run_id,
@@ -1700,7 +1710,8 @@ impl QueueServer {
                         &mut stream,
                         &net_protocol::queue::InvokeWorkResponse::Success,
                     )
-                    .await?;
+                    .await
+                    .located(here!())?;
 
                     // TODO: we could determine a more optimal sizing of the test results buffer by
                     // e.g. considering the size of the test manifest.
@@ -1738,7 +1749,9 @@ impl QueueServer {
                 };
                 let failure_msg = net_protocol::queue::InvokeWorkResponse::Failure(failure_reason);
 
-                net_protocol::async_write(&mut stream, &failure_msg).await?;
+                net_protocol::async_write(&mut stream, &failure_msg)
+                    .await
+                    .located(here!())?;
 
                 Ok(())
             }
@@ -1753,7 +1766,7 @@ impl QueueServer {
         state_cache: RunStateCache,
         entity: EntityId,
         run_id: RunId,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         tracing::info!(?run_id, ?entity, "test supervisor cancelled a test run");
 
         // IFTTT: handle_manifest_*, handle_worker_results
@@ -1789,7 +1802,7 @@ impl QueueServer {
         entity: EntityId,
         run_id: RunId,
         exit_code: ExitCode,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         tracing::info!(
             ?run_id,
             ?entity,
@@ -1814,7 +1827,9 @@ impl QueueServer {
             }
         };
 
-        net_protocol::async_write(&mut client, &response).await?;
+        net_protocol::async_write(&mut client, &response)
+            .await
+            .located(here!())?;
 
         Ok(())
     }
@@ -1825,7 +1840,7 @@ impl QueueServer {
         entity: EntityId,
         new_stream: Box<dyn net_async::ServerStream>,
         run_id: RunId,
-    ) -> Result<(), ClientReconnectionError> {
+    ) -> OpaqueResult<()> {
         use std::collections::hash_map::Entry;
 
         // When an abq client loses connection with the queue, they may attempt to reconnect.
@@ -1853,7 +1868,7 @@ impl QueueServer {
             }
             Entry::Vacant(_) => {
                 // There was never a connection for this run ID!
-                Err(ClientReconnectionError::NeverInvoked(run_id))
+                Err(ClientReconnectionError::NeverInvoked(run_id)).located(here!())
             }
         }
     }
@@ -1867,7 +1882,7 @@ impl QueueServer {
         run_id: RunId,
         manifest_result: ManifestResult,
         stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         match manifest_result {
             ManifestResult::Manifest(reported_manifest) => {
                 let ReportedManifest {
@@ -1936,10 +1951,12 @@ impl QueueServer {
         init_metadata: MetadataMap,
         native_runner_info: NativeRunnerInfo,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         tracing::info!(?run_id, ?entity, size=?flat_manifest.len(), "received manifest");
 
-        net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {}).await?;
+        net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {})
+            .await
+            .located(here!())?;
 
         // IFTTT: handle_run_cancellation
         //
@@ -1995,7 +2012,7 @@ impl QueueServer {
             (String, CapturedOutput), /* error manifest */
         >,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         // If a worker failed to generate a manifest, or the manifest is empty,
         // we're going to immediately end the test run.
         //
@@ -2015,7 +2032,9 @@ impl QueueServer {
         {
             // Immediately ACK to the worker responsible for the manifest, so they can relinquish
             // blocking and exit.
-            net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {}).await?;
+            net_protocol::async_write(&mut stream, &net_protocol::queue::AckManifest {})
+                .await
+                .located(here!())?;
             drop(stream);
         }
 
@@ -2054,7 +2073,9 @@ impl QueueServer {
             ClientResponder::DirectStream { mut stream, buffer } => {
                 debug_assert!(buffer.is_empty(), "messages before manifest received");
 
-                net_protocol::async_write(&mut stream, &final_message).await?;
+                net_protocol::async_write(&mut stream, &final_message)
+                    .await
+                    .located(here!())?;
 
                 drop(stream);
             }
@@ -2104,7 +2125,7 @@ impl QueueServer {
         entity: EntityId,
         run_id: RunId,
         results: Vec<AssociatedTestResults>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         // IFTTT: handle_fired_timeout
 
         let num_results = results.len();
@@ -2122,7 +2143,7 @@ impl QueueServer {
                         ?run_id,
                         "got test result for no-longer active (cancelled) run"
                     );
-                    return Err("run no longer active".into());
+                    return Err("run no longer active").located(here!());
                 }
             };
 
@@ -2140,7 +2161,7 @@ impl QueueServer {
                         ?run_id,
                         "got test result for no-longer active (cancelled) run"
                     );
-                    return Err("run no longer active".into());
+                    return Err("run no longer active").located(here!());
                 }
             };
 
@@ -2193,7 +2214,9 @@ impl QueueServer {
                     "no results should be buffered after drainage"
                 );
 
-                net_protocol::async_write(&mut stream, &InvokerTestData::EndOfResults).await?;
+                net_protocol::async_write(&mut stream, &InvokerTestData::EndOfResults)
+                    .await
+                    .located(here!())?;
 
                 // To avoid a race between the total test result observed by a supervisor vs.
                 // the total test result observed by a worker, require the supervisor to
@@ -2216,7 +2239,9 @@ impl QueueServer {
                 // updated to mark end-of-run until after the client acknowledges success.
                 //   In practice this degraded state is unlikely to materially affect the runtime
                 // of the queue, but we should avoid needless leaks here.
-                let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
+                let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream)
+                    .await
+                    .located(here!())?;
 
                 drop(stream);
 
@@ -2306,7 +2331,7 @@ impl QueueServer {
                 for error in errors.iter() {
                     tracing::error!(?error, ?run_id, "{}", fail_msg);
                 }
-                Err(errors.remove(0))
+                Err(errors.remove(0)).located(here!())
             }
         }
     }
@@ -2324,7 +2349,7 @@ impl QueueServer {
         active_runs: ActiveRunResponders,
         state_cache: RunStateCache,
         timeout: TimedOutRun,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         // IFTTT: handle_worker_results
         //
         // We must now take exclusive access on `active_runs` - since that is the first thing that
@@ -2362,7 +2387,7 @@ impl QueueServer {
                         ?reason,
                         "illegal state - product of run liveness and timeout reason is chronologically disjoint"
                     );
-                    return Err("illegal run liveness state and fired timeout".into());
+                    return Err("illegal run liveness state and fired timeout").located(here!());
                 }
             },
             None => {
@@ -2370,7 +2395,7 @@ impl QueueServer {
                     ?run_id,
                     "timeout for run was fired, but it's not known in the queue"
                 );
-                return Err("run not known in the queue".into());
+                return Err("run not known in the queue").located(here!());
             }
         }
 
@@ -2395,13 +2420,16 @@ impl QueueServer {
                     );
 
                     net_protocol::async_write(&mut stream, &InvokerTestData::TimedOut { after })
-                        .await?;
+                        .await
+                        .located(here!())?;
 
                     // To avoid a race between perceived cancellation by the supervisor and perceived
                     // timeout by the queue, require an ACK for the induced timeout notification. If
                     // instead the supervisor cancels prior to an ACK, this stream will break before
                     // the ACK is fulfilled, and the cancellation will be recorded.
-                    let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream).await?;
+                    let client::AckTestRunEnded {} = net_protocol::async_read(&mut stream)
+                        .await
+                        .located(here!())?;
 
                     drop(stream);
 
@@ -2509,7 +2537,7 @@ impl QueueServer {
         _stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         worker_results_tasks.insert(run_id, |rx_stop| async move {
-            rx_stop.await?;
+            rx_stop.await.located(here!())?;
             Ok(())
         });
 
@@ -2522,12 +2550,13 @@ impl QueueServer {
         run_id: RunId,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         let response = {
             let queues = queues;
             let liveness = queues
                 .get_run_liveness(&run_id)
-                .ok_or("Invalid state: worker is requesting run result for non-existent ID")?;
+                .ok_or("Invalid state: worker is requesting run result for non-existent ID")
+                .located(here!())?;
 
             match liveness {
                 RunLive::Active => net_protocol::queue::TotalRunResult::Pending,
@@ -2542,7 +2571,9 @@ impl QueueServer {
             }
         };
 
-        net_protocol::async_write(&mut stream, &response).await?;
+        net_protocol::async_write(&mut stream, &response)
+            .await
+            .located(here!())?;
 
         Ok(())
     }
@@ -2552,15 +2583,17 @@ impl QueueServer {
         retirement: RetirementCell,
         entity: EntityId,
         mut stream: Box<dyn net_async::ServerStream>,
-    ) -> Result<(), AnyError> {
+    ) -> OpaqueResult<()> {
         if !stream.role().is_admin() {
             tracing::warn!(?entity, "rejecting underprivileged request for retirement");
-            return Err("rejecting underprivileged request for retirement".into());
+            return Err("rejecting underprivileged request for retirement").located(here!());
         }
 
         retirement.notify_asked_to_retire();
 
-        net_protocol::async_write(&mut stream, &net_protocol::queue::AckRetirement {}).await?;
+        net_protocol::async_write(&mut stream, &net_protocol::queue::AckRetirement {})
+            .await
+            .located(here!())?;
 
         Ok(())
     }
@@ -2772,14 +2805,14 @@ impl WorkScheduler {
                     // However, the behavior could still be made better, in particular by
                     // re-enqueuing dropped tests.
                     // See https://github.com/rwx-research/abq/issues/185.
-                    let NextTestRequest {} = opt_read_error?;
+                    let NextTestRequest {} = opt_read_error.located(here!())?;
 
                     // Pull the next bundle of work.
                     let (bundle, pulled_tests_status) = { queues.next_work(run_id.clone()) };
 
                     let response = NextTestResponse::Bundle(bundle);
 
-                    net_protocol::async_write(&mut conn, &response).await?;
+                    net_protocol::async_write(&mut conn, &response).await.located(here!())?;
 
                     if let PulledTestsStatus::PulledLastTest { last_test_timeout } = pulled_tests_status {
                         // This was the last test, so start a timeout for the whole test run to
@@ -2824,9 +2857,8 @@ mod test {
         connections::ConnectedWorkers,
         invoke::{run_cancellation_pair, Client, IncrementalTestData, DEFAULT_CLIENT_POLL_TIMEOUT},
         queue::{
-            ActiveRunResponders, AddedManifest, BufferedResults, CancelReason,
-            ClientReconnectionError, ClientResponder, QueueServer, RunLive, SharedRuns,
-            WorkScheduler,
+            ActiveRunResponders, AddedManifest, BufferedResults, CancelReason, ClientResponder,
+            QueueServer, RunLive, SharedRuns, WorkScheduler,
         },
         timeout::{RunTimeoutManager, RunTimeoutStrategy},
     };
@@ -3054,7 +3086,10 @@ mod test {
         // Validate that the reconnection was granted
         assert!(reconnection_result.is_err());
         let err = reconnection_result.unwrap_err();
-        assert_eq!(err, ClientReconnectionError::NeverInvoked(run_id));
+        assert!(err
+            .error
+            .to_string()
+            .contains("never used to invoke work on the queue"));
     }
 
     #[tokio::test]

@@ -117,6 +117,7 @@ dependencies = [
  "abq_utils",
  "abq_with_protocol_version",
  "abq_workers",
+ "anyhow",
  "futures",
  "insta",
  "ntest",
