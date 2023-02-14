@@ -2390,8 +2390,12 @@ impl QueueServer {
             }
             connections::StopResult::Stopped(errors) if errors.is_empty() => Ok(()),
             connections::StopResult::Stopped(mut errors) => {
-                for error in errors.iter() {
-                    tracing::error!(?error, ?run_id, "{}", fail_msg);
+                for LocatedError {
+                    error,
+                    location: Location { file, line, column },
+                } in errors.iter()
+                {
+                    tracing::error!(file, line, column, ?error, ?run_id, "{}", fail_msg);
                 }
                 Err(errors.remove(0)).located(here!())
             }
