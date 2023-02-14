@@ -42,7 +42,12 @@ expression: json
       },
       "attempt": {
         "durationInNanoseconds": 11000000,
-        "meta": {},
+        "meta": {
+          "abq_metadata": {
+            "runner": 1,
+            "worker": 0
+          }
+        },
         "status": {
           "kind": "successful"
         },

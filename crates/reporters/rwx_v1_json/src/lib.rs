@@ -1,8 +1,10 @@
 use serde_derive::{Deserialize, Serialize};
+use serde_json::Map;
 use std::{io::Write, ops::Deref};
 
-use abq_utils::net_protocol::runners::{
-    self, NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime,
+use abq_utils::net_protocol::{
+    entity::RunnerMeta,
+    runners::{self, NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime},
 };
 
 // Note: this is intentionally permissive right now for `kind` and `language` until we have
@@ -177,8 +179,8 @@ pub struct Attempt {
     finished_at: Option<String>,
 }
 
-impl From<&TestResultSpec> for Attempt {
-    fn from(test_result: &TestResultSpec) -> Self {
+impl Attempt {
+    fn from(test_result: &TestResultSpec, runner_meta: RunnerMeta) -> Self {
         let TestResultSpec {
             status,
             output,
@@ -235,9 +237,21 @@ impl From<&TestResultSpec> for Attempt {
             .as_ref()
             .map(|s| String::from_utf8_lossy(s).to_string());
 
+        let worker_runner = runner_meta.runner;
+        let meta = {
+            let mut meta = meta.clone();
+
+            let mut abq_metadata = Map::new();
+            abq_metadata.insert("worker".to_owned(), worker_runner.worker().into());
+            abq_metadata.insert("runner".to_owned(), worker_runner.runner().into());
+
+            meta.insert("abq_metadata".to_owned(), abq_metadata.into());
+            meta
+        };
+
         Attempt {
             duration,
-            meta: Some(meta.clone()),
+            meta: Some(meta),
             status,
             stderr,
             stdout,
@@ -273,10 +287,13 @@ impl From<&TestResult> for Test {
             ..
         } = &test_result.deref();
 
-        let attempt = test_result.deref().into();
-        let past_attempts = past_attempts
-            .as_ref()
-            .map(|attempts| attempts.iter().map(Into::into).collect());
+        let attempt = Attempt::from(test_result.deref(), test_result.source);
+        let past_attempts = past_attempts.as_ref().map(|attempts| {
+            attempts
+                .iter()
+                .map(|result| Attempt::from(result, test_result.source))
+                .collect()
+        });
 
         Test {
             id: Some(id.to_owned()),
@@ -390,7 +407,7 @@ impl Collector {
 #[cfg(test)]
 mod test {
     use abq_utils::net_protocol::{
-        entity::RunnerMeta,
+        entity::{RunnerMeta, WorkerRunner},
         runners::{NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime},
     };
 
@@ -406,7 +423,7 @@ mod test {
         );
 
         collector.push_result(&TestResult::new(
-            RunnerMeta::fake(),
+            RunnerMeta::new(WorkerRunner::new(3, 1), false),
             TestResultSpec {
                 status: Status::Success,
                 id: "id1".to_string(),
@@ -418,7 +435,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::fake(),
+            RunnerMeta::new(WorkerRunner::new(2, 4), false),
             TestResultSpec {
                 status: Status::Failure {
                     exception: Some("test-exception".to_string()),
@@ -433,7 +450,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::fake(),
+            RunnerMeta::new(WorkerRunner::new(1, 8), false),
             TestResultSpec {
                 status: Status::Error {
                     exception: None,
@@ -448,7 +465,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::fake(),
+            RunnerMeta::new(WorkerRunner::new(0, 3), false),
             TestResultSpec {
                 status: Status::Pending,
                 id: "id4".to_string(),
@@ -460,7 +477,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::fake(),
+            RunnerMeta::new(WorkerRunner::new(5, 1), false),
             TestResultSpec {
                 status: Status::Skipped,
                 id: "id5".to_string(),

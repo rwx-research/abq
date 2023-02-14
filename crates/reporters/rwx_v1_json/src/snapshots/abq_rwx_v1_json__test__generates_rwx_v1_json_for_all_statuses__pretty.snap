@@ -43,6 +43,10 @@ expression: json
       "attempt": {
         "durationInNanoseconds": 11000000,
         "meta": {
+          "abq_metadata": {
+            "runner": 1,
+            "worker": 3
+          },
           "some": "value"
         },
         "status": {
@@ -69,7 +73,12 @@ expression: json
       },
       "attempt": {
         "durationInNanoseconds": 22000000,
-        "meta": {},
+        "meta": {
+          "abq_metadata": {
+            "runner": 4,
+            "worker": 2
+          }
+        },
         "status": {
           "kind": "failed",
           "exception": "test-exception",
@@ -100,7 +109,12 @@ expression: json
       },
       "attempt": {
         "durationInNanoseconds": 33000000,
-        "meta": {},
+        "meta": {
+          "abq_metadata": {
+            "runner": 8,
+            "worker": 1
+          }
+        },
         "status": {
           "kind": "failed"
         },
@@ -125,7 +139,12 @@ expression: json
       },
       "attempt": {
         "durationInNanoseconds": 44000000,
-        "meta": {},
+        "meta": {
+          "abq_metadata": {
+            "runner": 3,
+            "worker": 0
+          }
+        },
         "status": {
           "kind": "pended",
           "message": "Test 4 pending"
@@ -151,7 +170,12 @@ expression: json
       },
       "attempt": {
         "durationInNanoseconds": 55000000,
-        "meta": {},
+        "meta": {
+          "abq_metadata": {
+            "runner": 1,
+            "worker": 5
+          }
+        },
         "status": {
           "kind": "skipped"
         },
