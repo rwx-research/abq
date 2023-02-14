@@ -40,7 +40,7 @@ pub(crate) enum StopResult {
     /// The run ID was not associated in the connection set.
     RunNotAssociated,
     /// Stopped worker connection tasks for a run ID. Returns errors seen during stopping, if any.
-    Stopped(Vec<AnyError>),
+    Stopped(Vec<LocatedError>),
 }
 
 impl ConnectedWorkers {
@@ -100,12 +100,12 @@ impl ConnectedWorkers {
         }
 
         let wait_for_all_tasks = async {
-            let mut errors: Vec<AnyError> = vec![];
+            let mut errors: Vec<LocatedError> = vec![];
             while let Some(join_result) = all_tasks.join_next().await {
                 match join_result {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => errors.push(e.error),
-                    Err(e) => errors.push(e.into()),
+                    Ok(Err(e)) => errors.push(e),
+                    Err(e) => errors.push(e.located(here!())),
                 }
             }
             errors
@@ -119,7 +119,7 @@ impl ConnectedWorkers {
                 tracing::error!(?run_id, timeout=?self.timeout, "forcing abort for worker connections failing to exit");
                 all_tasks.shutdown().await;
                 StopResult::Stopped(
-                    vec![anyhow!("Forced abort for worker connections")]
+                    vec![anyhow!("Forced abort for worker connections").located(here!())]
                 )
             }
         }
@@ -138,8 +138,8 @@ mod test {
     use abq_utils::net_protocol::workers::RunId;
     use tokio::sync::Mutex;
 
+    use crate::connections::StopResult;
     use crate::prelude::*;
-    use crate::{connections::StopResult, prelude::AnyError};
 
     use super::ConnectedWorkers;
 
@@ -150,7 +150,7 @@ mod test {
 
     async fn with_many_runs<Fut>(
         do_run: impl Fn(&ConnectedWorkers, RunId, IdVec, IdVec),
-        check: impl Fn(Vec<AnyError>, IdVec, IdVec) -> Fut + Copy,
+        check: impl Fn(Vec<LocatedError>, IdVec, IdVec) -> Fut + Copy,
         timeout: Duration,
     ) where
         Fut: Future<Output = ()>,
@@ -268,7 +268,7 @@ mod test {
             |errors, launched, _stopped| async move {
                 let mut errors: Vec<_> = errors
                     .into_iter()
-                    .map(|e| e.to_string().parse::<usize>().unwrap())
+                    .map(|e| e.error.to_string().parse::<usize>().unwrap())
                     .collect();
                 errors.sort();
 
@@ -303,7 +303,7 @@ mod test {
                 assert_eq!(&*launched, &[1]);
 
                 assert_eq!(errors.len(), 1);
-                assert_eq!(errors[0].to_string(), "i died");
+                assert!(errors[0].to_string().starts_with("i died"));
             },
             Duration::MAX,
         )
