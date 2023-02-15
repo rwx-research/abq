@@ -2914,7 +2914,10 @@ mod test {
     use super::{RunState, RunStateCache, RunSuccess};
     use crate::{
         connections::ConnectedWorkers,
-        invoke::{run_cancellation_pair, Client, IncrementalTestData, DEFAULT_CLIENT_POLL_TIMEOUT},
+        invoke::{
+            run_cancellation_pair, Client, IncrementalTestData, DEFAULT_CLIENT_POLL_TIMEOUT,
+            DEFAULT_TICK_INTERVAL,
+        },
         queue::{
             ActiveRunResponders, AddedManifest, AssignedRunLookup, BufferedResults, CancelReason,
             ClientResponder, QueueServer, RunLive, SharedRuns, WorkScheduler,
@@ -3246,6 +3249,8 @@ mod test {
             client: client_opts.build_async().unwrap(),
             run_id: run_id.clone(),
             poll_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
+            next_poll_timeout_at: tokio::time::Instant::now() + Duration::from_secs(100),
+            tick_interval: DEFAULT_TICK_INTERVAL,
             stream: client_conn,
             cancellation_rx,
             async_reader: Default::default(),

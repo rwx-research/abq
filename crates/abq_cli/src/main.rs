@@ -903,6 +903,7 @@ fn start_test_result_reporter(
                 runner,
                 batch_size,
                 results_timeout,
+                invoke::DEFAULT_TICK_INTERVAL,
                 run_cancellation_rx,
                 track_exit_code_in_band,
             )
