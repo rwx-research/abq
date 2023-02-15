@@ -31,7 +31,7 @@ use abq_utils::{
 };
 
 use thiserror::Error;
-use tokio::time::Interval;
+use tokio::time::{Instant, Interval};
 
 /// The default maximum amount of a time a client will wait between consecutive
 /// test results streamed from the queue.
@@ -39,7 +39,7 @@ use tokio::time::Interval;
 pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// The time to tick the test result handlers, if we are waiting on results in the meantime.
-pub const TICK_TIMEOUT: Duration = Duration::from_millis(500);
+pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
 pub struct Client {
@@ -53,6 +53,8 @@ pub struct Client {
     // The maximum amount of a time a client should wait between consecutive test results
     // streamed from the queue.
     pub(crate) poll_timeout: Duration,
+    pub(crate) next_poll_timeout_at: Instant,
+    pub(crate) tick_interval: Duration,
     /// Signal to cancel an active test run.
     pub(crate) cancellation_rx: RunCancellationRx,
     pub(crate) async_reader: AsyncReaderDos,
@@ -146,6 +148,7 @@ impl Client {
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
         test_results_timeout: Duration,
+        tick_interval: Duration,
         cancellation_rx: RunCancellationRx,
         track_exit_code_in_band: bool,
     ) -> Result<Self, InvocationError> {
@@ -191,6 +194,8 @@ impl Client {
             poll_timeout: test_results_timeout,
             cancellation_rx,
             async_reader: Default::default(),
+            next_poll_timeout_at: Self::next_poll_timeout_at_from_timeout(test_results_timeout),
+            tick_interval,
         })
     }
 
@@ -229,6 +234,12 @@ impl Client {
         Ok(())
     }
 
+    // We use the timeout to determine a deadline of when when specifically to timeout.
+    // We update the deadline whenever we see activity.
+    fn next_poll_timeout_at_from_timeout(poll_timeout: Duration) -> Instant {
+        Instant::now() + poll_timeout
+    }
+
     /// Yields the next test result, as it streams in.
     /// Returns [None] when there are no more test results.
     pub(crate) async fn next(
@@ -243,16 +254,18 @@ impl Client {
                 _ = tick_interval.tick() => {
                     return Ok(IncrementalTestData::Tick);
                 }
-                _ = tokio::time::sleep(self.poll_timeout) => {
+                _ = tokio::time::sleep_until(self.next_poll_timeout_at) => {
                     tracing::error!(timeout=?self.poll_timeout, entity=?self.entity, run_id=?self.run_id, "timed out waiting for queue message");
                     self.cancel_active_run().await?;
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, "Timed out waiting for a message from the queue").into());
+                    return Err(TestResultError::TimedOut(self.poll_timeout));
                 }
                 _ = self.cancellation_rx.recv() => {
                     self.cancel_active_run().await?;
                     return Err(TestResultError::Cancelled);
                 }
             };
+
+            self.next_poll_timeout_at = Self::next_poll_timeout_at_from_timeout(self.poll_timeout);
 
             match read_result {
                 Ok(InvokerTestData::Results(results)) => {
@@ -330,7 +343,7 @@ impl Client {
 
         // The first tick interval will complete immediately and will prime the handler;
         // all subsequent ticks obey the interval.
-        let mut tick_interval = tokio::time::interval(TICK_TIMEOUT);
+        let mut tick_interval = tokio::time::interval(self.tick_interval);
 
         loop {
             match self.next(&mut tick_interval).await? {

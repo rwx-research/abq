@@ -627,7 +627,7 @@ test_all_network_config_options! {
             .always_capture_stderr(true)
             .run();
         assert!(!exit_status.success());
-        assert!(stderr.contains("--- ERROR ---\nTimed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
+        assert!(stderr.contains("--- ERROR ---\nThe test run timed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
 
         let CmdOutput {
             stdout,

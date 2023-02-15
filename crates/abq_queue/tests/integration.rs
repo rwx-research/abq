@@ -12,7 +12,7 @@ use std::{
 use abq_queue::{
     invoke::{
         self, run_cancellation_pair, Client, CompletedSummary, InvocationError, RunCancellationTx,
-        TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT,
+        TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT, DEFAULT_TICK_INTERVAL,
     },
     queue::{Abq, QueueConfig},
     timeout::{RunTimeoutStrategy, TimeoutReason},
@@ -127,6 +127,7 @@ struct SupervisorConfig {
     runner_kind: RunnerKind,
     batch_size: NonZeroU64,
     timeout: Duration,
+    tick_interval: Duration,
     track_exit_code_in_band: bool,
 }
 
@@ -136,6 +137,7 @@ impl SupervisorConfig {
             runner_kind,
             batch_size: one_nonzero(),
             timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
+            tick_interval: DEFAULT_TICK_INTERVAL,
             track_exit_code_in_band: true,
         }
     }
@@ -150,6 +152,17 @@ impl SupervisorConfig {
     fn with_track_exit_code_in_band(self, track_exit_code_in_band: bool) -> Self {
         Self {
             track_exit_code_in_band,
+            ..self
+        }
+    }
+
+    fn with_timeout(self, timeout: Duration) -> Self {
+        Self { timeout, ..self }
+    }
+
+    fn with_tick_interval(self, tick_interval: Duration) -> Self {
+        Self {
+            tick_interval,
             ..self
         }
     }
@@ -306,6 +319,7 @@ fn action_to_fut(
                 runner_kind,
                 batch_size,
                 timeout,
+                tick_interval,
                 track_exit_code_in_band,
             } = config;
             async move {
@@ -317,6 +331,7 @@ fn action_to_fut(
                     runner_kind,
                     batch_size,
                     timeout,
+                    tick_interval,
                     cancellation_rx,
                     track_exit_code_in_band,
                 )
@@ -1795,4 +1810,34 @@ fn multiple_workers_start_before_supervisor() {
         "abq_queue::worker_timings",
         "worker post completion idle seconds",
     );
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn timeout_with_slower_poll_timeout_than_tick_interval() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1".to_string()),
+            echo_test(proto, "echo2".to_string()),
+        ],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    // We should see the supervisor time out, even though the tick interval yields far more often
+    // than the timeout interval.
+    let config = SupervisorConfig::new(runner)
+        .with_tick_interval(Duration::from_micros(10))
+        .with_timeout(Duration::from_micros(1000));
+
+    TestBuilder::default()
+        .step(
+            [RunTest(Run(1), Sid(1), config)],
+            [TestExit(Sid(1), &|result| {
+                assert!(matches!(result, Err(TestResultError::TimedOut(..))))
+            })],
+        )
+        .test();
 }
