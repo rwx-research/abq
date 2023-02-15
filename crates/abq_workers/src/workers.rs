@@ -265,7 +265,7 @@ impl WorkerPool {
 
             let runner_id = runner_id + 1;
             let entity = Entity::runner(workers_tag, runner_id as u32);
-            let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(1));
+            let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(runner_id as u32));
             let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
             debug_assert!(!is_singleton_runner);
 
