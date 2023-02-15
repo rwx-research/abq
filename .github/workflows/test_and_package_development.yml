@@ -68,9 +68,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-release-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-unstable-1-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-unstable-1-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
@@ -88,7 +88,7 @@ jobs:
         uses: actions-rs/cargo@v1.0.3
         with:
           command: clippy
-          args: --workspace --tests --release --all-features --target=${{ env.RUST_TARGET }} -- --deny warnings
+          args: --workspace --tests --profile=release-unstable --all-features --target=${{ env.RUST_TARGET }} -- --deny warnings
 
       - name: Lint github workflows
         run: |
@@ -112,13 +112,13 @@ jobs:
 
       - name: Build release with tests
         run: |
-          cargo build --tests --bins --release --all-features --target="$RUST_TARGET"
+          cargo build --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
 
       - name: Run tests with cargo
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          cargo test --release --all-features --target="$RUST_TARGET"
+          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
         env:
           CI: false
 
@@ -127,7 +127,7 @@ jobs:
         if: github.run_attempt > 1
         run: |
           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --release --all-features --target="$RUST_TARGET" -- --nocapture
+          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
         env:
           CI: false
 
@@ -150,7 +150,7 @@ jobs:
         id: prepare_release
         run: |
           mkdir "${RELEASE_DIR}"
-          cp "target/$RUST_TARGET/release/abq" "${RELEASE_DIR}"
+          cp "target/$RUST_TARGET/release-unstable/abq" "${RELEASE_DIR}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
           echo "filesize=$(wc -c "$RELEASE_ARCHIVE" | awk '{ print $1}')" >> "$GITHUB_OUTPUT"
 
@@ -171,7 +171,7 @@ jobs:
           {
             echo "formatted_filesize=$(printf "%'d" "$FILESIZE")"
             echo "filesize=$FILESIZE"
-            echo "smaller_than_10mb=${{ steps.prepare_release.outputs.filesize < 10000000 && 'true' || 'false' }}"
+            echo "smaller_than_55mb=${{ steps.prepare_release.outputs.filesize < 55000000 && 'true' || 'false' }}"
           } >> "$GITHUB_OUTPUT"
         env:
           FILESIZE: ${{ steps.prepare_release.outputs.filesize }}
@@ -187,8 +187,9 @@ jobs:
           pr_number: ${{ steps.pr.outputs.number }}
           message: |
             **Zipped Filesize for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
-            ${{ steps.filesize.outputs.smaller_than_10mb == 'true' && ':white_check_mark: smaller than 10MB' || ':x: greater than 10MB' }}
+            ${{ steps.filesize.outputs.smaller_than_55mb == 'true' && ':white_check_mark: smaller than 55MB' || ':x: greater than 55MB' }}
             ${{ steps.filesize.outputs.formatted_filesize }} bytes
+            Note: this is a dev build where we don't do any size optimizations. We expect the filesizes to be much larger than the production builds (last checked: < 4mb)
 
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
