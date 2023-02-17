@@ -38,3 +38,16 @@ pub fn assert_scoped_logs(scope: &str, f: impl Fn(&[&str]) -> bool) {
         Err(e) => panic!("{e}"),
     }
 }
+
+pub fn sanitize_output(s: &str) -> String {
+    let re_paths = regex::Regex::new(r"at crates.*").unwrap();
+    let re_simulation_path = regex::Regex::new(r".*abqtest_native_runner_simulation.*").unwrap();
+    let re_finished_seconds = regex::Regex::new(r"Finished in .*").unwrap();
+
+    let s = re_paths.replace_all(s, "at <stripped path>");
+    let s = re_simulation_path.replace(&s, "<simulation cmd>");
+    let s =
+        re_finished_seconds.replace(&s, "Finished in XX seconds (XX seconds spent in test code)");
+
+    s.into_owned()
+}

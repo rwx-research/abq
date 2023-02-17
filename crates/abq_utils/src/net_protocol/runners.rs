@@ -771,6 +771,7 @@ impl CapturedOutput {
     }
 }
 
+#[derive(Debug)]
 pub struct TestRunnerExit {
     pub exit_code: ExitCode,
     /// Output captured during manifest generation, if any.

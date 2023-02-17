@@ -2,7 +2,7 @@
 // For convenience in tests.
 #![allow(clippy::useless_format)]
 
-use abq_test_utils::{artifacts_dir, WORKSPACE};
+use abq_test_utils::{artifacts_dir, sanitize_output, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
 use abq_utils::net_protocol::runners::{
     NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
@@ -1030,8 +1030,7 @@ fn test_with_invalid_command() {
     // The worker 0 process should exit with a failure
     assert!(!exit_status.success(), "{:?}", (stdout, stderr));
 
-    let re_paths = regex::Regex::new(r"at crates.*").unwrap();
-    let stderr = re_paths.replace_all(&stderr, "at <stripped path>");
+    let stderr = sanitize_output(&stderr);
 
     insta::assert_snapshot!(stderr);
 
@@ -1510,6 +1509,163 @@ test_all_network_config_options! {
         let worker_stdout = String::from_utf8_lossy(&stdout);
         let worker_stderr = String::from_utf8_lossy(&stderr);
         assert_eq!(status.code().unwrap(), 41, "STDOUT:\n{worker_stdout}\nSTDERR:\n{worker_stderr}");
+
+        term_queue(queue_proc);
+    }
+}
+
+test_all_network_config_options! {
+    native_runner_fails_while_executing_test |name, conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+
+        let mut queue_proc = Abq::new(name)
+            .args(conf.extend_args_for_start(vec![
+                format!("start"),
+                format!("--bind=0.0.0.0"),
+                format!("--port={server_port}"),
+                format!("--work-port={worker_port}"),
+                format!("--negotiator-port={negotiator_port}"),
+            ]))
+            .spawn();
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start") {
+                    break;
+                }
+            }
+        }
+
+        // Create a simulation test run to launch a worker with.
+        use abq_utils::net_protocol::runners::{ManifestMessage, Manifest, AbqProtocolVersion, InitSuccessMessage, TestOrGroup, Test};
+        use abq_native_runner_simulation::{pack, pack_msgs, Msg::*};
+
+        let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+        let test = TestOrGroup::test(Test::new(proto, "test1", vec![], Default::default()));
+        let manifest = ManifestMessage::new(Manifest::new(vec![test], Default::default()));
+
+        let simulation = [
+            Connect,
+            //
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            //
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![
+                    OpaqueWrite(pack(&manifest)),
+                    Stdout(b"hello from manifest stdout".to_vec()),
+                    Stderr(b"hello from manifest stderr".to_vec()),
+                    // Finish
+                    Exit(0),
+                ],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    // Read first test, then bail
+                    OpaqueRead,
+                    Stdout(b"I failed catastrophically".to_vec()),
+                    Stderr(b"For a reason explainable only by a backtrace".to_vec()),
+                    Exit(1),
+                ],
+            },
+        ];
+
+        let simulation_msg = pack_msgs(simulation);
+        let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let simfile_path = simfile.to_path_buf();
+        std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+        let test_args = |worker: usize| {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = simfile_path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id=test-run-id"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        };
+
+        // Run the test suite with an in-band worker.
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_worker0")
+            .args(test_args(0))
+            .run();
+
+        assert_eq!(exit_status.code().unwrap(), 101, "should exit with ABQ error");
+
+        let stdout = sanitize_output(&stdout);
+        let stderr = sanitize_output(&stderr);
+
+        insta::assert_snapshot!(stdout, @r###"
+        Started test run with ID test-run-id
+        E--- <internal test runner error>: ERRORED ---
+        -- Unexpected Test Runner Failure --
+
+        The test command
+
+        <simulation cmd>
+
+        stopped communicating with its abq worker before completing all test requests.
+
+        Here's the standard output/error we found for the failing command.
+
+        Stdout:
+
+        I failed catastrophically
+
+        Stderr:
+
+        For a reason explainable only by a backtrace
+
+        Please see worker 0, runner 1 for more details.
+
+        ----- STDOUT
+        my stderr
+        ----- STDERR
+        my stdout
+        (completed in 0 ms [worker 0])
+
+
+        --- [worker 0] BEFORE <internal test runner error> ---
+        ----- STDOUT
+        I failed catastrophically
+        ----- STDERR
+        For a reason explainable only by a backtrace
+
+        --- [worker 0] AFTER completion ---
+        ----- STDOUT
+        I failed catastrophically
+        ----- STDERR
+        For a reason explainable only by a backtrace
+
+
+
+        Finished in XX seconds (XX seconds spent in test code)
+        1 tests, 1 failures
+        "###);
+
+        insta::assert_snapshot!(stderr, @"");
 
         term_queue(queue_proc);
     }
