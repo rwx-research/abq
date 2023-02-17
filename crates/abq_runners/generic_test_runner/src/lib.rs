@@ -603,18 +603,23 @@ where
 
             if let Err((work_id, native_error)) = handled_test {
                 let remaining_tests = tests_rx.flush().await;
-                let final_output = capture_pipes.get_captured();
+
+                // Take the output to send over the wire by ref; this is because we'll
+                // steal the captured output when handling the error below for display
+                // in the returned overall error.
+                let _ = native_runner_handle.wait().await;
+                let final_output = capture_pipes.get_captured_ref();
 
                 handle_native_runner_failure(
                     runner_meta,
                     send_test_results,
                     &native_runner,
                     final_output,
-                    native_runner_handle,
                     estimated_runtime,
                     work_id,
                     remaining_tests,
-                );
+                )
+                .await;
 
                 return Err(GenericRunnerErrorKind::from(native_error).located(here!()));
             }
@@ -695,6 +700,14 @@ impl CapturePipes {
         // NB: if we ever measure this to be compute-expensive, consider making `end_capture` async
         let stdout = self.stdout.side_channel.get_captured();
         let stderr = self.stderr.side_channel.get_captured();
+
+        CapturedOutput { stderr, stdout }
+    }
+
+    /// Like get_captured, but does not slice off the captured buffer.
+    fn get_captured_ref(&self) -> CapturedOutput {
+        let stdout = self.stdout.side_channel.get_captured_ref();
+        let stderr = self.stderr.side_channel.get_captured_ref();
 
         CapturedOutput { stderr, stdout }
     }
@@ -898,12 +911,11 @@ fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
 }
 
 #[allow(clippy::format_push_string)] // write! can fail, push can't
-fn handle_native_runner_failure<I>(
+async fn handle_native_runner_failure<'a, I>(
     runner_meta: RunnerMeta,
-    send_test_result: SendTestResults,
+    send_test_result: SendTestResults<'a>,
     native_runner: &Command,
-    mut final_output: CapturedOutput,
-    mut native_runner_handle: process::Child,
+    final_output: CapturedOutput,
     estimated_time_to_failure: Duration,
     failed_on: WorkId,
     remaining_work: I,
@@ -938,48 +950,33 @@ fn handle_native_runner_failure<I>(
             The test command
 
             {}{}
+
+            stopped communicating with its abq worker before completing all test requests.
             "#
         ),
         INDENT, formatted_cmd
     );
+
     error_message.push('\n');
-    match native_runner_handle.try_wait() {
-        Ok(Some(exit_status)) => {
-            tracing::warn!(?exit_status, "native test runner exited before completion");
-
-            match exit_status.code() {
-                Some(code) => {
-                    error_message.push_str(&format!(
-                        "exited unexpectedly with code `{}` before completing all abq test requests.",
-                        code,
-                    ));
-                }
-                None => {
-                    error_message.push_str("\
-                        exited unexpectedly without an exit code before completing all abq test requests.\n\
-                        It was likely terminated by a signal.");
-                }
-            }
-        }
-        Ok(None) | Err(_) => {
-            error_message.push_str(
-                "stopped communicating with its abq worker before completing all test requests.",
-            );
-        }
-    }
-
-    error_message.push_str("\n\n");
     error_message.push_str(&format!(
         indoc!(
             r#"
-            Please see the standard output/error for worker
+            Here's the standard output/error we found for the failing command.
 
-            {}{:?}
+            Stdout:
 
-            to see the native test runner failure.
+            {}
+
+            Stderr:
+
+            {}
+
+            Please see {} for more details.
             "#
         ),
-        INDENT, runner_meta
+        String::from_utf8_lossy(&final_output.stdout),
+        String::from_utf8_lossy(&final_output.stderr),
+        runner_meta.runner
     ));
 
     tracing::warn!(?error_message, "native test runner failure");
@@ -1002,12 +999,12 @@ fn handle_native_runner_failure<I>(
         final_results.push(AssociatedTestResults {
             work_id,
             results: vec![error_result],
-            before_any_test: std::mem::replace(&mut final_output, CapturedOutput::empty()),
+            before_any_test: final_output.clone(),
             after_all_tests: None,
         });
     }
 
-    send_test_result(final_results);
+    send_test_result(final_results).await;
 }
 
 /// Executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.

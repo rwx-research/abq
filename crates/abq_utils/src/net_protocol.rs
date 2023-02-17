@@ -88,6 +88,13 @@ pub mod entity {
     #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
     pub struct WorkerRunner(WorkerTag, RunnerTag);
 
+    impl std::fmt::Display for WorkerRunner {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Self(WorkerTag(worker), RunnerTag(runner)) = self;
+            write!(f, "worker {worker}, runner {runner}")
+        }
+    }
+
     impl WorkerRunner {
         pub fn new(worker: impl Into<WorkerTag>, runner: impl Into<RunnerTag>) -> Self {
             Self(worker.into(), runner.into())
@@ -140,9 +147,7 @@ pub mod entity {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
                 Tag::Supervisor => write!(f, "supervisor"),
-                Tag::Runner(WorkerRunner(WorkerTag(worker), RunnerTag(runner))) => {
-                    write!(f, "worker {worker}, runner {runner}")
-                }
+                Tag::Runner(worker_runner) => worker_runner.fmt(f),
                 Tag::LocalClient => write!(f, "local client"),
                 Tag::ExternalClient => write!(f, "external client"),
             }

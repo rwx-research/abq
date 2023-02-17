@@ -29,6 +29,14 @@ impl SideChannel {
         std::mem::replace(&mut channel.buf, new_buf)
     }
 
+    /// Like [Self::get_captured], but does not slice off the captured output from the internal
+    /// buffer. Subsequent calls to `get_captured_ref`/`get_captured`/`finish` are supersets of the
+    /// first call to `_ref`.
+    pub fn get_captured_ref(&self) -> Vec<u8> {
+        let mut channel = self.0.lock();
+        channel.buf.clone()
+    }
+
     #[cfg(test)]
     fn read(&self) -> Vec<u8> {
         let mut channel = self.0.lock();

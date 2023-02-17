@@ -2,10 +2,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use abq_generic_test_runner::{
-    GenericTestRunner, GetNextTests, SendTestResultsBoxed, TestsFetcher,
+    GenericRunnerError, GenericTestRunner, GetNextTests, SendTestResultsBoxed, TestsFetcher,
 };
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
-use abq_test_utils::artifacts_dir;
+use abq_test_utils::{artifacts_dir, sanitize_output};
 use abq_utils::atomic;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
@@ -127,6 +127,77 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
             .into_inner(),
         manifest_generation_output,
         final_captured_output,
+        all_test_run.load(atomic::ORDERING),
+    )
+}
+
+fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
+    simulation: impl IntoIterator<Item = Msg>,
+    with_manifest: Option<SendManifest>,
+    get_next_test: GetNextTests,
+) -> (GenericRunnerError, Vec<AssociatedTestResults>, bool) {
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+    let input = NativeTestRunnerParams {
+        cmd: native_runner_simulation_bin(),
+        args: vec![simfile_path.display().to_string()],
+        extra_env: Default::default(),
+    };
+
+    let get_init_context = || {
+        Ok(Ok(InitContext {
+            init_meta: Default::default(),
+        }))
+    };
+    let all_results: Arc<Mutex<Vec<AssociatedTestResults>>> = Default::default();
+
+    let send_test_result: SendTestResultsBoxed = {
+        let all_results = all_results.clone();
+        Box::new(move |results| {
+            let all_results = all_results.clone();
+            Box::pin(async move {
+                all_results.lock().extend(results);
+            })
+        })
+    };
+
+    let all_test_run = Arc::new(AtomicBool::new(false));
+    let notify_all_tests_run = {
+        let all_run = all_test_run.clone();
+        move |_| {
+            async move {
+                all_run.store(true, atomic::ORDERING);
+            }
+            .boxed()
+        }
+    };
+
+    let err = GenericTestRunner::run(
+        Entity::runner(0, 1),
+        RunnerMeta::fake(),
+        input,
+        &std::env::current_dir().unwrap(),
+        || false,
+        5,
+        with_manifest,
+        get_init_context,
+        get_next_test,
+        &*send_test_result,
+        Box::new(notify_all_tests_run),
+        false,
+    )
+    .unwrap_err();
+
+    drop(send_test_result);
+
+    (
+        err,
+        Arc::try_unwrap(all_results)
+            .expect("outstanding refs to all results")
+            .into_inner(),
         all_test_run.load(atomic::ORDERING),
     )
 }
@@ -418,4 +489,106 @@ fn capture_output_during_manifest_gen() {
     let (tests, meta) = manifest.flatten();
     assert_eq!(tests.len(), 10);
     assert!(meta.is_empty());
+}
+
+#[test]
+#[with_protocol_version]
+fn native_runner_fails_while_executing_tests() {
+    use Msg::*;
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Read init context message + write ACK
+        OpaqueRead,
+        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+        //
+        // Read, write first test
+        OpaqueRead,
+        OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+        //
+        // Bail on the second test
+        OpaqueRead,
+        Stdout(b"I failed catastrophically".to_vec()),
+        Stderr(b"For a reason explainable only by a backtrace".to_vec()),
+        Exit(1),
+    ];
+
+    fn work_bundle(proto: ProtocolWitness) -> NextWorkBundle {
+        NextWorkBundle(vec![
+            NextWork::Work(WorkerTest {
+                test_case: TestCase::new(proto, "test1", Default::default()),
+                work_id: WorkId([1; 16]),
+            }),
+            NextWork::Work(WorkerTest {
+                test_case: TestCase::new(proto, "test2", Default::default()),
+                work_id: WorkId([2; 16]),
+            }),
+            NextWork::EndOfWork,
+        ])
+    }
+    let get_next_tests = ImmediateTests {
+        tests: vec![work_bundle(proto)],
+    };
+
+    let (error, mut results, _notified_all_run) =
+        run_simulated_runner_to_error(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
+
+    let GenericRunnerError { error: _, output } = error;
+
+    check_bytes!(&output.stdout, b"I failed catastrophically");
+    check_bytes!(
+        &output.stderr,
+        b"For a reason explainable only by a backtrace"
+    );
+
+    results.sort_by_key(|r| r.work_id);
+
+    assert_eq!(results.len(), 2, "{results:?}");
+
+    {
+        let AssociatedTestResults {
+            work_id, results, ..
+        } = &results[0];
+        assert_eq!(work_id.0, [1; 16]);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].output.as_ref().unwrap(), "my test output");
+    }
+    {
+        let AssociatedTestResults {
+            work_id, results, ..
+        } = &results[1];
+        assert_eq!(work_id.0, [2; 16]);
+
+        assert_eq!(results.len(), 1);
+
+        let output = results[0].output.as_ref().unwrap();
+        let output = sanitize_output(output);
+
+        insta::assert_snapshot!(output, @r###"
+        -- Unexpected Test Runner Failure --
+
+        The test command
+
+        <simulation cmd>
+
+        stopped communicating with its abq worker before completing all test requests.
+
+        Here's the standard output/error we found for the failing command.
+
+        Stdout:
+
+        I failed catastrophically
+
+        Stderr:
+
+        For a reason explainable only by a backtrace
+
+        Please see worker 0, runner 1 for more details.
+        "###);
+    }
 }
