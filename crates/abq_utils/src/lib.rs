@@ -1,5 +1,6 @@
 pub mod atomic;
 pub mod auth;
+pub mod decay;
 pub mod error;
 pub mod exit;
 pub mod log_assert;

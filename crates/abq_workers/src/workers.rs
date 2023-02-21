@@ -11,7 +11,7 @@ use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, Generi
 use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{self, Entity, RunnerMeta, WorkerRunner, WorkerTag};
-use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
+use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted, TestSpec};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, CapturedOutput, ManifestMessage, NativeRunnerSpecification, OutOfBandError,
     Status, TestId, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
@@ -553,7 +553,7 @@ fn build_test_like_runner_manifest_result(
         ManifestMessage::Failure(fail) => return Err(fail.error),
     };
 
-    let native_runner_protocol = AbqProtocolVersion::V0_1;
+    let native_runner_protocol = AbqProtocolVersion::V0_2;
     let native_runner_specification = NativeRunnerSpecification {
         name: "unknown-test-like-runner".to_string(),
         version: "0.0.1".to_owned(),
@@ -677,7 +677,8 @@ fn start_test_like_runner(
             Err(mpsc::TryRecvError::Disconnected) => panic!("Pool died before worker did"),
             Err(mpsc::TryRecvError::Empty) => {
                 // No message from the parent. Wait for the next test_id to come in.
-                let NextWorkBundle(bundle) = rt.block_on(tests_fetcher.get_next_tests());
+                let NextWorkBundle { work: bundle, .. } =
+                    rt.block_on(tests_fetcher.get_next_tests());
                 bundle
             }
         };
@@ -688,7 +689,10 @@ fn start_test_like_runner(
                     // Shut down the worker
                     break 'tests_done;
                 }
-                NextWork::Work(WorkerTest { test_case, work_id }) => {
+                NextWork::Work(WorkerTest {
+                    spec: TestSpec { test_case, work_id },
+                    run_number,
+                }) => {
                     if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == test_case.id() )
                     {
                         return Err(GenericRunnerError::no_captures(
@@ -708,6 +712,7 @@ fn start_test_like_runner(
                             init_context.clone(),
                             attempt_number,
                             allowed_attempts,
+                            run_number,
                         );
                         let runtime = start_time.elapsed().as_millis() as f64;
 
@@ -742,6 +747,7 @@ fn start_test_like_runner(
 
                         let associated_result = AssociatedTestResults {
                             work_id,
+                            run_number,
                             results,
                             before_any_test: CapturedOutput::empty(),
                             after_all_tests: None,
@@ -772,6 +778,7 @@ fn attempt_test_id_for_test_like_runner(
     init_context: InitContext,
     attempt: u8,
     allowed_attempts: u8,
+    run_number: u32,
 ) -> AttemptResult {
     use TestLikeRunner as R;
 
@@ -805,9 +812,16 @@ fn attempt_test_id_for_test_like_runner(
             }
             (R::FailOnTestName(fail_name), test) => {
                 if test == fail_name {
-                    panic!("INDUCED FAIL")
+                    vec![]
                 } else {
                     vec!["PASS".to_string()]
+                }
+            }
+            (R::FailUntilAttemptNumber(n), test) => {
+                if n != run_number {
+                    vec![]
+                } else {
+                    vec![test]
                 }
             }
             #[cfg(feature = "test-test_ids")]
@@ -828,7 +842,13 @@ fn attempt_test_id_for_test_like_runner(
 
     let result = result_handle.join();
     match result {
-        Ok(output) => Ok(output),
+        Ok(output) => {
+            if output.is_empty() {
+                Err(AttemptError::Panic("INDUCED FAIL".to_owned()))
+            } else {
+                Ok(output)
+            }
+        }
         Err(e) => {
             if attempt < allowed_attempts {
                 Err(AttemptError::ShouldRetry)
@@ -860,14 +880,14 @@ mod test {
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::entity::{Entity, WorkerTag};
-    use abq_utils::net_protocol::queue::AssociatedTestResults;
+    use abq_utils::net_protocol::queue::{AssociatedTestResults, TestSpec};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Test, TestCase, TestOrGroup, TestResult,
     };
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
-        WorkerTest,
+        WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
@@ -899,7 +919,7 @@ mod test {
         async fn get_next_tests(&mut self) -> NextWorkBundle {
             loop {
                 if let Some(work) = self.reader.lock().unwrap().pop_front() {
-                    return NextWorkBundle(vec![work]);
+                    return NextWorkBundle::new(vec![work]);
                 }
             }
         }
@@ -1019,8 +1039,11 @@ mod test {
 
     fn local_work(test: TestCase, work_id: WorkId) -> NextWork {
         NextWork::Work(WorkerTest {
-            test_case: test,
-            work_id,
+            spec: TestSpec {
+                test_case: test,
+                work_id,
+            },
+            run_number: INIT_RUN_NUMBER,
         })
     }
 
@@ -1028,7 +1051,7 @@ mod test {
         TestOrGroup::test(Test::new(protocol, echo_msg, [], Default::default()))
     }
 
-    fn await_manifest_test_cases(manifest: ManifestCollector) -> Vec<TestCase> {
+    fn await_manifest_tests(manifest: ManifestCollector) -> Vec<TestSpec> {
         loop {
             match manifest.lock().unwrap().take() {
                 Some(ManifestResult::Manifest(manifest)) => return manifest.manifest.flatten().0,
@@ -1088,10 +1111,10 @@ mod test {
         let mut pool = WorkerPool::new(config);
 
         // Write the work
-        let test_ids = await_manifest_test_cases(manifest_collector);
+        let tests = await_manifest_tests(manifest_collector);
 
-        for (i, test_id) in test_ids.into_iter().enumerate() {
-            write_work(local_work(test_id, WorkId([i as _; 16])))
+        for (i, test) in tests.into_iter().enumerate() {
+            write_work(local_work(test.test_case, WorkId([i as _; 16])))
         }
 
         for _ in 0..num_workers {
@@ -1183,7 +1206,7 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for test_id in await_manifest_test_cases(manifest_collector) {
+        for test_id in await_manifest_test_specs(manifest_collector) {
             write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
         }
 
@@ -1226,7 +1249,7 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for test_id in await_manifest_test_cases(manifest_collector) {
+        for test_id in await_manifest_test_specs(manifest_collector) {
             write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
         }
         write_work(NextWork::EndOfWork);
@@ -1268,7 +1291,7 @@ mod test {
         };
         let mut pool = WorkerPool::new(config);
 
-        for test_id in await_manifest_test_cases(manifest_collector) {
+        for test_id in await_manifest_test_specs(manifest_collector) {
             write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
         }
         write_work(NextWork::EndOfWork);

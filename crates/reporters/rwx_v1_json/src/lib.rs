@@ -1,6 +1,6 @@
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Map;
-use std::{io::Write, ops::Deref};
+use std::{collections::HashMap, io::Write, ops::Deref};
 
 use abq_utils::net_protocol::{
     entity::RunnerMeta,
@@ -99,6 +99,50 @@ impl Default for Summary {
     }
 }
 
+impl Summary {
+    fn account(&mut self, test: &TestSketch) {
+        self.tests += 1;
+
+        if !test.past_attempts.is_empty() {
+            self.retries += 1;
+        }
+
+        match &test.latest_attempt.status {
+            AttemptStatus::Canceled => {
+                self.status = SummaryStatus::Failed;
+                self.canceled += 1;
+            }
+            AttemptStatus::Failed {
+                exception: _,
+                message: _,
+                backtrace: _,
+            } => {
+                self.status = SummaryStatus::Failed;
+                self.failed += 1;
+            }
+            AttemptStatus::Pended { message: _ } => {
+                self.pended += 1;
+            }
+            AttemptStatus::Skipped { message: _ } => {
+                self.skipped += 1;
+            }
+            AttemptStatus::Successful => {
+                self.successful += 1;
+            }
+            AttemptStatus::TimedOut => {
+                self.status = SummaryStatus::Failed;
+                self.timed_out += 1;
+            }
+            AttemptStatus::Todo { message: _ } => {
+                self.todo += 1;
+            }
+            AttemptStatus::Quarantined { original_status: _ } => {
+                self.quarantined += 1;
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Location {
     file: String,
@@ -180,7 +224,7 @@ pub struct Attempt {
 }
 
 impl Attempt {
-    fn from(test_result: &TestResultSpec, runner_meta: RunnerMeta) -> Self {
+    fn from(test_result: &TestResultSpec, runner_meta: RunnerMeta) -> (Self, Option<Vec<Attempt>>) {
         let TestResultSpec {
             status,
             output,
@@ -191,6 +235,7 @@ impl Attempt {
             other_errors: _,
             stderr,
             stdout,
+            past_attempts,
             ..
         } = test_result;
 
@@ -249,7 +294,21 @@ impl Attempt {
             meta
         };
 
-        Attempt {
+        let past_attempts = past_attempts.as_ref().map(|attempts| {
+            let mut all_past_attempts = Vec::with_capacity(attempts.len());
+
+            for attempt in attempts.iter() {
+                let (attempt, extra_past_attempts) = Attempt::from(attempt, runner_meta);
+                all_past_attempts.push(attempt);
+                if let Some(extra) = extra_past_attempts {
+                    all_past_attempts.extend(extra);
+                }
+            }
+
+            all_past_attempts
+        });
+
+        let this_attempt = Attempt {
             duration,
             meta: Some(meta),
             status,
@@ -257,7 +316,9 @@ impl Attempt {
             stdout,
             started_at: started_at.as_ref().map(|t| t.0.clone()),
             finished_at: finished_at.as_ref().map(|t| t.0.clone()),
-        }
+        };
+
+        (this_attempt, past_attempts)
     }
 }
 
@@ -276,32 +337,63 @@ pub struct Test {
     past_attempts: Option<Vec<Attempt>>,
 }
 
-impl From<&TestResult> for Test {
+/// A sketch of a test result we use to assemble results across retries.
+#[derive(Clone)]
+struct TestSketch {
+    id: String,
+    name: String,
+    lineage: Option<Vec<String>>,
+    location: Option<Location>,
+
+    latest_attempt: Attempt,
+    past_attempts: Vec<Attempt>,
+}
+
+impl From<&TestResult> for TestSketch {
     fn from(test_result: &TestResult) -> Self {
         let TestResultSpec {
             id,
             display_name,
             location,
             lineage,
-            past_attempts,
             ..
         } = &test_result.deref();
 
-        let attempt = Attempt::from(test_result.deref(), test_result.source);
-        let past_attempts = past_attempts.as_ref().map(|attempts| {
-            attempts
-                .iter()
-                .map(|result| Attempt::from(result, test_result.source))
-                .collect()
-        });
+        let (attempt, past_attempts) = Attempt::from(test_result.deref(), test_result.source);
 
-        Test {
-            id: Some(id.to_owned()),
+        TestSketch {
+            id: id.to_owned(),
             name: display_name.clone(),
             lineage: lineage.clone(),
             location: location.as_ref().map(Into::into),
-            attempt,
+            latest_attempt: attempt,
+            past_attempts: past_attempts.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<TestSketch> for Test {
+    fn from(sketch: TestSketch) -> Self {
+        let TestSketch {
+            id,
+            name,
+            lineage,
+            location,
+            latest_attempt,
             past_attempts,
+        } = sketch;
+
+        Test {
+            id: Some(id),
+            name,
+            lineage,
+            location,
+            attempt: latest_attempt,
+            past_attempts: if past_attempts.is_empty() {
+                None
+            } else {
+                Some(past_attempts)
+            },
         }
     }
 }
@@ -320,58 +412,34 @@ pub struct TestResults {
 
 #[derive(Default, Clone)]
 pub struct Collector {
-    summary: Summary,
-    tests: Vec<Test>,
+    tests: HashMap<String, TestSketch>,
 }
 
 impl Collector {
     #[inline(always)]
     pub fn push_result(&mut self, test_result: &TestResult) {
-        let test: Test = test_result.into();
-
-        self.summary.tests += 1;
-
-        if let Some(past_attempts) = &test.past_attempts {
-            if !past_attempts.is_empty() {
-                self.summary.retries += 1;
+        let sketch = match self.tests.get_mut(&test_result.id) {
+            Some(sketch) => sketch,
+            None => {
+                // This will account for the first test result we saw; subsequent test results
+                // (due to retries) will trace the branch above.
+                self.tests
+                    .insert(test_result.id.clone(), test_result.into());
+                return;
             }
+        };
+
+        // This is a retry; add the attempt and push the old one back.
+        let (new_attempt, new_attempt_previous_attempts) =
+            Attempt::from(&test_result.result, test_result.source);
+
+        let prev_latest_attempt = std::mem::replace(&mut sketch.latest_attempt, new_attempt);
+        sketch.past_attempts.push(prev_latest_attempt);
+
+        // Also add any additional attempts the latest attempt produced.
+        if let Some(new_attempt_previous_attempts) = new_attempt_previous_attempts {
+            sketch.past_attempts.extend(new_attempt_previous_attempts);
         }
-
-        match &test.attempt.status {
-            AttemptStatus::Canceled => {
-                self.summary.status = SummaryStatus::Failed;
-                self.summary.canceled += 1;
-            }
-            AttemptStatus::Failed {
-                exception: _,
-                message: _,
-                backtrace: _,
-            } => {
-                self.summary.status = SummaryStatus::Failed;
-                self.summary.failed += 1;
-            }
-            AttemptStatus::Pended { message: _ } => {
-                self.summary.pended += 1;
-            }
-            AttemptStatus::Skipped { message: _ } => {
-                self.summary.skipped += 1;
-            }
-            AttemptStatus::Successful => {
-                self.summary.successful += 1;
-            }
-            AttemptStatus::TimedOut => {
-                self.summary.status = SummaryStatus::Failed;
-                self.summary.timed_out += 1;
-            }
-            AttemptStatus::Todo { message: _ } => {
-                self.summary.todo += 1;
-            }
-            AttemptStatus::Quarantined { original_status: _ } => {
-                self.summary.quarantined += 1;
-            }
-        }
-
-        self.tests.push(test);
     }
 
     pub fn write_json(
@@ -393,13 +461,24 @@ impl Collector {
     }
 
     fn test_results(self, runner_specification: &NativeRunnerSpecification) -> TestResults {
+        let mut summary = Summary::default();
+        self.tests.values().for_each(|test| summary.account(test));
+
+        let reified_schema_tests = if cfg!(test) {
+            let mut ordered_tests: Vec<Test> = self.tests.into_values().map(Into::into).collect();
+            ordered_tests.sort_by(|t1, t2| t1.id.cmp(&t2.id));
+            ordered_tests
+        } else {
+            self.tests.into_values().map(Into::into).collect()
+        };
+
         TestResults {
             schema:
                 "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json"
                     .to_string(),
             framework: runner_specification.into(),
-            summary: self.summary,
-            tests: self.tests,
+            summary,
+            tests: reified_schema_tests,
         }
     }
 }
@@ -546,6 +625,174 @@ mod test {
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__pretty", json)
         }
+    }
+
+    #[test]
+    fn generates_rwx_v1_json_with_retries_ultimately_failing() {
+        let mut collector = Collector::default();
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed once".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed again".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I ultimately failed".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+            .expect("failed to write");
+
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
+    }
+
+    #[test]
+    fn generates_rwx_v1_json_with_retries_ultimately_succeeding() {
+        let mut collector = Collector::default();
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed once".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed again".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Success,
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("Look at me, i succeeded!".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+            .expect("failed to write");
+
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
+    }
+
+    #[test]
+    fn retries_with_nested_past_attempts() {
+        let mut collector = Collector::default();
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed a second time".to_string()),
+                past_attempts: Some(vec![TestResultSpec {
+                    status: Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    },
+                    id: "id1".to_string(),
+                    display_name: "app::module::test1".to_string(),
+                    output: Some("I failed a first time".to_string()),
+                    ..TestResultSpec::fake()
+                }]),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed a final time".to_string()),
+                past_attempts: Some(vec![TestResultSpec {
+                    status: Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    },
+                    id: "id1".to_string(),
+                    display_name: "app::module::test1".to_string(),
+                    output: Some("I failed a third time".to_string()),
+                    ..TestResultSpec::fake()
+                }]),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+            .expect("failed to write");
+
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
     }
 
     #[test]

@@ -99,6 +99,41 @@ pub struct TestCaseMessage {
 pub struct TestCase {
     pub id: TestId,
     pub meta: MetadataMap,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<TestFocus>,
+}
+
+impl TestCase {
+    pub(crate) fn has_focus(&self) -> bool {
+        match &self.focus {
+            Some(TestFocus { test_ids }) => !test_ids.is_empty(),
+            None => false,
+        }
+    }
+
+    pub fn clear_focus(&mut self) {
+        self.focus = None;
+    }
+
+    pub fn add_focus(&mut self, test_id: TestId) {
+        match &mut self.focus {
+            None => {
+                self.focus = Some(TestFocus {
+                    test_ids: vec![test_id],
+                });
+            }
+            Some(TestFocus { test_ids }) => {
+                if !test_ids.contains(&test_id) {
+                    test_ids.push(test_id)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TestFocus {
+    test_ids: Vec<TestId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]

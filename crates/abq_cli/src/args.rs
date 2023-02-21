@@ -168,7 +168,14 @@ pub enum Command {
         /// There may not be duplicate worker numberings in an ABQ test suite run.
         /// An ABQ test suite run must always include an `abq test` launched with `--worker 0`.
         #[clap(long, required = false, default_value_t = 0)]
-        worker: usize,
+        worker: u32,
+
+        /// How many times to retry failed tests.
+        ///
+        /// A test will be attempted up to `1 + retries` times. If it fails in all of those
+        /// attempts, it will be reported as failed.
+        #[clap(long, required = false, default_value_t = 0)]
+        retries: u32,
 
         /// Working directory of the worker. Defaults to the current directory.
         #[clap(long, required = false)]

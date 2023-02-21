@@ -15,6 +15,7 @@ use std::{io, net::SocketAddr, num::NonZeroU64, time::Duration};
 
 use abq_utils::{
     auth::User,
+    exit::ExitCode,
     net_async,
     net_opt::ClientOptions,
     net_protocol::{
@@ -23,9 +24,10 @@ use abq_utils::{
         entity::Entity,
         queue::{
             self, AssociatedTestResults, InvokeWork, InvokerTestData, Message, NativeRunnerInfo,
+            RunStartData, TestSpec,
         },
         runners::CapturedOutput,
-        workers::{RunId, RunnerKind},
+        workers::{RunId, RunnerKind, WorkId, INIT_RUN_NUMBER},
         AsyncReaderDos,
     },
 };
@@ -43,25 +45,28 @@ pub const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A client of [Abq]. Issues work to [Abq], and listens for test results from it.
 pub struct Client {
-    pub(crate) entity: Entity,
-    pub(crate) abq_server_addr: SocketAddr,
-    pub(crate) client: Box<dyn net_async::ConfiguredClient>,
+    entity: Entity,
+    abq_server_addr: SocketAddr,
+    client: Box<dyn net_async::ConfiguredClient>,
     /// The test run this client is responsible for.
-    pub(crate) run_id: RunId,
+    run_id: RunId,
     /// The stream to the queue server.
-    pub(crate) stream: Box<dyn net_async::ClientStream>,
+    stream: Box<dyn net_async::ClientStream>,
     // The maximum amount of a time a client should wait between consecutive test results
     // streamed from the queue.
-    pub(crate) poll_timeout: Duration,
-    pub(crate) next_poll_timeout_at: Instant,
-    pub(crate) tick_interval: Duration,
+    poll_timeout: Duration,
+    next_poll_timeout_at: Instant,
+    tick_interval: Duration,
     /// Signal to cancel an active test run.
-    pub(crate) cancellation_rx: RunCancellationRx,
-    pub(crate) async_reader: AsyncReaderDos,
+    cancellation_rx: RunCancellationRx,
+    async_reader: AsyncReaderDos,
+    current_run_attempt: u32,
+    track_exit_code_in_band: bool,
+    max_run_attempt: u32,
 }
 
 #[derive(Debug, Error)]
-pub enum InvocationError {
+pub enum Error {
     #[error("{0}")]
     Io(#[from] io::Error),
 
@@ -77,9 +82,6 @@ pub enum InvocationError {
 
 #[derive(Debug, Error)]
 pub enum TestResultError {
-    #[error("{0}")]
-    Io(#[from] io::Error),
-
     #[error("The given test command failed to be executed by all workers. The recorded error message is:\n{0}")]
     TestCommandError(String, CapturedOutput),
 
@@ -114,11 +116,11 @@ impl RunCancellationRx {
     }
 }
 
-pub(crate) enum IncrementalTestData {
+pub enum IncrementalTestData {
     Tick,
     Results(Vec<AssociatedTestResults>),
     Finished,
-    NativeRunnerInfo(NativeRunnerInfo),
+    RunStart(RunStartData),
 }
 
 pub fn run_cancellation_pair() -> (RunCancellationTx, RunCancellationRx) {
@@ -133,8 +135,15 @@ pub struct CompletedSummary {
     pub native_runner_info: NativeRunnerInfo,
 }
 
+pub type StreamResult<H> = std::result::Result<(H, CompletedSummary), Error>;
+
 pub trait ResultHandler {
-    fn on_result(&mut self, result: ReportedResult);
+    type InitData;
+
+    fn create(manifest: Vec<TestSpec>, init: Self::InitData) -> Self;
+    fn on_result(&mut self, work_id: WorkId, run_number: u32, result: ReportedResult);
+    fn get_ordered_retry_manifest(&mut self, run_number: u32) -> Vec<TestSpec>;
+    fn get_exit_code(&self) -> ExitCode;
     fn tick(&mut self);
 }
 
@@ -148,14 +157,17 @@ impl Client {
         runner: RunnerKind,
         batch_size_hint: NonZeroU64,
         test_results_timeout: Duration,
+        retries: u32,
         tick_interval: Duration,
         cancellation_rx: RunCancellationRx,
         track_exit_code_in_band: bool,
-    ) -> Result<Self, InvocationError> {
+    ) -> Result<Self, Error> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
 
         tracing::debug!(?entity, ?run_id, "invoking new work");
+
+        let max_run_attempt = INIT_RUN_NUMBER + retries;
 
         let invoke_request = queue::Request {
             entity,
@@ -164,6 +176,7 @@ impl Client {
                 runner,
                 batch_size_hint,
                 test_results_timeout,
+                max_run_attempt,
                 track_exit_code_in_band,
             }),
         };
@@ -175,9 +188,9 @@ impl Client {
             match err {
                 queue::InvokeFailureReason::DuplicateRunId { recently_completed } => {
                     let error_msg = if recently_completed {
-                        InvocationError::DuplicateCompletedRun(run_id)
+                        Error::DuplicateCompletedRun(run_id)
                     } else {
-                        InvocationError::DuplicateRun(run_id)
+                        Error::DuplicateRun(run_id)
                     };
 
                     return Err(error_msg);
@@ -196,11 +209,14 @@ impl Client {
             async_reader: Default::default(),
             next_poll_timeout_at: Self::next_poll_timeout_at_from_timeout(test_results_timeout),
             tick_interval,
+            current_run_attempt: INIT_RUN_NUMBER,
+            max_run_attempt,
+            track_exit_code_in_band,
         })
     }
 
     /// Attempts to reconnect the client to the abq server.
-    pub(crate) async fn reconnect(&mut self) -> Result<(), io::Error> {
+    async fn reconnect(&mut self) -> Result<(), io::Error> {
         let mut new_stream = self.client.connect(self.abq_server_addr).await?;
 
         net_protocol::async_write(
@@ -242,10 +258,11 @@ impl Client {
 
     /// Yields the next test result, as it streams in.
     /// Returns [None] when there are no more test results.
-    pub(crate) async fn next(
+    async fn next<H: ResultHandler>(
         &mut self,
         tick_interval: &mut Interval,
-    ) -> Result<IncrementalTestData, TestResultError> {
+        handler: &mut Option<H>,
+    ) -> Result<IncrementalTestData, Error> {
         loop {
             let read_result = tokio::select! {
                 read = self.async_reader.next(&mut self.stream) => {
@@ -257,11 +274,11 @@ impl Client {
                 _ = tokio::time::sleep_until(self.next_poll_timeout_at) => {
                     tracing::error!(timeout=?self.poll_timeout, entity=?self.entity, run_id=?self.run_id, "timed out waiting for queue message");
                     self.cancel_active_run().await?;
-                    return Err(TestResultError::TimedOut(self.poll_timeout));
+                    return Err(TestResultError::TimedOut(self.poll_timeout).into());
                 }
                 _ = self.cancellation_rx.recv() => {
                     self.cancel_active_run().await?;
-                    return Err(TestResultError::Cancelled);
+                    return Err(TestResultError::Cancelled.into());
                 }
             };
 
@@ -272,7 +289,7 @@ impl Client {
                     // Send an acknowledgement of the result to the server. If it fails, attempt to reconnect once.
                     let ack_result = net_protocol::async_write(
                         &mut self.stream,
-                        &net_protocol::client::AckTestData {},
+                        &net_protocol::client::AckTestResults {},
                     )
                     .await;
                     if ack_result.is_err() {
@@ -282,41 +299,90 @@ impl Client {
                     return Ok(IncrementalTestData::Results(results));
                 }
                 Ok(InvokerTestData::EndOfResults) => {
-                    // Send a final ACK of the test results, so that cancellation signals do not
-                    // interfere with us here.
-                    net_protocol::async_write(
-                        &mut self.stream,
-                        &net_protocol::client::AckTestRunEnded {},
-                    )
-                    .await?;
+                    let is_last_run_attempt = self.current_run_attempt == self.max_run_attempt;
+                    let opt_retry_manifest = match (is_last_run_attempt, handler.as_mut()) {
+                        (true, _) | (false, None) => None,
+                        (false, Some(handler)) => {
+                            let retry_manifest =
+                                handler.get_ordered_retry_manifest(self.current_run_attempt);
 
-                    return Ok(IncrementalTestData::Finished);
+                            if !retry_manifest.is_empty() {
+                                Some(retry_manifest)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+
+                    match opt_retry_manifest {
+                        None => {
+                            // Finish up the test run.
+                            //
+                            // Send a final ACK of the test results, so that cancellation signals do not
+                            // interfere with us here.
+                            let exit_code = if self.track_exit_code_in_band {
+                                let code = handler
+                                    .as_ref()
+                                    .expect("handler must be known with manifest at this point")
+                                    .get_exit_code();
+                                Some(code)
+                            } else {
+                                None
+                            };
+
+                            net_protocol::async_write(
+                                &mut self.stream,
+                                &net_protocol::client::EndOfResultsResponse::AckEnd { exit_code },
+                            )
+                            .await?;
+
+                            return Ok(IncrementalTestData::Finished);
+                        }
+                        Some(ordered_manifest) => {
+                            let next_run_attempt = self.current_run_attempt + 1;
+
+                            net_protocol::async_write(
+                                &mut self.stream,
+                                &net_protocol::client::EndOfResultsResponse::AdditionalAttempts {
+                                    ordered_manifest,
+                                    attempt_number: next_run_attempt,
+                                },
+                            )
+                            .await?;
+
+                            self.current_run_attempt = next_run_attempt;
+
+                            continue;
+                        }
+                    }
                 }
                 Ok(InvokerTestData::TestCommandError { error, captured }) => {
-                    return Err(TestResultError::TestCommandError(error, captured))
+                    return Err(TestResultError::TestCommandError(error, captured).into())
                 }
                 Ok(InvokerTestData::TimedOut { after }) => {
                     // Send a final ACK of the test results, so that cancellation signals do not
                     // interfere with us here.
                     net_protocol::async_write(
                         &mut self.stream,
-                        &net_protocol::client::AckTestRunEnded {},
+                        &net_protocol::client::EndOfResultsResponse::AckEnd {
+                            exit_code: Some(ExitCode::CANCELLED),
+                        },
                     )
                     .await?;
 
-                    return Err(TestResultError::TimedOut(after));
+                    return Err(TestResultError::TimedOut(after).into());
                 }
-                Ok(InvokerTestData::NativeRunnerInfo(native_runner_info)) => {
+                Ok(InvokerTestData::RunStart(start_data)) => {
                     let ack_result = net_protocol::async_write(
                         &mut self.stream,
-                        &net_protocol::client::AckTestData {},
+                        &net_protocol::client::AckRunStart {},
                     )
                     .await;
                     if ack_result.is_err() {
                         self.reconnect().await?;
                     }
 
-                    return Ok(IncrementalTestData::NativeRunnerInfo(native_runner_info));
+                    return Ok(IncrementalTestData::RunStart(start_data));
                 }
                 Err(err) => {
                     // Attempt to reconnect once. If it's successful, just re-read the next message.
@@ -331,32 +397,38 @@ impl Client {
     }
 
     /// Blockingly calls [Self::next] until the are no more test results, or we failed to retrieve
-    /// test results from the queue and cannot reconnect. Cedes control to `on_result` when a
+    /// test results from the queue and cannot reconnect. Cedes control to the handler `H` when a
     /// result is received.
-    pub async fn stream_results(
+    pub async fn stream_results<H: ResultHandler>(
         mut self,
-        mut handler: impl ResultHandler,
-    ) -> Result<CompletedSummary, TestResultError> {
+        handler_data: H::InitData,
+    ) -> StreamResult<H> {
         use IncrementalTestData::*;
 
         let mut native_runner_info = None;
+        let mut handler: Option<H> = None;
+        let mut handler_data = Some(handler_data);
 
         // The first tick interval will complete immediately and will prime the handler;
         // all subsequent ticks obey the interval.
         let mut tick_interval = tokio::time::interval(self.tick_interval);
 
         loop {
-            match self.next(&mut tick_interval).await? {
+            match self.next(&mut tick_interval, &mut handler).await? {
                 Tick => {
-                    handler.tick();
+                    if let Some(handler) = handler.as_mut() {
+                        handler.tick();
+                    }
                     continue;
                 }
                 Finished => {
                     break;
                 }
                 Results(results) => {
+                    let handler = handler.as_mut().expect("illegal state - results handler not initialized before first result received");
                     for AssociatedTestResults {
-                        work_id: _,
+                        work_id,
+                        run_number,
                         results,
                         before_any_test,
                         after_all_tests,
@@ -382,21 +454,36 @@ impl Client {
                                 None
                             };
 
-                            handler.on_result(ReportedResult {
-                                output_before,
-                                test_result,
-                                output_after,
-                            })
+                            handler.on_result(
+                                work_id,
+                                run_number,
+                                ReportedResult {
+                                    output_before,
+                                    test_result,
+                                    output_after,
+                                },
+                            )
                         }
                     }
                 }
-                NativeRunnerInfo(runner_info) => {
+                RunStart(RunStartData {
+                    native_runner_info: runner_info,
+                    manifest,
+                }) => {
+                    assert!(
+                        handler.is_none(),
+                        "illegal state - initialized results handler before run start info"
+                    );
                     assert!(
                         native_runner_info.is_none(),
-                        "illegal run state - native runner info received more than once"
+                        "illegal state - native runner info received more than once"
                     );
 
                     native_runner_info = Some(runner_info);
+
+                    let handler_data = std::mem::take(&mut handler_data)
+                        .expect("illegal state - handler data can only be used once");
+                    handler = Some(H::create(manifest, handler_data));
                 }
             }
         }
@@ -404,7 +491,8 @@ impl Client {
         let native_runner_info = native_runner_info.expect(
             "illegal run state - run completed successfully but runner info never received",
         );
+        let handler = handler.expect("illegal state - handler must be available after completion");
 
-        Ok(CompletedSummary { native_runner_info })
+        Ok((handler, CompletedSummary { native_runner_info }))
     }
 }

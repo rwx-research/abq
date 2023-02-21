@@ -26,7 +26,7 @@ impl BufferedResults<'_> {
         }
     }
 
-    pub async fn flush(mut self) {
+    pub async fn flush(&mut self) {
         if !self.buffer.is_empty() {
             self.send().await;
         }

@@ -67,7 +67,10 @@ pub fn format_result_dot(writer: &mut impl WriteColor, result: &TestResult) -> i
 }
 
 pub enum SummaryKind<'a> {
-    Test(TestResult),
+    Test {
+        run_number: u32,
+        result: TestResult,
+    },
     Output {
         when: OutputOrdering<'a>,
         runner: RunnerMeta,
@@ -83,7 +86,9 @@ pub enum OutputOrdering<'a> {
 
 pub fn format_summary(writer: &mut impl WriteColor, summary: SummaryKind) -> io::Result<()> {
     match summary {
-        SummaryKind::Test(result) => format_test_result_summary(writer, &result),
+        SummaryKind::Test { run_number, result } => {
+            format_test_result_summary(writer, run_number, &result)
+        }
         SummaryKind::Output {
             when,
             runner,
@@ -94,7 +99,7 @@ pub fn format_summary(writer: &mut impl WriteColor, summary: SummaryKind) -> io:
 
 pub fn would_write_summary(summary: &SummaryKind) -> bool {
     match summary {
-        SummaryKind::Test(_) => true,
+        SummaryKind::Test { .. } => true,
         SummaryKind::Output { output, .. } => would_write_output(Some(output)),
     }
 }
@@ -102,9 +107,10 @@ pub fn would_write_summary(summary: &SummaryKind) -> bool {
 /// Formats a test result as a summary, possibly across multiple lines.
 pub fn format_test_result_summary(
     writer: &mut impl WriteColor,
+    run_number: u32,
     result: &TestResult,
 ) -> io::Result<()> {
-    // --- test/name: {status} ---
+    // --- test/name: {status} (attempt {run_number})? ---
     // {output}
     // ----- STDOUT
     // {stdout}
@@ -134,6 +140,9 @@ pub fn format_test_result_summary(
 
     write!(writer, "--- {display_name}: ")?;
     format_status(writer, status)?;
+    if run_number != 1 {
+        write!(writer, " (attempt {run_number})")?;
+    }
     writeln!(writer, " ---")?;
     writeln!(writer, "{output}")?;
     for (stdoutput, kind) in [(stdout, "STDOUT"), (stderr, "STDERR")] {
@@ -328,6 +337,7 @@ pub fn format_short_suite_summary(
     test_time: Duration,
     num_tests: u64,
     num_failing: u64,
+    num_retried: u64,
 ) -> io::Result<()> {
     // Finished in X seconds (X seconds spent in test code)
     // M tests, N failures
@@ -346,6 +356,11 @@ pub fn format_short_suite_summary(
     with_color_spec(writer, &failing_spec(num_failing), |w| {
         write!(w, "{num_failing} failures")
     })?;
+    if num_retried > 0 {
+        with_color_spec(writer, &yellow_bold_spec(), |w| {
+            write!(w, ", {num_retried} retried")
+        })?;
+    }
     writeln!(writer)?;
     Ok(())
 }
@@ -375,6 +390,13 @@ fn bold_spec() -> ColorSpec {
 fn green_bold_spec() -> ColorSpec {
     let mut spec = ColorSpec::new();
     spec.set_fg(Some(Color::Green)).set_bold(true);
+    spec
+}
+
+#[inline]
+fn yellow_bold_spec() -> ColorSpec {
+    let mut spec = ColorSpec::new();
+    spec.set_fg(Some(Color::Yellow)).set_bold(true);
     spec
 }
 
@@ -562,6 +584,16 @@ mod test {
                 // Test colored output
                 let mut buf = TestColorWriter(vec![]);
                 $fn(&mut buf, $item).unwrap();
+                let formatted = String::from_utf8(buf.0).unwrap();
+                insta::assert_snapshot!(formatted, @$expect_colored);
+            }
+        };
+        ($name:ident, $fn:ident, attempt $attempt:literal, $item:expr, @$expect_colored:literal) => {
+            #[test]
+            fn $name() {
+                // Test colored output
+                let mut buf = TestColorWriter(vec![]);
+                $fn(&mut buf, $attempt, $item).unwrap();
                 let formatted = String::from_utf8(buf.0).unwrap();
                 insta::assert_snapshot!(formatted, @$expect_colored);
             }
@@ -892,6 +924,7 @@ mod test {
 
     test_format!(
         format_summary_success, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
@@ -906,6 +939,7 @@ mod test {
 
     test_format!(
         format_summary_failure, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>FAILED<reset> ---
@@ -920,6 +954,7 @@ mod test {
 
     test_format!(
         format_summary_error, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>ERRORED<reset> ---
@@ -934,6 +969,7 @@ mod test {
 
     test_format!(
         format_summary_pending, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>pending<reset> ---
@@ -948,6 +984,7 @@ mod test {
 
     test_format!(
         format_summary_skipped, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
         @r###"
     --- abq/test: <yellow>skipped<reset> ---
@@ -962,6 +999,7 @@ mod test {
 
     test_format!(
         format_summary_multiline, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
@@ -979,6 +1017,7 @@ mod test {
 
     test_format!(
         format_summary_no_output, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
         @r###"
     --- abq/test: <green>ok<reset> ---
@@ -993,6 +1032,7 @@ mod test {
 
     test_format!(
         format_summary_only_stdout, format_test_result_summary,
+        attempt 1,
         &TestResult::new(
             RunnerMeta::fake(),
             TestResultSpec {
@@ -1013,6 +1053,7 @@ mod test {
 
     test_format!(
         format_summary_only_stderr, format_test_result_summary,
+        attempt 1,
         &TestResult::new(
             RunnerMeta::fake(),
             TestResultSpec {
@@ -1033,6 +1074,7 @@ mod test {
 
     test_format!(
         format_summary_failure_non_singleton_runner, format_test_result_summary,
+        attempt 1,
         &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>FAILED<reset> ---
@@ -1042,6 +1084,21 @@ mod test {
     ----- STDERR
     my stdout
     (completed in 1 m, 15 s, 3 ms [worker 5, runner 6])
+    "###
+    );
+
+    test_format!(
+        format_summary_failure_multi_attempt, format_test_result_summary,
+        attempt 3,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <red>FAILED<reset> (attempt 3) ---
+    Assertion failed: 1 != 2
+    ----- STDOUT
+    my stderr
+    ----- STDERR
+    my stdout
+    (completed in 1 m, 15 s, 3 ms [worker 0])
     "###
     );
 }

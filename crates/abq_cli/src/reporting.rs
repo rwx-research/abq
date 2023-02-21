@@ -1,3 +1,7 @@
+mod summary;
+
+mod retry_manifest_tracker;
+
 use std::{
     borrow::Cow,
     fmt::Display,
@@ -13,12 +17,14 @@ use abq_output::{
     format_summary, format_test_result_summary, would_write_output, would_write_summary,
     OutputOrdering, SummaryKind,
 };
-use abq_queue::invoke::CompletedSummary;
+use abq_queue::invoke::{self, CompletedSummary};
 use abq_utils::{
-    exit::{self, ExitCode},
+    exit::ExitCode,
     net_protocol::{
         client::ReportedResult,
+        queue::TestSpec,
         runners::{CapturedOutput, Status, TestResult, TestRuntime},
+        workers::WorkId,
     },
 };
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -114,78 +120,20 @@ pub enum ReportingError {
     Io(#[from] std::io::Error),
 }
 
-struct SuiteResultBuilder {
-    success: bool,
-    suggested_exit_code: ExitCode,
-    count: u64,
-    count_failed: u64,
-    start_time: Instant,
-    test_time: TestRuntime,
-}
-
-impl Default for SuiteResultBuilder {
-    fn default() -> Self {
-        Self {
-            success: true,
-            suggested_exit_code: ExitCode::new(0),
-            count: 0,
-            count_failed: 0,
-            start_time: Instant::now(),
-            test_time: TestRuntime::ZERO,
-        }
-    }
-}
-
 pub(crate) struct SuiteResult {
     /// Exit code suggested for the test suite.
     suggested_exit_code: ExitCode,
     /// Total number of tests run.
     count: u64,
     count_failed: u64,
+    /// How many individual tests were retried. Not the total count of how many retries were run.
+    /// For example, if test A was retried twice, its count in this metric is one.
+    tests_retried: u64,
     /// Runtime of the test suite, as accounted between the time the reporter started and the time
     /// it finished.
     wall_time: Duration,
     /// Runtime of the test suite, as accounted for in the actual time in tests.
     test_time: TestRuntime,
-}
-
-impl SuiteResultBuilder {
-    fn account_result(&mut self, test_result: &TestResult) {
-        self.count += 1;
-        self.count_failed += test_result.status.is_fail_like() as u64;
-        self.test_time += test_result.runtime;
-        match test_result.status {
-            Status::PrivateNativeRunnerError => {
-                self.success = false;
-                self.suggested_exit_code = ExitCode::new(exit::CODE_ERROR);
-            }
-            Status::Failure { .. } | Status::Error { .. } | Status::TimedOut if self.success => {
-                // If we already recorded a failure or error, that takes priority.
-                self.success = false;
-                self.suggested_exit_code = ExitCode::new(1);
-            }
-            _ => {}
-        }
-    }
-
-    fn finalize(self) -> SuiteResult {
-        let Self {
-            success: _,
-            suggested_exit_code,
-            count,
-            count_failed,
-            start_time,
-            test_time,
-        } = self;
-
-        SuiteResult {
-            suggested_exit_code,
-            count,
-            count_failed,
-            wall_time: start_time.elapsed(),
-            test_time,
-        }
-    }
 }
 
 impl SuiteResult {
@@ -196,6 +144,7 @@ impl SuiteResult {
             self.test_time.duration(),
             self.count,
             self.count_failed,
+            self.tests_retried,
         )
     }
 
@@ -209,7 +158,11 @@ impl SuiteResult {
 /// A reporter is allowed to be side-effectful.
 pub(crate) trait Reporter: Send {
     /// Consume the next test result.
-    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError>;
+    fn push_result(
+        &mut self,
+        run_number: u32,
+        result: &ReportedResult,
+    ) -> Result<(), ReportingError>;
 
     fn tick(&mut self);
 
@@ -254,7 +207,11 @@ struct LineReporter {
 }
 
 impl Reporter for LineReporter {
-    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+    fn push_result(
+        &mut self,
+        run_number: u32,
+        result: &ReportedResult,
+    ) -> Result<(), ReportingError> {
         let ReportedResult {
             output_before,
             output_after,
@@ -272,10 +229,12 @@ impl Reporter for LineReporter {
         self.seen_first = true;
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
-            format_test_result_summary(&mut self.buffer, test_result)?;
+            format_test_result_summary(&mut self.buffer, run_number, test_result)?;
         } else if test_result.status.is_fail_like() {
-            self.delayed_summaries
-                .push(SummaryKind::Test(test_result.clone()));
+            self.delayed_summaries.push(SummaryKind::Test {
+                run_number,
+                result: test_result.clone(),
+            });
         }
 
         Ok(())
@@ -329,7 +288,11 @@ impl DotReporter {
 }
 
 impl Reporter for DotReporter {
-    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+    fn push_result(
+        &mut self,
+        run_number: u32,
+        result: &ReportedResult,
+    ) -> Result<(), ReportingError> {
         let ReportedResult {
             output_before,
             output_after,
@@ -357,10 +320,12 @@ impl Reporter for DotReporter {
         );
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
-            format_test_result_summary(&mut self.buffer, test_result)?;
+            format_test_result_summary(&mut self.buffer, run_number, test_result)?;
         } else if test_result.status.is_fail_like() {
-            self.delayed_summaries
-                .push(SummaryKind::Test(test_result.clone()));
+            self.delayed_summaries.push(SummaryKind::Test {
+                run_number,
+                result: test_result.clone(),
+            });
         }
 
         self.maybe_push_delayed_output(
@@ -481,7 +446,11 @@ impl ProgressReporter {
 }
 
 impl Reporter for ProgressReporter {
-    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+    fn push_result(
+        &mut self,
+        run_number: u32,
+        result: &ReportedResult,
+    ) -> Result<(), ReportingError> {
         let ReportedResult {
             output_before,
             output_after,
@@ -511,7 +480,7 @@ impl Reporter for ProgressReporter {
             }
 
             if is_fail_like {
-                format_test_result_summary(&mut self.buffer, test_result)?;
+                format_test_result_summary(&mut self.buffer, run_number, test_result)?;
             }
 
             if let Some(output) = output_after {
@@ -565,7 +534,11 @@ struct JUnitXmlReporter {
 }
 
 impl Reporter for JUnitXmlReporter {
-    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+    fn push_result(
+        &mut self,
+        _run_number: u32,
+        result: &ReportedResult,
+    ) -> Result<(), ReportingError> {
         self.collector.push_result(&result.test_result);
         Ok(())
     }
@@ -599,7 +572,11 @@ struct RwxV1JsonReporter {
 }
 
 impl Reporter for RwxV1JsonReporter {
-    fn push_result(&mut self, result: &ReportedResult) -> Result<(), ReportingError> {
+    fn push_result(
+        &mut self,
+        _run_number: u32,
+        result: &ReportedResult,
+    ) -> Result<(), ReportingError> {
         self.collector.push_result(&result.test_result);
         Ok(())
     }
@@ -709,32 +686,39 @@ fn reporter_from_kind(
 
 pub(crate) struct SuiteReporters {
     reporters: Vec<Box<dyn Reporter>>,
-    overall_result: SuiteResultBuilder,
+    overall_tracker: summary::SuiteTracker,
 }
 
 impl SuiteReporters {
     pub fn new(
-        reporter_kinds: impl IntoIterator<Item = ReporterKind>,
+        reporter_kinds: Vec<ReporterKind>,
         stdout_preferences: StdoutPreferences,
         test_suite_name: &str,
+        manifest: Vec<TestSpec>,
     ) -> Self {
         Self {
             reporters: reporter_kinds
                 .into_iter()
                 .map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
                 .collect(),
-            overall_result: SuiteResultBuilder::default(),
+            overall_tracker: summary::SuiteTracker::new(manifest),
         }
     }
 
-    pub fn push_result(&mut self, result: &ReportedResult) -> Result<(), Vec<ReportingError>> {
+    fn push_result(
+        &mut self,
+        work_id: WorkId,
+        run_number: u32,
+        result: &ReportedResult,
+    ) -> Result<(), Vec<ReportingError>> {
         let errors: Vec<_> = self
             .reporters
             .iter_mut()
-            .filter_map(|reporter| reporter.push_result(result).err())
+            .filter_map(|reporter| reporter.push_result(run_number, result).err())
             .collect();
 
-        self.overall_result.account_result(&result.test_result);
+        self.overall_tracker
+            .account_result(work_id, run_number, &result.test_result);
 
         if errors.is_empty() {
             Ok(())
@@ -743,7 +727,7 @@ impl SuiteReporters {
         }
     }
 
-    pub fn tick(&mut self) {
+    fn do_tick(&mut self) {
         self.reporters
             .iter_mut()
             .for_each(|reporter| reporter.tick());
@@ -758,10 +742,10 @@ impl SuiteReporters {
     pub fn finish(self, summary: &CompletedSummary) -> (SuiteResult, Vec<ReportingError>) {
         let Self {
             reporters,
-            overall_result,
+            overall_tracker,
         } = self;
 
-        let overall_result = overall_result.finalize();
+        let overall_result = overall_tracker.suite_result();
 
         let errors: Vec<_> = reporters
             .into_iter()
@@ -769,6 +753,37 @@ impl SuiteReporters {
             .collect();
 
         (overall_result, errors)
+    }
+}
+
+impl invoke::ResultHandler for SuiteReporters {
+    type InitData = (Vec<ReporterKind>, StdoutPreferences, String);
+
+    fn create(manifest: Vec<TestSpec>, init: Self::InitData) -> Self {
+        let (reporter_kinds, stdout_preferences, test_suite_name) = init;
+        Self::new(
+            reporter_kinds,
+            stdout_preferences,
+            &test_suite_name,
+            manifest,
+        )
+    }
+
+    fn on_result(&mut self, work_id: WorkId, run_number: u32, result: ReportedResult) {
+        // TODO: is there a reasonable way to surface the error?
+        let _opt_error = self.push_result(work_id, run_number, &result);
+    }
+
+    fn get_ordered_retry_manifest(&mut self, run_number: u32) -> Vec<TestSpec> {
+        self.overall_tracker.ordered_retry_manifest(run_number)
+    }
+
+    fn get_exit_code(&self) -> ExitCode {
+        self.overall_tracker.exit_code()
+    }
+
+    fn tick(&mut self) {
+        self.do_tick()
     }
 }
 
@@ -980,6 +995,7 @@ mod test_line_reporter {
         client::ReportedResult,
         entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
+        workers::INIT_RUN_NUMBER,
     };
 
     use crate::reporting::mock_summary;
@@ -1013,16 +1029,22 @@ mod test_line_reporter {
             num_flushes,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    default_result(),
-                )))
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        default_result(),
+                    )),
+                )
                 .unwrap();
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    default_result(),
-                )))
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        default_result(),
+                    )),
+                )
                 .unwrap();
         });
 
@@ -1052,75 +1074,91 @@ mod test_line_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Success,
-                        display_name: "abq/test1".to_string(),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Failure {
-                            exception: None,
-                            backtrace: None,
-                        },
-                        display_name: "abq/test2".to_string(),
-                        output: Some("Assertion failed: 1 != 2".to_string()),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult {
-                    test_result: TestResult::new(
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
                         RunnerMeta::fake(),
                         TestResultSpec {
-                            status: Status::Skipped,
-                            display_name: "abq/test3".to_string(),
+                            status: Status::Success,
+                            display_name: "abq/test1".to_string(),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Failure {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test2".to_string(),
+                            output: Some("Assertion failed: 1 != 2".to_string()),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult {
+                        test_result: TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                status: Status::Skipped,
+                                display_name: "abq/test3".to_string(),
+                                output: Some(
+                                    r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                                ),
+                                ..default_result()
+                            },
+                        ),
+                        output_before: Some(CapturedOutput {
+                            stderr: b"test3-stderr".to_vec(),
+                            stdout: b"test3-stdout".to_vec(),
+                        }),
+                        output_after: None,
+                    },
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Error {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test4".to_string(),
+                            output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Pending,
+                            display_name: "abq/test5".to_string(),
                             output: Some(
-                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                                r#"Pending for reason: "implementation blocked on #1729""#
+                                    .to_string(),
                             ),
                             ..default_result()
                         },
-                    ),
-                    output_before: Some(CapturedOutput {
-                        stderr: b"test3-stderr".to_vec(),
-                        stdout: b"test3-stdout".to_vec(),
-                    }),
-                    output_after: None,
-                })
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Error {
-                            exception: None,
-                            backtrace: None,
-                        },
-                        display_name: "abq/test4".to_string(),
-                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Pending,
-                        display_name: "abq/test5".to_string(),
-                        output: Some(
-                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
-                        ),
-                        ..default_result()
-                    },
-                )))
+                    )),
+                )
                 .unwrap();
             reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
@@ -1166,6 +1204,7 @@ mod test_dot_reporter {
         client::ReportedResult,
         entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
+        workers::INIT_RUN_NUMBER,
     };
 
     use crate::reporting::{mock_summary, DOT_REPORTER_LINE_LIMIT};
@@ -1199,16 +1238,22 @@ mod test_dot_reporter {
             num_flushes,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    default_result(),
-                )))
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        default_result(),
+                    )),
+                )
                 .unwrap();
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    default_result(),
-                )))
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        default_result(),
+                    )),
+                )
                 .unwrap();
         });
 
@@ -1238,75 +1283,91 @@ mod test_dot_reporter {
             num_flushes: _,
         } = with_reporter(|mut reporter| {
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Success,
-                        display_name: "abq/test1".to_string(),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Failure {
-                            exception: None,
-                            backtrace: None,
-                        },
-                        display_name: "abq/test2".to_string(),
-                        output: Some("Assertion failed: 1 != 2".to_string()),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult {
-                    test_result: TestResult::new(
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
                         RunnerMeta::fake(),
                         TestResultSpec {
-                            status: Status::Skipped,
-                            display_name: "abq/test3".to_string(),
+                            status: Status::Success,
+                            display_name: "abq/test1".to_string(),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Failure {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test2".to_string(),
+                            output: Some("Assertion failed: 1 != 2".to_string()),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult {
+                        test_result: TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                status: Status::Skipped,
+                                display_name: "abq/test3".to_string(),
+                                output: Some(
+                                    r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                                ),
+                                ..default_result()
+                            },
+                        ),
+                        output_before: Some(CapturedOutput {
+                            stderr: b"test3-stderr".to_vec(),
+                            stdout: b"test3-stdout".to_vec(),
+                        }),
+                        output_after: None,
+                    },
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Error {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test4".to_string(),
+                            output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Pending,
+                            display_name: "abq/test5".to_string(),
                             output: Some(
-                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                                r#"Pending for reason: "implementation blocked on #1729""#
+                                    .to_string(),
                             ),
                             ..default_result()
                         },
-                    ),
-                    output_before: Some(CapturedOutput {
-                        stderr: b"test3-stderr".to_vec(),
-                        stdout: b"test3-stdout".to_vec(),
-                    }),
-                    output_after: None,
-                })
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Error {
-                            exception: None,
-                            backtrace: None,
-                        },
-                        display_name: "abq/test4".to_string(),
-                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Pending,
-                        display_name: "abq/test5".to_string(),
-                        output: Some(
-                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
-                        ),
-                        ..default_result()
-                    },
-                )))
+                    )),
+                )
                 .unwrap();
             reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
@@ -1358,13 +1419,16 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&ReportedResult::no_captures(TestResult::new(
-                        RunnerMeta::fake(),
-                        TestResultSpec {
-                            status,
-                            ..default_result()
-                        },
-                    )))
+                    .push_result(
+                        INIT_RUN_NUMBER,
+                        &ReportedResult::no_captures(TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                status,
+                                ..default_result()
+                            },
+                        )),
+                    )
                     .unwrap();
             }
 
@@ -1388,10 +1452,13 @@ mod test_dot_reporter {
         } = with_reporter(|mut reporter| {
             for _ in 0..DOT_REPORTER_LINE_LIMIT {
                 reporter
-                    .push_result(&ReportedResult::no_captures(TestResult::new(
-                        RunnerMeta::fake(),
-                        default_result(),
-                    )))
+                    .push_result(
+                        INIT_RUN_NUMBER,
+                        &ReportedResult::no_captures(TestResult::new(
+                            RunnerMeta::fake(),
+                            default_result(),
+                        )),
+                    )
                     .unwrap();
             }
 
@@ -1423,13 +1490,16 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&ReportedResult::no_captures(TestResult::new(
-                        RunnerMeta::fake(),
-                        TestResultSpec {
-                            status,
-                            ..default_result()
-                        },
-                    )))
+                    .push_result(
+                        INIT_RUN_NUMBER,
+                        &ReportedResult::no_captures(TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                status,
+                                ..default_result()
+                            },
+                        )),
+                    )
                     .unwrap();
             }
 
@@ -1471,13 +1541,16 @@ mod test_dot_reporter {
                 };
 
                 reporter
-                    .push_result(&ReportedResult::no_captures(TestResult::new(
-                        RunnerMeta::fake(),
-                        TestResultSpec {
-                            status,
-                            ..default_result()
-                        },
-                    )))
+                    .push_result(
+                        INIT_RUN_NUMBER,
+                        &ReportedResult::no_captures(TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                status,
+                                ..default_result()
+                            },
+                        )),
+                    )
                     .unwrap();
             }
 
@@ -1510,6 +1583,7 @@ mod test_progress_reporter {
         client::ReportedResult,
         entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
+        workers::INIT_RUN_NUMBER,
     };
     use indicatif::{ProgressDrawTarget, TermLike};
 
@@ -1608,75 +1682,91 @@ mod test_progress_reporter {
             progress_bar_cmds,
         ) = with_interactive_reporter(|mut reporter| {
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Success,
-                        display_name: "abq/test1".to_string(),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Failure {
-                            exception: None,
-                            backtrace: None,
-                        },
-                        display_name: "abq/test2".to_string(),
-                        output: Some("Assertion failed: 1 != 2".to_string()),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult {
-                    test_result: TestResult::new(
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
                         RunnerMeta::fake(),
                         TestResultSpec {
-                            status: Status::Skipped,
-                            display_name: "abq/test3".to_string(),
+                            status: Status::Success,
+                            display_name: "abq/test1".to_string(),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Failure {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test2".to_string(),
+                            output: Some("Assertion failed: 1 != 2".to_string()),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult {
+                        test_result: TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                status: Status::Skipped,
+                                display_name: "abq/test3".to_string(),
+                                output: Some(
+                                    r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                                ),
+                                ..default_result()
+                            },
+                        ),
+                        output_before: Some(CapturedOutput {
+                            stderr: b"test3-stderr".to_vec(),
+                            stdout: b"test3-stdout".to_vec(),
+                        }),
+                        output_after: None,
+                    },
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Error {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test4".to_string(),
+                            output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Pending,
+                            display_name: "abq/test5".to_string(),
                             output: Some(
-                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                                r#"Pending for reason: "implementation blocked on #1729""#
+                                    .to_string(),
                             ),
                             ..default_result()
                         },
-                    ),
-                    output_before: Some(CapturedOutput {
-                        stderr: b"test3-stderr".to_vec(),
-                        stdout: b"test3-stdout".to_vec(),
-                    }),
-                    output_after: None,
-                })
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Error {
-                            exception: None,
-                            backtrace: None,
-                        },
-                        display_name: "abq/test4".to_string(),
-                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Pending,
-                        display_name: "abq/test5".to_string(),
-                        output: Some(
-                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
-                        ),
-                        ..default_result()
-                    },
-                )))
+                    )),
+                )
                 .unwrap();
             reporter.after_all_results();
             reporter.finish(&mock_summary()).unwrap();
@@ -1779,48 +1869,57 @@ mod test_progress_reporter {
             reporter.tick();
 
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Success,
-                        display_name: "abq/test1".to_string(),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Failure {
-                            exception: None,
-                            backtrace: None,
-                        },
-                        display_name: "abq/test2".to_string(),
-                        output: Some("Assertion failed: 1 != 2".to_string()),
-                        ..default_result()
-                    },
-                )))
-                .unwrap();
-            reporter
-                .push_result(&ReportedResult {
-                    test_result: TestResult::new(
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
                         RunnerMeta::fake(),
                         TestResultSpec {
-                            status: Status::Skipped,
-                            display_name: "abq/test3".to_string(),
-                            output: Some(
-                                r#"Skipped for reason: "not a summer Friday""#.to_string(),
-                            ),
+                            status: Status::Success,
+                            display_name: "abq/test1".to_string(),
                             ..default_result()
                         },
-                    ),
-                    output_before: Some(CapturedOutput {
-                        stderr: b"test3-stderr".to_vec(),
-                        stdout: b"test3-stdout".to_vec(),
-                    }),
-                    output_after: None,
-                })
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Failure {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test2".to_string(),
+                            output: Some("Assertion failed: 1 != 2".to_string()),
+                            ..default_result()
+                        },
+                    )),
+                )
+                .unwrap();
+            reporter
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult {
+                        test_result: TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                status: Status::Skipped,
+                                display_name: "abq/test3".to_string(),
+                                output: Some(
+                                    r#"Skipped for reason: "not a summer Friday""#.to_string(),
+                                ),
+                                ..default_result()
+                            },
+                        ),
+                        output_before: Some(CapturedOutput {
+                            stderr: b"test3-stderr".to_vec(),
+                            stdout: b"test3-stdout".to_vec(),
+                        }),
+                        output_after: None,
+                    },
+                )
                 .unwrap();
 
             // Force a progress tick before the next output write
@@ -1829,31 +1928,38 @@ mod test_progress_reporter {
             }
 
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Error {
-                            exception: None,
-                            backtrace: None,
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Error {
+                                exception: None,
+                                backtrace: None,
+                            },
+                            display_name: "abq/test4".to_string(),
+                            output: Some("Process 28821 terminated early via SIGTERM".to_string()),
+                            ..default_result()
                         },
-                        display_name: "abq/test4".to_string(),
-                        output: Some("Process 28821 terminated early via SIGTERM".to_string()),
-                        ..default_result()
-                    },
-                )))
+                    )),
+                )
                 .unwrap();
             reporter
-                .push_result(&ReportedResult::no_captures(TestResult::new(
-                    RunnerMeta::fake(),
-                    TestResultSpec {
-                        status: Status::Pending,
-                        display_name: "abq/test5".to_string(),
-                        output: Some(
-                            r#"Pending for reason: "implementation blocked on #1729""#.to_string(),
-                        ),
-                        ..default_result()
-                    },
-                )))
+                .push_result(
+                    INIT_RUN_NUMBER,
+                    &ReportedResult::no_captures(TestResult::new(
+                        RunnerMeta::fake(),
+                        TestResultSpec {
+                            status: Status::Pending,
+                            display_name: "abq/test5".to_string(),
+                            output: Some(
+                                r#"Pending for reason: "implementation blocked on #1729""#
+                                    .to_string(),
+                            ),
+                            ..default_result()
+                        },
+                    )),
+                )
                 .unwrap();
 
             // Force a final tick
@@ -1906,91 +2012,11 @@ mod test_progress_reporter {
 mod suite {
     use std::time::Duration;
 
-    use abq_utils::{
-        exit,
-        net_protocol::runners::{Status, TestResult, TestResultSpec, TestRuntime},
-        net_protocol::{client::ReportedResult, entity::RunnerMeta},
-    };
+    use abq_utils::net_protocol::runners::TestRuntime;
 
     use crate::reporting::ExitCode;
 
-    use super::{
-        default_result, mock_summary, MockWriter, StdoutPreferences, SuiteReporters, SuiteResult,
-    };
-
-    fn get_overall_result<'a>(
-        results: impl IntoIterator<Item = &'a ReportedResult>,
-    ) -> SuiteResult {
-        let preferences = StdoutPreferences {
-            is_atty: false,
-            color: termcolor::ColorChoice::Auto,
-        };
-        let mut suite = SuiteReporters::new([], preferences, "test");
-        results
-            .into_iter()
-            .for_each(|r| suite.push_result(r).unwrap());
-        let (suite_result, _) = suite.finish(&mock_summary());
-        suite_result
-    }
-
-    macro_rules! test_status {
-        ($($test_name:ident, $status_order:expr, $expect_exit:expr, $count:expr)*) => {$(
-            #[test]
-            fn $test_name() {
-                use Status::*;
-
-                let results = $status_order.into_iter().map(|status| ReportedResult::no_captures(TestResult::new(RunnerMeta::fake(),TestResultSpec {
-                    status,
-                    ..default_result()
-                }))).collect::<Vec<_>>();
-
-                let SuiteResult {
-                    suggested_exit_code, count, ..
-                } = get_overall_result(&results);
-
-                assert_eq!(suggested_exit_code, $expect_exit);
-                assert_eq!(count, $count);
-            }
-        )*};
-    }
-
-    test_status! {
-        success_if_no_errors, [Success, Pending, Skipped], ExitCode::new(0), 3
-        fail_if_success_then_error, [
-            Success,
-            Error { exception: None, backtrace: None }],
-            ExitCode::new(1), 2
-        fail_if_error_then_success, [
-            Error { exception: None, backtrace: None },
-            Success],
-            ExitCode::new(1), 2
-        fail_if_success_then_failure, [
-            Success,
-            Failure { exception: None, backtrace: None }],
-            ExitCode::new(1), 2
-        fail_if_failure_then_success, [
-            Failure { exception: None, backtrace: None },
-            Success],
-            ExitCode::new(1), 2
-        error_if_success_then_internal_error, [Success, PrivateNativeRunnerError], ExitCode::new(exit::CODE_ERROR), 2
-        error_if_internal_error_then_success, [PrivateNativeRunnerError, Success], ExitCode::new(exit::CODE_ERROR), 2
-        error_if_error_then_internal_error, [
-            Error { exception: None, backtrace: None },
-            PrivateNativeRunnerError],
-            ExitCode::new(exit::CODE_ERROR), 2
-        error_if_internal_error_then_error, [
-            PrivateNativeRunnerError,
-            Error { exception: None, backtrace: None }],
-            ExitCode::new(exit::CODE_ERROR), 2
-        error_if_failure_then_internal_error, [
-            Failure { exception: None, backtrace: None },
-            PrivateNativeRunnerError],
-            ExitCode::new(exit::CODE_ERROR), 2
-        error_if_internal_error_then_failure, [
-            PrivateNativeRunnerError,
-            Failure { exception: None, backtrace: None }],
-            ExitCode::new(exit::CODE_ERROR), 2
-    }
+    use super::{MockWriter, SuiteResult};
 
     fn get_short_summary_lines(summary: SuiteResult) -> String {
         let mut mock_writer = MockWriter::default();
@@ -2006,6 +2032,7 @@ mod suite {
             suggested_exit_code: ExitCode::new(0),
             count: 10,
             count_failed: 0,
+            tests_retried: 0,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
         };
@@ -2021,12 +2048,29 @@ mod suite {
             suggested_exit_code: ExitCode::new(0),
             count: 10,
             count_failed: 5,
+            tests_retried: 0,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         Finished in 78.00 seconds (70.20 seconds spent in test code)
         10 tests, 5 failures
+        "###);
+    }
+
+    #[test]
+    fn summary_with_retries() {
+        let summary = SuiteResult {
+            suggested_exit_code: ExitCode::new(0),
+            count: 10,
+            count_failed: 5,
+            tests_retried: 3,
+            wall_time: Duration::from_secs(78),
+            test_time: TestRuntime::Milliseconds(70200.),
+        };
+        insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
+        Finished in 78.00 seconds (70.20 seconds spent in test code)
+        10 tests, 5 failures, 3 retried
         "###);
     }
 }

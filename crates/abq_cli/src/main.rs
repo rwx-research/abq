@@ -19,15 +19,12 @@ use std::{
 
 use abq_hosted::AccessToken;
 use abq_output::format_duration;
-use abq_queue::invoke::{
-    self, Client, CompletedSummary, InvocationError, ResultHandler, TestResultError,
-};
+use abq_queue::invoke::{self, Client, ResultHandler};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     exit::ExitCode,
     net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
-        client::ReportedResult,
         entity::{Entity, WorkerTag},
         health::Health,
         meta::DeprecationRecord,
@@ -299,6 +296,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         }
         Command::Test {
             worker,
+            retries,
             args,
             working_dir,
             run_id,
@@ -387,6 +385,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                     results_timeout,
                     num_runners,
                     working_dir,
+                    retries,
                 )
             } else {
                 workers::start_workers_standalone(
@@ -650,21 +649,6 @@ fn find_or_create_abq(
     }
 }
 
-struct ReporterHandlers {
-    reporters: &'static mut SuiteReporters,
-}
-
-impl invoke::ResultHandler for ReporterHandlers {
-    fn on_result(&mut self, result: ReportedResult) {
-        // TODO: is there a reasonable way to surface the error?
-        let _opt_error = self.reporters.push_result(&result);
-    }
-
-    fn tick(&mut self) {
-        self.reporters.tick();
-    }
-}
-
 fn run_sentinel_abq_test(
     supervisor_entity: Entity,
     access_token: &Option<AccessToken>,
@@ -677,19 +661,12 @@ fn run_sentinel_abq_test(
     results_timeout: Duration,
     num_runners: NonZeroUsize,
     working_dir: PathBuf,
+    retries: u32,
 ) -> anyhow::Result<ExitCode> {
     let test_suite_name = "suite"; // TODO: determine this correctly
 
-    let mut reporters = SuiteReporters::new(reporters, stdout_preferences, test_suite_name);
-
-    let result_handler = {
-        // Safety: rustc wants the `collector` to be live for the lifetime of the program because
-        // `work_results_thread` might escape. But, we know that `work_results_thread` won't
-        // escape; it vanishes at the end of this function, before `collector` is dropped.
-        let reporters: &'static mut SuiteReporters = unsafe { std::mem::transmute(&mut reporters) };
-
-        ReporterHandlers { reporters }
-    };
+    let reporter_data: <SuiteReporters as ResultHandler>::InitData =
+        (reporters, stdout_preferences, test_suite_name.to_owned());
 
     let runner = RunnerKind::GenericNativeTestRunner(runner_params.clone());
 
@@ -703,7 +680,8 @@ fn run_sentinel_abq_test(
         runner,
         batch_size,
         results_timeout,
-        result_handler,
+        retries,
+        reporter_data,
         track_exit_code_in_band,
     )?;
 
@@ -722,9 +700,11 @@ fn run_sentinel_abq_test(
         true, // workers in-band with supervisor
     )?;
 
-    let opt_invoked_error = work_results_thread.join().unwrap();
+    let mut opt_invoked_error = work_results_thread.join().unwrap();
 
-    reporters.after_all_results();
+    if let Ok((reporters, _)) = opt_invoked_error.as_mut() {
+        reporters.after_all_results();
+    }
 
     // Shutdown the localized worker pool
     {
@@ -744,7 +724,7 @@ fn run_sentinel_abq_test(
         print_final_runner_outputs(final_captured_outputs);
     }
 
-    let completed_summary = match opt_invoked_error {
+    let (reporters, completed_summary) = match opt_invoked_error {
         Ok(summary) => summary,
         Err(invoke_error) => {
             elaborate_invocation_error(invoke_error, runner_params)?;
@@ -780,20 +760,19 @@ fn run_sentinel_abq_test(
 }
 
 fn elaborate_invocation_error(
-    error: InvocationError,
+    error: invoke::Error,
     runner_params: NativeTestRunnerParams,
 ) -> io::Result<()> {
+    use invoke::Error::*;
+    use invoke::TestResultError::*;
     eprintln!("--- ERROR ---");
     let (err, opt_captured): (anyhow::Error, Option<CapturedOutput>) = match error {
-        InvocationError::Io(_)
-        | InvocationError::DuplicateRun(_)
-        | InvocationError::DuplicateCompletedRun(_) => {
+        Io(_) | DuplicateRun(_) | DuplicateCompletedRun(_) => {
             // The default error message provided is good here.
             (error.into(), None)
         }
-        InvocationError::TestResultError(error) => match error {
-            TestResultError::Io(error) => (error.into(), None),
-            TestResultError::TestCommandError(opaque_error, captured_output) => {
+        TestResultError(error) => match error {
+            TestCommandError(opaque_error, captured_output) => {
                 let NativeTestRunnerParams {
                     cmd,
                     args,
@@ -822,7 +801,7 @@ fn elaborate_invocation_error(
                 );
                 (anyhow::Error::msg(msg), Some(captured_output))
             }
-            TestResultError::TimedOut(after) => {
+            TimedOut(after) => {
                 let mut s = Vec::new();
                 format_duration(&mut s, TestRuntime::Milliseconds(after.as_millis() as _))
                     .expect("formatting duration to vec is infallible");
@@ -841,7 +820,7 @@ fn elaborate_invocation_error(
                 );
                 (anyhow::Error::msg(msg), None)
             }
-            TestResultError::Cancelled => (anyhow::Error::msg("Test run cancelled!"), None),
+            Cancelled => (anyhow::Error::msg("Test run cancelled!"), None),
         },
     };
 
@@ -876,9 +855,10 @@ fn start_test_result_reporter(
     runner: RunnerKind,
     batch_size: NonZeroU64,
     results_timeout: Duration,
-    result_handler: impl ResultHandler + Send + 'static,
+    retries: u32,
+    result_handler_data: <SuiteReporters as ResultHandler>::InitData,
     track_exit_code_in_band: bool,
-) -> io::Result<JoinHandle<Result<CompletedSummary, InvocationError>>> {
+) -> io::Result<JoinHandle<invoke::StreamResult<SuiteReporters>>> {
     let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
 
     let mut term_signals = Signals::new(TERM_SIGNALS)?;
@@ -903,13 +883,14 @@ fn start_test_result_reporter(
                 runner,
                 batch_size,
                 results_timeout,
+                retries,
                 invoke::DEFAULT_TICK_INTERVAL,
                 run_cancellation_rx,
                 track_exit_code_in_band,
             )
             .await?;
 
-            let completed_summary = abq_test_client.stream_results(result_handler).await?;
+            let completed_summary = abq_test_client.stream_results(result_handler_data).await?;
             Ok(completed_summary)
         });
 

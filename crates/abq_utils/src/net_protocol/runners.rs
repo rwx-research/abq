@@ -166,9 +166,31 @@ impl TestCase {
                 v0_2::TestCase {
                     id: id.into(),
                     meta,
+                    focus: None,
                 }
                 .into(),
             ),
+        }
+    }
+
+    pub fn has_focus(&self) -> bool {
+        use PrivTestCase::*;
+        match &self.0 {
+            V0_2(tc) => tc.has_focus(),
+        }
+    }
+
+    pub fn clear_focus(&mut self) {
+        use PrivTestCase::*;
+        match &mut self.0 {
+            V0_2(tc) => tc.clear_focus(),
+        }
+    }
+
+    pub fn add_test_focus(&mut self, test: TestId) {
+        use PrivTestCase::*;
+        match &mut self.0 {
+            V0_2(tc) => tc.add_focus(test),
         }
     }
 }
@@ -186,6 +208,13 @@ impl TestCaseMessage {
         use PrivTestCase::*;
         match test_case.0 {
             V0_2(test_case) => Self(v0_2::TestCaseMessage { test_case }.into()),
+        }
+    }
+
+    pub fn id(&self) -> TestId {
+        use PrivTestCaseMessage::*;
+        match &self.0 {
+            V0_2(msg) => msg.test_case.id.clone(),
         }
     }
 }
@@ -256,8 +285,8 @@ impl From<RawManifest> for Manifest {
 }
 
 impl Manifest {
-    /// Flattens a manifest into only [TestId]s, preserving the manifest order.
-    pub fn flatten(self) -> (Vec<TestCase>, MetadataMap) {
+    /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
+    pub fn flatten(self) -> (Vec<TestSpec>, MetadataMap) {
         use v0_2::{Group, Test, TestCase, TestOrGroup};
 
         let Manifest { members, init_meta } = self;
@@ -266,7 +295,19 @@ impl Manifest {
         while let Some(test_or_group) = queue.pop_front() {
             match test_or_group {
                 TestOrGroup::Test(Test { id, meta, .. }) => {
-                    collected.push(self::TestCase(TestCase { id, meta }.into()));
+                    let spec = TestSpec {
+                        // Generate a fresh ID for ABQ-internal usage.
+                        work_id: WorkId::new(),
+                        test_case: self::TestCase(
+                            TestCase {
+                                id,
+                                meta,
+                                focus: None,
+                            }
+                            .into(),
+                        ),
+                    };
+                    collected.push(spec);
                 }
                 TestOrGroup::Group(Group { members, .. }) => {
                     for member in members.into_iter().rev() {
@@ -466,8 +507,10 @@ impl std::fmt::Display for Location {
 pub use v0_2::OutOfBandError;
 
 use crate::exit::ExitCode;
+use crate::net_protocol::workers::WorkId;
 
 use super::entity::RunnerMeta;
+use super::queue::TestSpec;
 
 impl std::fmt::Display for OutOfBandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -684,6 +727,17 @@ impl RawTestResultMessage {
             V0_2 => Self(PrivTestResultMessage::V0_2(
                 v0_2::TestResultMessage::Single(v0_2::SingleTestResultMessage {
                     test_result: TestResult::fake().into(),
+                }),
+            )),
+        }
+    }
+
+    pub fn from_test_result(witness: ProtocolWitness, test_result: TestResult) -> Self {
+        use PrivProtocolWitness::*;
+        match witness.0 {
+            V0_2 => Self(PrivTestResultMessage::V0_2(
+                v0_2::TestResultMessage::Single(v0_2::SingleTestResultMessage {
+                    test_result: test_result.into(),
                 }),
             )),
         }

@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 regex.workspace = true
 tracing-test.workspace = true
+abq_utils = { path = "../../abq_utils" }

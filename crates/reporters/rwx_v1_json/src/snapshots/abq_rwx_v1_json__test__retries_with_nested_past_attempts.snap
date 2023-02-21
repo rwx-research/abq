@@ -1,0 +1,115 @@
+---
+source: crates/reporters/rwx_v1_json/src/lib.rs
+expression: json
+---
+{
+  "$schema": "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json",
+  "framework": {
+    "kind": "other",
+    "language": "other",
+    "providedKind": "zframework",
+    "providedLanguage": "zlang"
+  },
+  "summary": {
+    "status": {
+      "kind": "failed"
+    },
+    "tests": 1,
+    "otherErrors": 0,
+    "retries": 1,
+    "canceled": 0,
+    "failed": 1,
+    "pended": 0,
+    "quarantined": 0,
+    "skipped": 0,
+    "successful": 0,
+    "timedOut": 0,
+    "todo": 0
+  },
+  "tests": [
+    {
+      "id": "id1",
+      "name": "app::module::test1",
+      "lineage": [
+        "TopLevel",
+        "SubModule",
+        "Test"
+      ],
+      "location": {
+        "file": "a/b/x.file",
+        "line": 10,
+        "column": 15
+      },
+      "attempt": {
+        "durationInNanoseconds": 0,
+        "meta": {
+          "abq_metadata": {
+            "runner": 1,
+            "worker": 0
+          }
+        },
+        "status": {
+          "kind": "failed",
+          "message": "I failed a final time"
+        },
+        "stderr": "my stdout",
+        "stdout": "my stderr",
+        "startedAt": "1994-11-05T13:15:30Z",
+        "finishedAt": "1994-11-05T13:17:30Z"
+      },
+      "pastAttempts": [
+        {
+          "durationInNanoseconds": 0,
+          "meta": {
+            "abq_metadata": {
+              "runner": 1,
+              "worker": 0
+            }
+          },
+          "status": {
+            "kind": "failed",
+            "message": "I failed a first time"
+          },
+          "stderr": "my stdout",
+          "stdout": "my stderr",
+          "startedAt": "1994-11-05T13:15:30Z",
+          "finishedAt": "1994-11-05T13:17:30Z"
+        },
+        {
+          "durationInNanoseconds": 0,
+          "meta": {
+            "abq_metadata": {
+              "runner": 1,
+              "worker": 0
+            }
+          },
+          "status": {
+            "kind": "failed",
+            "message": "I failed a second time"
+          },
+          "stderr": "my stdout",
+          "stdout": "my stderr",
+          "startedAt": "1994-11-05T13:15:30Z",
+          "finishedAt": "1994-11-05T13:17:30Z"
+        },
+        {
+          "durationInNanoseconds": 0,
+          "meta": {
+            "abq_metadata": {
+              "runner": 1,
+              "worker": 0
+            }
+          },
+          "status": {
+            "kind": "failed",
+            "message": "I failed a third time"
+          },
+          "stderr": "my stdout",
+          "stdout": "my stderr",
+          "startedAt": "1994-11-05T13:15:30Z",
+          "finishedAt": "1994-11-05T13:17:30Z"
+        }
+      ]
+    }
+  ]
+}

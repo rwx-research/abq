@@ -1,7 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time};
 
 use abq_utils::{
-    exit::ExitCode,
     net_protocol::{entity::Entity, workers::RunId},
     vec_map::VecMap,
 };
@@ -9,37 +8,9 @@ use parking_lot::Mutex;
 
 use crate::worker_timings::{new_worker_timings, WorkerTimings};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum RunSuccess {
-    /// So far, has the run been entirely successful?
-    Success(bool),
-    /// The success and exit code of the run will be determined by an external process.
-    DetermineOutOfBand,
-}
-
-impl RunSuccess {
-    fn account(&mut self, partial_result_successful: bool) {
-        match self {
-            RunSuccess::Success(success) => {
-                *success = *success && partial_result_successful;
-            }
-            RunSuccess::DetermineOutOfBand => {}
-        }
-    }
-
-    pub fn into_opt_exit_code(self) -> Option<ExitCode> {
-        match self {
-            RunSuccess::Success(true) => Some(ExitCode::SUCCESS),
-            RunSuccess::Success(false) => Some(ExitCode::FAILURE),
-            RunSuccess::DetermineOutOfBand => None,
-        }
-    }
-}
-
 pub struct ActiveRunState {
     /// Amount of work items left for the run.
     work_left: usize,
-    run_success: RunSuccess,
 
     /// The timestamps at which each worker in the test run completed all tests it was assigned to.
     /// This data is stored to estimate deltas between when a worker completed its assigned
@@ -52,26 +23,29 @@ pub struct ActiveRunState {
 }
 
 impl ActiveRunState {
-    pub fn new(manifest_len: usize, starting_run_success_state: RunSuccess) -> Self {
+    pub fn new(manifest_len: usize) -> Self {
         Self {
             work_left: manifest_len,
-            run_success: starting_run_success_state,
             worker_completed_times: new_worker_timings(),
         }
     }
 
     /// Returns whether any work is left, and the current success status.
-    pub fn account_results(
-        &mut self,
-        num_results: usize,
-        is_any_fail_like: bool,
-    ) -> (bool, RunSuccess) {
+    pub fn account_results(&mut self, num_results: usize) -> bool {
         // TODO: hedge against underflow here
         self.work_left -= num_results;
 
-        self.run_success.account(!is_any_fail_like);
+        self.work_left == 0
+    }
 
-        (self.work_left == 0, self.run_success)
+    /// Add more work to run.
+    pub fn insert_additional_work_count(&mut self, retries: usize) {
+        self.work_left += retries;
+    }
+
+    #[cfg(test)]
+    pub fn get_work_left(&self) -> usize {
+        self.work_left
     }
 
     pub fn insert_worker_completed(

@@ -1,18 +1,21 @@
 //! Utilities for buffering and acting on messages (from the queue), refilling messages on-demand.
 
+use abq_utils::log_assert;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 enum Msg<T> {
     BatchSize(usize),
-    Msg(T),
+    Item(T),
+    ForceFlush,
 }
 
 impl<T> std::fmt::Debug for Msg<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BatchSize(arg0) => f.debug_tuple("BatchSize").field(arg0).finish(),
-            Self::Msg(_) => f.debug_tuple("Msg").finish(),
+            Self::Item(_) => f.debug_tuple("Item").finish(),
+            Self::ForceFlush => f.debug_tuple("ForceFlush").finish(),
         }
     }
 }
@@ -87,20 +90,28 @@ impl<T> BatchedProducer<T> {
     where
         F: FetchMessages<T = T>,
     {
-        let mut msgs;
-        let mut completed;
         loop {
-            (msgs, completed) = fetcher.fetch().await;
+            let (msgs, completed) = fetcher.fetch().await;
 
             // If we fail to send the message, the consumer has exited early and we have nothing
             // more to do.
-            if self.msg_tx.send(Msg::BatchSize(msgs.len())).await.is_err() {
-                return;
-            };
-            for msg in msgs {
-                if self.msg_tx.send(Msg::Msg(msg)).await.is_err() {
+            if msgs.len() > 0 {
+                if self.msg_tx.send(Msg::BatchSize(msgs.len())).await.is_err() {
+                    return;
+                };
+                for msg in msgs {
+                    if self.msg_tx.send(Msg::Item(msg)).await.is_err() {
+                        return;
+                    }
+                }
+                if self.msg_tx.send(Msg::ForceFlush).await.is_err() {
                     return;
                 }
+            } else {
+                log_assert!(
+                    completed.0,
+                    "empty batch should only appear when producer is complete"
+                );
             }
 
             if completed.0 {
@@ -115,9 +126,15 @@ impl<T> BatchedProducer<T> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RecvMsg<T> {
+    Item(T),
+    FlushProcessed,
+}
+
 impl<T> BatchedConsumer<T> {
     /// Returns the next message in the channel, or [None] if the channel is complete.
-    pub async fn recv(&mut self) -> Option<T> {
+    pub async fn recv(&mut self) -> Option<RecvMsg<T>> {
         // If the channel is closed, we're all done.
         let msg = self.msg_rx.recv().await?;
 
@@ -130,11 +147,12 @@ impl<T> BatchedConsumer<T> {
                 let msg = self.msg_rx.recv().await?;
 
                 match msg {
-                    Msg::BatchSize(_) => panic!("Unexpected batch size message"),
-                    Msg::Msg(msg) => msg,
+                    Msg::BatchSize(_) | Msg::ForceFlush => panic!("Unexpected batch size message"),
+                    Msg::Item(msg) => msg,
                 }
             }
-            Msg::Msg(msg) => msg,
+            Msg::Item(msg) => msg,
+            Msg::ForceFlush => return Some(RecvMsg::FlushProcessed),
         };
 
         self.current_batch_processed += 1;
@@ -159,7 +177,7 @@ impl<T> BatchedConsumer<T> {
             self.eligible_for_refill = false;
         }
 
-        Some(msg)
+        Some(RecvMsg::Item(msg))
     }
 
     /// Shuts down the consumer and producer, returning all pending messages from the producer. The
@@ -183,7 +201,8 @@ impl<T> BatchedConsumer<T> {
         while let Some(msg) = msg_rx.recv().await {
             match msg {
                 Msg::BatchSize(_) => continue,
-                Msg::Msg(msg) => remaining.push(msg),
+                Msg::ForceFlush => continue,
+                Msg::Item(msg) => remaining.push(msg),
             }
         }
         remaining
@@ -201,7 +220,7 @@ mod test {
     use abq_utils::atomic;
     use async_trait::async_trait;
 
-    use super::{channel, Completed, FetchMessages, RefillStrategy};
+    use super::{channel, Completed, FetchMessages, RecvMsg, RefillStrategy};
 
     async fn run_channels<F, E, C, CFut>(
         capacity: usize,
@@ -212,7 +231,7 @@ mod test {
     where
         F: FetchMessages,
 
-        C: Fn(F::T) -> CFut,
+        C: Fn(RecvMsg<F::T>) -> CFut,
         CFut: IntoFuture<Output = Result<(), E>>,
     {
         let (tx, mut rx) = channel(capacity, refill_strategy);
@@ -254,12 +273,26 @@ mod test {
         let mut fetcher = Fetcher { count: 0 };
 
         let next_expected = Arc::new(AtomicU8::new(1));
+        let next_expected_flush_msg = Arc::new(AtomicU8::new(2));
         let process_msg = |n| {
             let next_expected = next_expected.clone();
+            let next_expected_flush_msg = next_expected_flush_msg.clone();
             async move {
-                assert_eq!(next_expected.load(atomic::ORDERING), n);
-                next_expected.fetch_add(1, atomic::ORDERING);
-                Result::<_, Infallible>::Ok(())
+                match n {
+                    RecvMsg::Item(n) => {
+                        assert_eq!(next_expected.load(atomic::ORDERING), n);
+                        next_expected.fetch_add(1, atomic::ORDERING);
+                        Result::<_, Infallible>::Ok(())
+                    }
+                    RecvMsg::FlushProcessed => {
+                        let expected_flush_msg = next_expected_flush_msg.load(atomic::ORDERING);
+
+                        assert_eq!(next_expected.load(atomic::ORDERING), expected_flush_msg);
+                        next_expected_flush_msg.fetch_add(1, atomic::ORDERING);
+
+                        Ok(())
+                    }
+                }
             }
         };
 
@@ -294,12 +327,34 @@ mod test {
         let mut fetcher = Fetcher { count: 0 };
 
         let next_expected = Arc::new(AtomicU8::new(1));
+        let next_expected_flush_msg = Arc::new(AtomicU8::new(4));
         let process_msg = |n| {
             let next_expected = next_expected.clone();
+            let next_expected_flush_msg = next_expected_flush_msg.clone();
             async move {
-                assert_eq!(next_expected.load(atomic::ORDERING), n);
-                next_expected.fetch_add(1, atomic::ORDERING);
-                Result::<_, Infallible>::Ok(())
+                match n {
+                    RecvMsg::Item(n) => {
+                        assert_eq!(next_expected.load(atomic::ORDERING), n);
+                        next_expected.fetch_add(1, atomic::ORDERING);
+                        Result::<_, Infallible>::Ok(())
+                    }
+                    RecvMsg::FlushProcessed => {
+                        let expected_flush_msg = next_expected_flush_msg.load(atomic::ORDERING);
+
+                        assert_eq!(next_expected.load(atomic::ORDERING), expected_flush_msg);
+
+                        let next_expected_flush_idx = match expected_flush_msg {
+                            4 => 7,
+                            7 => 9,
+                            9 => 100,
+                            _ => unreachable!(),
+                        };
+
+                        next_expected_flush_msg.store(next_expected_flush_idx, atomic::ORDERING);
+
+                        Ok(())
+                    }
+                }
             }
         };
 
@@ -338,7 +393,7 @@ mod test {
         assert!(result.is_err(), "{:?}", result);
 
         let (n, rem_msgs) = result.unwrap_err();
-        assert_eq!(n, 1);
+        assert_eq!(n, RecvMsg::Item(1));
         assert_eq!(rem_msgs, &[2, 3, 4]);
 
         assert_eq!(fetcher.count, 1);
@@ -374,7 +429,7 @@ mod test {
             // Pull one message and immediately exit - this should force a refill on the producer
             // side, but the consumer may not be around.
             let msg = rx.recv().await.unwrap();
-            assert_eq!(msg, 1);
+            assert_eq!(msg, RecvMsg::Item(1));
 
             drop(rx);
         };
