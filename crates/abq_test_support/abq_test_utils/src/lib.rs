@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::{io, net::SocketAddr, num::NonZeroU64, path::PathBuf};
+
+use abq_utils::net_async;
 
 pub const WORKSPACE: &str = env!("ABQ_WORKSPACE_DIR");
 
@@ -37,6 +39,18 @@ pub fn assert_scoped_logs(scope: &str, f: impl Fn(&[&str]) -> bool) {
         Ok(()) => (),
         Err(e) => panic!("{e}"),
     }
+}
+
+pub fn one_nonzero() -> NonZeroU64 {
+    1.try_into().unwrap()
+}
+
+pub async fn accept_handshake(
+    listener: &dyn net_async::ServerListener,
+) -> io::Result<(Box<dyn net_async::ServerStream>, SocketAddr)> {
+    let (unverified, addr) = listener.accept().await?;
+    let stream = listener.handshake_ctx().handshake(unverified).await?;
+    Ok((stream, addr))
 }
 
 pub fn sanitize_output(s: &str) -> String {

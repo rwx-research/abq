@@ -878,6 +878,7 @@ mod test {
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::entity::{Entity, WorkerTag};
+    use abq_utils::net_protocol::queue::TestSpec;
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
     };
@@ -886,7 +887,7 @@ mod test {
     };
     use abq_utils::net_protocol::workers::{
         ManifestResult, NextWork, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
-        TestLikeRunner, WorkId, WorkerTest,
+        TestLikeRunner, WorkId, WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
@@ -927,10 +928,13 @@ mod test {
                             .0
                             .into_iter()
                             .enumerate()
-                            .map(|(i, test_case)| {
+                            .map(|(i, spec)| {
                                 NextWork::Work(WorkerTest {
-                                    test_case,
-                                    work_id: WorkId([i as _; 16]),
+                                    spec: TestSpec {
+                                        test_case: spec.test_case,
+                                        work_id: WorkId([i as _; 16]),
+                                    },
+                                    run_number: INIT_RUN_NUMBER,
                                 })
                             })
                             .collect();
@@ -962,7 +966,7 @@ mod test {
                             while !all_done {
                                 let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
                                 all_done = matches!(work, NextWork::EndOfWork);
-                                let work_bundle = NextWorkBundle(vec![work]);
+                                let work_bundle = NextWorkBundle::new(vec![work]);
 
                                 let NextTestRequest {} = match net_protocol::read(&mut worker) {
                                     Ok(r) => r,

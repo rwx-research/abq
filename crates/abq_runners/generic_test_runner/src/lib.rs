@@ -1,4 +1,5 @@
-use std::io::{self, Read};
+use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use std::process::Stdio;
@@ -13,11 +14,12 @@ use buffered_results::BufferedResults;
 use capture_output::OutputCapturer;
 use message_buffer::{Completed, RefillStrategy};
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{self, ChildStderr, ChildStdout, Command};
+use tokio::process::{self, ChildStderr, ChildStdout};
 
 use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
-use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted};
+use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted, TestSpec};
 use abq_utils::net_protocol::runners::{
     CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
     NativeRunnerSpawnedMessage, NativeRunnerSpecification, OutOfBandError, ProtocolWitness,
@@ -27,7 +29,7 @@ use abq_utils::net_protocol::runners::{
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
     ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, WorkId,
-    WorkerTest,
+    WorkerTest, INIT_RUN_NUMBER,
 };
 use abq_utils::{atomic, net_protocol};
 use futures::future::BoxFuture;
@@ -38,6 +40,7 @@ use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crate::capture_output::capture_output;
+use crate::message_buffer::RecvMsg;
 
 mod buffered_results;
 mod capture_output;
@@ -349,7 +352,232 @@ impl GenericTestRunner {
     }
 }
 
-type ResultsSender = mpsc::Sender<AssociatedTestResults>;
+#[derive(Clone, Copy)]
+struct NativeRunnerArgs<'a> {
+    program: &'a str,
+    args: &'a [String],
+    env: &'a HashMap<String, String>,
+    working_dir: &'a Path,
+}
+
+struct NativeRunnerState {
+    child: process::Child,
+    capture_pipes: CapturePipes,
+    conn: RunnerConnection,
+    runner_info: NativeRunnerInfo,
+}
+
+/// Representation of a native runner between one or more test suite runs.
+struct NativeRunnerHandle<'a> {
+    listener: TcpListener,
+    protocol_version_timeout: Duration,
+    args: NativeRunnerArgs<'a>,
+    /// The current test suite run number.
+    run_number: u32,
+    /// State of the native runner for the current [run_number].
+    state: NativeRunnerState,
+}
+
+// Allow access to a current native runner's state directly through the handle.
+impl<'a> std::ops::Deref for NativeRunnerHandle<'a> {
+    type Target = NativeRunnerState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+impl<'a> std::ops::DerefMut for NativeRunnerHandle<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl<'a> NativeRunnerHandle<'a> {
+    /// Create a new handle to manage one or more native runner instances across one or more
+    /// runs of a test suite.
+    async fn new(
+        mut listener: TcpListener,
+        args: NativeRunnerArgs<'a>,
+        protocol_version_timeout: Duration,
+    ) -> Result<NativeRunnerHandle<'a>, GenericRunnerError> {
+        let run_number = INIT_RUN_NUMBER;
+        let native_runner_state =
+            Self::new_native_runner(&mut listener, args, protocol_version_timeout).await?;
+        Ok(Self {
+            listener,
+            protocol_version_timeout,
+            args,
+            run_number,
+            state: native_runner_state,
+        })
+    }
+
+    // Start a test runner.
+    //
+    // The interface between us and the runner is described at
+    //   https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-Interface-0959f5a9144741d798ac122566a3d887
+    //
+    // In short: the protocol is
+    //
+    // Queue |                       | Worker (us) |                              | Native runner
+    //       |                       |             | <- recv ProtocolVersion -    |
+    //       | <- send Init-Meta -   |             |                              |
+    //       | - recv Init-Meta ->   |             |                              |
+    //       |                       |             | - send InitMessage    ->     |
+    //       |                       |             | <- recv InitSuccessMessage - |
+    //       | <- send Next-Test -   |             |                              |
+    //       | - recv Next-Test ->   |             |                              |
+    //       |                       |             | - send TestCaseMessage ->    |
+    //       |                       |             | <- recv TestResult -         |
+    //       | <- send Test-Result - |             |                              |
+    //       |                       |             |                              |
+    //       |          ...          |             |          ...                 |
+    //       |                       |             |                              |
+    //       | <- send Next-Test -   |             |                              |
+    //       | -   recv Done    ->   |             |      <close conn>            |
+    // Queue |                       | Worker (us) |                              | Native runner
+    async fn new_native_runner(
+        listener: &mut TcpListener,
+        args: NativeRunnerArgs<'a>,
+        protocol_version_timeout: Duration,
+    ) -> Result<NativeRunnerState, GenericRunnerError> {
+        let our_addr = try_setup!(listener.local_addr());
+
+        let NativeRunnerArgs {
+            program,
+            args,
+            env,
+            working_dir,
+        } = args;
+
+        let mut native_runner = process::Command::new(program);
+        native_runner.args(args);
+        native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
+        native_runner.envs(env);
+        native_runner.current_dir(working_dir);
+
+        // The stdout/stderr will be captured manually below.
+        native_runner.stdout(Stdio::piped());
+        native_runner.stderr(Stdio::piped());
+
+        // If launching the native runner fails here, it should have failed during manifest
+        // generation as well (unless this is a flakey error in the underlying test runner, channel
+        // we do not attempt to handle gracefully). Since the failure during manifest generation
+        // will have notified the queue, at this point, failures should just result in the worker
+        // exiting silently itself.
+        let mut child = try_setup!(native_runner.spawn());
+
+        // Set up capturing of the native runner's stdout/stderr.
+        // We want both standard pipes of the child to point to managed buffers from which
+        // we'll extract output when an individual test completes.
+        let capture_pipes = {
+            let child_stdout = child.stdout.take().expect("just spawned");
+            let child_stderr = child.stderr.take().expect("just spawned");
+            CapturePipes::new(child_stdout, child_stderr)
+        };
+
+        let native_runner_died = async {
+            let _ = child.wait().await;
+        };
+
+        // First, get and validate the protocol version message.
+        let opt_open_connection_err =
+            open_native_runner_connection(listener, protocol_version_timeout, native_runner_died)
+                .await
+                .located(here!());
+
+        let (runner_info, runner_conn) = match opt_open_connection_err {
+            Ok(r) => r,
+            Err(error) => {
+                let output = capture_pipes
+                    .finish()
+                    .await
+                    .unwrap_or_else(|_| CapturedOutput::empty());
+                return Err(GenericRunnerError { error, output });
+            }
+        };
+
+        Ok(NativeRunnerState {
+            child,
+            capture_pipes,
+            conn: runner_conn,
+            runner_info,
+        })
+    }
+
+    async fn send_init_message(&mut self, init_context: &InitContext) -> Result<(), LocatedError> {
+        let InitContext { init_meta } = init_context;
+        let init_message = net_protocol::runners::InitMessage::new(
+            self.state.runner_info.protocol,
+            // TODO: can we get rid of clone here?
+            init_meta.clone(),
+            FastExit(false),
+        );
+
+        self.state
+            .conn
+            .write(&init_message)
+            .await
+            .located(here!())?;
+
+        let _init_success: InitSuccessMessage = self.state.conn.read().await.located(here!())?;
+
+        Ok(())
+    }
+
+    async fn send_fast_exit_message(&mut self) -> Result<ExitCode, LocatedError> {
+        let init_message = net_protocol::runners::InitMessage::new(
+            self.state.runner_info.protocol,
+            Default::default(),
+            FastExit(true),
+        );
+        self.state
+            .conn
+            .write(&init_message)
+            .await
+            .located(here!())?;
+        let exit_status = self.state.child.wait().await.located(here!())?;
+        Ok(exit_status.into())
+    }
+
+    /// If the run number exceeds the currently-configured native runner's run number, allocate a
+    /// new native runner for the new suite run.
+    async fn reconcile_run_number(
+        &mut self,
+        new_run_number: u32,
+        init_context: &InitContext,
+    ) -> Result<(), LocatedError> {
+        if new_run_number == self.run_number {
+            return Ok(());
+        }
+
+        debug_assert!(
+            new_run_number >= self.run_number,
+            "run number must monotonically increase"
+        );
+
+        // We have hit the end of what we'll communicate to the current native runner for this test
+        // suite run, so shut it down and collect any remaining output.
+        self.state.conn.stream.shutdown().await.located(here!())?;
+        // TODO: record exit status, captures and pass it up when whole run completes.
+        let _exit_status = self.state.child.wait().await.located(here!())?;
+        let _captures = self.state.capture_pipes.get_captured();
+
+        // Prime the new runner.
+        self.state =
+            Self::new_native_runner(&mut self.listener, self.args, self.protocol_version_timeout)
+                .await
+                .map_err(|e| e.error)?;
+        self.run_number = new_run_number;
+
+        // Send the initialization message.
+        self.send_init_message(init_context)
+            .await
+            .located(here!())?;
+
+        Ok(())
+    }
+}
 
 async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     runner_entity: Entity,
@@ -406,76 +634,33 @@ where
         }
     }
 
-    // Now, start the test runner.
-    //
-    // The interface between us and the runner is described at
-    //   https://www.notion.so/rwx/ABQ-Worker-Native-Test-Runner-Interface-0959f5a9144741d798ac122566a3d887
-    //
-    // In short: the protocol is
-    //
-    // Queue |                       | Worker (us) |                              | Native runner
-    //       |                       |             | <- recv ProtocolVersion -    |
-    //       | <- send Init-Meta -   |             |                              |
-    //       | - recv Init-Meta ->   |             |                              |
-    //       |                       |             | - send InitMessage    ->     |
-    //       |                       |             | <- recv InitSuccessMessage - |
-    //       | <- send Next-Test -   |             |                              |
-    //       | - recv Next-Test ->   |             |                              |
-    //       |                       |             | - send TestCaseMessage ->    |
-    //       |                       |             | <- recv TestResult -         |
-    //       | <- send Test-Result - |             |                              |
-    //       |                       |             |                              |
-    //       |          ...          |             |          ...                 |
-    //       |                       |             |                              |
-    //       | <- send Next-Test -   |             |                              |
-    //       | -   recv Done    ->   |             |      <close conn>            |
-    // Queue |                       | Worker (us) |                              | Native runner
-    let our_listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
-    let our_addr = try_setup!(our_listener.local_addr());
-
-    let mut native_runner = process::Command::new(cmd);
-    native_runner.args(args);
-    native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
-    native_runner.envs(additional_env);
-    native_runner.current_dir(working_dir);
-
-    // The stdout/stderr will be captured manually below.
-    native_runner.stdout(Stdio::piped());
-    native_runner.stderr(Stdio::piped());
-
-    // If launching the native runner fails here, it should have failed during manifest
-    // generation as well (unless this is a flakey error in the underlying test runner, channel
-    // we do not attempt to handle gracefully). Since the failure during manifest generation
-    // will have notified the queue, at this point, failures should just result in the worker
-    // exiting silently itself.
-    let mut native_runner_handle = try_setup!(native_runner.spawn());
-
-    // Set up capturing of the native runner's stdout/stderr.
-    // We want both standard pipes of the child to point to managed buffers from which
-    // we'll extract output when an individual test completes.
-    let capture_pipes = {
-        let child_stdout = native_runner_handle.stdout.take().expect("just spawned");
-        let child_stderr = native_runner_handle.stderr.take().expect("just spawned");
-        CapturePipes::new(child_stdout, child_stderr)
+    let native_runner_args = NativeRunnerArgs {
+        program: &cmd,
+        args: &args,
+        env: &additional_env,
+        working_dir,
     };
 
+    let listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
+    let mut native_runner_handle =
+        NativeRunnerHandle::new(listener, native_runner_args, protocol_version_timeout).await?;
+
     let opt_err = run_help(
-        native_runner_handle,
-        our_listener,
-        protocol_version_timeout,
+        &mut native_runner_handle,
         get_init_context,
-        &capture_pipes,
         results_batch_size,
         get_next_test_bundle,
         send_test_results,
         notify_all_tests_run,
         runner_entity,
         runner_meta,
-        native_runner,
+        native_runner_args,
     )
     .await;
 
-    let output = capture_pipes
+    let output = native_runner_handle
+        .state
+        .capture_pipes
         .finish()
         .await
         .unwrap_or_else(|_| CapturedOutput::empty());
@@ -490,40 +675,51 @@ where
     }
 }
 
+/// A message sent to the results channel. Sometimes we need to force a flush, even if we
+/// haven't hit the test results buffer size.
+enum ResultsMsg {
+    Results(AssociatedTestResults),
+    ForceFlush,
+}
+
+type ResultsSender = mpsc::Sender<ResultsMsg>;
+
+async fn try_send_result_to_channel(
+    work_id: Option<WorkId>,
+    results_chan: &ResultsSender,
+    msg: ResultsMsg,
+) -> io::Result<()> {
+    let send_to_chan_result = results_chan.send(msg).await;
+
+    if send_to_chan_result.is_err() {
+        tracing::error!(?work_id, "results channel closed prematurely");
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "results channel closed prematurely, likely due to a previous failure to send test results across a network"
+        ));
+    }
+
+    Ok(())
+}
+
 async fn run_help<'a, GetInitContext>(
-    mut native_runner_handle: process::Child,
-    mut our_listener: TcpListener,
-    protocol_version_timeout: Duration,
+    native_runner_handle: &mut NativeRunnerHandle<'a>,
     get_init_context: GetInitContext,
-    capture_pipes: &'a CapturePipes,
     results_batch_size: u64,
     test_fetcher: GetNextTests,
     send_test_results: SendTestResults<'a>,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     runner_entity: Entity,
     runner_meta: RunnerMeta,
-    native_runner: Command,
+    native_runner_args: NativeRunnerArgs<'a>,
 ) -> Result<ExitCode, LocatedError>
 where
     GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
 {
-    let native_runner_died = async {
-        let _ = native_runner_handle.wait().await;
-    };
-
-    // First, get and validate the protocol version message.
-    let (runner_info, mut runner_conn) = open_native_runner_connection(
-        &mut our_listener,
-        protocol_version_timeout,
-        native_runner_died,
-    )
-    .await
-    .located(here!())?;
-
     let NativeRunnerInfo {
-        protocol,
+        protocol: _,
         specification: runner_spec,
-    } = runner_info;
+    } = &native_runner_handle.runner_info;
 
     tracing::info!(integration=?runner_spec.name, version=?runner_spec.version, "Launched native test runner");
 
@@ -534,26 +730,20 @@ where
     // context will be material. As such, we want to spawn the native runner before fetching
     // the initialization context; that way we can pay the price of startup and
     // context-fetching in parallel.
+    let init_context: InitContext;
     {
         match get_init_context().located(here!())? {
-            Ok(InitContext { init_meta }) => {
-                let init_message =
-                    net_protocol::runners::InitMessage::new(protocol, init_meta, FastExit(false));
-                runner_conn.write(&init_message).await.located(here!())?;
-                let _init_success: InitSuccessMessage =
-                    runner_conn.read().await.located(here!())?;
+            Ok(the_init_context) => {
+                init_context = the_init_context;
+                native_runner_handle
+                    .send_init_message(&init_context)
+                    .await?;
             }
             Err(RunAlreadyCompleted {}) => {
                 // There is nothing more for the native runner to do, so we tell it to
                 // fast-exit and wait for it to terminate.
-                let init_message = net_protocol::runners::InitMessage::new(
-                    protocol,
-                    Default::default(),
-                    FastExit(true),
-                );
-                runner_conn.write(&init_message).await.located(here!())?;
-                let exit_status = native_runner_handle.wait().await.located(here!())?;
-                return Ok(exit_status.into());
+                let exit_code = native_runner_handle.send_fast_exit_message().await?;
+                return Ok(exit_code);
             }
         };
     }
@@ -577,60 +767,86 @@ where
     let send_results_task = async {
         let mut pending_results = BufferedResults::new(results_batch_size, send_test_results);
 
-        while let Some(test_result) = results_rx.recv().await {
-            pending_results.push(test_result).await;
+        use ResultsMsg::*;
+
+        while let Some(msg) = results_rx.recv().await {
+            match msg {
+                Results(test_result) => pending_results.push(test_result).await,
+                ForceFlush => pending_results.flush().await,
+            }
         }
 
         pending_results.flush().await;
     };
 
     let run_tests_task = async {
-        while let Some(WorkerTest { test_case, work_id }) = tests_rx.recv().await {
-            let estimated_start = Instant::now();
+        while let Some(msg) = tests_rx.recv().await {
+            match msg {
+                RecvMsg::Item(WorkerTest {
+                    spec: TestSpec { test_case, work_id },
+                    run_number,
+                }) => {
+                    native_runner_handle
+                        .reconcile_run_number(run_number, &init_context)
+                        .await
+                        .located(here!())?;
 
-            let handled_test = handle_one_test(
-                runner_meta,
-                &mut runner_conn,
-                capture_pipes,
-                work_id,
-                test_case,
-                &results_tx,
-            )
-            .await
-            .located(here!())?;
+                    let estimated_start = Instant::now();
 
-            let estimated_runtime = estimated_start.elapsed();
+                    let handled_test = handle_one_test(
+                        runner_meta,
+                        native_runner_handle,
+                        work_id,
+                        run_number,
+                        test_case,
+                        &results_tx,
+                    )
+                    .await
+                    .located(here!())?;
 
-            if let Err((work_id, native_error)) = handled_test {
-                let remaining_tests = tests_rx.flush().await;
+                    let estimated_runtime = estimated_start.elapsed();
 
-                // Take the output to send over the wire by ref; this is because we'll
-                // steal the captured output when handling the error below for display
-                // in the returned overall error.
-                let _ = native_runner_handle.wait().await;
-                let final_output = capture_pipes.get_captured_ref();
+                    if let Err((work_id, native_error)) = handled_test {
+                        let remaining_tests = tests_rx.flush().await;
 
-                handle_native_runner_failure(
-                    runner_meta,
-                    send_test_results,
-                    &native_runner,
-                    final_output,
-                    estimated_runtime,
-                    work_id,
-                    remaining_tests,
-                )
-                .await;
+                        // Take the output to send over the wire by ref; this is because we'll
+                        // steal the captured output when handling the error below for display
+                        // in the returned overall error.
+                        let _ = native_runner_handle.child.wait().await;
+                        let final_output = native_runner_handle.capture_pipes.get_captured_ref();
 
-                return Err(GenericRunnerErrorKind::from(native_error).located(here!()));
+                        handle_native_runner_failure(
+                            runner_meta,
+                            send_test_results,
+                            native_runner_args,
+                            final_output,
+                            estimated_runtime,
+                            work_id,
+                            run_number,
+                            remaining_tests,
+                        )
+                        .await;
+
+                        return Err(GenericRunnerErrorKind::from(native_error).located(here!()));
+                    }
+                }
+                RecvMsg::FlushProcessed => {
+                    try_send_result_to_channel(None, &results_tx, ResultsMsg::ForceFlush)
+                        .await
+                        .located(here!())?;
+                }
             }
         }
 
         drop(results_tx);
-        drop(runner_conn);
-        drop(our_listener);
-
         let ((), exit_status) = tokio::join!(notify_all_tests_run(runner_entity), async {
-            native_runner_handle.wait().await.located(here!())
+            native_runner_handle
+                .conn
+                .stream
+                .shutdown()
+                .await
+                .located(here!())?;
+            native_runner_handle.child.wait().await.located(here!())
         });
 
         let exit_status = exit_status?;
@@ -656,22 +872,22 @@ impl message_buffer::FetchMessages for NextBundleFetcher {
     type Iter = std::vec::IntoIter<Self::T>;
 
     async fn fetch(&mut self) -> (Self::Iter, Completed) {
-        let NextWorkBundle(bundle) = self.test_fetcher.get_next_tests().await;
+        let NextWorkBundle { work } = self.test_fetcher.get_next_tests().await;
 
-        let recv_size = bundle.len();
+        let recv_size = work.len();
 
         // NB: we can get rid of this allocation by returning the filter directly, and a word
         // for the length of the list after filtering. The allocation doesn't matter though.
-        let filtered_bundle: Vec<_> = bundle
+        let filtered_work: Vec<_> = work
             .into_iter()
             .filter_map(|test| test.into_test())
             .collect();
 
         // Completed if the bundle contained `EndOfWork` markers, or if there were no tests to
         // begin with!
-        let completed = filtered_bundle.len() < recv_size || filtered_bundle.is_empty();
+        let completed = filtered_work.len() < recv_size || filtered_work.is_empty();
 
-        (filtered_bundle.into_iter(), Completed(completed))
+        (filtered_work.into_iter(), Completed(completed))
     }
 }
 
@@ -737,9 +953,9 @@ impl CapturePipes {
 
 async fn handle_one_test(
     runner_meta: RunnerMeta,
-    runner_conn: &mut RunnerConnection,
-    capture_pipes: &CapturePipes,
+    native_runner: &mut NativeRunnerState,
     work_id: WorkId,
+    run_number: u32,
     test_case: TestCase,
     results_chan: &ResultsSender,
 ) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerErrorKind> {
@@ -747,25 +963,21 @@ async fn handle_one_test(
 
     let opt_test_results = send_and_wait_for_test_results(
         runner_meta,
+        native_runner,
         work_id,
-        runner_conn,
-        capture_pipes,
+        run_number,
         test_case_message,
     )
     .await;
 
     match opt_test_results {
         Ok(test_results) => {
-            let send_to_chan_result = results_chan.send(test_results).await;
-
-            if let Err(se) = send_to_chan_result {
-                let work_id = se.0.work_id;
-                tracing::error!(?work_id, "results channel closed prematurely");
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "results channel closed prematurely, likely do to a previous failure to send test results across a network"
-                ).into());
-            }
+            try_send_result_to_channel(
+                Some(work_id),
+                results_chan,
+                ResultsMsg::Results(test_results),
+            )
+            .await?;
 
             Ok(Ok(()))
         }
@@ -775,9 +987,9 @@ async fn handle_one_test(
 
 async fn send_and_wait_for_test_results(
     runner_meta: RunnerMeta,
+    native_runner: &mut NativeRunnerState,
     work_id: WorkId,
-    runner_conn: &mut RunnerConnection,
-    capture_pipes: &CapturePipes,
+    run_number: u32,
     test_case_message: TestCaseMessage,
 ) -> Result<AssociatedTestResults, (WorkId, io::Error)> {
     macro_rules! bail {
@@ -790,7 +1002,7 @@ async fn send_and_wait_for_test_results(
     }
 
     // Grab the "before-any-test" output.
-    let before_any_test = capture_pipes.get_captured();
+    let before_any_test = native_runner.capture_pipes.get_captured();
 
     // Prime the "after-all-tests" output.
     // Today, this is empty by default, since in general we associate output outside of a test to
@@ -799,8 +1011,8 @@ async fn send_and_wait_for_test_results(
     // `Done` message can be considered "after-all-tests" output.
     let mut after_test_captures = None;
 
-    bail!(runner_conn.write(&test_case_message).await);
-    let raw_msg: RawTestResultMessage = bail!(runner_conn.read().await);
+    bail!(native_runner.conn.write(&test_case_message).await);
+    let raw_msg: RawTestResultMessage = bail!(native_runner.conn.read().await);
 
     use net_protocol::runners::{
         IncrementalTestResultStep, RawIncrementalTestResultMessage, TestResultSet,
@@ -808,7 +1020,7 @@ async fn send_and_wait_for_test_results(
 
     // stop capturing stdout after we receive a test result message, since it necessarily
     // corresponds to at least one test result notification
-    let mut captured = capture_pipes.get_captured();
+    let mut captured = native_runner.capture_pipes.get_captured();
 
     let results = match raw_msg.into_test_results(runner_meta) {
         TestResultSet::All(mut results) => {
@@ -828,11 +1040,11 @@ async fn send_and_wait_for_test_results(
 
                         // Wait for the next incremental result.
                         let raw_increment: RawIncrementalTestResultMessage =
-                            bail!(runner_conn.read().await);
+                            bail!(native_runner.conn.read().await);
 
                         // Get the captured output for the test result that just completed, in
                         // `raw_increment`.
-                        captured = capture_pipes.get_captured();
+                        captured = native_runner.capture_pipes.get_captured();
 
                         step = raw_increment.into_step(runner_meta);
                     }
@@ -853,6 +1065,7 @@ async fn send_and_wait_for_test_results(
 
     Ok(AssociatedTestResults {
         work_id,
+        run_number,
         results,
         before_any_test,
         after_all_tests: after_test_captures,
@@ -884,40 +1097,14 @@ fn attach_pipe_output_to_test_result(test_result: &mut TestResult, captured: Cap
 const INDENT: &str = "    ";
 
 #[allow(clippy::format_push_string)] // write! can fail, push can't
-#[allow(unused)] // NB(130): will once again become relevant with https://github.com/rwx-research/abq/issues/130
-fn format_failed_fd(fd: Option<impl Read>, writer: &mut String, channel: &str) {
-    let read_result = fd.map(|mut fd| {
-        let mut out_buf = Vec::new();
-        fd.read_to_end(&mut out_buf)
-            .map(|_| String::from_utf8_lossy(&out_buf).to_string())
-    });
-
-    if let Some(Ok(out)) = read_result {
-        if !out.is_empty() {
-            writer.push_str(&format!(
-                "\n\nHere's the standard {channel} of the command:"
-            ));
-            for line in out.lines() {
-                writer.push_str(&format!("\n{INDENT}{line}"));
-            }
-        } else {
-            writer.push_str(&format!("\n\nThe command had no standard {channel}."));
-        }
-    } else {
-        writer.push_str(&format!(
-            "\n\nUnfortunately, we couldn't read the full standard {channel} of the command.",
-        ));
-    }
-}
-
-#[allow(clippy::format_push_string)] // write! can fail, push can't
 async fn handle_native_runner_failure<'a, I>(
     runner_meta: RunnerMeta,
     send_test_result: SendTestResults<'a>,
-    native_runner: &Command,
+    native_runner_args: NativeRunnerArgs<'a>,
     final_output: CapturedOutput,
     estimated_time_to_failure: Duration,
     failed_on: WorkId,
+    run_number: u32,
     remaining_work: I,
 ) where
     I: IntoIterator<Item = WorkerTest>,
@@ -925,16 +1112,15 @@ async fn handle_native_runner_failure<'a, I>(
     // Our connection with the native test runner failed, for some
     // reason. Consider this a fatal error, and report internal errors
     // back to the queue for the remaining test in the batch.
-    let args: Vec<String> = std::iter::once(native_runner.as_std().get_program())
-        .chain(native_runner.as_std().get_args())
-        .map(|s| s.to_string_lossy().to_string())
+    let args: Vec<String> = std::iter::once(native_runner_args.program.to_string())
+        .chain(native_runner_args.args.iter().cloned())
         .collect();
 
     tracing::error!(?args, "underlying native test runner failed");
 
     let remaining_work = Some(failed_on)
         .into_iter()
-        .chain(remaining_work.into_iter().map(|test| test.work_id));
+        .chain(remaining_work.into_iter().map(|test| test.spec.work_id));
 
     let formatted_cmd = args.join(" ");
 
@@ -998,6 +1184,7 @@ async fn handle_native_runner_failure<'a, I>(
 
         final_results.push(AssociatedTestResults {
             work_id,
+            run_number,
             results: vec![error_result],
             before_any_test: final_output.clone(),
             after_all_tests: None,
@@ -1053,7 +1240,7 @@ pub fn execute_wrapped_runner(
 
     struct Fetcher {
         #[allow(clippy::type_complexity)]
-        manifest: Arc<Mutex<Option<(Vec<TestCase>, MetadataMap)>>>,
+        manifest: Arc<Mutex<Option<(Vec<TestSpec>, MetadataMap)>>>,
         test_case_index: AtomicUsize,
     }
 
@@ -1072,17 +1259,17 @@ pub fn execute_wrapped_runner(
                     }
                 };
                 let next = match next_test {
-                    Some(test_case) => {
+                    Some(test_spec) => {
                         self.test_case_index.fetch_add(1, atomic::ORDERING);
 
                         NextWork::Work(WorkerTest {
-                            test_case: test_case.clone(),
-                            work_id: WorkId(Default::default()),
+                            spec: test_spec.clone(),
+                            run_number: INIT_RUN_NUMBER,
                         })
                     }
                     None => NextWork::EndOfWork,
                 };
-                return NextWorkBundle(vec![next]);
+                return NextWorkBundle::new(vec![next]);
             }
         }
     }
@@ -1389,12 +1576,12 @@ mod test_abq_jest {
     };
     use abq_utils::atomic;
     use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
-    use abq_utils::net_protocol::queue::RunAlreadyCompleted;
+    use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, WorkId,
-        WorkerTest,
+        WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_with_protocol_version::with_protocol_version;
 
@@ -1438,7 +1625,7 @@ mod test_abq_jest {
             }))
         };
         let get_next_test = Box::new(ImmediateTests {
-            tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
+            tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
         });
         let send_test_result: SendTestResults = {
             let test_results = test_results.clone();
@@ -1512,15 +1699,15 @@ mod test_abq_jest {
         assert_eq!(test_results.len(), 2, "{:#?}", test_results);
 
         assert_eq!(test_results[0].status, Status::Success);
-        assert!(
-            test_results[0].id.ends_with("mona + lisa"),
+        assert_eq!(
+            test_results[0].id, "add.test.js@3:1#0",
             "{:?}",
             &test_results
         );
 
         assert_eq!(test_results[1].status, Status::Success);
-        assert!(
-            test_results[1].id.ends_with("three names"),
+        assert_eq!(
+            test_results[1].id, "names.test.js@3:1#0",
             "{:?}",
             &test_results
         );
@@ -1550,7 +1737,7 @@ mod test_abq_jest {
 
         {
             assert!(matches!(test_results[0].status, Status::Failure { .. }));
-            assert!(test_results[0].id.ends_with("1 + 2"));
+            assert_eq!(test_results[0].id, "add.test.js@3:1#0");
             assert!(
                 matches!(&test_results[0].stderr, Some(s) if s.is_empty()),
                 "{:?}",
@@ -1562,16 +1749,16 @@ mod test_abq_jest {
 
             insta::assert_snapshot!(stdout, @r###"
             |  console.log
-            |    hello from a second jest test
+            |    hello from a first jest test
             |
-            |      at Object.log (add2.test.js:4:11)
+            |      at Object.log (add.test.js:4:11)
             |
             "###);
         }
 
         {
             assert!(matches!(test_results[1].status, Status::Failure { .. }));
-            assert!(test_results[1].id.ends_with("mona + lisa"));
+            assert_eq!(test_results[1].id, "add2.test.js@3:1#0");
             assert!(
                 matches!(&test_results[0].stderr, Some(s) if s.is_empty()),
                 "{:?}",
@@ -1583,9 +1770,9 @@ mod test_abq_jest {
 
             insta::assert_snapshot!(stdout, @r###"
             |  console.log
-            |    hello from a first jest test
+            |    hello from a second jest test
             |
-            |      at Object.log (add.test.js:4:11)
+            |      at Object.log (add2.test.js:4:11)
             |
             "###);
         }
@@ -1602,9 +1789,12 @@ mod test_abq_jest {
 
         let get_init_context = || Ok(Err(RunAlreadyCompleted {}));
         let get_next_test = ImmediateTests {
-            tests: vec![NextWorkBundle(vec![NextWork::Work(WorkerTest {
-                test_case: TestCase::new(proto, "unreachable", Default::default()),
-                work_id: WorkId::new(),
+            tests: vec![NextWorkBundle::new(vec![NextWork::Work(WorkerTest {
+                spec: TestSpec {
+                    test_case: TestCase::new(proto, "unreachable", Default::default()),
+                    work_id: WorkId::new(),
+                },
+                run_number: INIT_RUN_NUMBER,
             })])],
         };
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
@@ -1665,7 +1855,7 @@ mod test_invalid_command {
             }))
         };
         let get_next_test = ImmediateTests {
-            tests: vec![NextWorkBundle(vec![NextWork::EndOfWork])],
+            tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
         };
         let send_test_result: SendTestResults = &|_| Box::pin(async {});
 

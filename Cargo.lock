@@ -15,6 +15,7 @@ dependencies = [
  "abq_rwx_v1_json",
  "abq_test_utils",
  "abq_utils",
+ "abq_with_protocol_version",
  "abq_workers",
  "anyhow",
  "atty",
@@ -26,6 +27,7 @@ dependencies = [
  "nix",
  "num_cpus",
  "paste",
+ "rand",
  "regex",
  "serde",
  "serde_derive",
@@ -114,6 +116,7 @@ dependencies = [
 name = "abq_queue"
 version = "0.1.0"
 dependencies = [
+ "abq_native_runner_simulation",
  "abq_run_n_times",
  "abq_test_utils",
  "abq_utils",
@@ -126,6 +129,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "serial_test",
  "static_assertions",
  "tempfile",
  "thiserror",
@@ -158,6 +162,7 @@ dependencies = [
 name = "abq_test_utils"
 version = "0.1.0"
 dependencies = [
+ "abq_utils",
  "regex",
  "tracing-test",
 ]

@@ -7,6 +7,7 @@ use abq_utils::auth::{AdminToken, UserToken};
 use abq_utils::net_protocol::runners::{
     NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
 };
+use abq_with_protocol_version::with_protocol_version;
 use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
@@ -1617,56 +1618,207 @@ test_all_network_config_options! {
         let stdout = sanitize_output(&stdout);
         let stderr = sanitize_output(&stderr);
 
-        insta::assert_snapshot!(stdout, @r###"
-        Started test run with ID test-run-id
-        E--- <internal test runner error>: ERRORED ---
-        -- Unexpected Test Runner Failure --
+        // Make sure the failing message is reflected both in a failing result reported to the
+        // supervisor, and captured worker stdout/stderr.
+        assert!(stdout.contains(
+r#"
+-- Unexpected Test Runner Failure --
 
-        The test command
+The test command
 
-        <simulation cmd>
+<simulation cmd>
 
-        stopped communicating with its abq worker before completing all test requests.
+stopped communicating with its abq worker before completing all test requests.
 
-        Here's the standard output/error we found for the failing command.
+Here's the standard output/error we found for the failing command.
 
-        Stdout:
+Stdout:
 
-        I failed catastrophically
+I failed catastrophically
 
-        Stderr:
+Stderr:
 
-        For a reason explainable only by a backtrace
+For a reason explainable only by a backtrace
 
-        Please see worker 0, runner 1 for more details.
+Please see worker 0, runner 1 for more details.
+"#.trim()), "STDOUT:\n{stdout}");
 
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 0 ms [worker 0])
-
-
-        --- [worker 0] BEFORE <internal test runner error> ---
-        ----- STDOUT
-        I failed catastrophically
-        ----- STDERR
-        For a reason explainable only by a backtrace
-
-        --- [worker 0] AFTER completion ---
-        ----- STDOUT
-        I failed catastrophically
-        ----- STDERR
-        For a reason explainable only by a backtrace
-
-
-
-        Finished in XX seconds (XX seconds spent in test code)
-        1 tests, 1 failures
-        "###);
+        assert!(stdout.contains(
+r#"
+--- [worker 0] AFTER completion ---
+----- STDOUT
+I failed catastrophically
+----- STDERR
+For a reason explainable only by a backtrace
+"#.trim()), "STDOUT:\n{stdout}");
 
         insta::assert_snapshot!(stderr, @"");
 
         term_queue(queue_proc);
     }
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn retries_smoke() {
+    // Smoke test for retries, that runs a number of tests on a number of workers and makes sure
+    // nothing blows up.
+    let name = "retries_smoke";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let attempts = 4;
+    let num_tests = 64;
+    let num_workers = 6;
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+
+    let mut queue_proc = Abq::new(name)
+        .args(conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]))
+        .spawn();
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start") {
+                break;
+            }
+        }
+    }
+
+    // Create a simulation test run to launch a worker with.
+    use abq_native_runner_simulation::{pack, pack_msgs, Msg::*};
+    use abq_utils::net_protocol::runners::{
+        AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, Status, Test,
+        TestOrGroup,
+    };
+
+    let mut manifest = vec![];
+
+    for t in 1..=num_tests {
+        manifest.push(TestOrGroup::test(Test::new(
+            proto,
+            t.to_string(),
+            [],
+            Default::default(),
+        )));
+    }
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: {
+                let mut run_tests = vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                ];
+
+                for _ in 0..num_tests {
+                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
+                    // faux result.
+                    // Otherwise assume we ran out of tests on our node and exit.
+                    run_tests.push(IfAliveReadAndWriteFake(Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    }));
+                }
+                run_tests
+            },
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+    let test_args = |worker: usize| {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = simfile_path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker={worker}"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("--retries={attempts}"),
+            format!("-n=1"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let other_workers: Vec<_> = (1..num_workers)
+        .map(|i| {
+            Abq::new(format!("{name}_worker{i}"))
+                .args(test_args(i))
+                .spawn()
+        })
+        .collect();
+
+    // Start the supervisor and run to completion.
+    {
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_worker0")
+            .args(test_args(0))
+            .run();
+
+        assert_eq!(exit_status.code().unwrap(), 1);
+        assert!(
+            stdout.contains("64 tests, 64 failures, 64 retried"),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+    }
+
+    for worker in other_workers {
+        let Output {
+            status,
+            stderr,
+            stdout,
+        } = worker.wait_with_output().unwrap();
+        let worker_stdout = String::from_utf8_lossy(&stdout);
+        let worker_stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(
+            status.code().unwrap(),
+            1,
+            "STDOUT:\n{worker_stdout}\nSTDERR:\n{worker_stderr}"
+        );
+    }
+
+    term_queue(queue_proc);
 }

@@ -11,13 +11,13 @@ use std::{
 
 use abq_queue::{
     invoke::{
-        self, run_cancellation_pair, Client, CompletedSummary, InvocationError, RunCancellationTx,
-        TestResultError, DEFAULT_CLIENT_POLL_TIMEOUT, DEFAULT_TICK_INTERVAL,
+        self, run_cancellation_pair, Client, CompletedSummary, RunCancellationTx, TestResultError,
+        DEFAULT_CLIENT_POLL_TIMEOUT, DEFAULT_TICK_INTERVAL,
     },
     queue::{Abq, QueueConfig},
     timeout::{RunTimeoutStrategy, TimeoutReason},
 };
-use abq_test_utils::assert_scoped_log;
+use abq_test_utils::{artifacts_dir, assert_scoped_log};
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
     exit::ExitCode,
@@ -25,17 +25,20 @@ use abq_utils::{
     net_opt::ClientOptions,
     net_protocol::{
         self,
-        entity::{Entity, WorkerTag},
+        entity::{Entity, RunnerMeta, WorkerTag},
         queue::{
             CancelReason, CannotSetOOBExitCodeReason, NativeRunnerInfo,
-            SetOutOfBandExitCodeResponse,
+            SetOutOfBandExitCodeResponse, TestSpec,
         },
         runners::{
-            AbqProtocolVersion, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
-            ProtocolWitness, Test, TestOrGroup, TestResult,
+            AbqProtocolVersion, InitSuccessMessage, Location, Manifest, ManifestMessage,
+            MetadataMap, OutOfBandError, ProtocolWitness, RawTestResultMessage, Status, Test,
+            TestOrGroup, TestResult, TestResultSpec,
         },
         work_server::{InitContext, InitContextResponse},
-        workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner},
+        workers::{
+            NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId, INIT_RUN_NUMBER,
+        },
     },
     tls::ClientTlsStrategy,
 };
@@ -48,6 +51,7 @@ use abq_workers::{
 use futures::FutureExt;
 use ntest::timeout;
 use parking_lot::Mutex;
+use serial_test::serial;
 use tracing_test::traced_test;
 use Action::*;
 use Assert::*;
@@ -113,13 +117,20 @@ fn default_workers_config(tag: impl Into<WorkerTag>) -> WorkersConfig {
     }
 }
 
-fn sort_results(results: &mut [TestResult]) -> Vec<&str> {
+fn sort_results(results: &mut [(WorkId, u32, TestResult)]) -> Vec<(u32, &str)> {
     let mut results = results
         .iter()
-        .map(|result| result.output.as_ref().unwrap().as_str())
+        .map(|(_, n, result)| (*n, result.output.as_ref().unwrap().as_str()))
         .collect::<Vec<_>>();
     results.sort_unstable();
     results
+}
+
+fn sort_results_owned(results: &mut [(WorkId, u32, TestResult)]) -> Vec<(u32, String)> {
+    sort_results(results)
+        .into_iter()
+        .map(|(attempt, r)| (attempt, r.to_string()))
+        .collect()
 }
 
 // TODO: put this on [Client] directly
@@ -129,6 +140,7 @@ struct SupervisorConfig {
     timeout: Duration,
     tick_interval: Duration,
     track_exit_code_in_band: bool,
+    retries: u32,
 }
 
 impl SupervisorConfig {
@@ -139,6 +151,7 @@ impl SupervisorConfig {
             timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
             tick_interval: DEFAULT_TICK_INTERVAL,
             track_exit_code_in_band: true,
+            retries: 0,
         }
     }
 
@@ -166,6 +179,17 @@ impl SupervisorConfig {
             ..self
         }
     }
+
+    fn with_retries(self, retries: u32) -> Self {
+        Self { retries, ..self }
+    }
+}
+
+fn native_runner_simulation_bin() -> String {
+    artifacts_dir()
+        .join("abqtest_native_runner_simulation")
+        .display()
+        .to_string()
 }
 
 type GetConn<'a> = &'a dyn Fn() -> Box<dyn ClientStream>;
@@ -193,11 +217,11 @@ enum Action {
 
 #[allow(clippy::type_complexity)]
 enum Assert<'a> {
-    CheckSupervisor(Sid, &'a dyn Fn(&Result<Client, InvocationError>) -> bool),
+    CheckSupervisor(Sid, &'a dyn Fn(&Result<Client, invoke::Error>) -> bool),
 
-    TestExit(Sid, &'a dyn Fn(&Result<CompletedSummary, TestResultError>)),
+    TestExit(Sid, &'a dyn Fn(&Result<CompletedSummary, invoke::Error>)),
     TestExitWithoutErr(Sid),
-    TestResults(Sid, &'a dyn Fn(&[TestResult]) -> bool),
+    TestResults(Sid, &'a dyn Fn(&[(WorkId, u32, TestResult)]) -> bool),
 
     SetOOBExitCode(ExternId, &'a dyn Fn(&SetOutOfBandExitCodeResponse)),
 
@@ -243,11 +267,10 @@ impl<'a> TestBuilder<'a> {
     }
 }
 
-type Supervisors = Arc<Mutex<HashMap<Sid, Result<Client, InvocationError>>>>;
-type SupervisorData =
-    Arc<tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, Arc<Mutex<Vec<TestResult>>>)>>>;
+type Supervisors = Arc<Mutex<HashMap<Sid, Result<Client, invoke::Error>>>>;
+type SupervisorData = Arc<tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, ResultsCollector)>>>;
 type SupervisorResults =
-    Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedSummary, TestResultError>>>>;
+    Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedSummary, invoke::Error>>>>;
 
 type Workers = Arc<Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
@@ -261,13 +284,64 @@ type SetOOBExitCodes = Arc<Mutex<HashMap<ExternId, SetOutOfBandExitCodeResponse>
 
 type BgTasks = HashMap<SpawnId, tokio::task::JoinHandle<()>>;
 
-struct Handler {
-    results: Arc<Mutex<Vec<TestResult>>>,
+#[derive(Default, Clone)]
+struct ResultsCollector {
+    results: Arc<Mutex<Vec<(WorkId, u32, TestResult)>>>,
+    manifest: Arc<Mutex<Option<Vec<TestSpec>>>>,
 }
 
-impl invoke::ResultHandler for Handler {
-    fn on_result(&mut self, result: net_protocol::client::ReportedResult) {
-        self.results.lock().push(result.test_result)
+impl invoke::ResultHandler for ResultsCollector {
+    type InitData = ResultsCollector;
+
+    fn create(manifest: Vec<TestSpec>, data: Self) -> Self {
+        *data.manifest.lock() = Some(manifest);
+        data
+    }
+
+    fn on_result(
+        &mut self,
+        work_id: WorkId,
+        run_number: u32,
+        result: net_protocol::client::ReportedResult,
+    ) {
+        self.results
+            .lock()
+            .push((work_id, run_number, result.test_result))
+    }
+
+    fn get_ordered_retry_manifest(&mut self, run_number: u32) -> Vec<TestSpec> {
+        let manifest = self.manifest.lock();
+        let manifest = manifest.as_ref().unwrap();
+        let results = self.results.lock();
+
+        results
+            .iter()
+            .filter_map(|(work_id, run, result)| {
+                if (*run == run_number) && result.status.is_fail_like() {
+                    let spec = manifest.iter().find(|spec| spec.work_id == *work_id);
+                    Some(spec.unwrap().clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn get_exit_code(&self) -> ExitCode {
+        let results = self.results.lock();
+        let max_run = results
+            .iter()
+            .map(|(_, run, _)| *run)
+            .max()
+            .unwrap_or(INIT_RUN_NUMBER);
+        let any_latest_failure = results
+            .iter()
+            .any(|(_, run, result)| *run == max_run && result.status.is_fail_like());
+        if any_latest_failure {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
     }
 
     fn tick(&mut self) {}
@@ -321,6 +395,7 @@ fn action_to_fut(
                 timeout,
                 tick_interval,
                 track_exit_code_in_band,
+                retries,
             } = config;
             async move {
                 let client = Client::invoke_work(
@@ -331,18 +406,19 @@ fn action_to_fut(
                     runner_kind,
                     batch_size,
                     timeout,
+                    retries,
                     tick_interval,
                     cancellation_rx,
                     track_exit_code_in_band,
                 )
                 .await;
 
-                let collected_results = Arc::new(Mutex::new(Vec::new()));
+                let results_collector = ResultsCollector::default();
 
                 supervisor_data
                     .lock()
                     .await
-                    .insert(super_id, (cancellation_tx, collected_results.clone()));
+                    .insert(super_id, (cancellation_tx, results_collector.clone()));
 
                 if !run_to_completion {
                     supervisors.lock().insert(super_id, client);
@@ -351,11 +427,10 @@ fn action_to_fut(
 
                 let client = client.unwrap();
 
-                let handler = Handler {
-                    results: collected_results.clone(),
-                };
-
-                let result = client.stream_results(handler).await;
+                let result = client
+                    .stream_results::<ResultsCollector>(results_collector)
+                    .await
+                    .map(|(_handler, summary)| summary);
 
                 supervisor_results.lock().await.insert(super_id, result);
             }
@@ -428,7 +503,6 @@ fn action_to_fut(
         }
 
         StopWorkers(n) => async move {
-            dbg!(n);
             let mut worker_pool = workers.lock().remove(&n).unwrap();
             let workers_result =
                 match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.shutdown())) {
@@ -549,19 +623,19 @@ fn run_test(servers: Servers, steps: Steps) {
                     TestExitWithoutErr(n) => {
                         let results = supervisor_results.lock().await;
                         let exit = results.get(&n).expect("supervisor exit not found");
-                        assert!(exit.is_ok());
+                        assert!(exit.is_ok(), "{:?}", exit);
                         let CompletedSummary { native_runner_info } = exit.as_ref().unwrap();
                         let NativeRunnerInfo {
                             protocol_version,
                             specification: _,
                         } = native_runner_info;
-                        assert_eq!(protocol_version, &AbqProtocolVersion::V0_1);
+                        assert_eq!(protocol_version, &AbqProtocolVersion::V0_2);
                     }
 
                     TestResults(n, check) => {
                         let supervisor_data = supervisor_data.lock().await;
-                        let (_, results) = supervisor_data.get(&n).expect("supervisor not found");
-                        let results = results.lock();
+                        let (_, collector) = supervisor_data.get(&n).expect("supervisor not found");
+                        let results = collector.results.lock();
                         assert!(check(&results));
                     }
 
@@ -649,7 +723,7 @@ fn multiple_jobs_complete() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1", "echo2"]
+                    results == [(1, "echo1"), (1, "echo2")]
                 }),
             ],
         )
@@ -709,14 +783,14 @@ fn multiple_invokers() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1", "echo2"]
+                    results == [(1, "echo1"), (1, "echo2")]
                 }),
                 //
                 TestExitWithoutErr(Sid(2)),
                 TestResults(Sid(2), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo3", "echo4", "echo5"]
+                    results == [(1, "echo3"), (1, "echo4"), (1, "echo5")]
                 }),
             ],
         )
@@ -762,7 +836,7 @@ fn batch_two_requests_at_a_time() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1", "echo2", "echo3", "echo4"]
+                    results == [(1, "echo1"), (1, "echo2"), (1, "echo3"), (1, "echo4")]
                 }),
             ],
         )
@@ -909,7 +983,7 @@ fn invoke_work_with_duplicate_id_is_an_error() {
         .step(
             [StartTest(Run(1), Sid(2), SupervisorConfig::new(runner))],
             [CheckSupervisor(Sid(2), &|s| {
-                matches!(s, Err(InvocationError::DuplicateRun(..)))
+                matches!(s, Err(invoke::Error::DuplicateRun(..)))
             })],
         )
         .test();
@@ -945,7 +1019,7 @@ fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
         .step(
             [StartTest(Run(1), Sid(1), SupervisorConfig::new(runner))],
             [CheckSupervisor(Sid(1), &|supervisor| {
-                matches!(supervisor, Err(InvocationError::DuplicateCompletedRun(..)))
+                matches!(supervisor, Err(invoke::Error::DuplicateCompletedRun(..)))
             })],
         )
         .test();
@@ -1197,7 +1271,7 @@ fn getting_run_after_work_is_complete_returns_nothing() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == [("echo1"), ("echo2")]
+                    results == [(1, "echo1"), (1, "echo2")]
                 }),
             ],
         )
@@ -1242,7 +1316,10 @@ fn test_cancellation_drops_remaining_work() {
         .step(
             [CancelTest(Sid(1))],
             [TestExit(Sid(1), &|result| {
-                assert!(matches!(result, Err(TestResultError::Cancelled)))
+                assert!(matches!(
+                    result,
+                    Err(invoke::Error::TestResultError(TestResultError::Cancelled))
+                ))
             })],
         )
         .act([StartWorkers(Run(1), Wid(1), default_workers_config(1))])
@@ -1277,7 +1354,7 @@ fn failure_to_run_worker_command_exits_gracefully() {
             [TestExit(Sid(1), &|results_err| {
                 assert!(matches!(
                     results_err.as_ref().unwrap_err(),
-                    TestResultError::TestCommandError(..)
+                    invoke::Error::TestResultError(TestResultError::TestCommandError(..))
                 ))
             })],
         )
@@ -1322,7 +1399,12 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
             StartWorkers(Run(1), Wid(1), workers_config),
         ],
         [TestExit(Sid(1), &|result| {
-            assert!(matches!(result, Err(TestResultError::TimedOut(..))));
+            assert!(matches!(
+                result,
+                Err(invoke::Error::TestResultError(TestResultError::TimedOut(
+                    ..
+                )))
+            ));
         })],
     )
     .act([StopWorkers(Wid(1))])
@@ -1382,7 +1464,7 @@ fn native_runner_returns_manifest_failure() {
             ],
             [TestExit(Sid(1), &|result| {
                 let err = result.as_ref().unwrap_err();
-                assert!(matches!(err, TestResultError::TestCommandError(..)));
+                assert!(matches!(err, invoke::Error::TestResultError(TestResultError::TestCommandError(..))));
                 let msg = err.to_string();
                 insta::assert_snapshot!(msg, @r###"
                 The given test command failed to be executed by all workers. The recorded error message is:
@@ -1429,7 +1511,15 @@ fn multiple_tests_per_work_id_reported() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1", "echo2", "echo3", "echo4", "echo5", "echo6"]
+                    results
+                        == [
+                            (1, "echo1"),
+                            (1, "echo2"),
+                            (1, "echo3"),
+                            (1, "echo4"),
+                            (1, "echo5"),
+                            (1, "echo6"),
+                        ]
                 }),
             ],
         )
@@ -1466,7 +1556,7 @@ fn set_exit_code_out_of_band() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1"]
+                    results == [(1, "echo1")]
                 }),
             ],
         )
@@ -1544,7 +1634,10 @@ fn trying_to_set_oob_exit_code_for_cancelled_run_is_error() {
         .step(
             [CancelTest(Sid(1))],
             [TestExit(Sid(1), &|result| {
-                assert!(matches!(result, Err(TestResultError::Cancelled)))
+                assert!(matches!(
+                    result,
+                    Err(invoke::Error::TestResultError(TestResultError::Cancelled))
+                ))
             })],
         )
         .step(
@@ -1587,7 +1680,7 @@ fn trying_to_set_oob_exit_code_for_completed_run_is_error() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1"]
+                    results == [(1, "echo1")]
                 }),
             ],
         )
@@ -1637,7 +1730,7 @@ fn trying_to_set_oob_exit_code_twice_is_error() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1"]
+                    results == [(1, "echo1")]
                 }),
             ],
         )
@@ -1781,7 +1874,7 @@ fn multiple_workers_start_before_supervisor() {
                 TestResults(Sid(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
-                    results == ["echo1", "echo2"]
+                    results == [(1, "echo1"), (1, "echo2")]
                 }),
             ],
         )
@@ -1836,8 +1929,269 @@ fn timeout_with_slower_poll_timeout_than_tick_interval() {
         .step(
             [RunTest(Run(1), Sid(1), config)],
             [TestExit(Sid(1), &|result| {
-                assert!(matches!(result, Err(TestResultError::TimedOut(..))))
+                assert!(matches!(
+                    result,
+                    Err(invoke::Error::TestResultError(TestResultError::TimedOut(
+                        ..
+                    )))
+                ))
             })],
         )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+#[timeout(2000)]
+fn many_retries_complete() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1".to_string()),
+            echo_test(proto, "echo2".to_string()),
+            echo_test(proto, "echo3".to_string()),
+            echo_test(proto, "echo4".to_string()),
+        ],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(
+        TestLikeRunner::FailUntilAttemptNumber(4),
+        Box::new(manifest),
+    );
+
+    let supervisor_config = SupervisorConfig::new(runner).with_retries(3);
+
+    let mut expected_results = vec![];
+    for attempt in 1..=4 {
+        for t in 1..=4 {
+            if attempt < 4 {
+                expected_results.push((attempt, "INDUCED FAIL".to_string()));
+            } else {
+                expected_results.push((attempt, format!("echo{t}")));
+            }
+        }
+    }
+
+    TestBuilder::default()
+        .step(
+            [
+                RunTest(Run(1), Sid(1), supervisor_config),
+                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+            ],
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results_owned(&mut results);
+                    results == expected_results
+                }),
+            ],
+        )
+        .step(
+            [StopWorkers(Wid(1))],
+            [WorkerExitStatus(Wid(1), &|e| {
+                assert!(matches!(e, &WorkersExitStatus::Success))
+            })],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+#[timeout(2000)]
+fn many_retries_many_workers_complete() {
+    let attempts = 4;
+    let num_tests = 64;
+    let num_workers = 6;
+
+    let mut manifest = vec![];
+    let mut expected_results = vec![];
+
+    for attempt in 1..=attempts {
+        for t in 1..=num_tests {
+            if attempt == 1 {
+                manifest.push(echo_test(proto, format!("echo{t}")));
+            }
+
+            if attempt < 4 {
+                expected_results.push((attempt, "INDUCED FAIL".to_string()));
+            } else {
+                expected_results.push((attempt, format!("echo{t}")));
+            }
+        }
+    }
+
+    expected_results.sort();
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let runner = RunnerKind::TestLikeRunner(
+        TestLikeRunner::FailUntilAttemptNumber(4),
+        Box::new(manifest),
+    );
+
+    let supervisor_config = SupervisorConfig::new(runner).with_retries(3);
+
+    let mut start_actions = vec![RunTest(Run(1), Sid(1), supervisor_config)];
+    let mut end_workers_actions = vec![];
+    let mut end_workers_asserts = vec![];
+    for i in 1..=num_workers {
+        start_actions.push(StartWorkers(
+            Run(1),
+            Wid(i),
+            default_workers_config(i as u32),
+        ));
+        end_workers_actions.push(StopWorkers(Wid(i)));
+        end_workers_asserts.push(WorkerExitStatus(Wid(i), &|e| {
+            assert!(matches!(e, &WorkersExitStatus::Success))
+        }));
+    }
+
+    TestBuilder::default()
+        .step(
+            start_actions,
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results_owned(&mut results);
+                    results == expected_results
+                }),
+            ],
+        )
+        .step(end_workers_actions, end_workers_asserts)
+        .test();
+}
+
+#[test]
+#[traced_test]
+#[with_protocol_version]
+#[serial]
+#[timeout(2000)] // 2 seconds
+fn many_retries_many_workers_complete_native() {
+    let attempts = 4;
+    let num_tests = 64;
+    let num_workers = 6;
+
+    let mut manifest = vec![];
+    let mut expected_results = vec![];
+
+    for attempt in 1..=attempts {
+        for t in 1..=num_tests {
+            if attempt == 1 {
+                manifest.push(TestOrGroup::test(Test::new(
+                    proto,
+                    t.to_string(),
+                    [],
+                    Default::default(),
+                )));
+            }
+
+            expected_results.push((attempt, "INDUCED FAIL".to_string()));
+        }
+    }
+
+    expected_results.sort();
+
+    use abq_native_runner_simulation::{legal_spawned_message, pack, pack_msgs, Msg::*};
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let fake_test_result = TestResult::new(
+        RunnerMeta::fake(),
+        TestResultSpec {
+            output: Some("INDUCED FAIL".to_string()),
+            status: Status::Failure {
+                exception: None,
+                backtrace: None,
+            },
+            ..TestResultSpec::fake()
+        },
+    );
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![
+                OpaqueWrite(pack(&manifest)),
+                Stdout(b"hello from manifest stdout".to_vec()),
+                Stderr(b"hello from manifest stderr".to_vec()),
+            ],
+            else_do: {
+                let mut run_tests = vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                ];
+
+                for _ in 0..num_tests {
+                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
+                    // faux result.
+                    // Otherwise assume we ran out of tests on our node and exit.
+                    run_tests.push(IfOpaqueReadSocketAlive {
+                        then_do: vec![OpaqueWrite(pack(RawTestResultMessage::from_test_result(
+                            proto,
+                            fake_test_result.clone(),
+                        )))],
+                        else_do: vec![Exit(0)],
+                    })
+                }
+                run_tests
+            },
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+    let runner = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+        cmd: native_runner_simulation_bin(),
+        args: vec![simfile_path.display().to_string()],
+        extra_env: Default::default(),
+    });
+
+    let supervisor_config = SupervisorConfig::new(runner).with_retries(3);
+
+    let mut start_actions = vec![RunTest(Run(1), Sid(1), supervisor_config)];
+    let mut end_workers_actions = vec![];
+    let mut end_workers_asserts = vec![];
+    for i in 1..=num_workers {
+        start_actions.push(StartWorkers(
+            Run(1),
+            Wid(i),
+            default_workers_config(i as u32),
+        ));
+        end_workers_actions.push(StopWorkers(Wid(i)));
+        end_workers_asserts.push(WorkerExitStatus(Wid(i), &|e| {
+            assert!(matches!(e, &WorkersExitStatus::Failure { .. }))
+        }));
+    }
+
+    TestBuilder::default()
+        .step(
+            start_actions,
+            [
+                TestExitWithoutErr(Sid(1)),
+                TestResults(Sid(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results_owned(&mut results);
+                    results == expected_results
+                }),
+            ],
+        )
+        .step(end_workers_actions, end_workers_asserts)
         .test();
 }

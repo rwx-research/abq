@@ -3,7 +3,9 @@
 #[macro_export]
 macro_rules! log_assert {
     ($check:expr, $($field:tt)*) => {{
-        if !($check) {
+        let check = $check;
+        debug_assert!(check);
+        if !check {
             tracing::error!($($field)*)
         }
     }}

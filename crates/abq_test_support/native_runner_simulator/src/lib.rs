@@ -1,11 +1,33 @@
-use abq_utils::net_protocol::{self, runners::ABQ_GENERATE_MANIFEST};
+use abq_utils::net_protocol::{
+    self,
+    entity::RunnerMeta,
+    runners::{
+        AbqProtocolVersion, NativeRunnerSpecification, ProtocolWitness,
+        RawNativeRunnerSpawnedMessage, RawTestResultMessage, Status, TestCaseMessage, TestResult,
+        TestResultSpec, ABQ_GENERATE_MANIFEST,
+    },
+};
 use serde_derive::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     io::{self, Write},
     process,
 };
-use tokio::net::TcpStream;
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+
+pub fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessage {
+    let protocol_version = proto.get_version();
+    let runner_specification = NativeRunnerSpecification {
+        name: "test".to_string(),
+        version: "0.0.0".to_string(),
+        test_framework: "rspec".to_owned(),
+        test_framework_version: "3.12.0".to_owned(),
+        language: "ruby".to_owned(),
+        language_version: "3.1.2p20".to_owned(),
+        host: "ruby 3.1.2p20 (2022-04-12 revision 4491bb740a) [x86_64-darwin21]".to_owned(),
+    };
+    RawNativeRunnerSpawnedMessage::new(proto, protocol_version, runner_specification)
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Msg {
@@ -20,6 +42,12 @@ pub enum Msg {
         then_do: Vec<Msg>,
         else_do: Vec<Msg>,
     },
+    IfOpaqueReadSocketAlive {
+        then_do: Vec<Msg>,
+        else_do: Vec<Msg>,
+    },
+    /// Read a test message and write a fake result back.
+    IfAliveReadAndWriteFake(Status),
     Exit(i32),
 }
 
@@ -81,7 +109,46 @@ pub async fn run_simulation(msgs: impl IntoIterator<Item = Msg>) {
                     .rev()
                     .for_each(|action| queue.push_front(action));
             }
+            Msg::IfOpaqueReadSocketAlive { then_do, else_do } => {
+                let read_result =
+                    net_protocol::async_read_local::<_, serde_json::Value>(&mut conn!()).await;
+                let extension = if read_result.is_ok() {
+                    then_do
+                } else {
+                    else_do
+                };
+                extension
+                    .into_iter()
+                    .rev()
+                    .for_each(|action| queue.push_front(action));
+            }
+            Msg::IfAliveReadAndWriteFake(status) => {
+                let read_result =
+                    net_protocol::async_read_local::<_, TestCaseMessage>(&mut conn!()).await;
+                if let Ok(tc) = read_result {
+                    let id = tc.id();
+                    let fake_result = RawTestResultMessage::from_test_result(
+                        AbqProtocolVersion::V0_2.get_supported_witness().unwrap(),
+                        TestResult::new(
+                            RunnerMeta::fake(),
+                            TestResultSpec {
+                                id,
+                                status,
+                                ..TestResultSpec::fake()
+                            },
+                        ),
+                    );
+
+                    net_protocol::async_write_local(&mut conn!(), &fake_result)
+                        .await
+                        .unwrap();
+                };
+            }
             Msg::Exit(ec) => {
+                io::stdout().flush().unwrap();
+                io::stderr().flush().unwrap();
+                let _ = conn!().flush().await;
+                let _ = conn!().shutdown().await;
                 process::exit(ec);
             }
         }

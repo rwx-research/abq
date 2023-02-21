@@ -211,9 +211,12 @@ pub mod entity {
 }
 
 pub mod workers {
-    use super::runners::{
-        AbqProtocolVersion, CapturedOutput, Manifest, ManifestMessage, NativeRunnerSpecification,
-        TestCase,
+    use super::{
+        queue::TestSpec,
+        runners::{
+            AbqProtocolVersion, CapturedOutput, Manifest, ManifestMessage,
+            NativeRunnerSpecification,
+        },
     };
     use serde_derive::{Deserialize, Serialize};
     use std::{
@@ -308,6 +311,8 @@ pub mod workers {
         NeverReturnOnTest(String),
         /// A worker that panics in a section of ABQ code.
         Panic,
+        /// A worker that fails with "INDUCED FAIL" until the given run attempt number.
+        FailUntilAttemptNumber(u32),
         /// Yields the given exit code.
         ExitWith(i32),
         /// A worker that echos a string given to it after a number of retries.
@@ -356,9 +361,17 @@ pub mod workers {
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
     pub struct WorkerTest {
-        pub test_case: TestCase,
-        pub work_id: WorkId,
+        pub spec: TestSpec,
+        /// The identity of the serial test suite run this test is a part of. Always starts at
+        /// [INIT_RUN_NUMBER].
+        /// Retried tests are always part of a larger run_number. For example, if test T is
+        /// executed three times, it will be done so with run_number 1, 2, and 3.
+        pub run_number: u32,
     }
+
+    /// The initial test suite run number.
+    /// Higher run numbers are reserved for retries of test suites.
+    pub const INIT_RUN_NUMBER: u32 = 1;
 
     /// A unit of work sent to a worker to be run.
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -378,7 +391,15 @@ pub mod workers {
 
     /// A bundle of work sent to a worker to be run in sequence.
     #[derive(Serialize, Deserialize, Debug)]
-    pub struct NextWorkBundle(pub Vec<NextWork>);
+    pub struct NextWorkBundle {
+        pub work: Vec<NextWork>,
+    }
+
+    impl NextWorkBundle {
+        pub fn new(work: Vec<NextWork>) -> Self {
+            Self { work }
+        }
+    }
 
     /// Manifest reported to from a worker to the queue, including
     /// - test manifest
@@ -420,7 +441,9 @@ pub mod queue {
     use super::{
         entity::Entity,
         meta::DeprecationRecord,
-        runners::{AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestResult},
+        runners::{
+            AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestCase, TestResult,
+        },
         workers::{ManifestResult, RunId, RunnerKind, WorkId},
     };
 
@@ -443,6 +466,7 @@ pub mod queue {
         pub run_id: RunId,
         pub runner: RunnerKind,
         pub batch_size_hint: NonZeroU64,
+        pub max_run_attempt: u32,
         pub test_results_timeout: Duration,
         /// If true, the exit code for the test run will be determined in-band by the queue.
         /// If false, the exit code will be awaited from an external source.
@@ -469,10 +493,21 @@ pub mod queue {
         Failure(InvokeFailureReason),
     }
 
+    /// Specification of a test case to run.
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+    pub struct TestSpec {
+        /// ABQ-internal identity of this test.
+        pub work_id: WorkId,
+        /// The test case communicated to a native runner.
+        pub test_case: TestCase,
+    }
+
     /// A set of test results associated with an individual unit of work.
     #[derive(Serialize, Deserialize, Debug)]
     pub struct AssociatedTestResults {
+        /// The run number this test result comes from.
         pub work_id: WorkId,
+        pub run_number: u32,
         pub results: Vec<TestResult>,
         pub before_any_test: CapturedOutput,
         pub after_all_tests: Option<CapturedOutput>,
@@ -488,6 +523,7 @@ pub mod queue {
             Self {
                 work_id,
                 results,
+                run_number: 1,
                 before_any_test: CapturedOutput::empty(),
                 after_all_tests: None,
             }
@@ -515,13 +551,16 @@ pub mod queue {
             error: String,
             captured: CapturedOutput,
         },
-        /// Information about the native test runner being used for the current test suite.
-        /// This message is sent exactly once per test run, and usually received at the start of a
-        /// test run.
-        /// Receipt of this message by the supervisor intentionally does not block
-        /// - the start of workers for a test run, or
-        /// - the consumption of test results by the supervisor
-        NativeRunnerInfo(NativeRunnerInfo),
+        /// Information about the start of the test suite run.
+        /// This message is sent exactly once per test run, after the run is confirmed and before
+        /// any test results.
+        RunStart(RunStartData),
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub struct RunStartData {
+        pub native_runner_info: NativeRunnerInfo,
+        pub manifest: Vec<TestSpec>,
     }
 
     #[derive(Serialize, Deserialize, Debug)]
@@ -715,22 +754,49 @@ pub mod work_server {
     pub enum NextTestResponse {
         /// The set of tests to run next
         Bundle(workers::NextWorkBundle),
+        /// There are more tests, but they are not yet known.
+        Pending,
     }
 }
 
 pub mod client {
     use serde_derive::{Deserialize, Serialize};
 
-    use super::runners::{CapturedOutput, TestResult};
+    use crate::exit::ExitCode;
+
+    use super::{
+        queue::TestSpec,
+        runners::{CapturedOutput, TestResult},
+    };
+
+    /// An acknowledgement of receiving a run-start notification from the queue server. Sent by the client.
+    #[derive(Serialize, Deserialize)]
+    pub struct AckTestResults {}
 
     /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
     #[derive(Serialize, Deserialize)]
-    pub struct AckTestData {}
+    pub struct AckRunStart {}
 
-    /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
+    /// Response to a notification from the queue that it has seen a test run end.
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "type")]
-    pub struct AckTestRunEnded {}
+    pub enum EndOfResultsResponse {
+        /// Acknowledgement of the end of the test run.
+        AckEnd {
+            /// The exit code that should be used.
+            /// `None` if an out-of-band exit code should be set instead.
+            exit_code: Option<ExitCode>,
+        },
+        /// Additional attempts should be added to the run.
+        AdditionalAttempts {
+            /// The manifest of test retries. Must be in the same order as the flat manifest
+            /// originally delivered to the supervisor.
+            ordered_manifest: Vec<TestSpec>,
+            /// The attempt number of all tests in the [ordered_manifest].
+            /// Must be monotonically increasing, and strictly larger than [super::workers::INIT_RUN_NUMBER].
+            attempt_number: u32,
+        },
+    }
 
     pub struct ReportedResult {
         pub output_before: Option<CapturedOutput>,
