@@ -61,7 +61,6 @@ pub struct Client {
     cancellation_rx: RunCancellationRx,
     async_reader: AsyncReaderDos,
     current_run_attempt: u32,
-    track_exit_code_in_band: bool,
     max_run_attempt: u32,
 }
 
@@ -160,7 +159,6 @@ impl Client {
         retries: u32,
         tick_interval: Duration,
         cancellation_rx: RunCancellationRx,
-        track_exit_code_in_band: bool,
     ) -> Result<Self, Error> {
         let client = client_options.build_async()?;
         let mut stream = client.connect(abq_server_addr).await?;
@@ -177,7 +175,6 @@ impl Client {
                 batch_size_hint,
                 test_results_timeout,
                 max_run_attempt,
-                track_exit_code_in_band,
             }),
         };
 
@@ -211,7 +208,6 @@ impl Client {
             tick_interval,
             current_run_attempt: INIT_RUN_NUMBER,
             max_run_attempt,
-            track_exit_code_in_band,
         })
     }
 
@@ -320,15 +316,10 @@ impl Client {
                             //
                             // Send a final ACK of the test results, so that cancellation signals do not
                             // interfere with us here.
-                            let exit_code = if self.track_exit_code_in_band {
-                                let code = handler
-                                    .as_ref()
-                                    .expect("handler must be known with manifest at this point")
-                                    .get_exit_code();
-                                Some(code)
-                            } else {
-                                None
-                            };
+                            let exit_code = handler
+                                .as_ref()
+                                .expect("handler must be known with manifest at this point")
+                                .get_exit_code();
 
                             net_protocol::async_write(
                                 &mut self.stream,
@@ -365,7 +356,7 @@ impl Client {
                     net_protocol::async_write(
                         &mut self.stream,
                         &net_protocol::client::EndOfResultsResponse::AckEnd {
-                            exit_code: Some(ExitCode::CANCELLED),
+                            exit_code: ExitCode::CANCELLED,
                         },
                     )
                     .await?;

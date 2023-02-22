@@ -35,28 +35,12 @@ impl Default for RunTimeoutStrategy {
     }
 }
 
-/// The maximum time reserved to wait for an out-of-band exit code for a test run.
-const OOB_EXIT_CODE_TIMEOUT: Duration = Duration::from_secs(3 * 60); // 3 minutes
-
 impl RunTimeoutStrategy {
     /// Determine a timeout duration for [TimeoutReason::ResultNotReceived].
     pub(crate) fn timeout_for_last_test_result(&self, timeout_for_run: Duration) -> TimeoutSpec {
         let reason = TimeoutReason::ResultNotReceived;
         let duration = match self.0 {
             RunTimeoutStrategyPriv::RunBased => timeout_for_run,
-            RunTimeoutStrategyPriv::Constant(timeout) => timeout(reason),
-        };
-        TimeoutSpec { duration, reason }
-    }
-
-    /// Determine a timeout duration for [TimeoutReason::OOBExitCodeNotReceived].
-    pub(crate) fn timeout_for_oob_exit_code(&self) -> TimeoutSpec {
-        let reason = TimeoutReason::OOBExitCodeNotReceived;
-        let duration = match self.0 {
-            RunTimeoutStrategyPriv::RunBased => {
-                // The OOB exit code timeout is constant for all runs.
-                OOB_EXIT_CODE_TIMEOUT
-            }
             RunTimeoutStrategyPriv::Constant(timeout) => timeout(reason),
         };
         TimeoutSpec { duration, reason }
@@ -87,16 +71,12 @@ pub(crate) struct RunTimeoutManager {
 pub enum TimeoutReason {
     /// A test run was timed-out because the last test result for a run was not received in time.
     ResultNotReceived,
-    /// A test run was timed-out because it was marked to have an OOB exit code set, and that exit
-    /// code was not received in time.
-    OOBExitCodeNotReceived,
 }
 
 impl From<TimeoutReason> for CancelReason {
     fn from(reason: TimeoutReason) -> Self {
         match reason {
             TimeoutReason::ResultNotReceived => CancelReason::TimeoutOnTestResult,
-            TimeoutReason::OOBExitCodeNotReceived => CancelReason::TimeoutOnOutOfBandExitCode,
         }
     }
 }
@@ -201,7 +181,9 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let spec = manager.strategy().timeout_for_oob_exit_code();
+        let spec = manager
+            .strategy()
+            .timeout_for_last_test_result(Duration::ZERO);
 
         manager.insert_run(run_id.clone(), spec).await;
         assert_eq!(
@@ -209,7 +191,7 @@ mod test {
             TimedOutRun {
                 run_id,
                 after: Duration::ZERO,
-                reason: TimeoutReason::OOBExitCodeNotReceived,
+                reason: TimeoutReason::ResultNotReceived,
             }
         );
     }
@@ -265,7 +247,7 @@ mod test {
 
         let old_spec = TimeoutSpec {
             duration: old_timeout,
-            reason: TimeoutReason::OOBExitCodeNotReceived,
+            reason: TimeoutReason::ResultNotReceived,
         };
 
         let young_timeout = Duration::from_micros(10);
@@ -273,7 +255,7 @@ mod test {
 
         let young_spec = TimeoutSpec {
             duration: young_timeout,
-            reason: TimeoutReason::OOBExitCodeNotReceived,
+            reason: TimeoutReason::ResultNotReceived,
         };
 
         manager.insert_run(old_run_id, old_spec).await;
@@ -288,7 +270,7 @@ mod test {
             TimedOutRun {
                 run_id: young_run_id,
                 after: young_timeout,
-                reason: TimeoutReason::OOBExitCodeNotReceived
+                reason: TimeoutReason::ResultNotReceived
             }
         )
     }

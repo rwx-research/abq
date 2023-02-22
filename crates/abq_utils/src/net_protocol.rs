@@ -468,9 +468,6 @@ pub mod queue {
         pub batch_size_hint: NonZeroU64,
         pub max_run_attempt: u32,
         pub test_results_timeout: Duration,
-        /// If true, the exit code for the test run will be determined in-band by the queue.
-        /// If false, the exit code will be awaited from an external source.
-        pub track_exit_code_in_band: bool,
     }
 
     /// Why an invocation of some work did not succeed.
@@ -593,30 +590,6 @@ pub mod queue {
         User,
         /// Timed out waiting for the last test result in a test run.
         TimeoutOnTestResult,
-        /// Timed out waiting for the out-of-band exit code for a test run.
-        TimeoutOnOutOfBandExitCode,
-    }
-
-    /// An attempt was made to set an out-of-band exit code for a run, but it failed.
-    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-    pub enum CannotSetOOBExitCodeReason {
-        /// The run is still on-going.
-        RunIsActive,
-        /// The exit code of the run was already determined.
-        // TODO(captain-cli#116): there are two cases why this can happen
-        // - the OOB exit code was already set
-        // - the exit code was determined in band
-        // distinguish between the two for better error messages
-        ExitCodeAlreadyDetermined,
-        /// The run was cancelled or terminated before an exit code could be set.
-        RunWasCancelled { reason: CancelReason },
-    }
-
-    /// Whether an out-of-band exit code could be set.
-    #[derive(Debug, Serialize, Deserialize)]
-    pub enum SetOutOfBandExitCodeResponse {
-        Success,
-        Failure(CannotSetOOBExitCodeReason),
     }
 
     /// A request sent to the queue.
@@ -675,9 +648,6 @@ pub mod queue {
         InvokeWork(InvokeWork),
         /// An ask to mark an active test run as cancelled.
         CancelRun(RunId),
-        /// An ask to set a test run's exit code.
-        /// Only relevant when a test run is marked as having an exit code determined out-of-band.
-        SetOutOfBandExitCode(RunId, ExitCode),
         /// An invoker of a test run would like to reconnect to the queue for results streaming.
         Reconnect(RunId),
         /// A work manifest for a given run.
@@ -784,8 +754,7 @@ pub mod client {
         /// Acknowledgement of the end of the test run.
         AckEnd {
             /// The exit code that should be used.
-            /// `None` if an out-of-band exit code should be set instead.
-            exit_code: Option<ExitCode>,
+            exit_code: ExitCode,
         },
         /// Additional attempts should be added to the run.
         AdditionalAttempts {

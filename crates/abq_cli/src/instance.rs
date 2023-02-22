@@ -215,8 +215,4 @@ impl AbqInstance {
     pub fn client_options(&self) -> &ClientOptions {
         &self.client_options
     }
-
-    pub fn take_client_options(self) -> ClientOptions {
-        self.client_options
-    }
 }

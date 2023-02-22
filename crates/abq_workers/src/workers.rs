@@ -385,10 +385,8 @@ impl WorkerPool {
             WorkersExitStatus::Error { errors }
         } else if self.supervisor_in_band {
             // The supervisor will always take over the exit code seen by the worker.
-            // Moreover, we must not wait for the exit code from the queue, because we could be
-            // running in an out-of-band exit code mode, which always need the supervisor to exit
-            // first.
-            // Default an erroring code to trace if the supervisor's exit-code-overwriting logic
+            //
+            // Default to an erroring code to trace if the supervisor's exit-code-overwriting logic
             // goes wrong.
             WorkersExitStatus::Failure {
                 exit_code: ExitCode::WORKER_CEDES_TO_SUPERVISOR,
