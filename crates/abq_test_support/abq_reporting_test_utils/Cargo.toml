@@ -1,0 +1,11 @@
+[package]
+name = "abq_reporting_test_utils"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+abq_utils = { path = "../../abq_utils" }
+abq_reporting = { path = "../../abq_reporting" }
+regex.workspace = true
+tracing-test.workspace = true
+termcolor.workspace = true

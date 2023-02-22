@@ -130,12 +130,12 @@ pub fn run_cancellation_pair() -> (RunCancellationTx, RunCancellationRx) {
 
 #[must_use]
 #[derive(Debug)]
-pub struct CompletedSummary {
+pub struct CompletedRunData {
     /// The native test runner that was in use for this test run.
     pub native_runner_info: NativeRunnerInfo,
 }
 
-pub type StreamResult<H> = std::result::Result<(H, CompletedSummary), Error>;
+pub type StreamResult<H> = std::result::Result<(H, CompletedRunData), Error>;
 
 pub trait ResultHandler {
     type InitData;
@@ -493,6 +493,6 @@ impl Client {
         );
         let handler = handler.expect("illegal state - handler must be available after completion");
 
-        Ok((handler, CompletedSummary { native_runner_info }))
+        Ok((handler, CompletedRunData { native_runner_info }))
     }
 }

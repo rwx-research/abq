@@ -5,13 +5,11 @@ use std::{
     time::Duration,
 };
 
-pub mod colors;
-
+use crate::{colors::ColorProvider, ReportingError};
 use abq_utils::net_protocol::{
     entity::RunnerMeta,
     runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
 };
-use colors::ColorProvider;
 use indoc::formatdoc;
 use termcolor::{Color, ColorSpec, WriteColor};
 
@@ -378,6 +376,25 @@ pub fn format_short_suite_summary(
     Ok(())
 }
 
+pub fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> {
+    writer
+        .write_all(buf)
+        .map_err(|_| ReportingError::FailedToWrite)
+}
+
+pub fn format_summary_results(
+    writer: &mut impl termcolor::WriteColor,
+    summaries: Vec<SummaryKind>,
+) -> Result<(), ReportingError> {
+    for summary in summaries {
+        if would_write_summary(&summary) {
+            write(writer, &[b'\n'])?;
+        }
+        format_summary(writer, summary)?;
+    }
+    Ok(())
+}
+
 pub fn deprecation<W>(
     writer: &mut W,
     notice: &str,
@@ -525,10 +542,9 @@ mod test {
         runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
     };
 
-    use crate::{format_duration_to_partial_seconds, format_result_dot, ShortSummary};
-
     use super::{
-        format_duration, format_result_line, format_short_suite_summary, format_test_result_summary,
+        format_duration, format_duration_to_partial_seconds, format_result_dot, format_result_line,
+        format_short_suite_summary, format_test_result_summary, ShortSummary,
     };
     use std::{io, time::Duration};
 

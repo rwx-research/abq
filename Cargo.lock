@@ -6,11 +6,15 @@ version = 3
 name = "abq"
 version = "1.2.0"
 dependencies = [
+ "abq_dot_reporter",
  "abq_hosted",
  "abq_junit_xml",
+ "abq_line_reporter",
  "abq_native_runner_simulation",
- "abq_output",
+ "abq_progress_reporter",
  "abq_queue",
+ "abq_reporting",
+ "abq_reporting_test_utils",
  "abq_run_n_times",
  "abq_rwx_v1_json",
  "abq_test_utils",
@@ -41,6 +45,17 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "abq_dot_reporter"
+version = "0.1.0"
+dependencies = [
+ "abq_reporting",
+ "abq_reporting_test_utils",
+ "abq_utils",
+ "insta",
+ "termcolor",
 ]
 
 [[package]]
@@ -92,6 +107,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "abq_line_reporter"
+version = "0.1.0"
+dependencies = [
+ "abq_reporting",
+ "abq_reporting_test_utils",
+ "abq_utils",
+ "insta",
+ "termcolor",
+]
+
+[[package]]
 name = "abq_native_runner_simulation"
 version = "0.1.0"
 dependencies = [
@@ -103,11 +129,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "abq_output"
+name = "abq_progress_reporter"
 version = "0.1.0"
 dependencies = [
+ "abq_reporting",
+ "abq_reporting_test_utils",
  "abq_utils",
- "indoc",
+ "indicatif",
  "insta",
  "termcolor",
 ]
@@ -136,6 +164,28 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
+]
+
+[[package]]
+name = "abq_reporting"
+version = "0.1.0"
+dependencies = [
+ "abq_utils",
+ "indoc",
+ "insta",
+ "termcolor",
+ "thiserror",
+]
+
+[[package]]
+name = "abq_reporting_test_utils"
+version = "0.1.0"
+dependencies = [
+ "abq_reporting",
+ "abq_utils",
+ "regex",
+ "termcolor",
  "tracing-test",
 ]
 

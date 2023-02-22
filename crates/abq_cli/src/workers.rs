@@ -122,7 +122,7 @@ pub(crate) fn print_manifest_generation_output(
 ) {
     // NB: there is no reasonable way to surface the error at this point, since we are
     // about to shut down.
-    let _opt_err = abq_output::format_manifest_generation_output(
+    let _opt_err = abq_reporting::output::format_manifest_generation_output(
         &mut std::io::stdout(),
         runner,
         &manifest_output,
@@ -135,7 +135,10 @@ pub(crate) fn print_final_runner_outputs(
     for (runner, runner_out) in final_captured_runner_outputs {
         // NB: there is no reasonable way to surface the error at this point, since we are
         // about to shut down.
-        let _opt_err =
-            abq_output::format_final_runner_output(&mut std::io::stdout(), runner, &runner_out);
+        let _opt_err = abq_reporting::output::format_final_runner_output(
+            &mut std::io::stdout(),
+            runner,
+            &runner_out,
+        );
     }
 }

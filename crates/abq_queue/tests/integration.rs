@@ -11,7 +11,7 @@ use std::{
 
 use abq_queue::{
     invoke::{
-        self, run_cancellation_pair, Client, CompletedSummary, RunCancellationTx, TestResultError,
+        self, run_cancellation_pair, Client, CompletedRunData, RunCancellationTx, TestResultError,
         DEFAULT_CLIENT_POLL_TIMEOUT, DEFAULT_TICK_INTERVAL,
     },
     queue::{Abq, QueueConfig},
@@ -219,7 +219,7 @@ enum Action {
 enum Assert<'a> {
     CheckSupervisor(Sid, &'a dyn Fn(&Result<Client, invoke::Error>) -> bool),
 
-    TestExit(Sid, &'a dyn Fn(&Result<CompletedSummary, invoke::Error>)),
+    TestExit(Sid, &'a dyn Fn(&Result<CompletedRunData, invoke::Error>)),
     TestExitWithoutErr(Sid),
     TestResults(Sid, &'a dyn Fn(&[(WorkId, u32, TestResult)]) -> bool),
 
@@ -270,7 +270,7 @@ impl<'a> TestBuilder<'a> {
 type Supervisors = Arc<Mutex<HashMap<Sid, Result<Client, invoke::Error>>>>;
 type SupervisorData = Arc<tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, ResultsCollector)>>>;
 type SupervisorResults =
-    Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedSummary, invoke::Error>>>>;
+    Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedRunData, invoke::Error>>>>;
 
 type Workers = Arc<Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
@@ -624,7 +624,7 @@ fn run_test(servers: Servers, steps: Steps) {
                         let results = supervisor_results.lock().await;
                         let exit = results.get(&n).expect("supervisor exit not found");
                         assert!(exit.is_ok(), "{:?}", exit);
-                        let CompletedSummary { native_runner_info } = exit.as_ref().unwrap();
+                        let CompletedRunData { native_runner_info } = exit.as_ref().unwrap();
                         let NativeRunnerInfo {
                             protocol_version,
                             specification: _,

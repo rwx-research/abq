@@ -18,8 +18,8 @@ use std::{
 };
 
 use abq_hosted::AccessToken;
-use abq_output::format_duration;
 use abq_queue::invoke::{self, Client, ResultHandler};
+use abq_reporting::{output::format_duration, CompletedSummary};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     exit::ExitCode,
@@ -724,7 +724,7 @@ fn run_sentinel_abq_test(
         print_final_runner_outputs(final_captured_outputs);
     }
 
-    let (reporters, completed_summary) = match opt_invoked_error {
+    let (reporters, completed_data) = match opt_invoked_error {
         Ok(summary) => summary,
         Err(invoke_error) => {
             elaborate_invocation_error(invoke_error, runner_params)?;
@@ -743,9 +743,13 @@ fn run_sentinel_abq_test(
             get_hosted_api_base_url(),
             access_token,
             &run_id,
-            &completed_summary.native_runner_info.specification,
+            &completed_data.native_runner_info.specification,
         )
     }
+
+    let completed_summary = CompletedSummary {
+        native_runner_info: completed_data.native_runner_info,
+    };
 
     let (suite_result, errors) = reporters.finish(&completed_summary);
 

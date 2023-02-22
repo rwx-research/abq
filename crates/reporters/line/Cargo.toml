@@ -1,0 +1,15 @@
+[package]
+edition = "2021"
+name = "abq_line_reporter"
+version = "0.1.0"
+
+[dependencies]
+abq_utils = { path = "../../abq_utils" }
+abq_reporting = { path = "../../abq_reporting" }
+
+termcolor.workspace = true
+
+[dev-dependencies]
+abq_utils = { path = "../../abq_utils", features = ["expose-native-protocols"] }
+abq_reporting_test_utils = { path = "../../abq_test_support/abq_reporting_test_utils" }
+insta.workspace = true

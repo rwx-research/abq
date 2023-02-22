@@ -1,6 +1,7 @@
 [package]
 edition = "2021"
-name = "abq_output"
+description = "Basic utilities for reporting, writing test results."
+name = "abq_reporting"
 version = "0.1.0"
 
 [dependencies]
@@ -8,6 +9,7 @@ abq_utils = { path = "../abq_utils" }
 
 termcolor.workspace = true
 indoc.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
