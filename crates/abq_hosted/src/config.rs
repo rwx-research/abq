@@ -181,7 +181,7 @@ mod test {
 
     use super::{Error, HostedQueueConfig};
 
-    use mockito::{mock, Matcher};
+    use mockito::{Matcher, Server};
 
     fn test_access_token() -> AccessToken {
         AccessToken::from_str("abqapi_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
@@ -202,9 +202,11 @@ mod test {
 
     #[test]
     fn get_hosted_queue_config_with_tls() {
+        let mut server = Server::new();
+
         let in_run_id = RunId("1234".to_string());
 
-        let _m = mock("GET", "/queue")
+        let _m = server.mock("GET", "/queue")
             .match_header(
                 "Authorization",
                 format!("Bearer {}", test_access_token()).as_str(),
@@ -228,8 +230,7 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-        } = HostedQueueConfig::from_api(mockito::server_url(), &test_access_token(), &in_run_id)
-            .unwrap();
+        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
@@ -239,9 +240,12 @@ mod test {
 
     #[test]
     fn get_hosted_queue_config_without_tls() {
+        let mut server = Server::new();
+
         let in_run_id = RunId("1234".to_string());
 
-        let _m = mock("GET", "/queue")
+        let _m = server
+            .mock("GET", "/queue")
             .match_header(
                 "Authorization",
                 format!("Bearer {}", test_access_token()).as_str(),
@@ -264,8 +268,7 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-        } = HostedQueueConfig::from_api(mockito::server_url(), &test_access_token(), &in_run_id)
-            .unwrap();
+        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
@@ -275,43 +278,46 @@ mod test {
 
     #[test]
     fn get_hosted_queue_config_wrong_authn() {
-        let _m = mock("GET", "/queue")
+        let mut server = Server::new();
+
+        let _m = server
+            .mock("GET", "/queue")
             .match_query(Matcher::Any)
             .with_status(401)
             .create();
 
-        let err = HostedQueueConfig::from_api(
-            mockito::server_url(),
-            &test_access_token(),
-            &RunId("".to_owned()),
-        )
-        .unwrap_err();
+        let err =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &RunId("".to_owned()))
+                .unwrap_err();
 
         assert!(matches!(err, Error::Unauthenticated));
     }
 
     #[test]
     fn get_hosted_queue_config_wrong_authz() {
-        let _m = mock("GET", "/queue")
+        let mut server = Server::new();
+
+        let _m = server
+            .mock("GET", "/queue")
             .match_query(Matcher::Any)
             .with_status(403)
             .create();
 
-        let err = HostedQueueConfig::from_api(
-            mockito::server_url(),
-            &test_access_token(),
-            &RunId("".to_owned()),
-        )
-        .unwrap_err();
+        let err =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &RunId("".to_owned()))
+                .unwrap_err();
 
         assert!(matches!(err, Error::Unauthorized));
     }
 
     #[test]
     fn get_hosted_queue_config_unexpected_response() {
+        let mut server = Server::new();
+
         let in_run_id = RunId("1234".to_string());
 
-        let _m = mock("GET", "/queue")
+        let _m = server
+            .mock("GET", "/queue")
             .match_header(
                 "Authorization",
                 format!("Bearer {}", test_access_token()).as_str(),
@@ -326,9 +332,8 @@ mod test {
             .with_body(r#"{"queue_url":"tcp://168.220.85.45:8080"}"#)
             .create();
 
-        let err =
-            HostedQueueConfig::from_api(mockito::server_url(), &test_access_token(), &in_run_id)
-                .unwrap_err();
+        let err = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+            .unwrap_err();
 
         assert!(matches!(err, Error::SchemaError(..)));
     }
@@ -347,17 +352,23 @@ mod test {
 
     #[test]
     fn retry_request_on_429() {
-        let mut m = mock("GET", "/")
+        let mut server = Server::new();
+
+        let mut m = server
+            .mock("GET", "/")
             .match_query(Matcher::Any)
             .with_status(429)
             .create();
 
         let mut last_seen_attempt = 0;
 
+        let server_url = server.url();
+
         let retrier = |last_attempt| {
             last_seen_attempt = last_attempt;
             if last_attempt == 1 {
-                m = mock("GET", "/")
+                m = server
+                    .mock("GET", "/")
                     .match_query(Matcher::Any)
                     .with_status(200)
                     .create();
@@ -369,7 +380,7 @@ mod test {
 
         let client = reqwest::blocking::Client::new();
         let resp =
-            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
+            send_request_with_decay_help(|| client.get(server_url.clone()), retrier).unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(last_seen_attempt, 1);
@@ -377,17 +388,23 @@ mod test {
 
     #[test]
     fn retry_request_on_500() {
-        let mut m = mock("GET", "/")
+        let mut server = Server::new();
+
+        let mut m = server
+            .mock("GET", "/")
             .match_query(Matcher::Any)
             .with_status(500)
             .create();
 
         let mut last_seen_attempt = 0;
 
+        let server_url = server.url();
+
         let retrier = |last_attempt| {
             last_seen_attempt = last_attempt;
             if last_attempt == 1 {
-                m = mock("GET", "/")
+                m = server
+                    .mock("GET", "/")
                     .match_query(Matcher::Any)
                     .with_status(200)
                     .create();
@@ -399,7 +416,7 @@ mod test {
 
         let client = reqwest::blocking::Client::new();
         let resp =
-            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
+            send_request_with_decay_help(|| client.get(server_url.clone()), retrier).unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(last_seen_attempt, 1);
@@ -407,17 +424,23 @@ mod test {
 
     #[test]
     fn do_not_retry_request_on_400_level() {
-        let mut m = mock("GET", "/")
+        let mut server = Server::new();
+
+        let mut m = server
+            .mock("GET", "/")
             .match_query(Matcher::Any)
             .with_status(401)
             .create();
 
         let mut last_seen_attempt = 0;
 
+        let server_url = server.url();
+
         let retrier = |last_attempt| {
             last_seen_attempt = last_attempt;
             if last_attempt == 1 {
-                m = mock("GET", "/")
+                m = server
+                    .mock("GET", "/")
                     .match_query(Matcher::Any)
                     .with_status(200)
                     .create();
@@ -429,7 +452,7 @@ mod test {
 
         let client = reqwest::blocking::Client::new();
         let resp =
-            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
+            send_request_with_decay_help(|| client.get(server_url.clone()), retrier).unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(last_seen_attempt, 0);
@@ -437,7 +460,10 @@ mod test {
 
     #[test]
     fn do_not_retry_request_when_retrier_is_done() {
-        let _m = mock("GET", "/")
+        let mut server = Server::new();
+
+        let _m = server
+            .mock("GET", "/")
             .match_query(Matcher::Any)
             .with_status(500)
             .create();
@@ -450,8 +476,7 @@ mod test {
         };
 
         let client = reqwest::blocking::Client::new();
-        let resp =
-            send_request_with_decay_help(|| client.get(mockito::server_url()), retrier).unwrap();
+        let resp = send_request_with_decay_help(|| client.get(server.url()), retrier).unwrap();
 
         assert_eq!(resp.status().as_u16(), 500);
         assert_eq!(last_seen_attempt, 3);

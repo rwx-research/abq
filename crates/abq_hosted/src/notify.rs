@@ -106,7 +106,7 @@ mod test {
 
     use abq_utils::net_protocol::{runners::NativeRunnerSpecification, workers::RunId};
 
-    use mockito::{mock, Matcher};
+    use mockito::{Matcher, Server};
 
     use crate::{error::Error, AccessToken};
 
@@ -131,8 +131,9 @@ mod test {
     #[test]
     fn send_success() {
         let run_id = RunId("1234".to_string());
+        let mut server = Server::new();
 
-        let _m = mock("POST", "/record_test_run")
+        let _m = server.mock("POST", "/record_test_run")
             .match_header(
                 "Authorization",
                 format!("Bearer {}", test_access_token()).as_str(),
@@ -145,7 +146,7 @@ mod test {
             .create();
 
         let result = record_test_run_metadata_help(
-            mockito::server_url(),
+            server.url(),
             &test_access_token(),
             &run_id,
             &test_native_runner_spec(),
@@ -156,13 +157,15 @@ mod test {
 
     #[test]
     fn get_hosted_queue_config_wrong_authn() {
-        let _m = mock("POST", "/record_test_run")
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/record_test_run")
             .match_query(Matcher::Any)
             .with_status(401)
             .create();
 
         let err = record_test_run_metadata_help(
-            mockito::server_url(),
+            server.url(),
             &test_access_token(),
             &RunId("1234".to_owned()),
             &test_native_runner_spec(),
@@ -175,13 +178,15 @@ mod test {
 
     #[test]
     fn get_hosted_queue_config_wrong_authz() {
-        let _m = mock("POST", "/record_test_run")
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/record_test_run")
             .match_query(Matcher::Any)
             .with_status(403)
             .create();
 
         let err = record_test_run_metadata_help(
-            mockito::server_url(),
+            server.url(),
             &test_access_token(),
             &RunId("1234".to_owned()),
             &test_native_runner_spec(),

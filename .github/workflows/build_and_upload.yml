@@ -105,7 +105,7 @@ jobs:
         run: git fetch --tags --force
 
       - name: Restore cargo cache
-        uses: actions/cache@v3.2.4
+        uses: actions/cache@v3.2.6
         env:
           cache-name: ci
         with:

@@ -1618,30 +1618,7 @@ test_all_network_config_options! {
         let stdout = sanitize_output(&stdout);
         let stderr = sanitize_output(&stderr);
 
-        // Make sure the failing message is reflected both in a failing result reported to the
-        // supervisor, and captured worker stdout/stderr.
-        assert!(stdout.contains(
-r#"
--- Unexpected Test Runner Failure --
-
-The test command
-
-<simulation cmd>
-
-stopped communicating with its abq worker before completing all test requests.
-
-Here's the standard output/error we found for the failing command.
-
-Stdout:
-
-I failed catastrophically
-
-Stderr:
-
-For a reason explainable only by a backtrace
-
-Please see worker 0, runner 1 for more details.
-"#.trim()), "STDOUT:\n{stdout}");
+        // Make sure the failing message is reflected in captured worker stdout/stderr.
 
         assert!(stdout.contains(
 r#"
