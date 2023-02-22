@@ -15,7 +15,7 @@ use abq_output::{
     colors::ColorProvider, format_interactive_progress, format_non_interactive_progress,
     format_result_dot, format_result_line, format_runner_output, format_short_suite_summary,
     format_summary, format_test_result_summary, would_write_output, would_write_summary,
-    OutputOrdering, SummaryKind,
+    OutputOrdering, ShortSummary, SummaryKind,
 };
 use abq_queue::invoke::{self, CompletedSummary};
 use abq_utils::{
@@ -140,11 +140,13 @@ impl SuiteResult {
     pub fn write_short_summary_lines(&self, w: &mut impl termcolor::WriteColor) -> io::Result<()> {
         format_short_suite_summary(
             w,
-            self.wall_time,
-            self.test_time.duration(),
-            self.count,
-            self.count_failed,
-            self.tests_retried,
+            ShortSummary {
+                wall_time: self.wall_time,
+                test_time: self.test_time.duration(),
+                num_tests: self.count,
+                num_failing: self.count_failed,
+                num_retried: self.tests_retried,
+            },
         )
     }
 

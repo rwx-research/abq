@@ -331,16 +331,28 @@ pub fn format_non_interactive_progress(
     writeln!(writer)
 }
 
+pub struct ShortSummary {
+    pub wall_time: Duration,
+    pub test_time: Duration,
+    pub num_tests: u64,
+    pub num_failing: u64,
+    pub num_retried: u64,
+}
+
 pub fn format_short_suite_summary(
     writer: &mut impl WriteColor,
-    wall_time: Duration,
-    test_time: Duration,
-    num_tests: u64,
-    num_failing: u64,
-    num_retried: u64,
+    summary: ShortSummary,
 ) -> io::Result<()> {
     // Finished in X seconds (X seconds spent in test code)
     // M tests, N failures
+
+    let ShortSummary {
+        wall_time,
+        test_time,
+        num_tests,
+        num_failing,
+        num_retried,
+    } = summary;
 
     with_color_spec(writer, &bold_spec(), |w| {
         write!(w, "Finished in ")?;
@@ -357,8 +369,9 @@ pub fn format_short_suite_summary(
         write!(w, "{num_failing} failures")
     })?;
     if num_retried > 0 {
+        write!(writer, ", ")?;
         with_color_spec(writer, &yellow_bold_spec(), |w| {
-            write!(w, ", {num_retried} retried")
+            write!(w, "{num_retried} retried")
         })?;
     }
     writeln!(writer)?;
@@ -512,9 +525,11 @@ mod test {
         runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
     };
 
-    use crate::{format_duration_to_partial_seconds, format_result_dot};
+    use crate::{format_duration_to_partial_seconds, format_result_dot, ShortSummary};
 
-    use super::{format_duration, format_result_line, format_test_result_summary};
+    use super::{
+        format_duration, format_result_line, format_short_suite_summary, format_test_result_summary,
+    };
     use std::{io, time::Duration};
 
     #[allow(clippy::identity_op)]
@@ -549,7 +564,6 @@ mod test {
 
         fn set_color(&mut self, spec: &termcolor::ColorSpec) -> io::Result<()> {
             assert!(spec.bg().is_none());
-            assert!(!spec.bold());
             assert!(!spec.intense());
             assert!(!spec.underline());
             assert!(!spec.dimmed());
@@ -557,19 +571,26 @@ mod test {
             assert!(spec.reset());
 
             use termcolor::Color::*;
-            let color = match spec.fg().unwrap() {
-                Black => "black",
-                Blue => "blue",
-                Green => "green",
-                Red => "red",
-                Cyan => "cyan",
-                Magenta => "magenta",
-                Yellow => "yellow",
-                White => "white",
-                _ => unreachable!(),
-            };
+            let mut spec_parts = vec![];
+            if spec.bold() {
+                spec_parts.push("bold")
+            }
+            if let Some(color) = spec.fg() {
+                let co = match color {
+                    Black => "black",
+                    Blue => "blue",
+                    Green => "green",
+                    Red => "red",
+                    Cyan => "cyan",
+                    Magenta => "magenta",
+                    Yellow => "yellow",
+                    White => "white",
+                    _ => unreachable!(),
+                };
+                spec_parts.push(co);
+            }
 
-            write!(&mut self.0, "<{color}>")
+            write!(&mut self.0, "<{}>", spec_parts.join("-"))
         }
 
         fn reset(&mut self) -> io::Result<()> {
@@ -1099,6 +1120,42 @@ mod test {
     ----- STDERR
     my stdout
     (completed in 1 m, 15 s, 3 ms [worker 0])
+    "###
+    );
+
+    test_format!(
+        format_short_suite_summary_with_failing_and_retried, format_short_suite_summary,
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 10, num_retried: 15 },
+        @r###"
+    <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
+    <bold-green>100 tests<reset>, <bold-red>10 failures<reset>, <bold-yellow>15 retried<reset>
+    "###
+    );
+
+    test_format!(
+        format_short_suite_summary_with_failing_without_retried, format_short_suite_summary,
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 10, num_retried: 0 },
+        @r###"
+    <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
+    <bold-green>100 tests<reset>, <bold-red>10 failures<reset>
+    "###
+    );
+
+    test_format!(
+        format_short_suite_summary_with_no_failing_no_retried, format_short_suite_summary,
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 0 },
+        @r###"
+    <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
+    <bold-green>100 tests<reset>, <>0 failures<reset>
+    "###
+    );
+
+    test_format!(
+        format_short_suite_summary_with_no_failing_but_retried, format_short_suite_summary,
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 10 },
+        @r###"
+    <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
+    <bold-green>100 tests<reset>, <>0 failures<reset>, <bold-yellow>10 retried<reset>
     "###
     );
 }
