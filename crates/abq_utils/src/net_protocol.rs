@@ -444,7 +444,7 @@ pub mod queue {
         runners::{
             AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestCase, TestResult,
         },
-        workers::{ManifestResult, RunId, RunnerKind, WorkId},
+        workers::{ManifestResult, RunId, WorkId},
     };
 
     /// Information about the queue and its negotiation server.
@@ -464,7 +464,6 @@ pub mod queue {
     #[derive(Serialize, Deserialize, Debug)]
     pub struct InvokeWork {
         pub run_id: RunId,
-        pub runner: RunnerKind,
         pub batch_size_hint: NonZeroU64,
         pub max_run_attempt: u32,
         pub test_results_timeout: Duration,

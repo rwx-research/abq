@@ -66,18 +66,12 @@ use abq_utils::{
 
 #[derive(Serialize, Deserialize)]
 struct ExecutionContext {
-    /// The work run we are connecting to.
-    run_id: RunId,
     /// Where workers should receive messages from.
     work_server_addr: SocketAddr,
     /// Where workers should send results to.
     queue_results_addr: SocketAddr,
-    /// The kind of native runner workers should start.
-    runner_kind: RunnerKind,
     /// Whether the queue wants a worker to generate the work manifest.
     worker_should_generate_manifest: bool,
-    /// Hint for how many test results should be sent back in a batch by a worker.
-    results_batch_size_hint: u64,
 }
 
 #[allow(clippy::large_enum_variant)] // I believe we can drop this after we upgrade to rust 1.65.0
@@ -106,7 +100,7 @@ pub enum MessageToQueueNegotiator {
     WantsToAttach {
         /// The run the worker wants to run tests for. The queue must respect assignment of
         /// work related to this run, or return an error.
-        run: RunId,
+        run_id: RunId,
     },
 }
 
@@ -114,10 +108,13 @@ pub enum MessageToQueueNegotiator {
 pub struct WorkersConfig {
     pub tag: WorkerTag,
     pub num_workers: NonZeroUsize,
+    pub runner_kind: RunnerKind,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
     pub supervisor_in_band: bool,
     pub debug_native_runner: bool,
+    /// Hint for how many test results should be sent back in a batch.
+    pub results_batch_size_hint: u64,
 }
 
 #[derive(Debug, Error)]
@@ -177,7 +174,7 @@ impl WorkersNegotiator {
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
         client_options: ClientOptions<User>,
-        wanted_run_id: RunId,
+        run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -188,7 +185,7 @@ impl WorkersNegotiator {
             workers_config,
             queue_negotiator_handle,
             client_options,
-            wanted_run_id,
+            run_id,
         ))
     }
 
@@ -199,7 +196,7 @@ impl WorkersNegotiator {
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
         client_options: ClientOptions<User>,
-        wanted_run_id: RunId,
+        run_id: RunId,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         let first_runner_entity = Entity::runner(workers_config.tag, 1);
         let client = client_options.clone().build()?;
@@ -208,18 +205,15 @@ impl WorkersNegotiator {
         let execution_decision = wait_for_execution_context(
             &*async_client,
             first_runner_entity,
-            &wanted_run_id,
+            &run_id,
             queue_negotiator_handle.0,
         )
         .await?;
 
         let ExecutionContext {
-            run_id,
             work_server_addr,
             queue_results_addr,
-            runner_kind,
             worker_should_generate_manifest,
-            results_batch_size_hint,
         } = match execution_decision {
             Ok(ctx) => ctx,
             Err(redundnant_workers) => return Ok(redundnant_workers),
@@ -234,9 +228,11 @@ impl WorkersNegotiator {
         let WorkersConfig {
             tag,
             num_workers,
+            runner_kind,
             worker_context,
             supervisor_in_band,
             debug_native_runner,
+            results_batch_size_hint,
         } = workers_config;
 
         let notify_results: NotifyResults = Arc::new({
@@ -455,7 +451,7 @@ impl WorkersNegotiator {
 async fn wait_for_execution_context(
     client: &dyn net_async::ConfiguredClient,
     entity: Entity,
-    wanted_run_id: &RunId,
+    run_id: &RunId,
     queue_negotiator_addr: SocketAddr,
 ) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
     let mut decay = Duration::from_millis(10);
@@ -465,7 +461,7 @@ async fn wait_for_execution_context(
         let wants_to_attach = negotiate::Request {
             entity,
             message: MessageToQueueNegotiator::WantsToAttach {
-                run: wanted_run_id.clone(),
+                run_id: run_id.clone(),
             },
         };
         net_protocol::async_write(&mut conn, &wants_to_attach).await?;
@@ -612,9 +608,7 @@ pub enum QueueNegotiateError {
 /// The test run a worker should ask for work on.
 pub struct AssignedRun {
     pub run_id: RunId,
-    pub runner_kind: RunnerKind,
     pub should_generate_manifest: bool,
-    pub results_batch_size_hint: u64,
 }
 
 /// A marker that a test run should work on has already completed by the time the worker started
@@ -779,23 +773,19 @@ impl QueueNegotiator {
                 }
                 write_result
             }
-            WantsToAttach { run: wanted_run_id } => {
-                let attach = tracing::debug_span!("Worker set negotiating", run_id=?wanted_run_id);
+            WantsToAttach { run_id } => {
+                let attach = tracing::debug_span!("Worker set negotiating", run_id=?run_id);
                 let _attach_span = attach.enter();
-                tracing::debug!(run_id=?wanted_run_id, "New worker set negotiating");
+                tracing::debug!(run_id=?run_id, "New worker set negotiating");
 
-                let assigned_run_result = (ctx.get_assigned_run)(&wanted_run_id, entity);
+                let assigned_run_result = (ctx.get_assigned_run)(&run_id, entity);
 
                 use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
                     Run(AssignedRun {
                         run_id,
-                        runner_kind,
                         should_generate_manifest,
-                        results_batch_size_hint,
                     }) => {
-                        debug_assert_eq!(run_id, wanted_run_id);
-
                         tracing::debug!(
                             ?should_generate_manifest,
                             ?run_id,
@@ -805,25 +795,22 @@ impl QueueNegotiator {
                         MessageFromQueueNegotiator::ExecutionContext(ExecutionContext {
                             work_server_addr: ctx.advertised_queue_work_scheduler_addr,
                             queue_results_addr: ctx.advertised_queue_results_addr,
-                            results_batch_size_hint,
-                            runner_kind,
                             worker_should_generate_manifest: should_generate_manifest,
-                            run_id,
                         })
                     }
                     AlreadyDone { exit_code } => {
-                        tracing::debug!(?wanted_run_id, "run already completed");
+                        tracing::debug!(?run_id, "run already completed");
                         MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code }
                     }
                     CompleteButExitCodeNotKnown => {
                         tracing::debug!(
-                            ?wanted_run_id,
+                            ?run_id,
                             "run already completed, but exit code not yet known"
                         );
                         MessageFromQueueNegotiator::RunCompleteButExitCodeNotKnown
                     }
                     RunUnknown => {
-                        tracing::debug!(?wanted_run_id, "run not yet known");
+                        tracing::debug!(?run_id, "run not yet known");
                         MessageFromQueueNegotiator::RunUnknown
                     }
                 };
@@ -1112,16 +1099,15 @@ mod test {
 
         let run_id = RunId::unique();
 
+        let manifest = ManifestMessage::new(Manifest::new(
+            [echo_test(proto, "hello".to_string())],
+            Default::default(),
+        ));
+
         let get_assigned_run = move |run_id: &RunId, _entity| {
-            let manifest = ManifestMessage::new(Manifest::new(
-                [echo_test(proto, "hello".to_string())],
-                Default::default(),
-            ));
             AssignedRunStatus::Run(AssignedRun {
                 run_id: run_id.clone(),
-                runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
                 should_generate_manifest: true,
-                results_batch_size_hint: 2,
             })
         };
 
@@ -1140,9 +1126,11 @@ mod test {
         let workers_config = WorkersConfig {
             tag: WorkerTag::new(0),
             num_workers: NonZeroUsize::new(1).unwrap(),
+            runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
             worker_context: WorkerContext::AssumeLocal,
             supervisor_in_band: false,
             debug_native_runner: false,
+            results_batch_size_hint: 1,
         };
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
@@ -1189,12 +1177,7 @@ mod test {
             move |_, _| {
                 AssignedRunStatus::Run(AssignedRun {
                     run_id: RunId::unique(),
-                    runner_kind: RunnerKind::TestLikeRunner(
-                        TestLikeRunner::Echo,
-                        ManifestMessage::new(Manifest::new([], Default::default())).into(),
-                    ),
                     should_generate_manifest: true,
-                    results_batch_size_hint: 2,
                 })
             },
         )

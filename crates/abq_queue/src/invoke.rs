@@ -27,7 +27,7 @@ use abq_utils::{
             RunStartData, TestSpec,
         },
         runners::CapturedOutput,
-        workers::{RunId, RunnerKind, WorkId, INIT_RUN_NUMBER},
+        workers::{RunId, WorkId, INIT_RUN_NUMBER},
         AsyncReaderDos,
     },
 };
@@ -153,7 +153,6 @@ impl Client {
         abq_server_addr: SocketAddr,
         client_options: ClientOptions<User>,
         run_id: RunId,
-        runner: RunnerKind,
         batch_size_hint: NonZeroU64,
         test_results_timeout: Duration,
         retries: u32,
@@ -171,7 +170,6 @@ impl Client {
             entity,
             message: Message::InvokeWork(InvokeWork {
                 run_id: run_id.clone(),
-                runner,
                 batch_size_hint,
                 test_results_timeout,
                 max_run_attempt,

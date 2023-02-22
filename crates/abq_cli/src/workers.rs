@@ -6,7 +6,7 @@ use std::time::Duration;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
 use abq_utils::net_protocol::runners::CapturedOutput;
-use abq_utils::net_protocol::workers::RunId;
+use abq_utils::net_protocol::workers::{RunId, RunnerKind};
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
 };
@@ -17,12 +17,14 @@ use signal_hook::iterator::Signals;
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
 pub fn start_workers(
+    run_id: RunId,
     tag: WorkerTag,
     num_workers: NonZeroUsize,
+    runner_kind: RunnerKind,
     working_dir: PathBuf,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
-    run_id: RunId,
+    results_batch_size: u64,
     supervisor_in_band: bool,
 ) -> anyhow::Result<NegotiatedWorkers> {
     let context = WorkerContext::AlwaysWorkIn { working_dir };
@@ -30,9 +32,11 @@ pub fn start_workers(
     let workers_config = WorkersConfig {
         tag,
         num_workers,
+        runner_kind,
         worker_context: context,
         supervisor_in_band,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
+        results_batch_size_hint: results_batch_size,
     };
 
     tracing::debug!(
@@ -53,20 +57,24 @@ pub fn start_workers(
 }
 
 pub fn start_workers_standalone(
+    run_id: RunId,
     tag: WorkerTag,
     num_workers: NonZeroUsize,
+    runner_kind: RunnerKind,
     working_dir: PathBuf,
+    results_batch_size: u64,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
-    run_id: RunId,
 ) -> ! {
     let mut worker_pool = start_workers(
+        run_id,
         tag,
         num_workers,
+        runner_kind,
         working_dir,
         queue_negotiator,
         client_opts,
-        run_id,
+        results_batch_size,
         false, // no supervisor in-band
     )
     .unwrap();

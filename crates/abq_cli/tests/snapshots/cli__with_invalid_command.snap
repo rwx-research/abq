@@ -3,11 +3,7 @@ source: crates/abq_cli/tests/cli.rs
 expression: stderr
 ---
 --- ERROR ---
-The command
-
-    __zzz_not_a_command__
-
-failed to be run by all ABQ workers associating to this test run.
+The given runner command failed to be run by all ABQ workers associating to this test run.
 
 Here's a message we found concerning the failure:
 

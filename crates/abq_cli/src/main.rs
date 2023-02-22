@@ -371,11 +371,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             statefile::optional_write_worker_statefile(&run_id, is_supervisor)?;
 
+            let runner = RunnerKind::GenericNativeTestRunner(runner_params);
+
             if is_supervisor {
                 run_sentinel_abq_test(
                     entity,
                     &access_token,
-                    runner_params,
+                    runner,
                     abq,
                     run_id,
                     reporters,
@@ -388,12 +390,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 )
             } else {
                 workers::start_workers_standalone(
+                    run_id,
                     WorkerTag::new(worker as _),
                     num_runners,
+                    runner,
                     working_dir,
+                    batch_size.get(),
                     abq.negotiator_handle(),
                     abq.client_options().clone(),
-                    run_id,
                 )
             }
         }
@@ -604,7 +608,7 @@ fn find_or_create_abq(
 fn run_sentinel_abq_test(
     supervisor_entity: Entity,
     access_token: &Option<AccessToken>,
-    runner_params: NativeTestRunnerParams,
+    runner: RunnerKind,
     abq: AbqInstance,
     run_id: RunId,
     reporters: Vec<ReporterKind>,
@@ -620,14 +624,11 @@ fn run_sentinel_abq_test(
     let reporter_data: <SuiteReporters as ResultHandler>::InitData =
         (reporters, stdout_preferences, test_suite_name.to_owned());
 
-    let runner = RunnerKind::GenericNativeTestRunner(runner_params.clone());
-
     let work_results_thread = start_test_result_reporter(
         supervisor_entity,
         abq.server_addr(),
         abq.client_options().clone(),
         run_id.clone(),
-        runner,
         batch_size,
         results_timeout,
         retries,
@@ -640,12 +641,14 @@ fn run_sentinel_abq_test(
     )?;
 
     let mut worker_pool = workers::start_workers(
+        run_id.clone(),
         WorkerTag::ZERO,
         num_runners,
+        runner,
         working_dir,
         abq.negotiator_handle(),
         abq.client_options().clone(),
-        run_id.clone(),
+        batch_size.get(),
         true, // workers in-band with supervisor
     )?;
 
@@ -676,7 +679,7 @@ fn run_sentinel_abq_test(
     let (reporters, completed_data) = match opt_invoked_error {
         Ok(summary) => summary,
         Err(invoke_error) => {
-            elaborate_invocation_error(invoke_error, runner_params)?;
+            elaborate_invocation_error(invoke_error)?;
             return Ok(ExitCode::FAILURE);
         }
     };
@@ -712,10 +715,7 @@ fn run_sentinel_abq_test(
     Ok(suite_result.suggested_exit_code())
 }
 
-fn elaborate_invocation_error(
-    error: invoke::Error,
-    runner_params: NativeTestRunnerParams,
-) -> io::Result<()> {
+fn elaborate_invocation_error(error: invoke::Error) -> io::Result<()> {
     use invoke::Error::*;
     use invoke::TestResultError::*;
     eprintln!("--- ERROR ---");
@@ -726,31 +726,17 @@ fn elaborate_invocation_error(
         }
         TestResultError(error) => match error {
             TestCommandError(opaque_error, captured_output) => {
-                let NativeTestRunnerParams {
-                    cmd,
-                    args,
-                    extra_env: _,
-                } = runner_params;
-
-                let mut cmd = vec![cmd];
-                cmd.extend(args);
-                let cmd = cmd.join(" ");
-
                 let msg = format!(
                     indoc::indoc!(
                         r#"
-                        The command
-
-                            {}
-
-                        failed to be run by all ABQ workers associating to this test run.
+                        The given runner command failed to be run by all ABQ workers associating to this test run.
 
                         Here's a message we found concerning the failure:
 
                         {}
                         "#
                     ),
-                    cmd, opaque_error,
+                    opaque_error,
                 );
                 (anyhow::Error::msg(msg), Some(captured_output))
             }
@@ -805,7 +791,6 @@ fn start_test_result_reporter(
     abq_server_addr: SocketAddr,
     client_opts: ClientOptions<User>,
     test_id: RunId,
-    runner: RunnerKind,
     batch_size: NonZeroU64,
     results_timeout: Duration,
     retries: u32,
@@ -832,7 +817,6 @@ fn start_test_result_reporter(
                 abq_server_addr,
                 client_opts,
                 test_id,
-                runner,
                 batch_size,
                 results_timeout,
                 retries,

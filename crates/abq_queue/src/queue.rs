@@ -21,7 +21,7 @@ use abq_utils::net_protocol::queue::{
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
 use abq_utils::net_protocol::work_server;
 use abq_utils::net_protocol::workers::{
-    ManifestResult, NextWorkBundle, ReportedManifest, RunnerKind, WorkerTest, INIT_RUN_NUMBER,
+    ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
 };
 use abq_utils::net_protocol::{
     self,
@@ -125,7 +125,6 @@ enum RunState {
 }
 
 struct RunData {
-    runner: Box<RunnerKind>,
     /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
     batch_size_hint: NonZeroU64,
     /// The timeout for the last test result.
@@ -135,7 +134,7 @@ struct RunData {
 }
 
 // Just the stack size of the RunData, the closure of RunData may be much larger.
-static_assertions::assert_eq_size!(RunData, (usize, u64, Duration, bool));
+static_assertions::assert_eq_size!(RunData, (u64, Duration, bool));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
@@ -272,7 +271,6 @@ impl AllRuns {
     pub fn create_queue(
         &self,
         run_id: RunId,
-        runner: RunnerKind,
         batch_size_hint: NonZeroU64,
         max_run_attempt: u32,
         last_test_timeout: Duration,
@@ -322,7 +320,6 @@ impl AllRuns {
                 worker_connection_times: worker_timings,
             },
             data: Some(RunData {
-                runner: Box::new(runner),
                 batch_size_hint,
                 last_test_timeout,
                 max_attempt_no: max_run_attempt,
@@ -373,54 +370,41 @@ impl AllRuns {
             }
         };
 
-        let (runner, batch_size_hint) = match &run.data {
-            Some(RunData {
-                runner,
-                batch_size_hint,
-                ..
-            }) => ((**runner).clone(), *batch_size_hint),
-            None => {
-                // If there is an active run, then the run data exists iff the run state exists;
-                // however, if the run state is known to be complete, the run data will already
-                // have been pruned, and the worker should not be given a run.
-                match &mut run.state {
-                    RunState::Done { exit_code } => {
-                        return AssignedRunLookup::AlreadyDone {
-                            exit_code: *exit_code,
-                        }
+        if run.data.is_none() {
+            // If there is an active run, then the run data exists iff the run state exists;
+            // however, if the run state is known to be complete, the run data will already
+            // have been pruned, and the worker should not be given a run.
+            match &mut run.state {
+                RunState::Done { exit_code } => {
+                    return AssignedRunLookup::AlreadyDone {
+                        exit_code: *exit_code,
                     }
-                    RunState::Cancelled { .. } => {
-                        return AssignedRunLookup::AlreadyDone {
-                            exit_code: ExitCode::CANCELLED,
-                        }
+                }
+                RunState::Cancelled { .. } => {
+                    return AssignedRunLookup::AlreadyDone {
+                        exit_code: ExitCode::CANCELLED,
                     }
-                    RunState::WaitingForSupervisor {
-                        worker_connection_times,
-                    } => {
-                        if !worker_connection_times.contains(&worker_entity) {
-                            worker_connection_times.insert(worker_entity, time::Instant::now());
-                        }
-                        return AssignedRunLookup::NotFound;
+                }
+                RunState::WaitingForSupervisor {
+                    worker_connection_times,
+                } => {
+                    if !worker_connection_times.contains(&worker_entity) {
+                        worker_connection_times.insert(worker_entity, time::Instant::now());
                     }
-                    st => {
-                        tracing::error!(
-                            run_state=?st,
-                            "run data is missing, but run state is present and not marked as Done"
-                        );
-                        unreachable!(
-                            "run state should only be `Done` if data is missing, but it was {:?}",
-                            st
-                        );
-                    }
+                    return AssignedRunLookup::NotFound;
+                }
+                st => {
+                    tracing::error!(
+                        run_state=?st,
+                        "run data is missing, but run state is present and not marked as Done"
+                    );
+                    unreachable!(
+                        "run state should only be `Done` if data is missing, but it was {:?}",
+                        st
+                    );
                 }
             }
         };
-
-        // Instruct the worker to batch test results in packages of the same size as the batches of
-        // test-to-run that they will receive.
-        // NB: in the future, the worker may not obey this hint explicitly, and we may want to more
-        // intelligently determine the batch size here.
-        let results_batch_size_hint = batch_size_hint.get();
 
         let assigned_run = match &mut run.state {
             RunState::WaitingForFirstWorker {
@@ -432,9 +416,7 @@ impl AllRuns {
                 };
                 AssignedRun {
                     run_id: run_id.clone(),
-                    runner_kind: runner,
                     should_generate_manifest: true,
-                    results_batch_size_hint,
                 }
             }
             // Otherwise we are already waiting for the manifest, or already have it; just tell
@@ -448,16 +430,12 @@ impl AllRuns {
                 }
                 AssignedRun {
                     run_id: run_id.clone(),
-                    runner_kind: runner,
                     should_generate_manifest: false,
-                    results_batch_size_hint,
                 }
             }
             _ => AssignedRun {
                 run_id: run_id.clone(),
-                runner_kind: runner,
                 should_generate_manifest: false,
-                results_batch_size_hint,
             },
         };
 
@@ -1499,7 +1477,6 @@ impl QueueServer {
 
         let InvokeWork {
             run_id,
-            runner,
             batch_size_hint,
             max_run_attempt,
             test_results_timeout,
@@ -1528,7 +1505,6 @@ impl QueueServer {
 
         let could_create_queue = queues.create_queue(
             run_id.clone(),
-            runner,
             batch_size_hint,
             max_run_attempt,
             test_results_timeout,
@@ -2810,14 +2786,7 @@ impl WorkScheduler {
 }
 
 #[cfg(test)]
-use abq_utils::net_protocol::runners::{ManifestMessage, ProtocolWitness};
-
-#[cfg(test)]
-fn empty_manifest_msg() -> Box<ManifestMessage> {
-    use abq_utils::net_protocol::runners::Manifest;
-
-    Box::new(ManifestMessage::new(Manifest::new([], Default::default())))
-}
+use abq_utils::net_protocol::runners::ProtocolWitness;
 
 #[cfg(test)]
 fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
@@ -2839,7 +2808,7 @@ mod test {
         thread::{self, JoinHandle},
     };
 
-    use super::{empty_manifest_msg, RunState, RunStateCache};
+    use super::{RunState, RunStateCache};
     use crate::{
         connections::ConnectedWorkers,
         invoke::DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -2869,7 +2838,7 @@ mod test {
             },
             runners::{NativeRunnerSpecification, TestCase, TestResult},
             work_server,
-            workers::{RunId, RunnerKind, TestLikeRunner, WorkId, INIT_RUN_NUMBER},
+            workers::{RunId, WorkId, INIT_RUN_NUMBER},
         },
         shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -2885,7 +2854,6 @@ mod test {
     fn faux_invoke_work() -> InvokeWork {
         InvokeWork {
             run_id: RunId::unique(),
-            runner: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
             batch_size_hint: one_nonzero(),
             test_results_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
             max_run_attempt: INIT_RUN_NUMBER,
@@ -3525,7 +3493,6 @@ mod test {
         queues
             .create_queue(
                 RunId::unique(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 INIT_RUN_NUMBER,
                 DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3545,7 +3512,6 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 INIT_RUN_NUMBER,
                 DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3567,7 +3533,6 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 INIT_RUN_NUMBER,
                 DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3591,7 +3556,6 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 INIT_RUN_NUMBER,
                 DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3621,7 +3585,6 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     INIT_RUN_NUMBER,
                     DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3652,7 +3615,6 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 INIT_RUN_NUMBER,
                 DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3680,7 +3642,6 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 INIT_RUN_NUMBER,
                 DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3710,7 +3671,6 @@ mod test {
         queues
             .create_queue(
                 run_id.clone(),
-                RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                 one_nonzero(),
                 INIT_RUN_NUMBER,
                 DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3764,7 +3724,6 @@ mod test {
                 queues
                     .create_queue(
                         run_id,
-                        RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                         one_nonzero(),
                         INIT_RUN_NUMBER,
                         DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3829,7 +3788,6 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     INIT_RUN_NUMBER,
                     DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -3947,7 +3905,6 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     INIT_RUN_NUMBER,
                     DEFAULT_CLIENT_POLL_TIMEOUT,
@@ -4075,7 +4032,6 @@ mod test {
             queues
                 .create_queue(
                     run_id.clone(),
-                    RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg()),
                     one_nonzero(),
                     INIT_RUN_NUMBER,
                     DEFAULT_CLIENT_POLL_TIMEOUT,

@@ -104,13 +104,15 @@ fn empty_manifest_msg() -> Box<ManifestMessage> {
     Box::new(ManifestMessage::new(Manifest::new([], Default::default())))
 }
 
-fn default_workers_config(tag: impl Into<WorkerTag>) -> WorkersConfig {
+fn workers_config(tag: impl Into<WorkerTag>, runner_kind: RunnerKind) -> WorkersConfig {
     WorkersConfig {
         tag: tag.into(),
         num_workers: 2.try_into().unwrap(),
+        runner_kind,
         worker_context: WorkerContext::AssumeLocal,
         supervisor_in_band: false,
         debug_native_runner: false,
+        results_batch_size_hint: 1,
     }
 }
 
@@ -132,7 +134,6 @@ fn sort_results_owned(results: &mut [(WorkId, u32, TestResult)]) -> Vec<(u32, St
 
 // TODO: put this on [Client] directly
 struct SupervisorConfig {
-    runner_kind: RunnerKind,
     batch_size: NonZeroU64,
     timeout: Duration,
     tick_interval: Duration,
@@ -140,9 +141,8 @@ struct SupervisorConfig {
 }
 
 impl SupervisorConfig {
-    fn new(runner_kind: RunnerKind) -> Self {
+    fn new() -> Self {
         Self {
-            runner_kind,
             batch_size: one_nonzero(),
             timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
             tick_interval: DEFAULT_TICK_INTERVAL,
@@ -369,7 +369,6 @@ fn action_to_fut(
 
             let queue_server_addr = queue.server_addr();
             let SupervisorConfig {
-                runner_kind,
                 batch_size,
                 timeout,
                 tick_interval,
@@ -381,7 +380,6 @@ fn action_to_fut(
                     queue_server_addr,
                     client_opts,
                     run_id,
-                    runner_kind,
                     batch_size,
                     timeout,
                     retries,
@@ -650,8 +648,8 @@ fn multiple_jobs_complete() {
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [
                 TestExitWithoutErr(Sid(1)),
@@ -707,11 +705,11 @@ fn multiple_invokers() {
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner1)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner1)),
                 //
-                RunTest(Run(2), Sid(2), SupervisorConfig::new(runner2)),
-                StartWorkers(Run(2), Wid(2), default_workers_config(2)),
+                RunTest(Run(2), Sid(2), SupervisorConfig::new()),
+                StartWorkers(Run(2), Wid(2), workers_config(2, runner2)),
             ],
             [
                 TestExitWithoutErr(Sid(1)),
@@ -759,12 +757,8 @@ fn batch_two_requests_at_a_time() {
     TestBuilder::default()
         .step(
             [
-                RunTest(
-                    Run(1),
-                    Sid(1),
-                    SupervisorConfig::new(runner).with_batch_size(2),
-                ),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new().with_batch_size(2)),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [
                 TestExitWithoutErr(Sid(1)),
@@ -800,13 +794,13 @@ fn worker_exits_with_failure_if_test_fails() {
     );
 
     let workers_config = WorkersConfig {
-        ..default_workers_config(1)
+        ..workers_config(1, runner)
     };
 
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
                 StartWorkers(Run(1), Wid(1), workers_config),
             ],
             [],
@@ -850,13 +844,13 @@ fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
     );
 
     let workers_config = WorkersConfig {
-        ..default_workers_config(1)
+        ..workers_config(1, runner)
     };
 
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
                 StartWorkers(Run(1), Wid(1), workers_config.clone()),
                 StartWorkers(Run(1), Wid(2), workers_config),
             ],
@@ -897,26 +891,15 @@ fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn invoke_work_with_duplicate_id_is_an_error() {
-    let manifest = ManifestMessage::new(Manifest::new(
-        [echo_test(proto, "echo1".to_string())],
-        Default::default(),
-    ));
-
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
-
     TestBuilder::default()
         // Start one client with the run ID
         .step(
-            [StartTest(
-                Run(1),
-                Sid(1),
-                SupervisorConfig::new(runner.clone()),
-            )],
+            [StartTest(Run(1), Sid(1), SupervisorConfig::new())],
             [CheckSupervisor(Sid(1), &|s| s.is_ok())],
         )
         // Start a second, with the same run ID
         .step(
-            [StartTest(Run(1), Sid(2), SupervisorConfig::new(runner))],
+            [StartTest(Run(1), Sid(2), SupervisorConfig::new())],
             [CheckSupervisor(Sid(2), &|s| {
                 matches!(s, Err(invoke::Error::DuplicateRun(..)))
             })],
@@ -939,8 +922,8 @@ fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
         // Start one client, and have it drain its test queue
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner.clone())),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [TestExit(Sid(1), &|result| assert!(result.is_ok()))],
         )
@@ -952,7 +935,7 @@ fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
         )
         // Start a second, with the same run ID
         .step(
-            [StartTest(Run(1), Sid(1), SupervisorConfig::new(runner))],
+            [StartTest(Run(1), Sid(1), SupervisorConfig::new())],
             [CheckSupervisor(Sid(1), &|supervisor| {
                 matches!(supervisor, Err(invoke::Error::DuplicateCompletedRun(..)))
             })],
@@ -968,8 +951,8 @@ fn empty_manifest_exits_gracefully() {
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [
                 TestExitWithoutErr(Sid(1)),
@@ -989,16 +972,9 @@ fn empty_manifest_exits_gracefully() {
 #[traced_test]
 #[with_protocol_version]
 fn get_init_context_from_work_server_waiting_for_first_worker() {
-    let manifest = ManifestMessage::new(Manifest::new(
-        [echo_test(proto, "echo1".to_string())],
-        Default::default(),
-    ));
-
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, manifest.into());
-
     TestBuilder::default()
         // Set up the queue so that a run ID is invoked, but no worker has connected yet.
-        .act([StartTest(Run(1), Sid(1), SupervisorConfig::new(runner))])
+        .act([StartTest(Run(1), Sid(1), SupervisorConfig::new())])
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
@@ -1036,8 +1012,8 @@ fn get_init_context_from_work_server_waiting_for_manifest() {
 
     TestBuilder::default()
         .act([
-            StartTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-            StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+            StartTest(Run(1), Sid(1), SupervisorConfig::new()),
+            StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
         ])
         .act([WSRunRequest(
             Run(1),
@@ -1088,12 +1064,12 @@ fn get_init_context_from_work_server_active() {
 
     let workers_config = WorkersConfig {
         num_workers: one_nonzero_usize(),
-        ..default_workers_config(1)
+        ..workers_config(1, runner)
     };
 
     TestBuilder::default()
         .act([
-            StartTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
+            StartTest(Run(1), Sid(1), SupervisorConfig::new()),
             StartWorkers(Run(1), Wid(1), workers_config),
         ])
         .act([WSRunRequest(
@@ -1145,8 +1121,8 @@ fn get_init_context_after_run_already_completed() {
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [TestExitWithoutErr(Sid(1))],
         )
@@ -1198,8 +1174,8 @@ fn getting_run_after_work_is_complete_returns_nothing() {
         // First off, run the test suite to completion. It should complete successfully.
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner.clone())),
             ],
             [
                 TestExitWithoutErr(Sid(1)),
@@ -1219,7 +1195,7 @@ fn getting_run_after_work_is_complete_returns_nothing() {
         // Now, simulate a new set of workers connecting again. Negotiation should succeed, but
         // they should be marked as redundant.
         .step(
-            [StartWorkers(Run(1), Wid(2), default_workers_config(2))],
+            [StartWorkers(Run(1), Wid(2), workers_config(2, runner))],
             [WorkersAreRedundant(Wid(2))],
         )
         .step(
@@ -1246,7 +1222,7 @@ fn test_cancellation_drops_remaining_work() {
     TestBuilder::default()
         .act([Spawn(
             SpawnId(1),
-            Box::new(RunTest(Run(1), Sid(1), SupervisorConfig::new(runner))),
+            Box::new(RunTest(Run(1), Sid(1), SupervisorConfig::new())),
         )])
         .step(
             [CancelTest(Sid(1))],
@@ -1257,7 +1233,7 @@ fn test_cancellation_drops_remaining_work() {
                 ))
             })],
         )
-        .act([StartWorkers(Run(1), Wid(1), default_workers_config(1))])
+        .act([StartWorkers(Run(1), Wid(1), workers_config(1, runner))])
         .step(
             [StopWorkers(Wid(1))],
             [WorkerExitStatus(Wid(1), &|e| {
@@ -1283,8 +1259,8 @@ fn failure_to_run_worker_command_exits_gracefully() {
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [TestExit(Sid(1), &|results_err| {
                 assert!(matches!(
@@ -1316,7 +1292,7 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
 
     let workers_config = WorkersConfig {
         num_workers: one_nonzero_usize(),
-        ..default_workers_config(1)
+        ..workers_config(1, runner)
     };
 
     fn zero(_: TimeoutReason) -> Duration {
@@ -1329,7 +1305,7 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
     }))
     .step(
         [
-            RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
+            RunTest(Run(1), Sid(1), SupervisorConfig::new()),
             // After pulling the only test, the queue should time us out.
             StartWorkers(Run(1), Wid(1), workers_config),
         ],
@@ -1348,20 +1324,25 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
 
 #[test]
 fn pending_worker_attachment_does_not_block_other_attachers() {
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
+
     TestBuilder::default()
         // Start a set of workers that will never find their execution context, and just
         // continuously poll the queue.
         .act([Spawn(
             SpawnId(1),
-            Box::new(StartWorkers(Run(1), Wid(1), default_workers_config(1))),
+            Box::new(StartWorkers(
+                Run(1),
+                Wid(1),
+                workers_config(1, runner.clone()),
+            )),
         )])
         // In the meantime, start and execute a run that should complete successfully.
         .step(
             {
-                let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
                 [
-                    RunTest(Run(2), Sid(2), SupervisorConfig::new(runner)),
-                    StartWorkers(Run(2), Wid(2), default_workers_config(2)),
+                    RunTest(Run(2), Sid(2), SupervisorConfig::new()),
+                    StartWorkers(Run(2), Wid(2), workers_config(2, runner)),
                 ]
             },
             [TestExitWithoutErr(Sid(2))],
@@ -1394,8 +1375,8 @@ fn native_runner_returns_manifest_failure() {
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [TestExit(Sid(1), &|result| {
                 let err = result.as_ref().unwrap_err();
@@ -1438,8 +1419,8 @@ fn multiple_tests_per_work_id_reported() {
     TestBuilder::default()
         .step(
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [
                 TestExitWithoutErr(Sid(1)),
@@ -1481,8 +1462,8 @@ fn runner_panic_stops_worker() {
     TestBuilder::default()
         .step(
             [
-                StartTest(Run(1), Sid(1), SupervisorConfig::new(runner)),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                StartTest(Run(1), Sid(1), SupervisorConfig::new()),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [WaitForWorkerDead(Wid(1))],
         )
@@ -1514,15 +1495,19 @@ fn multiple_workers_start_before_supervisor() {
         .act([
             Spawn(
                 SpawnId(1),
-                Box::new(StartWorkers(Run(1), Wid(1), default_workers_config(1))),
+                Box::new(StartWorkers(
+                    Run(1),
+                    Wid(1),
+                    workers_config(1, runner.clone()),
+                )),
             ),
             Spawn(
                 SpawnId(2),
-                Box::new(StartWorkers(Run(1), Wid(2), default_workers_config(2))),
+                Box::new(StartWorkers(Run(1), Wid(2), workers_config(2, runner))),
             ),
         ])
         .step(
-            [RunTest(Run(1), Sid(1), SupervisorConfig::new(runner))],
+            [RunTest(Run(1), Sid(1), SupervisorConfig::new())],
             [
                 TestExitWithoutErr(Sid(1)),
                 TestResults(Sid(1), &|results| {
@@ -1563,19 +1548,9 @@ fn multiple_workers_start_before_supervisor() {
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
 fn timeout_with_slower_poll_timeout_than_tick_interval() {
-    let manifest = ManifestMessage::new(Manifest::new(
-        [
-            echo_test(proto, "echo1".to_string()),
-            echo_test(proto, "echo2".to_string()),
-        ],
-        Default::default(),
-    ));
-
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
-
     // We should see the supervisor time out, even though the tick interval yields far more often
     // than the timeout interval.
-    let config = SupervisorConfig::new(runner)
+    let config = SupervisorConfig::new()
         .with_tick_interval(Duration::from_micros(10))
         .with_timeout(Duration::from_micros(1000));
 
@@ -1614,7 +1589,7 @@ fn many_retries_complete() {
         Box::new(manifest),
     );
 
-    let supervisor_config = SupervisorConfig::new(runner).with_retries(3);
+    let supervisor_config = SupervisorConfig::new().with_retries(3);
 
     let mut expected_results = vec![];
     for attempt in 1..=4 {
@@ -1631,7 +1606,7 @@ fn many_retries_complete() {
         .step(
             [
                 RunTest(Run(1), Sid(1), supervisor_config),
-                StartWorkers(Run(1), Wid(1), default_workers_config(1)),
+                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
             ],
             [
                 TestExitWithoutErr(Sid(1)),
@@ -1686,7 +1661,7 @@ fn many_retries_many_workers_complete() {
         Box::new(manifest),
     );
 
-    let supervisor_config = SupervisorConfig::new(runner).with_retries(3);
+    let supervisor_config = SupervisorConfig::new().with_retries(3);
 
     let mut start_actions = vec![RunTest(Run(1), Sid(1), supervisor_config)];
     let mut end_workers_actions = vec![];
@@ -1695,7 +1670,7 @@ fn many_retries_many_workers_complete() {
         start_actions.push(StartWorkers(
             Run(1),
             Wid(i),
-            default_workers_config(i as u32),
+            workers_config(i as u32, runner.clone()),
         ));
         end_workers_actions.push(StopWorkers(Wid(i)));
         end_workers_asserts.push(WorkerExitStatus(Wid(i), &|e| {
@@ -1817,7 +1792,7 @@ fn many_retries_many_workers_complete_native() {
         extra_env: Default::default(),
     });
 
-    let supervisor_config = SupervisorConfig::new(runner).with_retries(3);
+    let supervisor_config = SupervisorConfig::new().with_retries(3);
 
     let mut start_actions = vec![RunTest(Run(1), Sid(1), supervisor_config)];
     let mut end_workers_actions = vec![];
@@ -1826,7 +1801,7 @@ fn many_retries_many_workers_complete_native() {
         start_actions.push(StartWorkers(
             Run(1),
             Wid(i),
-            default_workers_config(i as u32),
+            workers_config(i as u32, runner.clone()),
         ));
         end_workers_actions.push(StopWorkers(Wid(i)));
         end_workers_asserts.push(WorkerExitStatus(Wid(i), &|e| {
