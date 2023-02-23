@@ -1,24 +1,24 @@
 use abq_utils::net_protocol::queue::AssociatedTestResults;
 
-use crate::SendTestResults;
+use crate::ResultsHandler;
 
-pub(crate) struct BufferedResults<'a> {
+pub(crate) struct BufferedResults {
     buffer: Vec<AssociatedTestResults>,
     batch_size: usize,
-    send_test_results: SendTestResults<'a>,
+    handler: ResultsHandler,
 }
 
-impl<'a> BufferedResults<'a> {
-    pub fn new(batch_size: usize, send_test_results: SendTestResults<'a>) -> Self {
+impl BufferedResults {
+    pub fn new(batch_size: usize, handler: ResultsHandler) -> Self {
         Self {
             buffer: Vec::with_capacity(batch_size),
             batch_size,
-            send_test_results,
+            handler,
         }
     }
 }
 
-impl BufferedResults<'_> {
+impl BufferedResults {
     pub async fn push(&mut self, result: AssociatedTestResults) {
         self.buffer.push(result);
         if self.buffer.len() >= self.batch_size {
@@ -35,6 +35,6 @@ impl BufferedResults<'_> {
     async fn send(&mut self) {
         let fresh_buf = Vec::with_capacity(self.buffer.len());
         let results = std::mem::replace(&mut self.buffer, fresh_buf);
-        (self.send_test_results)(results).await
+        self.handler.send_results(results).await
     }
 }

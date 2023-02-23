@@ -1,9 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use abq_generic_test_runner::{
-    GenericRunnerError, GenericTestRunner, GetNextTests, SendTestResultsBoxed, TestsFetcher,
-};
+use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner, GetNextTests, TestsFetcher};
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
 use abq_utils::atomic;
@@ -20,6 +18,7 @@ use abq_utils::net_protocol::workers::{
     ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, WorkId, WorkerTest,
     INIT_RUN_NUMBER,
 };
+use abq_utils::results_handler::StaticResultsHandler;
 
 use abq_with_protocol_version::with_protocol_version;
 use async_trait::async_trait;
@@ -77,15 +76,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     };
     let all_results: Arc<Mutex<Vec<AssociatedTestResults>>> = Default::default();
 
-    let send_test_result: SendTestResultsBoxed = {
-        let all_results = all_results.clone();
-        Box::new(move |results| {
-            let all_results = all_results.clone();
-            Box::pin(async move {
-                all_results.lock().extend(results);
-            })
-        })
-    };
+    let results_handler = Box::new(StaticResultsHandler::new(all_results.clone()));
 
     let all_test_run = Arc::new(AtomicBool::new(false));
     let notify_all_tests_run = {
@@ -112,15 +103,13 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
         with_manifest,
         get_init_context,
         get_next_test,
-        &*send_test_result,
+        results_handler,
         Box::new(notify_all_tests_run),
         false,
     )
     .unwrap();
 
     assert_eq!(exit_code, ExitCode::SUCCESS);
-
-    drop(send_test_result);
 
     (
         Arc::try_unwrap(all_results)
@@ -155,15 +144,7 @@ fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
     };
     let all_results: Arc<Mutex<Vec<AssociatedTestResults>>> = Default::default();
 
-    let send_test_result: SendTestResultsBoxed = {
-        let all_results = all_results.clone();
-        Box::new(move |results| {
-            let all_results = all_results.clone();
-            Box::pin(async move {
-                all_results.lock().extend(results);
-            })
-        })
-    };
+    let results_handler = Box::new(StaticResultsHandler::new(all_results.clone()));
 
     let all_test_run = Arc::new(AtomicBool::new(false));
     let notify_all_tests_run = {
@@ -186,13 +167,11 @@ fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
         with_manifest,
         get_init_context,
         get_next_test,
-        &*send_test_result,
+        results_handler,
         Box::new(notify_all_tests_run),
         false,
     )
     .unwrap_err();
-
-    drop(send_test_result);
 
     (
         err,

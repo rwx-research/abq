@@ -226,6 +226,7 @@ dependencies = [
  "derive_more",
  "flate2",
  "insta",
+ "parking_lot",
  "rand",
  "rand_chacha",
  "rustls",

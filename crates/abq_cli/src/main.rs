@@ -30,6 +30,7 @@ use abq_utils::{
         runners::{CapturedOutput, TestRuntime},
         workers::{NativeTestRunnerParams, RunId, RunnerKind},
     },
+    results_handler::NoopResultsHandler,
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
 
@@ -389,12 +390,16 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                     retries,
                 )
             } else {
+                // TODO
+                let results_handler = Box::new(NoopResultsHandler);
+
                 workers::start_workers_standalone(
                     run_id,
                     WorkerTag::new(worker as _),
                     num_runners,
                     runner,
                     working_dir,
+                    results_handler,
                     batch_size.get(),
                     abq.negotiator_handle(),
                     abq.client_options().clone(),
@@ -640,12 +645,16 @@ fn run_sentinel_abq_test(
         "Started test run with ID {run_id}"
     )?;
 
+    // TODO
+    let results_handler = Box::new(NoopResultsHandler);
+
     let mut worker_pool = workers::start_workers(
         run_id.clone(),
         WorkerTag::ZERO,
         num_runners,
         runner,
         working_dir,
+        results_handler,
         abq.negotiator_handle(),
         abq.client_options().clone(),
         batch_size.get(),

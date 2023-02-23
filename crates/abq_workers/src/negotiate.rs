@@ -16,10 +16,11 @@ use tracing::{error, instrument};
 
 use crate::{
     negotiate, persistent_test_fetcher,
+    results_handler::{MultiplexingResultsHandler, QueueResultsSender, ResultsHandlerGenerator},
     workers::{
         GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyManifest,
-        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, NotifyResults, RunExitCode,
-        WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
+        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, RunExitCode, WorkerContext,
+        WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
     },
 };
 use abq_utils::{
@@ -36,6 +37,7 @@ use abq_utils::{
         queue::{NegotiatorInfo, RunAlreadyCompleted},
         workers::{RunId, RunnerKind},
     },
+    results_handler::SharedResultsHandler,
     retry::{async_retry_n, retry_n},
     shutdown::ShutdownReceiver,
 };
@@ -104,11 +106,13 @@ pub enum MessageToQueueNegotiator {
     },
 }
 
-#[derive(Clone, Debug)]
 pub struct WorkersConfig {
     pub tag: WorkerTag,
     pub num_workers: NonZeroUsize,
     pub runner_kind: RunnerKind,
+    /// How should test results be handled, locally?
+    /// The handler will be shared between all workers created on the pool.
+    pub local_results_handler: SharedResultsHandler,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
     pub supervisor_in_band: bool,
@@ -229,52 +233,31 @@ impl WorkersNegotiator {
             tag,
             num_workers,
             runner_kind,
+            local_results_handler,
             worker_context,
             supervisor_in_band,
             debug_native_runner,
             results_batch_size_hint,
         } = workers_config;
 
-        let notify_results: NotifyResults = Arc::new({
+        let results_handler_generator: ResultsHandlerGenerator = {
             let client = async_client.boxed_clone();
-
-            move |entity, run_id, results| {
-                let run_id = run_id.clone();
-                let client = client.boxed_clone();
-                Box::pin(async move {
-                    let span = tracing::trace_span!("notify_results", run_id=?run_id, results=?results.len(), queue_server=?queue_results_addr);
-                    let _notify_results = span.enter();
-
-                    let request = net_protocol::queue::Request {
-                        entity,
-                        message: net_protocol::queue::Message::WorkerResult(
-                            run_id.clone(),
-                            results,
-                        ),
-                    };
-
-                    let client = &client;
-                    let mut stream =
-                        async_retry_n(5, Duration::from_secs(3), |attempt| async move {
-                            if attempt > 1 {
-                                tracing::info!(
-                                    "reattempting connection to queue for results {}",
-                                    attempt
-                                );
-                            }
-                            client.connect(queue_results_addr).await
-                        })
-                        .await
-                        .unwrap();
-
-                    net_protocol::async_write(&mut stream, &request)
-                        .await
-                        .unwrap();
-                    let net_protocol::queue::AckTestResults {} =
-                        net_protocol::async_read(&mut stream).await.unwrap();
-                })
+            let run_id = run_id.clone();
+            let local_results_handler = local_results_handler.boxed_clone();
+            &move |entity| {
+                let queue_handler = QueueResultsSender::new(
+                    client.boxed_clone(),
+                    queue_results_addr,
+                    entity,
+                    run_id.clone(),
+                );
+                let notifier = MultiplexingResultsHandler::new(
+                    queue_handler,
+                    local_results_handler.boxed_clone(),
+                );
+                Box::new(notifier)
             }
-        });
+        };
 
         let get_init_context: GetInitContext = Arc::new({
             let client = client.boxed_clone();
@@ -423,7 +406,7 @@ impl WorkersNegotiator {
             runner_kind,
             get_next_tests_generator,
             get_init_context,
-            notify_results,
+            results_handler_generator,
             notify_all_tests_run_generator,
             run_exit_code,
             results_batch_size_hint,
@@ -876,6 +859,7 @@ mod test {
         ManifestResult, NextWork, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
         TestLikeRunner, WorkId, WorkerTest, INIT_RUN_NUMBER,
     };
+    use abq_utils::results_handler::NoopResultsHandler;
     use abq_utils::shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{net, net_protocol};
@@ -1127,6 +1111,7 @@ mod test {
             tag: WorkerTag::new(0),
             num_workers: NonZeroUsize::new(1).unwrap(),
             runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
+            local_results_handler: Box::new(NoopResultsHandler),
             worker_context: WorkerContext::AssumeLocal,
             supervisor_in_band: false,
             debug_native_runner: false,

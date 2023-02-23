@@ -499,7 +499,7 @@ pub mod queue {
     }
 
     /// A set of test results associated with an individual unit of work.
-    #[derive(Serialize, Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct AssociatedTestResults {
         /// The run number this test result comes from.
         pub work_id: WorkId,

@@ -4,16 +4,18 @@ use std::path::{Path, PathBuf};
 
 use std::process::Stdio;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use abq_utils::error::{here, ErrorLocation, LocatedError, ResultLocation};
 use abq_utils::exit::ExitCode;
+use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
 use capture_output::OutputCapturer;
 use message_buffer::{Completed, RefillStrategy};
 
+use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, ChildStderr, ChildStdout};
@@ -292,9 +294,6 @@ impl GenericRunnerError {
     }
 }
 
-pub type SendTestResults<'a> = &'a dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>;
-pub type SendTestResultsBoxed = Box<dyn Fn(Vec<AssociatedTestResults>) -> BoxFuture<'static, ()>>;
-
 /// Notifies the queue that this runner finished running all assigned tests for a given run_id.
 /// This is only called if the runner actually executed tests, and after all such tests were
 /// executed.
@@ -321,7 +320,7 @@ impl GenericTestRunner {
         send_manifest: Option<SendManifest>,
         get_init_context: GetInitContext,
         get_next_test_bundle: GetNextTests,
-        send_test_results: SendTestResults,
+        results_handler: ResultsHandler,
         notify_all_tests_run: NotifyMaterialTestsAllRun,
         debug_native_runner: bool,
     ) -> Result<TestRunnerExit, GenericRunnerError>
@@ -345,7 +344,7 @@ impl GenericTestRunner {
             send_manifest,
             get_init_context,
             get_next_test_bundle,
-            send_test_results,
+            results_handler,
             notify_all_tests_run,
             debug_native_runner,
         ))
@@ -589,7 +588,7 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     send_manifest: Option<SendManifest>,
     get_init_context: GetInitContext,
     get_next_test_bundle: GetNextTests,
-    send_test_results: SendTestResults<'_>,
+    results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     _debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError>
@@ -650,7 +649,7 @@ where
         get_init_context,
         results_batch_size,
         get_next_test_bundle,
-        send_test_results,
+        results_handler,
         notify_all_tests_run,
         runner_entity,
         runner_meta,
@@ -682,11 +681,11 @@ enum ResultsMsg {
     ForceFlush,
 }
 
-type ResultsSender = mpsc::Sender<ResultsMsg>;
+type ResultsChanRx = mpsc::Sender<ResultsMsg>;
 
 async fn try_send_result_to_channel(
     work_id: Option<WorkId>,
-    results_chan: &ResultsSender,
+    results_chan: &ResultsChanRx,
     msg: ResultsMsg,
 ) -> io::Result<()> {
     let send_to_chan_result = results_chan.send(msg).await;
@@ -707,7 +706,7 @@ async fn run_help<'a, GetInitContext>(
     get_init_context: GetInitContext,
     results_batch_size: u64,
     test_fetcher: GetNextTests,
-    send_test_results: SendTestResults<'a>,
+    results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     runner_entity: Entity,
     runner_meta: RunnerMeta,
@@ -765,7 +764,7 @@ where
     let (results_tx, mut results_rx) = mpsc::channel(results_batch_size * 2);
 
     let send_results_task = async {
-        let mut pending_results = BufferedResults::new(results_batch_size, send_test_results);
+        let mut pending_results = BufferedResults::new(results_batch_size, results_handler);
 
         use ResultsMsg::*;
 
@@ -817,7 +816,7 @@ where
 
                         handle_native_runner_failure(
                             runner_meta,
-                            send_test_results,
+                            &results_tx,
                             native_runner_args,
                             final_output,
                             estimated_runtime,
@@ -825,7 +824,8 @@ where
                             run_number,
                             remaining_tests,
                         )
-                        .await;
+                        .await
+                        .located(here!())?;
 
                         return Err(GenericRunnerErrorKind::from(native_error).located(here!()));
                     }
@@ -957,7 +957,7 @@ async fn handle_one_test(
     work_id: WorkId,
     run_number: u32,
     test_case: TestCase,
-    results_chan: &ResultsSender,
+    results_chan: &ResultsChanRx,
 ) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerErrorKind> {
     let test_case_message = TestCaseMessage::new(test_case);
 
@@ -1099,14 +1099,15 @@ const INDENT: &str = "    ";
 #[allow(clippy::format_push_string)] // write! can fail, push can't
 async fn handle_native_runner_failure<'a, I>(
     runner_meta: RunnerMeta,
-    send_test_result: SendTestResults<'a>,
+    results_chan: &ResultsChanRx,
     native_runner_args: NativeRunnerArgs<'a>,
     final_output: CapturedOutput,
     estimated_time_to_failure: Duration,
     failed_on: WorkId,
     run_number: u32,
     remaining_work: I,
-) where
+) -> io::Result<()>
+where
     I: IntoIterator<Item = WorkerTest>,
 {
     // Our connection with the native test runner failed, for some
@@ -1167,7 +1168,6 @@ async fn handle_native_runner_failure<'a, I>(
 
     tracing::warn!(?error_message, "native test runner failure");
 
-    let mut final_results = vec![];
     for work_id in remaining_work {
         let error_result = TestResult::new(
             runner_meta,
@@ -1181,17 +1181,23 @@ async fn handle_native_runner_failure<'a, I>(
                 ..TestResultSpec::fake()
             },
         );
-
-        final_results.push(AssociatedTestResults {
+        let error_result = AssociatedTestResults {
             work_id,
             run_number,
             results: vec![error_result],
             before_any_test: final_output.clone(),
             after_all_tests: None,
-        });
+        };
+
+        try_send_result_to_channel(
+            Some(work_id),
+            results_chan,
+            ResultsMsg::Results(error_result),
+        )
+        .await?;
     }
 
-    send_test_result(final_results).await;
+    Ok(())
 }
 
 /// Executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.
@@ -1218,7 +1224,7 @@ pub fn execute_wrapped_runner(
         let opt_error_cell = &mut opt_error_cell;
         move |manifest_result: ManifestResult| match manifest_result {
             ManifestResult::Manifest(real_manifest) => {
-                let mut flat_manifest = flat_manifest.lock().unwrap();
+                let mut flat_manifest = flat_manifest.lock();
 
                 if manifest_message.is_some() || flat_manifest.is_some() {
                     panic!("Manifest has already been defined, but is being sent again");
@@ -1248,7 +1254,7 @@ pub fn execute_wrapped_runner(
     impl TestsFetcher for Fetcher {
         async fn get_next_tests(&mut self) -> NextWorkBundle {
             loop {
-                let manifest_and_data = self.manifest.lock().unwrap();
+                let manifest_and_data = self.manifest.lock();
                 let next_test = match &(*manifest_and_data) {
                     Some((manifest, _)) => {
                         manifest.get(self.test_case_index.load(atomic::ORDERING))
@@ -1283,18 +1289,8 @@ pub fn execute_wrapped_runner(
             test_case_index,
         })
     };
-    let send_test_result: SendTestResults = {
-        let test_results = test_results.clone();
-        &move |results| {
-            let test_results = test_results.clone();
-            Box::pin(async move {
-                test_results
-                    .lock()
-                    .unwrap()
-                    .extend(results.into_iter().map(|tr| tr.results))
-            })
-        }
-    };
+
+    let results_handler = Box::new(StaticResultsHandler::new(test_results.clone()));
 
     let _opt_exit_error = GenericTestRunner::run(
         Entity::runner(0, 1),
@@ -1306,7 +1302,7 @@ pub fn execute_wrapped_runner(
         Some(send_manifest),
         get_init_context,
         get_next_test,
-        send_test_result,
+        results_handler,
         Box::new(|_| async {}.boxed()),
         false,
     );
@@ -1318,11 +1314,15 @@ pub fn execute_wrapped_runner(
         });
     }
 
-    let test_results = test_results.lock();
+    let test_results = test_results
+        .lock()
+        .iter()
+        .map(|t| t.results.clone())
+        .collect();
 
     Ok((
         manifest_message.expect("manifest never received!"),
-        test_results.as_deref().unwrap().clone(),
+        test_results,
     ))
 }
 
@@ -1570,10 +1570,7 @@ fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
 #[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
-    use crate::{
-        execute_wrapped_runner, notify_all_tests_run, GenericTestRunner, ImmediateTests,
-        SendTestResults,
-    };
+    use crate::{execute_wrapped_runner, notify_all_tests_run, GenericTestRunner, ImmediateTests};
     use abq_utils::atomic;
     use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
     use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
@@ -1583,10 +1580,12 @@ mod test_abq_jest {
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, WorkId,
         WorkerTest, INIT_RUN_NUMBER,
     };
+    use abq_utils::results_handler::{NoopResultsHandler, StaticResultsHandler};
     use abq_with_protocol_version::with_protocol_version;
 
+    use parking_lot::Mutex;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn npm_jest_project_path() -> PathBuf {
         PathBuf::from(std::env::var("ABQ_WORKSPACE_DIR").unwrap())
@@ -1627,18 +1626,7 @@ mod test_abq_jest {
         let get_next_test = Box::new(ImmediateTests {
             tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
         });
-        let send_test_result: SendTestResults = {
-            let test_results = test_results.clone();
-            &move |results| {
-                let test_results = test_results.clone();
-                Box::pin(async move {
-                    test_results
-                        .lock()
-                        .unwrap()
-                        .push(results.into_iter().map(|tr| tr.results))
-                })
-            }
-        };
+        let results_handler = Box::new(StaticResultsHandler::new(test_results.clone()));
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
         GenericTestRunner::run(
@@ -1651,13 +1639,13 @@ mod test_abq_jest {
             Some(send_manifest),
             get_init_context,
             get_next_test,
-            send_test_result,
+            results_handler,
             notify_all_tests_run,
             false,
         )
         .unwrap();
 
-        assert!(test_results.lock().unwrap().is_empty());
+        assert!(test_results.lock().is_empty());
 
         let ReportedManifest {
             mut manifest,
@@ -1797,7 +1785,7 @@ mod test_abq_jest {
                 run_number: INIT_RUN_NUMBER,
             })])],
         };
-        let send_test_result: SendTestResults = &|_| Box::pin(async {});
+        let results_handler = Box::new(NoopResultsHandler);
 
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
@@ -1811,7 +1799,7 @@ mod test_abq_jest {
             None,
             get_init_context,
             Box::new(get_next_test),
-            send_test_result,
+            results_handler,
             notify_all_tests_run,
             false,
         );
@@ -1827,16 +1815,14 @@ mod test_abq_jest {
 
 #[cfg(test)]
 mod test_invalid_command {
-    use crate::{
-        notify_all_tests_run, GenericRunnerError, GenericTestRunner, ImmediateTests,
-        SendTestResults,
-    };
+    use crate::{notify_all_tests_run, GenericRunnerError, GenericTestRunner, ImmediateTests};
     use abq_utils::atomic;
     use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle,
     };
+    use abq_utils::results_handler::NoopResultsHandler;
 
     #[test]
     fn invalid_command_yields_error() {
@@ -1857,7 +1843,7 @@ mod test_invalid_command {
         let get_next_test = ImmediateTests {
             tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
         };
-        let send_test_result: SendTestResults = &|_| Box::pin(async {});
+        let results_handler = Box::new(NoopResultsHandler);
 
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
@@ -1871,7 +1857,7 @@ mod test_invalid_command {
             Some(send_manifest),
             get_init_context,
             Box::new(get_next_test),
-            send_test_result,
+            results_handler,
             notify_all_tests_run,
             false,
         );

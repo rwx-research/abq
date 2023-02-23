@@ -37,6 +37,7 @@ use abq_utils::{
             NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId, INIT_RUN_NUMBER,
         },
     },
+    results_handler::NoopResultsHandler,
     tls::ClientTlsStrategy,
 };
 
@@ -109,6 +110,7 @@ fn workers_config(tag: impl Into<WorkerTag>, runner_kind: RunnerKind) -> Workers
         tag: tag.into(),
         num_workers: 2.try_into().unwrap(),
         runner_kind,
+        local_results_handler: Box::new(NoopResultsHandler),
         worker_context: WorkerContext::AssumeLocal,
         supervisor_in_band: false,
         debug_native_runner: false,
@@ -826,33 +828,34 @@ fn multiple_worker_sets_all_exit_with_failure_if_any_test_fails() {
     // NOTE: we set up two workers and unleash them on the following manifest, setting both
     // workers to fail only on the `echo_fail` case. That way, no matter which one picks it up,
     // we should observe a failure for both workers sets.
+    let workers_config = move || {
+        let manifest = ManifestMessage::new(Manifest::new(
+            [
+                echo_test(proto, "echo1".to_string()),
+                echo_test(proto, "echo2".to_string()),
+                echo_test(proto, "echo_fail".to_string()),
+                echo_test(proto, "echo3".to_string()),
+                echo_test(proto, "echo4".to_string()),
+            ],
+            Default::default(),
+        ));
 
-    let manifest = ManifestMessage::new(Manifest::new(
-        [
-            echo_test(proto, "echo1".to_string()),
-            echo_test(proto, "echo2".to_string()),
-            echo_test(proto, "echo_fail".to_string()),
-            echo_test(proto, "echo3".to_string()),
-            echo_test(proto, "echo4".to_string()),
-        ],
-        Default::default(),
-    ));
+        let runner = RunnerKind::TestLikeRunner(
+            TestLikeRunner::FailOnTestName("echo_fail".to_string()),
+            Box::new(manifest),
+        );
 
-    let runner = RunnerKind::TestLikeRunner(
-        TestLikeRunner::FailOnTestName("echo_fail".to_string()),
-        Box::new(manifest),
-    );
-
-    let workers_config = WorkersConfig {
-        ..workers_config(1, runner)
+        WorkersConfig {
+            ..workers_config(1, runner)
+        }
     };
 
     TestBuilder::default()
         .step(
             [
                 RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config.clone()),
-                StartWorkers(Run(1), Wid(2), workers_config),
+                StartWorkers(Run(1), Wid(1), workers_config()),
+                StartWorkers(Run(1), Wid(2), workers_config()),
             ],
             [],
         )

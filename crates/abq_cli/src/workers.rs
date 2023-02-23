@@ -7,6 +7,7 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
 use abq_utils::net_protocol::runners::CapturedOutput;
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
+use abq_utils::results_handler::SharedResultsHandler;
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
 };
@@ -22,6 +23,7 @@ pub fn start_workers(
     num_workers: NonZeroUsize,
     runner_kind: RunnerKind,
     working_dir: PathBuf,
+    local_results_handler: SharedResultsHandler,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
     results_batch_size: u64,
@@ -33,6 +35,7 @@ pub fn start_workers(
         tag,
         num_workers,
         runner_kind,
+        local_results_handler,
         worker_context: context,
         supervisor_in_band,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
@@ -62,6 +65,7 @@ pub fn start_workers_standalone(
     num_workers: NonZeroUsize,
     runner_kind: RunnerKind,
     working_dir: PathBuf,
+    local_results_handler: SharedResultsHandler,
     results_batch_size: u64,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
@@ -72,6 +76,7 @@ pub fn start_workers_standalone(
         num_workers,
         runner_kind,
         working_dir,
+        local_results_handler,
         queue_negotiator,
         client_opts,
         results_batch_size,
