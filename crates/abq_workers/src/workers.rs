@@ -2,7 +2,6 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::panic;
 use std::path::PathBuf;
-use std::sync::atomic::{self, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{sync::mpsc, thread};
@@ -23,6 +22,7 @@ use abq_utils::net_protocol::workers::{
 use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind};
 use abq_utils::results_handler::ResultsHandler;
 
+use crate::liveness::LiveCount;
 use crate::results_handler::ResultsHandlerGenerator;
 use crate::test_like_runner;
 
@@ -37,7 +37,7 @@ pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 pub use abq_generic_test_runner::TestsFetcher;
 
 pub type GetNextTests = Box<dyn TestsFetcher + Send>;
-pub type GetNextTestsGenerator<'a> = &'a dyn Fn(Entity) -> GetNextTests;
+pub type GetNextTestsGenerator<'a> = &'a (dyn Fn(Entity) -> GetNextTests + Send + Sync);
 
 pub type GetInitContext =
     Arc<dyn Fn(Entity) -> io::Result<InitContextResult> + Send + Sync + 'static>;
@@ -46,9 +46,10 @@ pub type NotifyManifest = Box<dyn Fn(Entity, &RunId, ManifestResult) + Send + Sy
 pub type RunExitCode = Arc<dyn Fn(Entity) -> ExitCode + Send + Sync + 'static>;
 
 pub type NotifyMaterialTestsAllRun = abq_generic_test_runner::NotifyMaterialTestsAllRun;
-pub type NotifyMaterialTestsAllRunGenerator<'a> = &'a dyn Fn() -> NotifyMaterialTestsAllRun;
+pub type NotifyMaterialTestsAllRunGenerator<'a> =
+    &'a (dyn Fn() -> NotifyMaterialTestsAllRun + Send + Sync);
 
-type MarkWorkerComplete = Arc<dyn Fn() + Send + Sync + 'static>;
+type MarkWorkerComplete = Box<dyn FnOnce() + Send + Sync + 'static>;
 
 #[derive(Clone, Debug)]
 pub enum WorkerContext {
@@ -115,34 +116,13 @@ pub struct WorkerPool {
     active: bool,
     runners: Vec<(RunnerMeta, ThreadWorker)>,
     worker_msg_tx: mpsc::Sender<MessageFromPool>,
-    live_count: LiveWorkers,
+    live_count: LiveCount,
     /// Query the exit code of the run assigned for this pool.
     run_exit_code: RunExitCode,
     /// The entity of the worker pool itself.
     first_runner_entity: Entity,
     /// Whether this pool is running in-band with a supervisor.
     supervisor_in_band: bool,
-}
-
-struct LiveWorkers(Arc<AtomicUsize>);
-
-impl LiveWorkers {
-    fn new(count: usize) -> Self {
-        LiveWorkers(Arc::new(AtomicUsize::new(count)))
-    }
-
-    fn dec(&self) {
-        self.0.fetch_sub(1, atomic::Ordering::SeqCst);
-    }
-
-    /// *Not* guaranteed to be atomic in its answer.
-    fn read(&self) -> usize {
-        self.0.load(atomic::Ordering::SeqCst)
-    }
-
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -168,7 +148,7 @@ pub struct WorkersExit {
 }
 
 impl WorkerPool {
-    pub fn new(config: WorkerPoolConfig) -> Self {
+    pub async fn new(config: WorkerPoolConfig<'_>) -> Self {
         let WorkerPoolConfig {
             size,
             first_runner_entity,
@@ -190,20 +170,19 @@ impl WorkerPool {
         let num_workers = size.get();
         let mut runners = Vec::with_capacity(num_workers);
 
-        let live_count = LiveWorkers::new(num_workers);
+        let (live_count, signal_completed) = LiveCount::new(num_workers).await;
         tracing::debug!(live_count=?live_count.read(), ?results_batch_size, ?run_id, "Starting worker pool");
 
         let (worker_msg_tx, worker_msg_rx) = mpsc::channel();
         let shared_worker_msg_rx = Arc::new(Mutex::new(worker_msg_rx));
 
-        let mark_worker_complete = {
-            let live_count: LiveWorkers = live_count.clone();
-            move || {
-                live_count.dec();
-                tracing::debug!("worker done, {} left", live_count.read());
-            }
+        let mark_worker_complete = || {
+            let signal_completed = signal_completed.clone();
+            Box::new(move || {
+                signal_completed.completed();
+                tracing::debug!("worker done");
+            })
         };
-        let mark_worker_complete: MarkWorkerComplete = Arc::new(Box::new(mark_worker_complete));
 
         let is_singleton_runner = num_workers == 1;
 
@@ -213,7 +192,7 @@ impl WorkerPool {
             // TODO: consider hiding this behind a macro for code duplication purposes
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let get_init_context = Arc::clone(&get_init_context);
-            let mark_worker_complete = Arc::clone(&mark_worker_complete);
+            let mark_worker_complete = mark_worker_complete();
 
             let entity = first_runner_entity;
             let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(1));
@@ -253,7 +232,7 @@ impl WorkerPool {
         for runner_id in 1..num_workers {
             let msg_rx = Arc::clone(&shared_worker_msg_rx);
             let get_init_context = Arc::clone(&get_init_context);
-            let mark_worker_complete = Arc::clone(&mark_worker_complete);
+            let mark_worker_complete = mark_worker_complete();
 
             let runner_id = runner_id + 1;
             let entity = Entity::runner(workers_tag, runner_id as u32);
@@ -298,6 +277,10 @@ impl WorkerPool {
             first_runner_entity,
             supervisor_in_band,
         }
+    }
+
+    pub async fn wait(&mut self) {
+        self.live_count.wait().await
     }
 
     /// Answers whether there are any workers that are still alive.
@@ -1085,7 +1068,7 @@ mod test {
         }
     }
 
-    fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
+    async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
         let (write_work, get_next_tests) = work_writer();
         let (results, results_handler_generator, run_completed_successfully) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
@@ -1115,7 +1098,7 @@ mod test {
             ..default_config
         };
 
-        let mut pool = WorkerPool::new(config);
+        let mut pool = WorkerPool::new(config).await;
 
         // Write the work
         let tests = await_manifest_tests(manifest_collector);
@@ -1156,34 +1139,34 @@ mod test {
         artifacts_dir().join("abqtest_write_runner_number")
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn test_1_worker_1_echo() {
-        test_echo_n(proto, 1, 1);
+    async fn test_1_worker_1_echo() {
+        test_echo_n(proto, 1, 1).await;
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn test_2_workers_1_echo() {
-        test_echo_n(proto, 2, 1);
+    async fn test_2_workers_1_echo() {
+        test_echo_n(proto, 2, 1).await;
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn test_1_worker_2_echos() {
-        test_echo_n(proto, 1, 2);
+    async fn test_1_worker_2_echos() {
+        test_echo_n(proto, 1, 2).await;
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn test_2_workers_2_echos() {
-        test_echo_n(proto, 2, 2);
+    async fn test_2_workers_2_echos() {
+        test_echo_n(proto, 2, 2).await;
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn test_2_workers_8_echos() {
-        test_echo_n(proto, 2, 8);
+    async fn test_2_workers_8_echos() {
+        test_echo_n(proto, 2, 8).await;
     }
 
     #[test]
@@ -1352,8 +1335,8 @@ mod test {
         logs_with_scope_contain("", "error handling connection");
     }
 
-    #[test]
-    fn exit_with_error_if_worker_errors() {
+    #[tokio::test]
+    async fn exit_with_error_if_worker_errors() {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator, run_completed_successfully) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
@@ -1372,7 +1355,7 @@ mod test {
             run_completed_successfully,
         );
 
-        let mut pool = WorkerPool::new(default_config);
+        let mut pool = WorkerPool::new(default_config).await;
 
         let pool_exit = pool.shutdown();
 
@@ -1383,8 +1366,8 @@ mod test {
         assert!(!all_completed[0].load(atomic::ORDERING));
     }
 
-    #[test]
-    fn sets_abq_native_runner_env_vars() {
+    #[tokio::test]
+    async fn sets_abq_native_runner_env_vars() {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator, run_completed_successfully) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
@@ -1408,7 +1391,7 @@ mod test {
 
         config.size = NonZeroUsize::new(5).unwrap();
 
-        let mut pool = WorkerPool::new(config);
+        let mut pool = WorkerPool::new(config).await;
         let _pool_exit = pool.shutdown();
 
         let worker_ids = std::fs::read_to_string(writefile).unwrap();
@@ -1420,9 +1403,9 @@ mod test {
         assert_eq!(all_completed.len(), 5);
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn worker_exits_with_runner_exit() {
+    async fn worker_exits_with_runner_exit() {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator, _run_completed_successfully) =
             results_collector();
@@ -1445,7 +1428,7 @@ mod test {
 
         config.size = NonZeroUsize::new(1).unwrap();
 
-        let mut pool = WorkerPool::new(config);
+        let mut pool = WorkerPool::new(config).await;
         let pool_exit = pool.shutdown();
 
         assert!(

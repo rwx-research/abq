@@ -160,6 +160,14 @@ impl NegotiatedWorkers {
         }
     }
 
+    /// Returns a future that resolves when all workers are completed and ready to shut down.
+    pub async fn wait(&mut self) {
+        match self {
+            NegotiatedWorkers::Redundant { .. } => {}
+            NegotiatedWorkers::Pool(pool) => pool.wait().await,
+        }
+    }
+
     pub fn workers_alive(&self) -> bool {
         match self {
             NegotiatedWorkers::Redundant { .. } => false,
@@ -418,7 +426,7 @@ impl WorkersNegotiator {
         };
 
         tracing::debug!("Starting worker pool");
-        let pool = WorkerPool::new(pool_config);
+        let pool = WorkerPool::new(pool_config).await;
         tracing::debug!("Started worker pool");
 
         Ok(NegotiatedWorkers::Pool(pool))

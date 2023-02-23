@@ -5,7 +5,6 @@ use std::{
     panic,
     pin::Pin,
     sync::Arc,
-    thread,
     time::Duration,
 };
 
@@ -257,7 +256,7 @@ type SupervisorData = Arc<tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, Re
 type SupervisorResults =
     Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedRunData, invoke::Error>>>>;
 
-type Workers = Arc<Mutex<HashMap<Wid, NegotiatedWorkers>>>;
+type Workers = Arc<tokio::sync::Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
 enum WorkersResult {
     Exit(WorkersExit),
@@ -444,13 +443,13 @@ fn action_to_fut(
                     matches!(worker_pool, NegotiatedWorkers::Redundant { .. }),
                 );
 
-                workers.lock().insert(worker_id, worker_pool);
+                workers.lock().await.insert(worker_id, worker_pool);
             }
             .boxed()
         }
 
         StopWorkers(n) => async move {
-            let mut worker_pool = workers.lock().remove(&n).unwrap();
+            let mut worker_pool = workers.lock().await.remove(&n).unwrap();
             let workers_result =
                 match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.shutdown())) {
                     Ok(exit) => WorkersResult::Exit(exit),
@@ -602,21 +601,9 @@ fn run_test(servers: Servers, steps: Steps) {
                     }
 
                     WaitForWorkerDead(n) => {
-                        let mut attempts = 0;
-                        loop {
-                            attempts += 1;
-
-                            let workers = workers.lock();
-                            let worker = workers.get(&n).expect("worker not found");
-                            if worker.workers_alive() {
-                                if attempts > 100 {
-                                    panic!("waited too long for worker to be dead");
-                                }
-                                thread::sleep(Duration::from_millis(10))
-                            } else {
-                                break;
-                            }
-                        }
+                        let mut workers = workers.lock().await;
+                        let worker = workers.get_mut(&n).expect("worker not found");
+                        worker.wait().await;
                     }
 
                     CheckSupervisor(n, check) => {

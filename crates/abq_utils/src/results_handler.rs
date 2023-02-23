@@ -17,7 +17,7 @@ pub trait SharedNotifyResults: NotifyResults {
     fn boxed_clone(&self) -> SharedResultsHandler;
 }
 
-pub type SharedResultsHandler = Box<dyn SharedNotifyResults + Send>;
+pub type SharedResultsHandler = Box<dyn SharedNotifyResults + Send + Sync>;
 
 //
 

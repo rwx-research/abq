@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use tracing::instrument;
 
 /// A way to get a new [NotifyResults] value for a unique test run.
-pub type ResultsHandlerGenerator<'a> = &'a dyn Fn(Entity) -> ResultsHandler;
+pub type ResultsHandlerGenerator<'a> = &'a (dyn Fn(Entity) -> ResultsHandler + Send + Sync);
 
 /// A results handler that dispatches results to the remote queue, and also any local handlers.
 pub(crate) struct MultiplexingResultsHandler {

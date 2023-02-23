@@ -18,6 +18,7 @@ abq_rwx_v1_json = { path = "../reporters/rwx_v1_json" }
 
 anyhow.workspace = true
 signal-hook.workspace = true
+signal-hook-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_derive.workspace = true
@@ -30,6 +31,7 @@ atty.workspace = true
 indicatif.workspace = true
 
 tokio.workspace = true
+futures.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true

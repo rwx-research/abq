@@ -24,6 +24,7 @@ dependencies = [
  "anyhow",
  "atty",
  "clap",
+ "futures",
  "indicatif",
  "indoc",
  "insta",
@@ -38,6 +39,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "signal-hook",
+ "signal-hook-tokio",
  "tempfile",
  "termcolor",
  "thiserror",
@@ -255,6 +257,7 @@ name = "abq_workers"
 version = "0.1.0"
 dependencies = [
  "abq_generic_test_runner",
+ "abq_run_n_times",
  "abq_test_utils",
  "abq_utils",
  "abq_with_protocol_version",
@@ -1628,6 +1631,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e51e73328dc4ac0c7ccbda3a494dfa03df1de2f46018127f60c693f2648455b0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "signal-hook-tokio"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "213241f76fb1e37e27de3b6aa1b068a2c333233b59cca6634f634b80a27ecf1e"
+dependencies = [
+ "futures-core",
+ "libc",
+ "signal-hook",
+ "tokio",
 ]
 
 [[package]]
