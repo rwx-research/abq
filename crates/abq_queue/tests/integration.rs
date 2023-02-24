@@ -294,24 +294,6 @@ impl invoke::ResultHandler for ResultsCollector {
             .push((work_id, run_number, result.test_result))
     }
 
-    fn get_ordered_retry_manifest(&mut self, run_number: u32) -> Vec<TestSpec> {
-        let manifest = self.manifest.lock();
-        let manifest = manifest.as_ref().unwrap();
-        let results = self.results.lock();
-
-        results
-            .iter()
-            .filter_map(|(work_id, run, result)| {
-                if (*run == run_number) && result.status.is_fail_like() {
-                    let spec = manifest.iter().find(|spec| spec.work_id == *work_id);
-                    Some(spec.unwrap().clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     fn get_exit_code(&self) -> ExitCode {
         let results = self.results.lock();
         let max_run = results
@@ -1469,6 +1451,7 @@ fn timeout_with_slower_poll_timeout_than_tick_interval() {
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)]
+#[ignore = "TODO(1.3-retries)"]
 fn many_retries_complete() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
@@ -1527,6 +1510,7 @@ fn many_retries_complete() {
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)]
+#[ignore = "TODO(1.3-retries)"]
 fn many_retries_many_workers_complete() {
     let attempts = 4;
     let num_tests = 64;
@@ -1596,6 +1580,7 @@ fn many_retries_many_workers_complete() {
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)] // 2 seconds
+#[ignore = "TODO(1.3-retries)"]
 fn many_retries_many_workers_complete_native() {
     let attempts = 4;
     let num_tests = 64;

@@ -1,7 +1,5 @@
 mod summary;
 
-mod retry_manifest_tracker;
-
 use std::{
     fmt::Display,
     io::{self},
@@ -386,10 +384,6 @@ impl invoke::ResultHandler for SuiteReporters {
     fn on_result(&mut self, work_id: WorkId, run_number: u32, result: ReportedResult) {
         // TODO: is there a reasonable way to surface the error?
         let _opt_error = self.push_result(work_id, run_number, &result);
-    }
-
-    fn get_ordered_retry_manifest(&mut self, run_number: u32) -> Vec<TestSpec> {
-        self.overall_tracker.ordered_retry_manifest(run_number)
     }
 
     fn get_exit_code(&self) -> ExitCode {

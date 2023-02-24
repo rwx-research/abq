@@ -731,10 +731,7 @@ pub mod client {
 
     use crate::exit::ExitCode;
 
-    use super::{
-        queue::TestSpec,
-        runners::{CapturedOutput, TestResult},
-    };
+    use super::runners::{CapturedOutput, TestResult};
 
     /// An acknowledgement of receiving a run-start notification from the queue server. Sent by the client.
     #[derive(Serialize, Deserialize)]
@@ -752,15 +749,6 @@ pub mod client {
         AckEnd {
             /// The exit code that should be used.
             exit_code: ExitCode,
-        },
-        /// Additional attempts should be added to the run.
-        AdditionalAttempts {
-            /// The manifest of test retries. Must be in the same order as the flat manifest
-            /// originally delivered to the supervisor.
-            ordered_manifest: Vec<TestSpec>,
-            /// The attempt number of all tests in the [ordered_manifest].
-            /// Must be monotonically increasing, and strictly larger than [super::workers::INIT_RUN_NUMBER].
-            attempt_number: u32,
         },
     }
 

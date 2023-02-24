@@ -11,7 +11,7 @@ use abq_utils::{
     },
 };
 
-use super::{retry_manifest_tracker::RetryManifestTracker, SuiteResult};
+use super::SuiteResult;
 
 /// Status of a test, possibly across multiple attempts.
 enum StatusTag {
@@ -86,8 +86,6 @@ pub(super) struct SuiteTracker {
 
     tests: HashMap<TestId, OverallStatus>,
 
-    manifest: RetryManifestTracker,
-
     // (total_attempts, aggregated metrics)
     // Need to re-calculate every time the total attempts change.
     cached_aggregated_metric: Cell<Option<(u64, AggregatedMetrics)>>,
@@ -103,13 +101,11 @@ impl SuiteTracker {
 
             tests: HashMap::with_capacity(manifest.len()),
 
-            manifest: RetryManifestTracker::new(manifest),
-
             cached_aggregated_metric: Cell::new(None),
         }
     }
 
-    pub fn account_result(&mut self, work_id: WorkId, run_number: u32, test_result: &TestResult) {
+    pub fn account_result(&mut self, _work_id: WorkId, run_number: u32, test_result: &TestResult) {
         use StatusTag::*;
 
         self.total_attempts += 1;
@@ -146,15 +142,6 @@ impl SuiteTracker {
             _ => { /* no update */ }
         }
         entry.retried = run_number > INIT_RUN_NUMBER;
-
-        if is_fail_like {
-            self.manifest
-                .account_failure(work_id, run_number, test_result.id.clone());
-        }
-    }
-
-    pub fn ordered_retry_manifest(&mut self, run_number: u32) -> Vec<TestSpec> {
-        self.manifest.failing_subset(run_number)
     }
 
     fn load_aggregated_metrics(&self) -> AggregatedMetrics {

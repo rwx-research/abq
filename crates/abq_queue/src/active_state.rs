@@ -38,16 +38,6 @@ impl ActiveRunState {
         self.work_left == 0
     }
 
-    /// Add more work to run.
-    pub fn insert_additional_work_count(&mut self, retries: usize) {
-        self.work_left += retries;
-    }
-
-    #[cfg(test)]
-    pub fn get_work_left(&self) -> usize {
-        self.work_left
-    }
-
     pub fn insert_worker_completed(
         &mut self,
         worker: Entity,

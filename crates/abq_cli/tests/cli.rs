@@ -1441,6 +1441,7 @@ For a reason explainable only by a backtrace
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore = "TODO(1.3-retries)"]
 fn retries_smoke() {
     // Smoke test for retries, that runs a number of tests on a number of workers and makes sure
     // nothing blows up.

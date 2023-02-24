@@ -60,8 +60,6 @@ pub struct Client {
     /// Signal to cancel an active test run.
     cancellation_rx: RunCancellationRx,
     async_reader: AsyncReaderDos,
-    current_run_attempt: u32,
-    max_run_attempt: u32,
 }
 
 #[derive(Debug, Error)]
@@ -141,7 +139,6 @@ pub trait ResultHandler {
 
     fn create(manifest: Vec<TestSpec>, init: Self::InitData) -> Self;
     fn on_result(&mut self, work_id: WorkId, run_number: u32, result: ReportedResult);
-    fn get_ordered_retry_manifest(&mut self, run_number: u32) -> Vec<TestSpec>;
     fn get_exit_code(&self) -> ExitCode;
     fn tick(&mut self);
 }
@@ -204,8 +201,6 @@ impl Client {
             async_reader: Default::default(),
             next_poll_timeout_at: Self::next_poll_timeout_at_from_timeout(test_results_timeout),
             tick_interval,
-            current_run_attempt: INIT_RUN_NUMBER,
-            max_run_attempt,
         })
     }
 
@@ -293,57 +288,22 @@ impl Client {
                     return Ok(IncrementalTestData::Results(results));
                 }
                 Ok(InvokerTestData::EndOfResults) => {
-                    let is_last_run_attempt = self.current_run_attempt == self.max_run_attempt;
-                    let opt_retry_manifest = match (is_last_run_attempt, handler.as_mut()) {
-                        (true, _) | (false, None) => None,
-                        (false, Some(handler)) => {
-                            let retry_manifest =
-                                handler.get_ordered_retry_manifest(self.current_run_attempt);
+                    // Finish up the test run.
+                    //
+                    // Send a final ACK of the test results, so that cancellation signals do not
+                    // interfere with us here.
+                    let exit_code = handler
+                        .as_ref()
+                        .expect("handler must be known with manifest at this point")
+                        .get_exit_code();
 
-                            if !retry_manifest.is_empty() {
-                                Some(retry_manifest)
-                            } else {
-                                None
-                            }
-                        }
-                    };
+                    net_protocol::async_write(
+                        &mut self.stream,
+                        &net_protocol::client::EndOfResultsResponse::AckEnd { exit_code },
+                    )
+                    .await?;
 
-                    match opt_retry_manifest {
-                        None => {
-                            // Finish up the test run.
-                            //
-                            // Send a final ACK of the test results, so that cancellation signals do not
-                            // interfere with us here.
-                            let exit_code = handler
-                                .as_ref()
-                                .expect("handler must be known with manifest at this point")
-                                .get_exit_code();
-
-                            net_protocol::async_write(
-                                &mut self.stream,
-                                &net_protocol::client::EndOfResultsResponse::AckEnd { exit_code },
-                            )
-                            .await?;
-
-                            return Ok(IncrementalTestData::Finished);
-                        }
-                        Some(ordered_manifest) => {
-                            let next_run_attempt = self.current_run_attempt + 1;
-
-                            net_protocol::async_write(
-                                &mut self.stream,
-                                &net_protocol::client::EndOfResultsResponse::AdditionalAttempts {
-                                    ordered_manifest,
-                                    attempt_number: next_run_attempt,
-                                },
-                            )
-                            .await?;
-
-                            self.current_run_attempt = next_run_attempt;
-
-                            continue;
-                        }
-                    }
+                    return Ok(IncrementalTestData::Finished);
                 }
                 Ok(InvokerTestData::TestCommandError { error, captured }) => {
                     return Err(TestResultError::TestCommandError(error, captured).into())

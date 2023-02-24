@@ -35,10 +35,6 @@ impl AttemptsCounter {
     pub fn completed_all_attempts(&self) -> bool {
         self.last_completed_attempt == self.max_attempt_number
     }
-
-    pub fn last_completed_attempt(&self) -> u32 {
-        self.last_completed_attempt
-    }
 }
 
 #[cfg(test)]
