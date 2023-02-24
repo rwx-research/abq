@@ -41,7 +41,7 @@ pub fn mock_summary() -> CompletedSummary {
     use abq_utils::net_protocol::{queue::NativeRunnerInfo, runners::NativeRunnerSpecification};
 
     CompletedSummary {
-        native_runner_info: NativeRunnerInfo {
+        native_runner_info: Some(NativeRunnerInfo {
             protocol_version: abq_utils::net_protocol::runners::AbqProtocolVersion::V0_2,
             specification: NativeRunnerSpecification {
                 name: "test-runner".to_owned(),
@@ -52,7 +52,7 @@ pub fn mock_summary() -> CompletedSummary {
                 language_version: "7.8.9".to_owned(),
                 host: "zmachine".to_owned(),
             },
-        },
+        }),
     }
 }
 

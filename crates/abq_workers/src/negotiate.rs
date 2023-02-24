@@ -154,6 +154,7 @@ impl NegotiatedWorkers {
                     status,
                     manifest_generation_output: None,
                     final_captured_outputs: Default::default(),
+                    native_runner_info: None,
                 }
             }
             NegotiatedWorkers::Pool(pool) => pool.shutdown(),

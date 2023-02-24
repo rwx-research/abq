@@ -510,7 +510,7 @@ use crate::exit::ExitCode;
 use crate::net_protocol::workers::WorkId;
 
 use super::entity::RunnerMeta;
-use super::queue::TestSpec;
+use super::queue::{NativeRunnerInfo, TestSpec};
 
 impl std::fmt::Display for OutOfBandError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -828,6 +828,7 @@ impl CapturedOutput {
 #[derive(Debug)]
 pub struct TestRunnerExit {
     pub exit_code: ExitCode,
+    pub native_runner_info: Option<NativeRunnerInfo>,
     /// Output captured during manifest generation, if any.
     pub manifest_generation_output: Option<CapturedOutput>,
     /// Captured stdout/stderr after all tests have been run

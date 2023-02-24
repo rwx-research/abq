@@ -10,7 +10,9 @@ use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, Generi
 use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{self, Entity, RunnerMeta, WorkerRunner, WorkerTag};
-use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted, TestSpec};
+use abq_utils::net_protocol::queue::{
+    AssociatedTestResults, NativeRunnerInfo, RunAlreadyCompleted, TestSpec,
+};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, CapturedOutput, ManifestMessage, NativeRunnerSpecification, OutOfBandError,
     Status, TestId, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
@@ -142,6 +144,7 @@ pub enum WorkersExitStatus {
 #[derive(Debug)]
 pub struct WorkersExit {
     pub status: WorkersExitStatus,
+    pub native_runner_info: Option<NativeRunnerInfo>,
     pub manifest_generation_output: Option<(RunnerMeta, CapturedOutput)>,
     /// Final captured output of each runner, after all tests were run on each runner.
     pub final_captured_outputs: Vec<(RunnerMeta, CapturedOutput)>,
@@ -306,6 +309,7 @@ impl WorkerPool {
         let mut failure_exit_code = ExitCode::new(1);
         let mut final_captured_outputs = Vec::with_capacity(self.runners.len());
         let mut manifest_generation_output = None;
+        let mut native_runner_info = None;
         for (runner_meta, runner_thread) in self.runners.iter_mut() {
             let opt_err = runner_thread
                 .handle
@@ -319,7 +323,10 @@ impl WorkerPool {
                     exit_code,
                     manifest_generation_output: this_manifest_output,
                     final_captured_output,
+                    native_runner_info: this_native_runner_info,
                 }) => {
+                    native_runner_info = native_runner_info.or(this_native_runner_info);
+
                     debug_assert!(
                         this_manifest_output.is_none() || manifest_generation_output.is_none(),
                     );
@@ -381,6 +388,7 @@ impl WorkerPool {
             manifest_generation_output,
             final_captured_outputs,
             status,
+            native_runner_info,
         }
     }
 }
@@ -574,6 +582,7 @@ fn start_test_like_runner(
                 exit_code: ExitCode::new(ec),
                 manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
+                native_runner_info: None,
             });
         }
         TestLikeRunner::Panic => {
@@ -612,6 +621,7 @@ fn start_test_like_runner(
                     exit_code: ExitCode::SUCCESS,
                     manifest_generation_output: None,
                     final_captured_output: CapturedOutput::empty(),
+                    native_runner_info: None,
                 });
             }
         },
@@ -621,6 +631,7 @@ fn start_test_like_runner(
                 exit_code: ExitCode::ABQ_ERROR,
                 manifest_generation_output: None,
                 final_captured_output: CapturedOutput::empty(),
+                native_runner_info: None,
             });
         }
     };
@@ -737,6 +748,7 @@ fn start_test_like_runner(
         exit_code: ExitCode::SUCCESS,
         manifest_generation_output: None,
         final_captured_output: CapturedOutput::empty(),
+        native_runner_info: None,
     })
 }
 

@@ -9,7 +9,8 @@ pub mod output;
 #[derive(Debug)]
 pub struct CompletedSummary {
     /// The native test runner that was in use for this test run.
-    pub native_runner_info: NativeRunnerInfo,
+    /// Can be [None] if the returned worker never ran any tests.
+    pub native_runner_info: Option<NativeRunnerInfo>,
 }
 
 #[derive(Debug, Error)]

@@ -665,11 +665,23 @@ where
         .unwrap_or_else(|_| CapturedOutput::empty());
 
     match opt_err {
-        Ok(exit) => Ok(TestRunnerExit {
-            exit_code: exit,
-            manifest_generation_output,
-            final_captured_output: output,
-        }),
+        Ok(exit) => {
+            let native_runner_info = abq_utils::net_protocol::queue::NativeRunnerInfo {
+                protocol_version: native_runner_handle
+                    .state
+                    .runner_info
+                    .protocol
+                    .get_version(),
+                specification: native_runner_handle.state.runner_info.specification,
+            };
+
+            Ok(TestRunnerExit {
+                exit_code: exit,
+                native_runner_info: Some(native_runner_info),
+                manifest_generation_output,
+                final_captured_output: output,
+            })
+        }
         Err(err) => Err(GenericRunnerError { error: err, output }),
     }
 }

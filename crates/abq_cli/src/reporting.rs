@@ -109,18 +109,18 @@ impl FromStr for ColorPreference {
 
 pub(crate) struct SuiteResult {
     /// Exit code suggested for the test suite.
-    suggested_exit_code: ExitCode,
+    pub suggested_exit_code: ExitCode,
     /// Total number of tests run.
-    count: u64,
-    count_failed: u64,
+    pub count: u64,
+    pub count_failed: u64,
     /// How many individual tests were retried. Not the total count of how many retries were run.
     /// For example, if test A was retried twice, its count in this metric is one.
-    tests_retried: u64,
+    pub tests_retried: u64,
     /// Runtime of the test suite, as accounted between the time the reporter started and the time
     /// it finished.
-    wall_time: Duration,
+    pub wall_time: Duration,
     /// Runtime of the test suite, as accounted for in the actual time in tests.
-    test_time: TestRuntime,
+    pub test_time: TestRuntime,
 }
 
 impl SuiteResult {
@@ -211,8 +211,13 @@ impl Reporter for RwxV1JsonReporter {
             .write(true)
             .open(self.path)?;
 
+        let opt_specification = summary
+            .native_runner_info
+            .as_ref()
+            .map(|runner| &runner.specification);
+
         self.collector
-            .write_json(fd, &summary.native_runner_info.specification)
+            .write_json(fd, opt_specification)
             .map_err(|_| ReportingError::FailedToFormat)?;
 
         Ok(())
@@ -252,7 +257,7 @@ impl StdoutPreferences {
     }
 }
 
-fn reporter_from_kind(
+pub fn reporter_from_kind(
     kind: ReporterKind,
     stdout_preferences: StdoutPreferences,
     test_suite_name: &str,

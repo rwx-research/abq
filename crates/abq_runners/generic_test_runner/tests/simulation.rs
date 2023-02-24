@@ -93,6 +93,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
         final_captured_output,
         manifest_generation_output,
         exit_code,
+        native_runner_info: _,
     } = GenericTestRunner::run(
         Entity::runner(0, 1),
         RunnerMeta::fake(),

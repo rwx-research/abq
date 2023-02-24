@@ -22,6 +22,7 @@ dependencies = [
  "abq_with_protocol_version",
  "abq_workers",
  "anyhow",
+ "async-trait",
  "atty",
  "clap",
  "futures",

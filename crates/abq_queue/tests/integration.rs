@@ -258,10 +258,13 @@ type SupervisorResults =
 
 type Workers = Arc<tokio::sync::Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
+
+#[allow(clippy::large_enum_variant)]
 enum WorkersResult {
     Exit(WorkersExit),
     Panic,
 }
+
 type WorkersResults = Arc<Mutex<HashMap<Wid, WorkersResult>>>;
 
 type BgTasks = HashMap<SpawnId, tokio::task::JoinHandle<()>>;

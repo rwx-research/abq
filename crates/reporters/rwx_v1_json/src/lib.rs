@@ -23,6 +23,17 @@ pub struct Framework {
     provided_language: Option<String>,
 }
 
+impl Framework {
+    fn other() -> Self {
+        Self {
+            kind: "other".to_owned(),
+            language: "other".to_owned(),
+            provided_kind: None,
+            provided_language: None,
+        }
+    }
+}
+
 impl From<&NativeRunnerSpecification> for Framework {
     fn from(spec: &NativeRunnerSpecification) -> Self {
         // Normalize kind/language for native runners we know to https://github.com/rwx-research/test-results-schema/blob/main/v1.json
@@ -445,7 +456,7 @@ impl Collector {
     pub fn write_json(
         self,
         writer: impl Write,
-        runner_specification: &NativeRunnerSpecification,
+        runner_specification: Option<&NativeRunnerSpecification>,
     ) -> Result<(), String> {
         serde_json::to_writer(writer, &self.test_results(runner_specification))
             .map_err(|e| e.to_string())
@@ -454,13 +465,13 @@ impl Collector {
     pub fn write_json_pretty(
         self,
         writer: impl Write,
-        runner_specification: &NativeRunnerSpecification,
+        runner_specification: Option<&NativeRunnerSpecification>,
     ) -> Result<(), String> {
         serde_json::to_writer_pretty(writer, &self.test_results(runner_specification))
             .map_err(|e| e.to_string())
     }
 
-    fn test_results(self, runner_specification: &NativeRunnerSpecification) -> TestResults {
+    fn test_results(self, runner_specification: Option<&NativeRunnerSpecification>) -> TestResults {
         let mut summary = Summary::default();
         self.tests.values().for_each(|test| summary.account(test));
 
@@ -472,11 +483,22 @@ impl Collector {
             self.tests.into_values().map(Into::into).collect()
         };
 
+        let framework = match runner_specification {
+            Some(spec) => spec.into(),
+            None => {
+                assert!(
+                    reified_schema_tests.is_empty(),
+                    "runner specification may only be unknown if no tests were run on a node"
+                );
+                Framework::other()
+            }
+        };
+
         TestResults {
             schema:
                 "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json"
                     .to_string(),
-            framework: runner_specification.into(),
+            framework,
             summary,
             tests: reified_schema_tests,
         }
@@ -572,7 +594,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json(&mut buf, &NativeRunnerSpecification::fake())
+                .write_json(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_all_statuses__compact", json)
@@ -582,7 +604,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+                .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_all_statuses__pretty", json)
@@ -610,7 +632,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json(&mut buf, &NativeRunnerSpecification::fake())
+                .write_json(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__compact", json)
@@ -620,7 +642,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+                .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__pretty", json)
@@ -675,7 +697,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");
@@ -727,7 +749,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");
@@ -788,7 +810,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, &NativeRunnerSpecification::fake())
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");
@@ -811,7 +833,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, &runner_spec)
+            .write_json_pretty(&mut buf, Some(&runner_spec))
             .expect("failed to write");
         let json = String::from_utf8(buf).expect("not utf8 JSON");
         insta::assert_snapshot!(json)
@@ -833,7 +855,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, &runner_spec)
+            .write_json_pretty(&mut buf, Some(&runner_spec))
             .expect("failed to write");
         let json = String::from_utf8(buf).expect("not utf8 JSON");
         insta::assert_snapshot!(json)

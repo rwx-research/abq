@@ -1,6 +1,7 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
+use abq_reporting::{CompletedSummary, Reporter};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
 use abq_utils::net_protocol::runners::CapturedOutput;
@@ -11,9 +12,18 @@ use abq_workers::negotiate::{
 };
 use abq_workers::workers::{WorkerContext, WorkersExit, WorkersExitStatus};
 
+mod reporting;
+mod retry_manifest_tracker;
+mod summary;
+
 use futures::stream::StreamExt;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook_tokio::Signals;
+
+use crate::reporting::{ReporterKind, StdoutPreferences};
+use crate::workers::reporting::create_reporting_task;
+
+use self::reporting::{build_reporters, ReportingTaskHandle};
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
@@ -65,7 +75,8 @@ pub fn start_workers_standalone(
     num_workers: NonZeroUsize,
     runner_kind: RunnerKind,
     working_dir: PathBuf,
-    local_results_handler: SharedResultsHandler,
+    reporter_kinds: Vec<ReporterKind>,
+    stdout_preferences: StdoutPreferences,
     results_batch_size: u64,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
@@ -75,13 +86,17 @@ pub fn start_workers_standalone(
         .build()
         .unwrap();
 
+    let test_suite_name = "suite"; // TODO: determine this correctly
+    let reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name);
+
     rt.block_on(start_standalone_help(
         run_id,
         tag,
         num_workers,
         runner_kind,
         working_dir,
-        local_results_handler,
+        reporters,
+        stdout_preferences,
         results_batch_size,
         queue_negotiator,
         client_opts,
@@ -94,18 +109,21 @@ async fn start_standalone_help(
     num_workers: NonZeroUsize,
     runner_kind: RunnerKind,
     working_dir: PathBuf,
-    local_results_handler: SharedResultsHandler,
+    reporters: Vec<Box<dyn Reporter>>,
+    stdout_preferences: StdoutPreferences,
     results_batch_size: u64,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
 ) -> ! {
     let context = WorkerContext::AlwaysWorkIn { working_dir };
 
+    let (reporting_proxy, reporting_handle) = create_reporting_task(reporters);
+
     let workers_config = WorkersConfig {
         tag,
         num_workers,
         runner_kind,
-        local_results_handler,
+        local_results_handler: Box::new(reporting_proxy),
         worker_context: context,
         supervisor_in_band: false,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
@@ -136,35 +154,54 @@ async fn start_standalone_help(
     loop {
         tokio::select! {
             () = worker_pool.wait() => {
-                do_shutdown(worker_pool);
+                do_shutdown(worker_pool, reporting_handle, stdout_preferences).await;
             }
             _ = term_signals.next() => {
-                do_shutdown(worker_pool);
+                // Shutdown immediately
+                do_forceful_shutdown(worker_pool);
             }
         }
     }
 }
 
-fn do_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
+async fn do_shutdown(
+    mut worker_pool: NegotiatedWorkers,
+    reporting_handle: ReportingTaskHandle,
+    stdout_preferences: StdoutPreferences,
+) -> ! {
     let WorkersExit {
         status,
+        native_runner_info,
         manifest_generation_output,
         final_captured_outputs,
     } = worker_pool.shutdown();
 
     tracing::debug!("Workers shutdown");
 
+    let finalized_reporters = reporting_handle.join().await;
+
     if let Some((runner, manifest_output)) = manifest_generation_output {
         print_manifest_generation_output(runner, manifest_output);
     }
     print_final_runner_outputs(final_captured_outputs);
 
-    // We want to exit with an appropriate code if the workers were determined to have run
-    // any test that failed. This way, in distributed contexts, failure of test runs induces
-    // failures of workers, and it is enough to restart all unsuccessful processes to
-    // re-initialize an ABQ run.
+    let completed_summary = CompletedSummary { native_runner_info };
+
+    let (suite_result, errors) = finalized_reporters.finish(&completed_summary);
+
+    for error in errors {
+        eprintln!("{error}");
+    }
+
+    print!("\n\n");
+    suite_result
+        .write_short_summary_lines(&mut stdout_preferences.stdout_stream())
+        .unwrap();
+
+    // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,
+    // indicate the worker fault.
     let exit_code = match status {
-        WorkersExitStatus::Success => ExitCode::SUCCESS,
+        WorkersExitStatus::Success => suite_result.suggested_exit_code(),
         WorkersExitStatus::Failure { exit_code } => exit_code,
         WorkersExitStatus::Error { errors } => {
             for error in errors {
@@ -173,7 +210,14 @@ fn do_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
             ExitCode::ABQ_ERROR
         }
     };
+
     std::process::exit(exit_code.get());
+}
+
+fn do_forceful_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
+    worker_pool.shutdown();
+
+    std::process::exit(ExitCode::CANCELLED.get());
 }
 
 pub(crate) fn print_manifest_generation_output(

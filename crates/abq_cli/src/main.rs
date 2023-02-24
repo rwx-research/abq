@@ -390,16 +390,14 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                     retries,
                 )
             } else {
-                // TODO
-                let results_handler = Box::new(NoopResultsHandler);
-
                 workers::start_workers_standalone(
                     run_id,
                     WorkerTag::new(worker as _),
                     num_runners,
                     runner,
                     working_dir,
-                    results_handler,
+                    reporters,
+                    stdout_preferences,
                     batch_size.get(),
                     abq.negotiator_handle(),
                     abq.client_options().clone(),
@@ -672,6 +670,7 @@ fn run_sentinel_abq_test(
         let WorkersExit {
             // The exit code will be determined by the test result status.
             status: _,
+            native_runner_info: _,
             final_captured_outputs,
             manifest_generation_output,
         } = worker_pool.shutdown();
@@ -709,7 +708,7 @@ fn run_sentinel_abq_test(
     }
 
     let completed_summary = CompletedSummary {
-        native_runner_info: completed_data.native_runner_info,
+        native_runner_info: Some(completed_data.native_runner_info),
     };
 
     let (suite_result, errors) = reporters.finish(&completed_summary);
