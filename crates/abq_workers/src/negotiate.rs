@@ -19,8 +19,8 @@ use crate::{
     results_handler::{MultiplexingResultsHandler, QueueResultsSender, ResultsHandlerGenerator},
     workers::{
         GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyManifest,
-        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, RunExitCode, WorkerContext,
-        WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
+        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, WorkerContext, WorkerPool,
+        WorkerPoolConfig, WorkersExit, WorkersExitStatus,
     },
 };
 use abq_utils::{
@@ -144,19 +144,12 @@ pub enum NegotiatedWorkers {
 impl NegotiatedWorkers {
     pub fn shutdown(&mut self) -> WorkersExit {
         match self {
-            &mut NegotiatedWorkers::Redundant { exit_code, .. } => {
-                let status = if exit_code == ExitCode::SUCCESS {
-                    WorkersExitStatus::Success
-                } else {
-                    WorkersExitStatus::Failure { exit_code }
-                };
-                WorkersExit {
-                    status,
-                    manifest_generation_output: None,
-                    final_captured_outputs: Default::default(),
-                    native_runner_info: None,
-                }
-            }
+            &mut NegotiatedWorkers::Redundant { exit_code } => WorkersExit {
+                status: WorkersExitStatus::Completed(exit_code),
+                manifest_generation_output: None,
+                final_captured_outputs: Default::default(),
+                native_runner_info: None,
+            },
             NegotiatedWorkers::Pool(pool) => pool.shutdown(),
         }
     }
@@ -369,45 +362,6 @@ impl WorkersNegotiator {
             }
         };
 
-        let run_exit_code: RunExitCode = Arc::new({
-            // When our worker finishes and polls the queue for the final status of the run,
-            // there still may be active work. So for now, let's poll every second; we can make
-            // the strategy here more sophisticated in the future, e.g. with exponential backoffs.
-            const BACKOFF: Duration = Duration::from_secs(1);
-            let run_id = run_id.clone();
-
-            move |entity| {
-                let span = tracing::trace_span!("run_completed_successfully", run_id=?run_id, queue_addr=?queue_results_addr);
-                let _run_completed_successfully = span.enter();
-
-                use net_protocol::queue::{Message, Request, TotalRunResult};
-                loop {
-                    let mut stream = retry_n(5, Duration::from_secs(3), |attempt| {
-                        if attempt > 1 {
-                            tracing::info!("reattempting connection to work server {}", attempt);
-                        }
-                        client.connect(queue_results_addr)
-                    })
-                    .expect("work server not available");
-
-                    let request = Request {
-                        entity,
-                        message: Message::RequestTotalRunResult(run_id.clone()),
-                    };
-                    net_protocol::write(&mut stream, request).unwrap();
-                    let run_result = net_protocol::read(&mut stream).unwrap();
-
-                    match run_result {
-                        TotalRunResult::Pending => {
-                            std::thread::sleep(BACKOFF);
-                            continue;
-                        }
-                        TotalRunResult::Completed { exit_code } => return exit_code,
-                    }
-                }
-            }
-        });
-
         let pool_config = WorkerPoolConfig {
             size: num_workers,
             tag,
@@ -417,7 +371,6 @@ impl WorkersNegotiator {
             get_init_context,
             results_handler_generator,
             notify_all_tests_run_generator,
-            run_exit_code,
             results_batch_size_hint,
             worker_context,
             run_id,
@@ -1024,16 +977,9 @@ mod test {
                     net_protocol::write(&mut client, net_protocol::queue::AckManifest {}).unwrap();
                 }
                 net_protocol::queue::Message::RequestTotalRunResult(_) => {
-                    let failed = msgs2
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .any(|result| result.status.is_fail_like());
                     net_protocol::write(
                         &mut client,
-                        net_protocol::queue::TotalRunResult::Completed {
-                            exit_code: ExitCode::new(failed as _),
-                        },
+                        net_protocol::queue::TotalRunResult::Completed,
                     )
                     .unwrap();
                 }
@@ -1145,7 +1091,10 @@ mod test {
         });
 
         let workers_exit = workers.shutdown();
-        assert!(matches!(workers_exit.status, WorkersExitStatus::Success));
+        assert!(matches!(
+            workers_exit.status,
+            WorkersExitStatus::Completed(ExitCode::SUCCESS)
+        ));
 
         shutdown_tx.shutdown_immediately().unwrap();
         queue_negotiator.join();

@@ -742,8 +742,7 @@ test_all_network_config_options! {
             exit_status,
         } = Abq::new(name.to_string() + "_test0").args(test_args(0)).run();
 
-        // The `abq test` process should exit with a failure
-        assert!(!exit_status.success(), "{:?}", (stdout, stderr));
+        let mut at_least_one_failed = !exit_status.success();
 
         let mut lines = stdout.lines();
         assert!(lines.next().unwrap().contains("Started test run"));
@@ -755,7 +754,10 @@ test_all_network_config_options! {
         // The `abq work` process should also exit with a failure, corresponding to having
         // witnessed a test failure in the run.
         let worker_exit_status = test1_proc.wait().unwrap();
-        assert!(!worker_exit_status.success());
+        at_least_one_failed = at_least_one_failed || !worker_exit_status.success();
+
+        // At least one of the workers should fail with a non-zero code.
+        assert!(at_least_one_failed);
 
         term_queue(queue_proc);
     }
@@ -1583,20 +1585,13 @@ fn retries_smoke() {
         )
     }
 
+    let mut at_least_one_is_failing = false;
     for worker in other_workers {
-        let Output {
-            status,
-            stderr,
-            stdout,
-        } = worker.wait_with_output().unwrap();
-        let worker_stdout = String::from_utf8_lossy(&stdout);
-        let worker_stderr = String::from_utf8_lossy(&stderr);
-        assert_eq!(
-            status.code().unwrap(),
-            1,
-            "STDOUT:\n{worker_stdout}\nSTDERR:\n{worker_stderr}"
-        );
+        let Output { status, .. } = worker.wait_with_output().unwrap();
+        at_least_one_is_failing = at_least_one_is_failing || status.code().unwrap() == 1;
     }
+
+    assert!(at_least_one_is_failing);
 
     term_queue(queue_proc);
 }

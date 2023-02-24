@@ -44,8 +44,6 @@ pub type GetNextTestsGenerator<'a> = &'a (dyn Fn(Entity) -> GetNextTests + Send 
 pub type GetInitContext =
     Arc<dyn Fn(Entity) -> io::Result<InitContextResult> + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(Entity, &RunId, ManifestResult) + Send + Sync + 'static>;
-/// Returns the exit code of the given run for a worker.
-pub type RunExitCode = Arc<dyn Fn(Entity) -> ExitCode + Send + Sync + 'static>;
 
 pub type NotifyMaterialTestsAllRun = abq_generic_test_runner::NotifyMaterialTestsAllRun;
 pub type NotifyMaterialTestsAllRunGenerator<'a> =
@@ -92,9 +90,6 @@ pub struct WorkerPoolConfig<'a> {
     pub notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
     /// How many results should be sent back at a time?
     pub results_batch_size_hint: u64,
-    /// Query the assigned run's exit code.
-    /// Blocks until the result is well-known.
-    pub run_exit_code: RunExitCode,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
 
@@ -119,26 +114,19 @@ pub struct WorkerPool {
     runners: Vec<(RunnerMeta, ThreadWorker)>,
     worker_msg_tx: mpsc::Sender<MessageFromPool>,
     live_count: LiveCount,
-    /// Query the exit code of the run assigned for this pool.
-    run_exit_code: RunExitCode,
-    /// The entity of the worker pool itself.
-    first_runner_entity: Entity,
-    /// Whether this pool is running in-band with a supervisor.
-    supervisor_in_band: bool,
 }
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum WorkersExitStatus {
-    /// This pool of workers was determined to complete successfully.
-    /// Corresponds to all workers for a given [run][RunId] having only work that was
-    /// successful.
-    Success,
-    /// This pool of workers was determined to fail.
-    /// Corresponds to any workers for a given [run][RunId] having any work that failed.
-    Failure { exit_code: ExitCode },
-    /// Some worker in this pool errored in an unexpected way.
-    /// Includes all noted errors.
-    Error { errors: Vec<String> },
+    /// This pool of workers completed. The exit code is the highest exit code of any native runner.
+    Completed(ExitCode),
+    Error {
+        errors: Vec<String>,
+    },
+}
+
+impl WorkersExitStatus {
+    pub const SUCCESS: Self = Self::Completed(ExitCode::SUCCESS);
 }
 
 #[derive(Debug)]
@@ -164,7 +152,6 @@ impl WorkerPool {
             results_handler_generator,
             notify_manifest,
             notify_all_tests_run_generator,
-            run_exit_code,
             worker_context,
             supervisor_in_band,
             debug_native_runner,
@@ -276,9 +263,6 @@ impl WorkerPool {
             runners,
             worker_msg_tx,
             live_count,
-            run_exit_code,
-            first_runner_entity,
-            supervisor_in_band,
         }
     }
 
@@ -306,7 +290,7 @@ impl WorkerPool {
         }
 
         let mut errors = vec![];
-        let mut failure_exit_code = ExitCode::new(1);
+        let mut highest_exit_code = ExitCode::new(0);
         let mut final_captured_outputs = Vec::with_capacity(self.runners.len());
         let mut manifest_generation_output = None;
         let mut native_runner_info = None;
@@ -336,7 +320,7 @@ impl WorkerPool {
 
                     // Choose the highest exit code of all the test runners this worker started to
                     // be the exit code of the worker.
-                    failure_exit_code = exit_code.max(failure_exit_code);
+                    highest_exit_code = exit_code.max(exit_code);
                     final_captured_output
                 }
                 Err(GenericRunnerError {
@@ -365,23 +349,8 @@ impl WorkerPool {
 
         let status = if !errors.is_empty() {
             WorkersExitStatus::Error { errors }
-        } else if self.supervisor_in_band {
-            // The supervisor will always take over the exit code seen by the worker.
-            //
-            // Default to an erroring code to trace if the supervisor's exit-code-overwriting logic
-            // goes wrong.
-            WorkersExitStatus::Failure {
-                exit_code: ExitCode::WORKER_CEDES_TO_SUPERVISOR,
-            }
         } else {
-            let exit_code = (self.run_exit_code)(self.first_runner_entity);
-            if exit_code == ExitCode::SUCCESS {
-                WorkersExitStatus::Success
-            } else {
-                WorkersExitStatus::Failure {
-                    exit_code: exit_code.max(failure_exit_code),
-                }
-            }
+            WorkersExitStatus::Completed(highest_exit_code)
         };
 
         WorkersExit {
@@ -883,8 +852,8 @@ mod test {
 
     use super::{
         GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest,
-        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, RunExitCode, TestsFetcher,
-        WorkerContext, WorkerPool,
+        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, TestsFetcher, WorkerContext,
+        WorkerPool,
     };
     use crate::negotiate::QueueNegotiator;
     use crate::results_handler::ResultsHandlerGenerator;
@@ -951,11 +920,7 @@ mod test {
         }
     }
 
-    fn results_collector() -> (
-        ResultsCollector,
-        impl Fn(Entity) -> ResultsHandler,
-        RunExitCode,
-    ) {
+    fn results_collector() -> (ResultsCollector, impl Fn(Entity) -> ResultsHandler) {
         let results: ResultsCollector = Default::default();
         let results2 = results.clone();
 
@@ -965,16 +930,7 @@ mod test {
             });
             results_notifier
         };
-        let results3 = Arc::clone(&results);
-        let get_completed_status: RunExitCode = Arc::new(move |_| {
-            let any_is_failure = results3
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|(_, results)| results.iter().any(|r| r.status.is_fail_like()));
-            ExitCode::new(any_is_failure as _)
-        });
-        (results, results_handler_generator, get_completed_status)
+        (results, results_handler_generator)
     }
 
     fn notify_all_tests_run() -> (
@@ -1014,7 +970,6 @@ mod test {
         get_next_tests_generator: GetNextTestsGenerator<'a>,
         results_handler_generator: ResultsHandlerGenerator<'a>,
         notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
-        run_exit_code: RunExitCode,
     ) -> (WorkerPoolConfig<'a>, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
 
@@ -1030,7 +985,6 @@ mod test {
             notify_manifest: Some(notify_manifest),
             results_handler_generator,
             notify_all_tests_run_generator,
-            run_exit_code,
             worker_context: WorkerContext::AssumeLocal,
             supervisor_in_band: false,
             debug_native_runner: false,
@@ -1082,7 +1036,7 @@ mod test {
 
     async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
         let (write_work, get_next_tests) = work_writer();
-        let (results, results_handler_generator, run_completed_successfully) = results_collector();
+        let (results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
 
         let run_id = RunId::unique();
@@ -1102,7 +1056,6 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
-            run_completed_successfully,
         );
 
         let config = WorkerPoolConfig {
@@ -1140,7 +1093,10 @@ mod test {
         });
 
         let exit = pool.shutdown();
-        assert!(matches!(exit.status, WorkersExitStatus::Success));
+        assert!(matches!(
+            exit.status,
+            WorkersExitStatus::Completed(ExitCode::SUCCESS)
+        ));
 
         let all_completed = all_completed.lock().unwrap();
         assert_eq!(all_completed.len(), num_workers);
@@ -1350,7 +1306,7 @@ mod test {
     #[tokio::test]
     async fn exit_with_error_if_worker_errors() {
         let (_write_work, get_next_tests) = work_writer();
-        let (_results, results_handler_generator, run_completed_successfully) = results_collector();
+        let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
         let (default_config, _manifest_collector) = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
@@ -1364,7 +1320,6 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
-            run_completed_successfully,
         );
 
         let mut pool = WorkerPool::new(default_config).await;
@@ -1381,7 +1336,7 @@ mod test {
     #[tokio::test]
     async fn sets_abq_native_runner_env_vars() {
         let (_write_work, get_next_tests) = work_writer();
-        let (_results, results_handler_generator, run_completed_successfully) = results_collector();
+        let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
 
         let writefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
@@ -1398,7 +1353,6 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
-            run_completed_successfully,
         );
 
         config.size = NonZeroUsize::new(5).unwrap();
@@ -1419,10 +1373,8 @@ mod test {
     #[with_protocol_version]
     async fn worker_exits_with_runner_exit() {
         let (_write_work, get_next_tests) = work_writer();
-        let (_results, results_handler_generator, _run_completed_successfully) =
-            results_collector();
+        let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
-        let run_exit_code = Arc::new(Box::new(|_| ExitCode::FAILURE));
 
         let manifest = ManifestMessage::new(Manifest::new(
             [echo_test(proto, "test1".to_string())],
@@ -1435,7 +1387,6 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
-            run_exit_code,
         );
 
         config.size = NonZeroUsize::new(1).unwrap();
@@ -1446,9 +1397,7 @@ mod test {
         assert!(
             matches!(
                 pool_exit.status,
-                WorkersExitStatus::Failure {
-                    exit_code
-                } if exit_code.get() == 27
+                WorkersExitStatus::Completed(ec) if ec.get() == 27
             ),
             "{pool_exit:?}"
         );

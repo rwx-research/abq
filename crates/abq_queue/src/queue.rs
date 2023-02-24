@@ -115,9 +115,7 @@ enum RunState {
         /// The test suite is seen as complete when the end of the queue is at the max attempt number.
         attempts_counter: AttemptsCounter,
     },
-    Done {
-        exit_code: ExitCode,
-    },
+    Done,
     Cancelled {
         #[allow(unused)] // yet
         reason: CancelReason,
@@ -210,7 +208,7 @@ enum AssignedRunLookup {
 #[derive(Debug, Clone, Copy)]
 enum RunLive {
     Active,
-    Done { exit_code: ExitCode },
+    Done,
     Cancelled,
 }
 
@@ -360,10 +358,12 @@ impl AllRuns {
             // however, if the run state is known to be complete, the run data will already
             // have been pruned, and the worker should not be given a run.
             match &mut run.state {
-                RunState::Done { exit_code } => {
+                RunState::Done => {
+                    // The worker should exit successfully locally, regardless of what the overall
+                    // code was.
                     return AssignedRunLookup::AlreadyDone {
-                        exit_code: *exit_code,
-                    }
+                        exit_code: ExitCode::SUCCESS,
+                    };
                 }
                 RunState::Cancelled { .. } => {
                     return AssignedRunLookup::AlreadyDone {
@@ -668,7 +668,7 @@ impl AllRuns {
         }
     }
 
-    pub fn mark_complete(&self, run_id: &RunId, exit_code: ExitCode) {
+    pub fn mark_complete(&self, run_id: &RunId) {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").lock();
@@ -689,7 +689,7 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Done { exit_code };
+        run.state = RunState::Done;
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -720,9 +720,7 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Done {
-            exit_code: ExitCode::FAILURE,
-        };
+        run.state = RunState::Done;
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -755,9 +753,7 @@ impl AllRuns {
         }
 
         // Trivially successful
-        run.state = RunState::Done {
-            exit_code: ExitCode::SUCCESS,
-        };
+        run.state = RunState::Done;
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -798,7 +794,7 @@ impl AllRuns {
             RunState::WaitingForFirstWorker { .. }
             | RunState::WaitingForManifest { .. }
             | RunState::HasWork { .. } => Some(RunLive::Active),
-            RunState::Done { exit_code } => Some(RunLive::Done { exit_code }),
+            RunState::Done => Some(RunLive::Done),
             RunState::Cancelled { .. } => Some(RunLive::Cancelled),
         }
     }
@@ -2149,7 +2145,7 @@ impl QueueServer {
 
         let run_state = state_cache.lock().remove(run_id);
 
-        queues.mark_complete(run_id, exit_code);
+        queues.mark_complete(run_id);
 
         let (opt_worker_results_tasks_err, opt_worker_next_tests_tasks_err) = tokio::join!(
             Self::shutdown_persisted_worker_connection_tasks(
@@ -2295,7 +2291,7 @@ impl QueueServer {
                 (RunLive::Active, TimeoutReason::ResultNotReceived) => {
                     // pass through, the run needs to be timed out.
                 }
-                (RunLive::Done { .. }, _) | (RunLive::Cancelled, _) => {
+                (RunLive::Done {}, _) | (RunLive::Cancelled, _) => {
                     return Ok(()); // run was already complete, disregard the timeout
                 }
             },
@@ -2472,13 +2468,11 @@ impl QueueServer {
 
             match liveness {
                 RunLive::Active => net_protocol::queue::TotalRunResult::Pending,
-                RunLive::Done { exit_code } => {
+                RunLive::Done => {
                     tracing::info!(?run_id, ?entity, "notifying worker of run exit code");
-                    net_protocol::queue::TotalRunResult::Completed { exit_code }
+                    net_protocol::queue::TotalRunResult::Completed
                 }
-                RunLive::Cancelled => net_protocol::queue::TotalRunResult::Completed {
-                    exit_code: ExitCode::CANCELLED,
-                },
+                RunLive::Cancelled => net_protocol::queue::TotalRunResult::Completed,
             }
         };
 
@@ -2811,7 +2805,6 @@ mod test {
             build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
             UserToken,
         },
-        exit::ExitCode,
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
             self,
@@ -3550,7 +3543,7 @@ mod test {
         queues.find_run_for_worker(&run_id, Entity::local_client());
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
-        queues.mark_complete(&run_id, ExitCode::SUCCESS);
+        queues.mark_complete(&run_id);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
@@ -3585,7 +3578,7 @@ mod test {
         }
 
         for run_id in [run_id1, run_id2] {
-            queues.mark_complete(&run_id, ExitCode::SUCCESS);
+            queues.mark_complete(&run_id);
         }
 
         assert_eq!(queues.estimate_num_active_runs(), expected_active);

@@ -201,8 +201,9 @@ async fn do_shutdown(
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,
     // indicate the worker fault.
     let exit_code = match status {
-        WorkersExitStatus::Success => suite_result.suggested_exit_code(),
-        WorkersExitStatus::Failure { exit_code } => exit_code,
+        WorkersExitStatus::Completed(runner_exit_code) => {
+            suite_result.suggested_exit_code().max(runner_exit_code)
+        }
         WorkersExitStatus::Error { errors } => {
             for error in errors {
                 eprintln!("{error}");
