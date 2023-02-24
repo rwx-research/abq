@@ -54,21 +54,3 @@ pub fn log_workers_waited_for_manifest_latency(
         );
     }
 }
-
-pub fn log_workers_waited_for_supervisor_latency(
-    run_id: &RunId,
-    worker_first_connected_times: &VecMap<Entity, time::Instant>,
-    supervisor_started_run_time: time::Instant,
-) {
-    for (worker, worker_connected) in worker_first_connected_times.iter() {
-        let pre_supervisor_idle_seconds =
-            (supervisor_started_run_time - *worker_connected).as_secs();
-        tracing::info!(
-            entity_id=%worker.display_id(),
-            entity_tag=%worker.tag,
-            %run_id,
-            pre_supervisor_idle_seconds,
-            "worker pre-supervisor idle seconds"
-        );
-    }
-}

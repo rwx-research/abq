@@ -1520,13 +1520,8 @@ fn multiple_workers_start_before_supervisor() {
         )
         .test();
 
-    // Should log how long these workers were idle before supervisor
     // Should log how long these workers were idle before manifest
     // Should log how long these worker took
-    assert_scoped_log(
-        "abq_queue::worker_timings",
-        "worker pre-supervisor idle seconds",
-    );
     assert_scoped_log(
         "abq_queue::worker_timings",
         "worker pre-manifest idle seconds",

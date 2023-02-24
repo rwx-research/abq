@@ -50,7 +50,7 @@ use crate::supervisor_responder::{BufferedResults, SupervisorResponder};
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
 use crate::worker_timings::{
     log_workers_idle_after_completion_latency, log_workers_waited_for_manifest_latency,
-    log_workers_waited_for_supervisor_latency, new_worker_timings, WorkerTimings,
+    new_worker_timings, WorkerTimings,
 };
 
 #[derive(Default, Debug)]
@@ -280,32 +280,17 @@ impl AllRuns {
 
         let worker_timings;
         match runs.get(&run_id) {
-            Some(state) => {
-                match &mut state.lock().state {
-                    RunState::WaitingForFirstWorker { .. }
-                    | RunState::WaitingForManifest { .. }
-                    | RunState::HasWork { .. } => {
-                        return Err(NewQueueError::RunIdAlreadyInProgress)
-                    }
-                    RunState::Done { .. } | RunState::Cancelled { .. } => {
-                        return Err(NewQueueError::RunIdPreviouslyCompleted)
-                    }
-                    RunState::WaitingForSupervisor {
-                        worker_connection_times,
-                    } => {
-                        // This is a legal state, pass through.
-                        // Take the worker connection timings from when they were waiting for the
-                        // supervisor, as those initial connections continue to be useful for
-                        // measuring the latency until material run start.
-                        worker_timings = std::mem::take(worker_connection_times);
-                        log_workers_waited_for_supervisor_latency(
-                            &run_id,
-                            &worker_timings,
-                            time::Instant::now(),
-                        );
-                    }
+            Some(state) => match &mut state.lock().state {
+                RunState::WaitingForFirstWorker { .. }
+                | RunState::WaitingForManifest { .. }
+                | RunState::HasWork { .. } => return Err(NewQueueError::RunIdAlreadyInProgress),
+                RunState::Done { .. } | RunState::Cancelled { .. } => {
+                    return Err(NewQueueError::RunIdPreviouslyCompleted)
                 }
-            }
+                RunState::WaitingForSupervisor {
+                    worker_connection_times,
+                } => worker_timings = std::mem::take(worker_connection_times),
+            },
             None => {
                 worker_timings = new_worker_timings();
             }
