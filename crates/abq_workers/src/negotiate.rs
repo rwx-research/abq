@@ -34,7 +34,7 @@ use abq_utils::{
         entity::{Entity, WorkerTag},
         meta::DeprecationRecord,
         publicize_addr,
-        queue::{NegotiatorInfo, RunAlreadyCompleted},
+        queue::{InvokeWork, NegotiatorInfo, RunAlreadyCompleted},
         workers::{RunId, RunnerKind},
     },
     results_handler::SharedResultsHandler,
@@ -99,11 +99,7 @@ pub struct Request {
 #[derive(Serialize, Deserialize)]
 pub enum MessageToQueueNegotiator {
     HealthCheck,
-    WantsToAttach {
-        /// The run the worker wants to run tests for. The queue must respect assignment of
-        /// work related to this run, or return an error.
-        run_id: RunId,
-    },
+    WantsToAttach { invoke_data: InvokeWork },
 }
 
 pub struct WorkersConfig {
@@ -115,7 +111,6 @@ pub struct WorkersConfig {
     pub local_results_handler: SharedResultsHandler,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
-    pub supervisor_in_band: bool,
     pub debug_native_runner: bool,
     /// Hint for how many test results should be sent back in a batch.
     pub results_batch_size_hint: u64,
@@ -180,7 +175,7 @@ impl WorkersNegotiator {
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
         client_options: ClientOptions<User>,
-        run_id: RunId,
+        invoke_data: InvokeWork,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -191,7 +186,7 @@ impl WorkersNegotiator {
             workers_config,
             queue_negotiator_handle,
             client_options,
-            run_id,
+            invoke_data,
         ))
     }
 
@@ -202,17 +197,19 @@ impl WorkersNegotiator {
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
         client_options: ClientOptions<User>,
-        run_id: RunId,
+        invoke_data: InvokeWork,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         let first_runner_entity = Entity::runner(workers_config.tag, 1);
         let client = client_options.clone().build()?;
         let async_client = client_options.build_async()?;
 
+        let run_id = invoke_data.run_id.clone();
+
         let execution_decision = wait_for_execution_context(
             &*async_client,
             first_runner_entity,
-            &run_id,
             queue_negotiator_handle.0,
+            invoke_data,
         )
         .await?;
 
@@ -237,7 +234,6 @@ impl WorkersNegotiator {
             runner_kind,
             local_results_handler,
             worker_context,
-            supervisor_in_band,
             debug_native_runner,
             results_batch_size_hint,
         } = workers_config;
@@ -375,7 +371,6 @@ impl WorkersNegotiator {
             worker_context,
             run_id,
             notify_manifest,
-            supervisor_in_band,
             debug_native_runner,
         };
 
@@ -396,8 +391,8 @@ impl WorkersNegotiator {
 async fn wait_for_execution_context(
     client: &dyn net_async::ConfiguredClient,
     entity: Entity,
-    run_id: &RunId,
     queue_negotiator_addr: SocketAddr,
+    invoke_data: InvokeWork,
 ) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
     let mut decay = Duration::from_millis(10);
     let max_decay = Duration::from_secs(3);
@@ -406,7 +401,7 @@ async fn wait_for_execution_context(
         let wants_to_attach = negotiate::Request {
             entity,
             message: MessageToQueueNegotiator::WantsToAttach {
-                run_id: run_id.clone(),
+                invoke_data: invoke_data.clone(),
             },
         };
         net_protocol::async_write(&mut conn, &wants_to_attach).await?;
@@ -552,6 +547,7 @@ pub enum QueueNegotiateError {
 
 /// The test run a worker should ask for work on.
 pub struct AssignedRun {
+    // TODO(ayaz): we can get rid of this!
     pub run_id: RunId,
     pub should_generate_manifest: bool,
 }
@@ -586,7 +582,7 @@ pub enum QueueNegotiatorServerError {
 
 struct QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
+    GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
 {
     /// Fetches the status of an assigned run, and yields immediately.
     get_assigned_run: Arc<GetAssignedRun>,
@@ -597,7 +593,7 @@ where
 
 impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
 where
-    GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
+    GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -622,7 +618,7 @@ impl QueueNegotiator {
         get_assigned_run: GetAssignedRun,
     ) -> Result<Self, QueueNegotiatorServerError>
     where
-        GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
+        GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
     {
         let addr = listener.local_addr()?;
 
@@ -693,7 +689,7 @@ impl QueueNegotiator {
         stream: net_async::UnverifiedServerStream,
     ) -> Result<(), EntityfulError>
     where
-        GetAssignedRun: Fn(&RunId, Entity) -> AssignedRunStatus + Send + Sync + 'static,
+        GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
     {
         let mut stream = ctx
             .handshake_ctx
@@ -718,12 +714,13 @@ impl QueueNegotiator {
                 }
                 write_result
             }
-            WantsToAttach { run_id } => {
+            WantsToAttach { invoke_data } => {
+                let run_id = &invoke_data.run_id;
                 let attach = tracing::debug_span!("Worker set negotiating", run_id=?run_id);
                 let _attach_span = attach.enter();
                 tracing::debug!(run_id=?run_id, "New worker set negotiating");
 
-                let assigned_run_result = (ctx.get_assigned_run)(&run_id, entity);
+                let assigned_run_result = (ctx.get_assigned_run)(entity, &invoke_data);
 
                 use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
@@ -803,6 +800,7 @@ mod test {
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExitStatus};
+    use abq_test_utils::one_nonzero;
     use abq_utils::auth::{
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
         UserToken,
@@ -810,7 +808,7 @@ mod test {
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::entity::{Entity, WorkerTag};
-    use abq_utils::net_protocol::queue::TestSpec;
+    use abq_utils::net_protocol::queue::{InvokeWork, TestSpec};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
     };
@@ -1043,9 +1041,9 @@ mod test {
             Default::default(),
         ));
 
-        let get_assigned_run = move |run_id: &RunId, _entity| {
+        let get_assigned_run = move |_entity, data: &InvokeWork| {
             AssignedRunStatus::Run(AssignedRun {
-                run_id: run_id.clone(),
+                run_id: data.run_id.clone(),
                 should_generate_manifest: true,
             })
         };
@@ -1068,15 +1066,21 @@ mod test {
             runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
             local_results_handler: Box::new(NoopResultsHandler),
             worker_context: WorkerContext::AssumeLocal,
-            supervisor_in_band: false,
             debug_native_runner: false,
             results_batch_size_hint: 1,
         };
+
+        let invoke_data = InvokeWork {
+            run_id,
+            batch_size_hint: one_nonzero(),
+            test_results_timeout: Duration::MAX,
+        };
+
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
             workers_config,
             queue_negotiator.get_handle(),
             ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls()),
-            run_id,
+            invoke_data,
         )
         .unwrap();
 

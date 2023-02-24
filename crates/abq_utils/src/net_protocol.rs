@@ -135,7 +135,6 @@ pub mod entity {
 
     #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
     pub enum Tag {
-        Supervisor,
         Runner(WorkerRunner),
         /// An anonymous client created through the ABQ interface (e.g. CLI)
         LocalClient,
@@ -146,7 +145,6 @@ pub mod entity {
     impl std::fmt::Display for Tag {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Tag::Supervisor => write!(f, "supervisor"),
                 Tag::Runner(worker_runner) => worker_runner.fmt(f),
                 Tag::LocalClient => write!(f, "local client"),
                 Tag::ExternalClient => write!(f, "external client"),
@@ -168,10 +166,6 @@ pub mod entity {
                 id: uuid::Uuid::new_v4().into_bytes(),
                 tag,
             }
-        }
-
-        pub fn supervisor() -> Self {
-            Self::new(Tag::Supervisor)
         }
 
         pub fn runner(worker: impl Into<WorkerTag>, runner: impl Into<RunnerTag>) -> Self {
@@ -459,32 +453,11 @@ pub mod queue {
     pub struct RunAlreadyCompleted {}
 
     /// An ask to run some work by an invoker.
-    #[derive(Serialize, Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct InvokeWork {
         pub run_id: RunId,
         pub batch_size_hint: NonZeroU64,
-        pub max_run_attempt: u32,
         pub test_results_timeout: Duration,
-    }
-
-    /// Why an invocation of some work did not succeed.
-    #[derive(Serialize, Deserialize, Debug)]
-    pub enum InvokeFailureReason {
-        /// There is a run of the same ID already in progress, or recently completed.
-        DuplicateRunId {
-            /// A hint as to whether the run was determined to have recently completed.
-            recently_completed: bool,
-        },
-    }
-
-    /// Response from the queue regarding an ask to [invoke work][InvokeWork].
-    #[derive(Serialize, Deserialize, Debug)]
-    pub enum InvokeWorkResponse {
-        /// The work invocation was acknowledged and is enqueued.
-        /// The invoker should move to reading [test result][InvokerTestResult]s.
-        Success,
-        /// The work invocation failed.
-        Failure(InvokeFailureReason),
     }
 
     /// Specification of a test case to run.
@@ -524,39 +497,6 @@ pub mod queue {
         }
     }
 
-    /// An incremental unit of information about the state of a test suite, or its test result.
-    #[derive(Serialize, Deserialize, Debug)]
-    pub enum InvokerTestData {
-        /// A batch of test results.
-        Results(Vec<AssociatedTestResults>),
-        /// No more results are known.
-        EndOfResults,
-        /// The present test run has timed out, and not all test results have been reported in
-        /// time.
-        /// This is likely due to an error on a worker.
-        TimedOut {
-            /// How long after the timeout was set that it fired.
-            after: Duration,
-        },
-        /// The given test command is determined to have failed for all workers associated with
-        /// this test run, and the test run will not continue.
-        TestCommandError {
-            /// Opaque error message related to the failure of the test command.
-            error: String,
-            captured: CapturedOutput,
-        },
-        /// Information about the start of the test suite run.
-        /// This message is sent exactly once per test run, after the run is confirmed and before
-        /// any test results.
-        RunStart(RunStartData),
-    }
-
-    #[derive(Serialize, Deserialize, Debug)]
-    pub struct RunStartData {
-        pub native_runner_info: NativeRunnerInfo,
-        pub manifest: Vec<TestSpec>,
-    }
-
     #[derive(Serialize, Deserialize, Debug)]
     pub struct NativeRunnerInfo {
         pub protocol_version: AbqProtocolVersion,
@@ -583,7 +523,7 @@ pub mod queue {
     /// A reason a test run was cancelled.
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, Copy)]
     pub enum CancelReason {
-        /// The test run was cancelled by the supervisor
+        /// The test run was cancelled on a worker
         User,
         /// Timed out waiting for the last test result in a test run.
         TimeoutOnTestResult,
@@ -613,17 +553,11 @@ pub mod queue {
     #[serde(tag = "type")]
     pub struct AckWorkerRanAllTests {}
 
-    /// An acknowledgement of receiving a test cancellation request from a supervisor
+    /// An acknowledgement of receiving a test cancellation request from a worker
     /// Sent by the queue.
     #[derive(Serialize, Deserialize)]
     #[serde(tag = "type")]
     pub struct AckTestCancellation {}
-
-    /// **ADMIN RESPONSE**
-    /// The queue acknowledges retirement.
-    #[derive(Serialize, Deserialize)]
-    #[serde(tag = "type")]
-    pub struct AckRetirement {}
 
     /// A message sent to the queue.
     #[derive(Serialize, Deserialize)]
@@ -638,15 +572,11 @@ pub mod queue {
         /// An ask to return information needed to begin negotiation with the queue.
         NegotiatorInfo {
             run_id: RunId,
-            /// Deprecations from the ABQ worker/supervisor client.
+            /// Deprecations from an ABQ client.
             deprecations: DeprecationRecord,
         },
-        /// An ask to run some work by an invoker.
-        InvokeWork(InvokeWork),
         /// An ask to mark an active test run as cancelled.
         CancelRun(RunId),
-        /// An invoker of a test run would like to reconnect to the queue for results streaming.
-        Reconnect(RunId),
         /// A work manifest for a given run.
         ManifestResult(RunId, ManifestResult),
         /// The result of some work from the queue.
@@ -662,10 +592,6 @@ pub mod queue {
         /// A worker is connecting with the intent to hold a persistent connection over which test
         /// results will be communicated back.
         PersistentWorkerResultsConnection(RunId),
-
-        /// **ADMIN REQUEST**
-        /// Asks the queue to retire, rejecting any new test run requests.
-        Retire,
     }
 }
 
@@ -723,49 +649,6 @@ pub mod work_server {
         Bundle(workers::NextWorkBundle),
         /// There are more tests, but they are not yet known.
         Pending,
-    }
-}
-
-pub mod client {
-    use serde_derive::{Deserialize, Serialize};
-
-    use crate::exit::ExitCode;
-
-    use super::runners::{CapturedOutput, TestResult};
-
-    /// An acknowledgement of receiving a run-start notification from the queue server. Sent by the client.
-    #[derive(Serialize, Deserialize)]
-    pub struct AckTestResults {}
-
-    /// An acknowledgement of receiving a test result from the queue server. Sent by the client.
-    #[derive(Serialize, Deserialize)]
-    pub struct AckRunStart {}
-
-    /// Response to a notification from the queue that it has seen a test run end.
-    #[derive(Serialize, Deserialize)]
-    #[serde(tag = "type")]
-    pub enum EndOfResultsResponse {
-        /// Acknowledgement of the end of the test run.
-        AckEnd {
-            /// The exit code that should be used.
-            exit_code: ExitCode,
-        },
-    }
-
-    pub struct ReportedResult {
-        pub output_before: Option<CapturedOutput>,
-        pub test_result: TestResult,
-        pub output_after: Option<CapturedOutput>,
-    }
-
-    impl ReportedResult {
-        pub fn no_captures(test_result: TestResult) -> Self {
-            Self {
-                output_before: Default::default(),
-                test_result,
-                output_after: Default::default(),
-            }
-        }
     }
 }
 

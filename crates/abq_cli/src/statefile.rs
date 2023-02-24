@@ -12,16 +12,12 @@ struct WorkerState<'a> {
     abq_executable: &'a Path,
     abq_version: &'a str,
     run_id: &'a RunId,
-    supervisor: bool,
 }
 
 /// Optionally writes a statefile for an ABQ worker invocation, if the invocation state indicates so.
 ///
 /// Intended for integration with Captain. See RWX RFC#18.
-pub(crate) fn optional_write_worker_statefile(
-    run_id: &RunId,
-    is_supervisor: bool,
-) -> anyhow::Result<()> {
+pub(crate) fn optional_write_worker_statefile(run_id: &RunId) -> anyhow::Result<()> {
     let statefile = match std::env::var("ABQ_STATE_FILE") {
         Ok(path_s) => PathBuf::from(path_s),
         Err(_) => {
@@ -34,7 +30,6 @@ pub(crate) fn optional_write_worker_statefile(
         abq_executable: &std::env::current_exe()?,
         abq_version: abq_utils::VERSION,
         run_id,
-        supervisor: is_supervisor,
     };
 
     let mut statefile = fs::OpenOptions::new()

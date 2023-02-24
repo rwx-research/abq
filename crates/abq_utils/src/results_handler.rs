@@ -21,15 +21,17 @@ pub type SharedResultsHandler = Box<dyn SharedNotifyResults + Send + Sync>;
 
 //
 
+pub type SharedAssociatedTestResults = Arc<Mutex<Vec<AssociatedTestResults>>>;
+
 /// A results handler that collects all test results.
 /// For use in the wrapped runner and tests.
 #[derive(Clone)]
 pub struct StaticResultsHandler {
-    test_results: Arc<Mutex<Vec<AssociatedTestResults>>>,
+    test_results: SharedAssociatedTestResults,
 }
 
 impl StaticResultsHandler {
-    pub fn new(test_results: Arc<Mutex<Vec<AssociatedTestResults>>>) -> Self {
+    pub fn new(test_results: SharedAssociatedTestResults) -> Self {
         Self { test_results }
     }
 }

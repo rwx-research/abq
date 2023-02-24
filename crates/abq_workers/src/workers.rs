@@ -93,9 +93,6 @@ pub struct WorkerPoolConfig<'a> {
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
 
-    /// Whether an ABQ supervisor is running in-band this worker process.
-    pub supervisor_in_band: bool,
-
     /// Whether to allow passthrough of stdout/stderr from the native runner process.
     pub debug_native_runner: bool,
 }
@@ -153,7 +150,6 @@ impl WorkerPool {
             notify_manifest,
             notify_all_tests_run_generator,
             worker_context,
-            supervisor_in_band,
             debug_native_runner,
         } = config;
 
@@ -202,7 +198,6 @@ impl WorkerPool {
                 context: worker_context.clone(),
                 notify_manifest,
                 notify_all_tests_run: notify_all_tests_run_generator(),
-                supervisor_in_band,
                 debug_native_runner,
             };
 
@@ -242,7 +237,6 @@ impl WorkerPool {
                 notify_all_tests_run: notify_all_tests_run_generator(),
                 context: worker_context.clone(),
                 notify_manifest: None,
-                supervisor_in_band,
                 debug_native_runner,
             };
 
@@ -394,8 +388,6 @@ struct RunnerEnv {
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     context: WorkerContext,
-    // Is this running in-band with a supervisor process?
-    supervisor_in_band: bool,
     debug_native_runner: bool,
 }
 
@@ -443,17 +435,17 @@ fn start_generic_test_runner(
         results_batch_size,
         context,
         msg_from_pool_rx,
-        supervisor_in_band,
         debug_native_runner,
     } = env;
 
     tracing::debug!(?entity, ?run_id, "Starting new generic test runner");
 
-    if !supervisor_in_band {
-        // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
-        // so that they can correlate failures observed in workers with the workers they've launched.
-        eprintln!("Generic test runner started on worker {:?}", entity);
-    }
+    // We expose the worker ID to the end user, even without tracing to standard pipes enabled,
+    // so that they can correlate failures observed in workers with the workers they've launched.
+    eprintln!(
+        "Generic test runner for {:?} started on worker {:?}",
+        run_id, entity
+    );
 
     let notify_manifest = notify_manifest.map(|notify_manifest| {
         let run_id = run_id.clone();
@@ -535,7 +527,6 @@ fn start_test_like_runner(
         notify_all_tests_run,
         context,
         notify_manifest,
-        supervisor_in_band: _,
         debug_native_runner: _,
     } = env;
 
@@ -986,7 +977,6 @@ mod test {
             results_handler_generator,
             notify_all_tests_run_generator,
             worker_context: WorkerContext::AssumeLocal,
-            supervisor_in_band: false,
             debug_native_runner: false,
         };
 

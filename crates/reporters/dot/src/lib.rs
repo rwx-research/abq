@@ -5,12 +5,9 @@ use abq_reporting::{
         format_result_dot, format_summary_results, format_test_result_summary, write,
         OutputOrdering, SummaryKind,
     },
-    CompletedSummary, Reporter, ReportingError,
+    CompletedSummary, ReportedResult, Reporter, ReportingError,
 };
-use abq_utils::net_protocol::{
-    client::ReportedResult,
-    runners::{CapturedOutput, Status, TestResult},
-};
+use abq_utils::net_protocol::runners::{CapturedOutput, Status, TestResult};
 
 /// Max number of dots to print per line.
 const DOT_REPORTER_LINE_LIMIT: u64 = 80;
@@ -124,8 +121,8 @@ impl Reporter for DotReporter {
 
 #[cfg(test)]
 mod test_dot_reporter {
+    use abq_reporting::ReportedResult;
     use abq_utils::net_protocol::{
-        client::ReportedResult,
         entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
         workers::INIT_RUN_NUMBER,

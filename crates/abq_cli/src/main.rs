@@ -6,19 +6,10 @@ mod statefile;
 mod workers;
 
 use std::{
-    collections::HashMap,
-    io::{self, Write},
-    net::SocketAddr,
-    num::NonZeroU64,
-    num::NonZeroUsize,
-    path::PathBuf,
-    thread::{self, JoinHandle},
-    time::Duration,
+    collections::HashMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration,
 };
 
 use abq_hosted::AccessToken;
-use abq_queue::invoke::{self, Client, ResultHandler};
-use abq_reporting::{output::format_duration, CompletedSummary};
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     exit::ExitCode,
@@ -27,14 +18,11 @@ use abq_utils::{
         entity::{Entity, WorkerTag},
         health::Health,
         meta::DeprecationRecord,
-        runners::{CapturedOutput, TestRuntime},
         workers::{NativeTestRunnerParams, RunId, RunnerKind},
     },
-    results_handler::NoopResultsHandler,
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
 
-use abq_workers::workers::WorkersExit;
 use args::{
     Cli, Command,
     NumWorkers::{CpuCores, Fixed},
@@ -42,17 +30,10 @@ use args::{
 use clap::Parser;
 
 use instance::AbqInstance;
-use reporting::{ReporterKind, SuiteReporters};
-use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
-use crate::{
-    args::Token,
-    health::HealthCheckKind,
-    reporting::StdoutPreferences,
-    workers::{print_final_runner_outputs, print_manifest_generation_output},
-};
+use crate::{args::Token, health::HealthCheckKind, reporting::StdoutPreferences};
 
 #[cfg(all(target_arch = "x86_64", target_env = "musl"))]
 #[global_allocator]
@@ -296,7 +277,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         }
         Command::Test {
             worker,
-            retries,
+            retries: _,
             args,
             working_dir,
             run_id,
@@ -323,23 +304,11 @@ fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
 
-            let is_supervisor = worker == 0;
-
             let ResolvedConfig {
                 queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
             } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
-
-            if !is_supervisor && resolved_queue_addr.is_none() {
-                let mut cmd = Cli::command();
-                let cmd = cmd.find_subcommand_mut("test").unwrap();
-                let error = cmd.error(
-                    ErrorKind::MissingRequiredArgument,
-                    format!("--worker={worker} must specify --queue-addr or --access-token"),
-                );
-                clap::Error::exit(&error);
-            }
 
             let client_auth = resolved_token.into();
 
@@ -347,11 +316,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             let runner_params = validate_abq_test_args(args)?;
 
-            let entity = if is_supervisor {
-                Entity::supervisor()
-            } else {
-                Entity::local_client()
-            };
+            let entity = Entity::local_client();
             let abq = find_or_create_abq(
                 entity,
                 run_id.clone(),
@@ -370,39 +335,23 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
-            statefile::optional_write_worker_statefile(&run_id, is_supervisor)?;
+            statefile::optional_write_worker_statefile(&run_id)?;
 
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
 
-            if is_supervisor {
-                run_sentinel_abq_test(
-                    entity,
-                    &access_token,
-                    runner,
-                    abq,
-                    run_id,
-                    reporters,
-                    stdout_preferences,
-                    batch_size,
-                    results_timeout,
-                    num_runners,
-                    working_dir,
-                    retries,
-                )
-            } else {
-                workers::start_workers_standalone(
-                    run_id,
-                    WorkerTag::new(worker as _),
-                    num_runners,
-                    runner,
-                    working_dir,
-                    reporters,
-                    stdout_preferences,
-                    batch_size.get(),
-                    abq.negotiator_handle(),
-                    abq.client_options().clone(),
-                )
-            }
+            workers::start_workers_standalone(
+                run_id,
+                WorkerTag::new(worker as _),
+                num_runners,
+                runner,
+                working_dir,
+                reporters,
+                stdout_preferences,
+                batch_size,
+                results_timeout,
+                abq.negotiator_handle(),
+                abq.client_options().clone(),
+            )
         }
         Command::Health {
             queue,
@@ -606,246 +555,6 @@ fn find_or_create_abq(
             ))
         }
     }
-}
-
-fn run_sentinel_abq_test(
-    supervisor_entity: Entity,
-    access_token: &Option<AccessToken>,
-    runner: RunnerKind,
-    abq: AbqInstance,
-    run_id: RunId,
-    reporters: Vec<ReporterKind>,
-    stdout_preferences: StdoutPreferences,
-    batch_size: NonZeroU64,
-    results_timeout: Duration,
-    num_runners: NonZeroUsize,
-    working_dir: PathBuf,
-    retries: u32,
-) -> anyhow::Result<ExitCode> {
-    let test_suite_name = "suite"; // TODO: determine this correctly
-
-    let reporter_data: <SuiteReporters as ResultHandler>::InitData =
-        (reporters, stdout_preferences, test_suite_name.to_owned());
-
-    let work_results_thread = start_test_result_reporter(
-        supervisor_entity,
-        abq.server_addr(),
-        abq.client_options().clone(),
-        run_id.clone(),
-        batch_size,
-        results_timeout,
-        retries,
-        reporter_data,
-    )?;
-
-    writeln!(
-        &mut stdout_preferences.stdout_stream(),
-        "Started test run with ID {run_id}"
-    )?;
-
-    // TODO
-    let results_handler = Box::new(NoopResultsHandler);
-
-    let mut worker_pool = workers::start_workers(
-        run_id.clone(),
-        WorkerTag::ZERO,
-        num_runners,
-        runner,
-        working_dir,
-        results_handler,
-        abq.negotiator_handle(),
-        abq.client_options().clone(),
-        batch_size.get(),
-        true, // workers in-band with supervisor
-    )?;
-
-    let mut opt_invoked_error = work_results_thread.join().unwrap();
-
-    if let Ok((reporters, _)) = opt_invoked_error.as_mut() {
-        reporters.after_all_results();
-    }
-
-    // Shutdown the localized worker pool
-    {
-        let WorkersExit {
-            // The exit code will be determined by the test result status.
-            status: _,
-            native_runner_info: _,
-            final_captured_outputs,
-            manifest_generation_output,
-        } = worker_pool.shutdown();
-
-        // We need to print the final runner outputs (if any) at this point.
-        // This is safe, as the runners thread is dead by now, so the reporters shouldn't
-        // be writing to output streams.
-        if let Some((runner, manifest_output)) = manifest_generation_output {
-            print_manifest_generation_output(runner, manifest_output);
-        }
-        print_final_runner_outputs(final_captured_outputs);
-    }
-
-    let (reporters, completed_data) = match opt_invoked_error {
-        Ok(summary) => summary,
-        Err(invoke_error) => {
-            elaborate_invocation_error(invoke_error)?;
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-
-    // NB: right now, this last step of flushing the reporters and sending home the native runner
-    // info is sequential. Can we parallelize it? Or, even better, can we send home the native
-    // runner info during a test run?
-
-    if let Some(access_token) = access_token {
-        // Send home information about the native test runner that was involved in this test run.
-        // For non-hosted uses, there is nothing meaningful for us to do with the summary here.
-        abq_hosted::record_test_run_metadata(
-            get_hosted_api_base_url(),
-            access_token,
-            &run_id,
-            &completed_data.native_runner_info.specification,
-        )
-    }
-
-    let completed_summary = CompletedSummary {
-        native_runner_info: Some(completed_data.native_runner_info),
-    };
-
-    let (suite_result, errors) = reporters.finish(&completed_summary);
-
-    for error in errors {
-        eprintln!("{error}");
-    }
-
-    print!("\n\n");
-    suite_result.write_short_summary_lines(&mut stdout_preferences.stdout_stream())?;
-
-    Ok(suite_result.suggested_exit_code())
-}
-
-fn elaborate_invocation_error(error: invoke::Error) -> io::Result<()> {
-    use invoke::Error::*;
-    use invoke::TestResultError::*;
-    eprintln!("--- ERROR ---");
-    let (err, opt_captured): (anyhow::Error, Option<CapturedOutput>) = match error {
-        Io(_) | DuplicateRun(_) | DuplicateCompletedRun(_) => {
-            // The default error message provided is good here.
-            (error.into(), None)
-        }
-        TestResultError(error) => match error {
-            TestCommandError(opaque_error, captured_output) => {
-                let msg = format!(
-                    indoc::indoc!(
-                        r#"
-                        The given runner command failed to be run by all ABQ workers associating to this test run.
-
-                        Here's a message we found concerning the failure:
-
-                        {}
-                        "#
-                    ),
-                    opaque_error,
-                );
-                (anyhow::Error::msg(msg), Some(captured_output))
-            }
-            TimedOut(after) => {
-                let mut s = Vec::new();
-                format_duration(&mut s, TestRuntime::Milliseconds(after.as_millis() as _))
-                    .expect("formatting duration to vec is infallible");
-                let timeout_s = String::from_utf8_lossy(&s);
-
-                let msg = format!(
-                    indoc::indoc!(
-                        r#"
-                        The test run timed out after {}.
-
-                        This likely indicates a problem in your test suite, or in an ABQ worker setup.
-                        Please check the logs of your ABQ workers.
-                        "#
-                    ),
-                    timeout_s
-                );
-                (anyhow::Error::msg(msg), None)
-            }
-            Cancelled => (anyhow::Error::msg("Test run cancelled!"), None),
-        },
-    };
-
-    eprintln!("{err}");
-    if let Some(CapturedOutput { stderr, stdout }) = opt_captured {
-        if !stderr.is_empty() {
-            eprintln!("Standard error from the worker producing this failure:");
-            std::io::stderr().write_all(&stderr)?;
-            writeln!(std::io::stderr())?;
-        }
-
-        if !stdout.is_empty() {
-            eprintln!("Standard output from the worker producing this failure:");
-            std::io::stdout().write_all(&stdout)?;
-            writeln!(std::io::stdout())?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Starts a test result reporter on a new thread.
-/// This should not block the main thread, only return a handle to the reporter.
-///
-/// NOTE: this function takes control of the process's signal handlers! It may not be
-/// composed with other functions that expect control or access to signal handlers.
-fn start_test_result_reporter(
-    entity: Entity,
-    abq_server_addr: SocketAddr,
-    client_opts: ClientOptions<User>,
-    test_id: RunId,
-    batch_size: NonZeroU64,
-    results_timeout: Duration,
-    retries: u32,
-    result_handler_data: <SuiteReporters as ResultHandler>::InitData,
-) -> io::Result<JoinHandle<invoke::StreamResult<SuiteReporters>>> {
-    let (run_cancellation_tx, run_cancellation_rx) = invoke::run_cancellation_pair();
-
-    let mut term_signals = Signals::new(TERM_SIGNALS)?;
-    let term_signals_handle = term_signals.handle();
-    let kill_run_thread = thread::spawn(move || {
-        if term_signals.into_iter().next().is_some() {
-            // If this fails, we definitely want a panic.
-            run_cancellation_tx.blocking_send().unwrap();
-        }
-    });
-
-    let test_results_thread = thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let result = runtime.block_on(async move {
-            let abq_test_client = Client::invoke_work(
-                entity,
-                abq_server_addr,
-                client_opts,
-                test_id,
-                batch_size,
-                results_timeout,
-                retries,
-                invoke::DEFAULT_TICK_INTERVAL,
-                run_cancellation_rx,
-            )
-            .await?;
-
-            let completed_summary = abq_test_client.stream_results(result_handler_data).await?;
-            Ok(completed_summary)
-        });
-
-        // No matter how we exited, now close the thread responsible for capturing termination
-        // signals.
-        term_signals_handle.close();
-        kill_run_thread.join().unwrap();
-
-        result
-    });
-
-    Ok(test_results_thread)
 }
 
 #[cfg(test)]

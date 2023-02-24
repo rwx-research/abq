@@ -6,9 +6,8 @@ use abq_reporting::{
         self, format_interactive_progress, format_non_interactive_progress, format_runner_output,
         format_test_result_summary, would_write_output, OutputOrdering,
     },
-    CompletedSummary, Reporter, ReportingError,
+    CompletedSummary, ReportedResult, Reporter, ReportingError,
 };
-use abq_utils::net_protocol::client::ReportedResult;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 /// Streams a progress bar of number of executed tests and any failures so far.
@@ -184,10 +183,9 @@ impl Reporter for ProgressReporter {
 mod test {
     use std::sync::{Arc, Mutex};
 
-    use abq_reporting::colors::ColorProvider;
+    use abq_reporting::{colors::ColorProvider, ReportedResult};
     use abq_reporting_test_utils::{default_result, mock_summary, MockWriter};
     use abq_utils::net_protocol::{
-        client::ReportedResult,
         entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
         workers::INIT_RUN_NUMBER,

@@ -1,8 +1,8 @@
 use abq_reporting::{
     output::{format_result_line, format_summary_results, format_test_result_summary, SummaryKind},
-    CompletedSummary, Reporter, ReportingError,
+    CompletedSummary, ReportedResult, Reporter, ReportingError,
 };
-use abq_utils::net_protocol::{client::ReportedResult, runners::Status};
+use abq_utils::net_protocol::runners::Status;
 
 /// Streams all test results line-by-line to an output buffer, and prints a summary for failing and
 /// erroring tests at the end.
@@ -80,8 +80,8 @@ impl Reporter for LineReporter {
 
 #[cfg(test)]
 mod test {
+    use abq_reporting::ReportedResult;
     use abq_utils::net_protocol::{
-        client::ReportedResult,
         entity::RunnerMeta,
         runners::{CapturedOutput, Status, TestResult, TestResultSpec},
         workers::INIT_RUN_NUMBER,

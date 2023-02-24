@@ -1,7 +1,7 @@
-use abq_reporting::{CompletedSummary, Reporter, ReportingError};
+use abq_reporting::{CompletedSummary, ReportedResult, Reporter, ReportingError};
 use abq_utils::{
     log_assert,
-    net_protocol::{client::ReportedResult, queue::AssociatedTestResults},
+    net_protocol::queue::AssociatedTestResults,
     results_handler::{NotifyResults, SharedNotifyResults, SharedResultsHandler},
 };
 use async_trait::async_trait;

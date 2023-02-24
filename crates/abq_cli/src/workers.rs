@@ -1,12 +1,13 @@
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use abq_reporting::{CompletedSummary, Reporter};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
+use abq_utils::net_protocol::queue::InvokeWork;
 use abq_utils::net_protocol::runners::CapturedOutput;
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
-use abq_utils::results_handler::SharedResultsHandler;
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
 };
@@ -27,48 +28,6 @@ use self::reporting::{build_reporters, ReportingTaskHandle};
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
-pub fn start_workers(
-    run_id: RunId,
-    tag: WorkerTag,
-    num_workers: NonZeroUsize,
-    runner_kind: RunnerKind,
-    working_dir: PathBuf,
-    local_results_handler: SharedResultsHandler,
-    queue_negotiator: QueueNegotiatorHandle,
-    client_opts: ClientOptions,
-    results_batch_size: u64,
-    supervisor_in_band: bool,
-) -> anyhow::Result<NegotiatedWorkers> {
-    let context = WorkerContext::AlwaysWorkIn { working_dir };
-
-    let workers_config = WorkersConfig {
-        tag,
-        num_workers,
-        runner_kind,
-        local_results_handler,
-        worker_context: context,
-        supervisor_in_band,
-        debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
-        results_batch_size_hint: results_batch_size,
-    };
-
-    tracing::debug!(
-        "Workers attaching to queue negotiator {}",
-        queue_negotiator.get_address()
-    );
-
-    let worker_pool = WorkersNegotiator::negotiate_and_start_pool(
-        workers_config,
-        queue_negotiator,
-        client_opts,
-        run_id,
-    )?;
-
-    tracing::debug!("Workers attached");
-
-    Ok(worker_pool)
-}
-
 pub fn start_workers_standalone(
     run_id: RunId,
     tag: WorkerTag,
@@ -77,7 +36,8 @@ pub fn start_workers_standalone(
     working_dir: PathBuf,
     reporter_kinds: Vec<ReporterKind>,
     stdout_preferences: StdoutPreferences,
-    results_batch_size: u64,
+    batch_size: NonZeroU64,
+    test_results_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
 ) -> ! {
@@ -97,7 +57,8 @@ pub fn start_workers_standalone(
         working_dir,
         reporters,
         stdout_preferences,
-        results_batch_size,
+        batch_size,
+        test_results_timeout,
         queue_negotiator,
         client_opts,
     ))
@@ -111,7 +72,8 @@ async fn start_standalone_help(
     working_dir: PathBuf,
     reporters: Vec<Box<dyn Reporter>>,
     stdout_preferences: StdoutPreferences,
-    results_batch_size: u64,
+    batch_size: NonZeroU64,
+    test_results_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
 ) -> ! {
@@ -125,9 +87,8 @@ async fn start_standalone_help(
         runner_kind,
         local_results_handler: Box::new(reporting_proxy),
         worker_context: context,
-        supervisor_in_band: false,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
-        results_batch_size_hint: results_batch_size,
+        results_batch_size_hint: batch_size.get(),
     };
 
     tracing::debug!(
@@ -135,11 +96,17 @@ async fn start_standalone_help(
         queue_negotiator.get_address()
     );
 
+    let invoke_work = InvokeWork {
+        run_id: run_id.clone(),
+        batch_size_hint: batch_size,
+        test_results_timeout,
+    };
+
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool_on_executor(
         workers_config,
         queue_negotiator,
         client_opts,
-        run_id,
+        invoke_work,
     )
     .await
     .unwrap();

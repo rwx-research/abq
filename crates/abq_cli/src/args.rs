@@ -82,7 +82,7 @@ pub enum Command {
         #[clap(long, required = false)]
         public_ip: Option<IpAddr>,
 
-        /// A token against which user messages (from workers/supervisors) to the queue will be authorized.
+        /// A token against which messages to the queue will be authorized.
         /// When provided, the same token must be provided to runs of the `work` and `test`
         /// commands.
         /// When not provided, the queue will start without assuming enforcing authorization.
@@ -120,18 +120,11 @@ pub enum Command {
     ///
     /// WORKERS:
     ///
-    ///   `--worker 0` controls what process will stream test results:
-    ///
-    ///     - `--worker 0` starts a worker, and also streams test results to the configured `--reporter`s.
-    ///     - `--worker N` for any N > 0 starts only a worker, and does not stream test results.
-    ///
-    ///   An ABQ test run must include a process launched with `--worker 0`.
-    ///
     ///   The executable given to `abq test` must implement the ABQ protocol.
     ///
     /// EXAMPLES:
     ///
-    ///   # Run a test suite with a single worker; `--worker 0` is implicit
+    ///   # Run a test suite with a single worker, implicitly named worker 0.
     ///   abq test -- yarn jest -t "onboard flow"
     ///
     ///   # Run a test suite with a single worker
@@ -157,16 +150,7 @@ pub enum Command {
     Test {
         /// The number of the test worker connecting for a test suite run.
         ///
-        /// `--worker 0` is the test supervisor, and is responsible both for acting as a worker and
-        /// executing all provided `--reporter`s.
-        ///
-        /// All other `--worker` numbers launch only a worker, and disregard test reporting.
-        ///
-        /// All `--worker`s in a unique test suite run must connect to the `--run-id` configured by
-        /// `--worker 0`.
-        ///
         /// There may not be duplicate worker numberings in an ABQ test suite run.
-        /// An ABQ test suite run must always include an `abq test` launched with `--worker 0`.
         #[clap(long, required = false, default_value_t = 0)]
         worker: u32,
 
@@ -276,7 +260,7 @@ pub enum Command {
         /// configuration.
         ///
         /// Only relevant with `--worker 0`.
-        #[clap(long, default_value_t = abq_queue::invoke::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
+        #[clap(long, default_value_t = abq_queue::queue::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
         inactivity_timeout_seconds: u64,
 
         /// Arguments to the test executable.

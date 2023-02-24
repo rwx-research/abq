@@ -2,11 +2,6 @@
 source: crates/abq_cli/tests/cli.rs
 expression: stderr
 ---
---- ERROR ---
-The given runner command failed to be run by all ABQ workers associating to this test run.
-
-Here's a message we found concerning the failure:
-
+Generic test runner started on <stripped>
 No such file or directory (os error 2) at <stripped path>
-
 

@@ -7,9 +7,9 @@
 //!     strategy][ServerAuthStrategy].
 //!   - An entity can be authorized as one of two roles:
 //!     - User: this is the generic role permitting general use of the ABQ queue server; it is
-//!       what ABQ workers and supervisors exercise.
+//!       what ABQ workers exercise.
 //!     - Admin: a role permitting administrative use of the ABQ queue server; never exercised by
-//!       ABQ workers and supervisors, but may be exercised by managers of queue servers.
+//!       ABQ workers, but may be exercised by managers of queue servers.
 
 mod token;
 

@@ -1,5 +1,4 @@
 //! Tracks summary of a test suite run.
-// NB(ayaz): this is duplicated for the supervisor currently. Get rid of that one soon.
 
 use std::{cell::Cell, collections::HashMap, time::Instant};
 

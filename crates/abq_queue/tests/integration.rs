@@ -9,11 +9,7 @@ use std::{
 };
 
 use abq_queue::{
-    invoke::{
-        self, run_cancellation_pair, Client, CompletedRunData, RunCancellationTx, TestResultError,
-        DEFAULT_CLIENT_POLL_TIMEOUT, DEFAULT_TICK_INTERVAL,
-    },
-    queue::{Abq, QueueConfig},
+    queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT},
     timeout::{RunTimeoutStrategy, TimeoutReason},
 };
 use abq_test_utils::{artifacts_dir, assert_scoped_log};
@@ -25,18 +21,16 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::{Entity, RunnerMeta, WorkerTag},
-        queue::{NativeRunnerInfo, TestSpec},
+        queue::{AssociatedTestResults, InvokeWork},
         runners::{
-            AbqProtocolVersion, InitSuccessMessage, Location, Manifest, ManifestMessage,
-            MetadataMap, OutOfBandError, ProtocolWitness, RawTestResultMessage, Status, Test,
-            TestOrGroup, TestResult, TestResultSpec,
+            InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
+            ProtocolWitness, RawTestResultMessage, Status, Test, TestOrGroup, TestResult,
+            TestResultSpec,
         },
         work_server::{InitContext, InitContextResponse},
-        workers::{
-            NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId, INIT_RUN_NUMBER,
-        },
+        workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
     },
-    results_handler::NoopResultsHandler,
+    results_handler::{NoopResultsHandler, SharedAssociatedTestResults, StaticResultsHandler},
     tls::ClientTlsStrategy,
 };
 
@@ -60,10 +54,6 @@ struct Run(usize);
 /// Worker ID
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Wid(usize);
-
-/// Supervisor ID
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Sid(usize);
 
 /// External party ID
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,20 +94,37 @@ fn empty_manifest_msg() -> Box<ManifestMessage> {
     Box::new(ManifestMessage::new(Manifest::new([], Default::default())))
 }
 
-fn workers_config(tag: impl Into<WorkerTag>, runner_kind: RunnerKind) -> WorkersConfig {
-    WorkersConfig {
-        tag: tag.into(),
-        num_workers: 2.try_into().unwrap(),
-        runner_kind,
-        local_results_handler: Box::new(NoopResultsHandler),
-        worker_context: WorkerContext::AssumeLocal,
-        supervisor_in_band: false,
-        debug_native_runner: false,
-        results_batch_size_hint: 1,
+struct WorkersConfigBuilder {
+    config: WorkersConfig,
+    batch_size_hint: NonZeroU64,
+    test_results_timeout: Duration,
+}
+
+impl WorkersConfigBuilder {
+    fn new(tag: impl Into<WorkerTag>, runner_kind: RunnerKind) -> Self {
+        let config = WorkersConfig {
+            tag: tag.into(),
+            num_workers: 2.try_into().unwrap(),
+            runner_kind,
+            local_results_handler: Box::new(NoopResultsHandler),
+            worker_context: WorkerContext::AssumeLocal,
+            debug_native_runner: false,
+            results_batch_size_hint: 1,
+        };
+        Self {
+            config,
+            batch_size_hint: one_nonzero(),
+            test_results_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
+        }
+    }
+
+    fn with_num_workers(mut self, num_workers: NonZeroUsize) -> Self {
+        self.config.num_workers = num_workers;
+        self
     }
 }
 
-fn sort_results(results: &mut [(WorkId, u32, TestResult)]) -> Vec<(u32, &str)> {
+fn sort_results<'a>(results: &mut [FlatResult<'a>]) -> Vec<(u32, &'a str)> {
     let mut results = results
         .iter()
         .map(|(_, n, result)| (*n, result.output.as_ref().unwrap().as_str()))
@@ -126,52 +133,11 @@ fn sort_results(results: &mut [(WorkId, u32, TestResult)]) -> Vec<(u32, &str)> {
     results
 }
 
-fn sort_results_owned(results: &mut [(WorkId, u32, TestResult)]) -> Vec<(u32, String)> {
+fn sort_results_owned(results: &mut [FlatResult<'_>]) -> Vec<(u32, String)> {
     sort_results(results)
         .into_iter()
         .map(|(attempt, r)| (attempt, r.to_string()))
         .collect()
-}
-
-// TODO: put this on [Client] directly
-struct SupervisorConfig {
-    batch_size: NonZeroU64,
-    timeout: Duration,
-    tick_interval: Duration,
-    retries: u32,
-}
-
-impl SupervisorConfig {
-    fn new() -> Self {
-        Self {
-            batch_size: one_nonzero(),
-            timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
-            tick_interval: DEFAULT_TICK_INTERVAL,
-            retries: 0,
-        }
-    }
-
-    fn with_batch_size(self, batch_size: u64) -> Self {
-        Self {
-            batch_size: batch_size.try_into().unwrap(),
-            ..self
-        }
-    }
-
-    fn with_timeout(self, timeout: Duration) -> Self {
-        Self { timeout, ..self }
-    }
-
-    fn with_tick_interval(self, tick_interval: Duration) -> Self {
-        Self {
-            tick_interval,
-            ..self
-        }
-    }
-
-    fn with_retries(self, retries: u32) -> Self {
-        Self { retries, ..self }
-    }
 }
 
 fn native_runner_simulation_bin() -> String {
@@ -184,35 +150,26 @@ fn native_runner_simulation_bin() -> String {
 type GetConn<'a> = &'a dyn Fn() -> Box<dyn ClientStream>;
 
 enum Action {
-    RunTest(Run, Sid, SupervisorConfig),
-    StartTest(Run, Sid, SupervisorConfig),
-    CancelTest(Sid),
+    CancelTest(Run),
 
     // TODO: consolidate start/stop workers by making worker pools async by default
-    StartWorkers(Run, Wid, WorkersConfig),
+    StartWorkers(Run, Wid, WorkersConfigBuilder),
     StopWorkers(Wid),
 
     /// Make a connection to the work server, the callback will test a request.
     WSRunRequest(Run, Box<dyn Fn(GetConn, RunId) + Send + Sync>),
-
-    /// Spawn an action in a new task. Do this if the action is blocking.
-    Spawn(SpawnId, Box<Action>),
-    /// Wait for a spawned action to complete.
-    Join(SpawnId),
 }
+
+type FlatResult<'a> = (WorkId, u32, &'a TestResult);
 
 #[allow(clippy::type_complexity)]
 enum Assert<'a> {
-    CheckSupervisor(Sid, &'a dyn Fn(&Result<Client, invoke::Error>) -> bool),
+    TestResults(Run, &'a dyn Fn(&[FlatResult<'_>]) -> bool),
+    QueryRunStatus(Run),
 
-    TestExit(Sid, &'a dyn Fn(&Result<CompletedRunData, invoke::Error>)),
-    TestExitWithoutErr(Sid),
-    TestResults(Sid, &'a dyn Fn(&[(WorkId, u32, TestResult)]) -> bool),
-
-    WaitForWorkerDead(Wid),
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, Box<dyn Fn(&WorkersExitStatus)>),
-    WorkerResultStatus(Wid, &'a dyn Fn(&WorkersResult)),
+    WorkerResultStatus(Wid, &'a dyn Fn(&WorkersExitKind)),
 }
 
 type Steps<'a> = Vec<(Vec<Action>, Vec<Assert<'a>>)>;
@@ -251,84 +208,28 @@ impl<'a> TestBuilder<'a> {
     }
 }
 
-type Supervisors = Arc<Mutex<HashMap<Sid, Result<Client, invoke::Error>>>>;
-type SupervisorData = Arc<tokio::sync::Mutex<HashMap<Sid, (RunCancellationTx, ResultsCollector)>>>;
-type SupervisorResults =
-    Arc<tokio::sync::Mutex<HashMap<Sid, Result<CompletedRunData, invoke::Error>>>>;
-
 type Workers = Arc<tokio::sync::Mutex<HashMap<Wid, NegotiatedWorkers>>>;
 type WorkersRedundant = Arc<Mutex<HashMap<Wid, bool>>>;
 
 #[allow(clippy::large_enum_variant)]
-enum WorkersResult {
+#[derive(Debug)]
+enum WorkersExitKind {
     Exit(WorkersExit),
     Panic,
 }
 
-type WorkersResults = Arc<Mutex<HashMap<Wid, WorkersResult>>>;
-
-type BgTasks = HashMap<SpawnId, tokio::task::JoinHandle<()>>;
-
-#[derive(Default, Clone)]
-struct ResultsCollector {
-    results: Arc<Mutex<Vec<(WorkId, u32, TestResult)>>>,
-    manifest: Arc<Mutex<Option<Vec<TestSpec>>>>,
-}
-
-impl invoke::ResultHandler for ResultsCollector {
-    type InitData = ResultsCollector;
-
-    fn create(manifest: Vec<TestSpec>, data: Self) -> Self {
-        *data.manifest.lock() = Some(manifest);
-        data
-    }
-
-    fn on_result(
-        &mut self,
-        work_id: WorkId,
-        run_number: u32,
-        result: net_protocol::client::ReportedResult,
-    ) {
-        self.results
-            .lock()
-            .push((work_id, run_number, result.test_result))
-    }
-
-    fn get_exit_code(&self) -> ExitCode {
-        let results = self.results.lock();
-        let max_run = results
-            .iter()
-            .map(|(_, run, _)| *run)
-            .max()
-            .unwrap_or(INIT_RUN_NUMBER);
-        let any_latest_failure = results
-            .iter()
-            .any(|(_, run, result)| *run == max_run && result.status.is_fail_like());
-        if any_latest_failure {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        }
-    }
-
-    fn tick(&mut self) {}
-}
+type WorkersExitKinds = Arc<Mutex<HashMap<Wid, WorkersExitKind>>>;
 
 fn action_to_fut(
     queue: &Abq,
     run_ids: &mut HashMap<Run, RunId>,
+    run_results: &mut HashMap<Run, SharedAssociatedTestResults>,
     client: Box<dyn ConfiguredClient>,
     client_opts: ClientOptions<User>,
 
-    supervisors: Supervisors,
-    supervisor_data: SupervisorData,
-    supervisor_results: SupervisorResults,
-
     workers: Workers,
     workers_redundant: WorkersRedundant,
-    worker_results: WorkersResults,
-
-    background_tasks: &mut BgTasks,
+    worker_exit_kinds: WorkersExitKinds,
 
     action: Action,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -343,82 +244,46 @@ fn action_to_fut(
         };
     }
 
-    let is_run_to_completion = matches!(action, RunTest(..));
+    macro_rules! get_run_results {
+        ($n:expr) => {
+            run_results
+                .entry($n)
+                .or_insert_with(Default::default)
+                .clone()
+        };
+    }
 
     match action {
-        StartTest(n, super_id, config) | RunTest(n, super_id, config) => {
-            let run_to_completion = is_run_to_completion;
+        CancelTest(_n) => async move { todo!() }.boxed(),
 
+        StartWorkers(n, worker_id, workers_config_builder) => {
             let run_id = get_run_id!(n);
-
-            let (cancellation_tx, cancellation_rx) = run_cancellation_pair();
-
-            let queue_server_addr = queue.server_addr();
-            let SupervisorConfig {
-                batch_size,
-                timeout,
-                tick_interval,
-                retries,
-            } = config;
-            async move {
-                let client = Client::invoke_work(
-                    Entity::supervisor(),
-                    queue_server_addr,
-                    client_opts,
-                    run_id,
-                    batch_size,
-                    timeout,
-                    retries,
-                    tick_interval,
-                    cancellation_rx,
-                )
-                .await;
-
-                let results_collector = ResultsCollector::default();
-
-                supervisor_data
-                    .lock()
-                    .await
-                    .insert(super_id, (cancellation_tx, results_collector.clone()));
-
-                if !run_to_completion {
-                    supervisors.lock().insert(super_id, client);
-                    return;
-                }
-
-                let client = client.unwrap();
-
-                let result = client
-                    .stream_results::<ResultsCollector>(results_collector)
-                    .await
-                    .map(|(_handler, summary)| summary);
-
-                supervisor_results.lock().await.insert(super_id, result);
-            }
-            .boxed()
-        }
-
-        CancelTest(super_id) => async move {
-            loop {
-                let data = supervisor_data.lock().await;
-                if let Some((cancellation_tx, _)) = data.get(&super_id) {
-                    cancellation_tx.send().await.unwrap();
-                    return;
-                }
-            }
-        }
-        .boxed(),
-
-        StartWorkers(n, worker_id, workers_config) => {
-            let run_id = get_run_id!(n);
+            let run_results = get_run_results!(n);
             let negotiator = queue.get_negotiator_handle();
+
+            let WorkersConfigBuilder {
+                config,
+                batch_size_hint,
+                test_results_timeout,
+            } = workers_config_builder;
+
+            let invoke_work = InvokeWork {
+                run_id,
+                batch_size_hint,
+                test_results_timeout,
+            };
+
+            let config = WorkersConfig {
+                local_results_handler: Box::new(StaticResultsHandler::new(run_results)),
+                ..config
+            };
 
             async move {
                 let worker_pool = WorkersNegotiator::negotiate_and_start_pool_on_executor(
-                    workers_config,
+                    config,
                     negotiator,
                     client_opts.clone(),
-                    run_id,
+                    invoke_work,
                 )
                 .await
                 .unwrap();
@@ -435,12 +300,15 @@ fn action_to_fut(
 
         StopWorkers(n) => async move {
             let mut worker_pool = workers.lock().await.remove(&n).unwrap();
+
+            worker_pool.wait().await;
+
             let workers_result =
                 match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.shutdown())) {
-                    Ok(exit) => WorkersResult::Exit(exit),
-                    Err(_) => WorkersResult::Panic,
+                    Ok(exit) => WorkersExitKind::Exit(exit),
+                    Err(_) => WorkersExitKind::Panic,
                 };
-            worker_results.lock().insert(n, workers_result);
+            worker_exit_kinds.lock().insert(n, workers_result);
         }
         .boxed(),
 
@@ -450,37 +318,6 @@ fn action_to_fut(
             async move {
                 let get_conn = &|| client.connect(work_scheduler_addr).unwrap();
                 callback(get_conn, run_id);
-            }
-            .boxed()
-        }
-
-        Spawn(id, action) => {
-            let fut = action_to_fut(
-                queue,
-                run_ids,
-                client,
-                client_opts,
-                supervisors,
-                supervisor_data,
-                supervisor_results,
-                workers,
-                workers_redundant,
-                worker_results,
-                background_tasks,
-                *action,
-            );
-
-            let handle = tokio::spawn(fut);
-
-            background_tasks.insert(id, handle);
-
-            async {}.boxed()
-        }
-
-        Join(id) => {
-            let handle = background_tasks.remove(&id).unwrap();
-            async move {
-                handle.await.unwrap();
             }
             .boxed()
         }
@@ -502,16 +339,11 @@ fn run_test(servers: Servers, steps: Steps) {
         .unwrap();
     rt.block_on(async {
         let mut run_ids: HashMap<Run, RunId> = Default::default();
-
-        let supervisors = Supervisors::default();
-        let supervisor_data = SupervisorData::default();
-        let supervisor_results = SupervisorResults::default();
+        let mut run_results: HashMap<Run, SharedAssociatedTestResults> = Default::default();
 
         let workers = Workers::default();
         let workers_redundant = WorkersRedundant::default();
-        let worker_results = WorkersResults::default();
-
-        let mut background_tasks = BgTasks::default();
+        let worker_exit_kinds = WorkersExitKinds::default();
 
         for (action_set, asserts) in steps {
             let mut futs = vec![];
@@ -519,15 +351,12 @@ fn run_test(servers: Servers, steps: Steps) {
                 let fut = action_to_fut(
                     &queue,
                     &mut run_ids,
+                    &mut run_results,
                     client.boxed_clone(),
                     client_opts.clone(),
-                    supervisors.clone(),
-                    supervisor_data.clone(),
-                    supervisor_results.clone(),
                     workers.clone(),
                     workers_redundant.clone(),
-                    worker_results.clone(),
-                    &mut background_tasks,
+                    worker_exit_kinds.clone(),
                     action,
                 );
 
@@ -539,62 +368,46 @@ fn run_test(servers: Servers, steps: Steps) {
 
             for check in asserts {
                 match check {
-                    TestExit(n, check) => loop {
-                        let results = supervisor_results.lock().await;
-                        if let Some(exit) = results.get(&n) {
-                            check(exit);
-                            break;
-                        }
-                    },
-
-                    TestExitWithoutErr(n) => {
-                        let results = supervisor_results.lock().await;
-                        let exit = results.get(&n).expect("supervisor exit not found");
-                        assert!(exit.is_ok(), "{:?}", exit);
-                        let CompletedRunData { native_runner_info } = exit.as_ref().unwrap();
-                        let NativeRunnerInfo {
-                            protocol_version,
-                            specification: _,
-                        } = native_runner_info;
-                        assert_eq!(protocol_version, &AbqProtocolVersion::V0_2);
-                    }
-
                     TestResults(n, check) => {
-                        let supervisor_data = supervisor_data.lock().await;
-                        let (_, collector) = supervisor_data.get(&n).expect("supervisor not found");
-                        let results = collector.results.lock();
-                        assert!(check(&results));
+                        let results = run_results.get(&n).expect("run results not found");
+                        let results = results.lock();
+
+                        let flattened_results: Vec<_> = results
+                            .iter()
+                            .flat_map(
+                                |AssociatedTestResults {
+                                     work_id,
+                                     run_number,
+                                     results,
+                                     ..
+                                 }| {
+                                    results.iter().map(|result| (*work_id, *run_number, result))
+                                },
+                            )
+                            .collect();
+
+                        assert!(check(&flattened_results), "{:?}", results);
                     }
+
+                    QueryRunStatus(_) => todo!(),
 
                     WorkersAreRedundant(n) => {
                         assert!(workers_redundant.lock().get(&n).unwrap());
                     }
 
                     WorkerExitStatus(n, workers_exit) => {
-                        let results = worker_results.lock();
+                        let results = worker_exit_kinds.lock();
                         let real_result = results.get(&n).expect("workers result not found");
                         match real_result {
-                            WorkersResult::Exit(exit) => workers_exit(&exit.status),
-                            WorkersResult::Panic => panic!("expected exit result, not panic"),
+                            WorkersExitKind::Exit(exit) => workers_exit(&exit.status),
+                            WorkersExitKind::Panic => panic!("expected exit result, not panic"),
                         }
                     }
 
                     WorkerResultStatus(n, workers_result) => {
-                        let results = worker_results.lock();
+                        let results = worker_exit_kinds.lock();
                         let real_result = results.get(&n).expect("workers result not found");
                         workers_result(real_result)
-                    }
-
-                    WaitForWorkerDead(n) => {
-                        let mut workers = workers.lock().await;
-                        let worker = workers.get_mut(&n).expect("worker not found");
-                        worker.wait().await;
-                    }
-
-                    CheckSupervisor(n, check) => {
-                        let supervisors = supervisors.lock();
-                        let supervisor = supervisors.get(&n).expect("supervisor not found");
-                        check(supervisor);
                     }
                 }
             }
@@ -620,26 +433,24 @@ fn multiple_jobs_complete() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
 
     TestBuilder::default()
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
+            [StopWorkers(Wid(1))],
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
+                TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
                     results == [(1, "echo1"), (1, "echo2")]
                 }),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
             ],
-        )
-        .step(
-            [StopWorkers(Wid(1))],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
         )
         .test();
 
@@ -678,33 +489,25 @@ fn multiple_invokers() {
     };
 
     TestBuilder::default()
+        .act([
+            StartWorkers(Run(1), Wid(1), WorkersConfigBuilder::new(1, runner1)),
+            //
+            StartWorkers(Run(2), Wid(2), WorkersConfigBuilder::new(2, runner2)),
+        ])
         .step(
+            [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner1)),
-                //
-                RunTest(Run(2), Sid(2), SupervisorConfig::new()),
-                StartWorkers(Run(2), Wid(2), workers_config(2, runner2)),
-            ],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
+                TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
                     results == [(1, "echo1"), (1, "echo2")]
                 }),
                 //
-                TestExitWithoutErr(Sid(2)),
-                TestResults(Sid(2), &|results| {
+                TestResults(Run(2), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
                     results == [(1, "echo3"), (1, "echo4"), (1, "echo5")]
                 }),
-            ],
-        )
-        .step(
-            [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
-            [
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| (assert_eq!(e, &WorkersExitStatus::SUCCESS))),
@@ -736,83 +539,24 @@ fn batch_two_requests_at_a_time() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
 
     TestBuilder::default()
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
+            [StopWorkers(Wid(1))],
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new().with_batch_size(2)),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
+                TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
                     results == [(1, "echo1"), (1, "echo2"), (1, "echo3"), (1, "echo4")]
                 }),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
             ],
-        )
-        .step(
-            [StopWorkers(Wid(1))],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
-        )
-        .test();
-}
-
-#[test]
-#[with_protocol_version]
-#[timeout(1000)] // 1 second
-fn invoke_work_with_duplicate_id_is_an_error() {
-    TestBuilder::default()
-        // Start one client with the run ID
-        .step(
-            [StartTest(Run(1), Sid(1), SupervisorConfig::new())],
-            [CheckSupervisor(Sid(1), &|s| s.is_ok())],
-        )
-        // Start a second, with the same run ID
-        .step(
-            [StartTest(Run(1), Sid(2), SupervisorConfig::new())],
-            [CheckSupervisor(Sid(2), &|s| {
-                matches!(s, Err(invoke::Error::DuplicateRun(..)))
-            })],
-        )
-        .test();
-}
-
-#[test]
-#[with_protocol_version]
-#[timeout(1000)] // 1 second
-fn invoke_work_with_duplicate_id_after_completion_is_an_error() {
-    let manifest = ManifestMessage::new(Manifest::new(
-        [echo_test(proto, "echo1".to_string())],
-        Default::default(),
-    ));
-
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
-
-    TestBuilder::default()
-        // Start one client, and have it drain its test queue
-        .step(
-            [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [TestExit(Sid(1), &|result| assert!(result.is_ok()))],
-        )
-        .step(
-            [StopWorkers(Wid(1))],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
-        )
-        // Start a second, with the same run ID
-        .step(
-            [StartTest(Run(1), Sid(1), SupervisorConfig::new())],
-            [CheckSupervisor(Sid(1), &|supervisor| {
-                matches!(supervisor, Err(invoke::Error::DuplicateCompletedRun(..)))
-            })],
         )
         .test();
 }
@@ -823,22 +567,20 @@ fn empty_manifest_exits_gracefully() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
 
     TestBuilder::default()
-        .step(
-            [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| results.is_empty()),
-            ],
-        )
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
+            [
+                TestResults(Run(1), &|results| results.is_empty()),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+            ],
         )
         .test();
 }
@@ -847,9 +589,26 @@ fn empty_manifest_exits_gracefully() {
 #[traced_test]
 #[with_protocol_version]
 fn get_init_context_from_work_server_waiting_for_first_worker() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1".to_string()),
+            echo_test(proto, "echo2".to_string()),
+            echo_test(proto, "echo3".to_string()),
+            echo_test(proto, "echo4".to_string()),
+        ],
+        Default::default(),
+    ));
+
+    let runner =
+        RunnerKind::TestLikeRunner(TestLikeRunner::NeverReturnManifest, Box::new(manifest));
+
     TestBuilder::default()
         // Set up the queue so that a run ID is invoked, but no worker has connected yet.
-        .act([StartTest(Run(1), Sid(1), SupervisorConfig::new())])
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
@@ -886,10 +645,11 @@ fn get_init_context_from_work_server_waiting_for_manifest() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::NeverReturnManifest, manifest.into());
 
     TestBuilder::default()
-        .act([
-            StartTest(Run(1), Sid(1), SupervisorConfig::new()),
-            StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-        ])
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
@@ -937,16 +697,10 @@ fn get_init_context_from_work_server_active() {
         Box::new(manifest),
     );
 
-    let workers_config = WorkersConfig {
-        num_workers: one_nonzero_usize(),
-        ..workers_config(1, runner)
-    };
+    let workers_config = WorkersConfigBuilder::new(1, runner).with_num_workers(one_nonzero_usize());
 
     TestBuilder::default()
-        .act([
-            StartTest(Run(1), Sid(1), SupervisorConfig::new()),
-            StartWorkers(Run(1), Wid(1), workers_config),
-        ])
+        .act([StartWorkers(Run(1), Wid(1), workers_config)])
         .act([WSRunRequest(
             Run(1),
             Box::new(move |get_conn, run_id| {
@@ -985,6 +739,7 @@ fn get_init_context_from_work_server_active() {
 
 #[test]
 #[with_protocol_version]
+#[traced_test]
 fn get_init_context_after_run_already_completed() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
@@ -994,13 +749,11 @@ fn get_init_context_after_run_already_completed() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
 
     TestBuilder::default()
-        .step(
-            [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [TestExitWithoutErr(Sid(1))],
-        )
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
             [StopWorkers(Wid(1))],
             [WorkerExitStatus(
@@ -1027,6 +780,8 @@ fn get_init_context_after_run_already_completed() {
 
                 let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
 
+                dbg!(&response);
+
                 assert!(matches!(response, InitContextResponse::RunAlreadyCompleted));
             }),
         )])
@@ -1048,31 +803,33 @@ fn getting_run_after_work_is_complete_returns_nothing() {
 
     TestBuilder::default()
         // First off, run the test suite to completion. It should complete successfully.
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner.clone()),
+        )])
         .step(
+            [StopWorkers(Wid(1))],
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner.clone())),
-            ],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
+                TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
                     results == [(1, "echo1"), (1, "echo2")]
                 }),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
             ],
-        )
-        .step(
-            [StopWorkers(Wid(1))],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
         )
         // Now, simulate a new set of workers connecting again. Negotiation should succeed, but
         // they should be marked as redundant.
         .step(
-            [StartWorkers(Run(1), Wid(2), workers_config(2, runner))],
+            [StartWorkers(
+                Run(1),
+                Wid(2),
+                WorkersConfigBuilder::new(2, runner),
+            )],
             [WorkersAreRedundant(Wid(2))],
         )
         .step(
@@ -1087,6 +844,7 @@ fn getting_run_after_work_is_complete_returns_nothing() {
 
 #[test]
 #[with_protocol_version]
+#[ignore = "TODO(1.3) implement cancel in new model"]
 fn test_cancellation_drops_remaining_work() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
@@ -1098,20 +856,23 @@ fn test_cancellation_drops_remaining_work() {
     );
 
     TestBuilder::default()
-        .act([Spawn(
-            SpawnId(1),
-            Box::new(RunTest(Run(1), Sid(1), SupervisorConfig::new())),
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner.clone()),
         )])
         .step(
-            [CancelTest(Sid(1))],
-            [TestExit(Sid(1), &|result| {
-                assert!(matches!(
-                    result,
-                    Err(invoke::Error::TestResultError(TestResultError::Cancelled))
-                ))
-            })],
+            [CancelTest(Run(1)), StopWorkers(Wid(1))],
+            [WorkerExitStatus(
+                Wid(1),
+                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+            )],
         )
-        .act([StartWorkers(Run(1), Wid(1), workers_config(1, runner))])
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
             [StopWorkers(Wid(1))],
             [WorkerExitStatus(
@@ -1131,18 +892,11 @@ fn failure_to_run_worker_command_exits_gracefully() {
     });
 
     TestBuilder::default()
-        .step(
-            [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [TestExit(Sid(1), &|results_err| {
-                assert!(matches!(
-                    results_err.as_ref().unwrap_err(),
-                    invoke::Error::TestResultError(TestResultError::TestCommandError(..))
-                ))
-            })],
-        )
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
             [StopWorkers(Wid(1))],
             [WorkerExitStatus(
@@ -1155,6 +909,7 @@ fn failure_to_run_worker_command_exits_gracefully() {
 
 #[test]
 #[with_protocol_version]
+#[ignore = "TODO(1.3) implement query for run status"]
 fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
@@ -1165,10 +920,7 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
         Box::new(manifest),
     );
 
-    let workers_config = WorkersConfig {
-        num_workers: one_nonzero_usize(),
-        ..workers_config(1, runner)
-    };
+    let workers_config = WorkersConfigBuilder::new(1, runner).with_num_workers(one_nonzero_usize());
 
     fn zero(_: TimeoutReason) -> Duration {
         Duration::ZERO
@@ -1180,60 +932,17 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
     }))
     .step(
         [
-            RunTest(Run(1), Sid(1), SupervisorConfig::new()),
             // After pulling the only test, the queue should time us out.
             StartWorkers(Run(1), Wid(1), workers_config),
         ],
-        [TestExit(Sid(1), &|result| {
-            assert!(matches!(
-                result,
-                Err(invoke::Error::TestResultError(TestResultError::TimedOut(
-                    ..
-                )))
-            ));
-        })],
+        [QueryRunStatus(Run(1))],
     )
     .act([StopWorkers(Wid(1))])
     .test();
 }
 
 #[test]
-fn pending_worker_attachment_does_not_block_other_attachers() {
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
-
-    TestBuilder::default()
-        // Start a set of workers that will never find their execution context, and just
-        // continuously poll the queue.
-        .act([Spawn(
-            SpawnId(1),
-            Box::new(StartWorkers(
-                Run(1),
-                Wid(1),
-                workers_config(1, runner.clone()),
-            )),
-        )])
-        // In the meantime, start and execute a run that should complete successfully.
-        .step(
-            {
-                [
-                    RunTest(Run(2), Sid(2), SupervisorConfig::new()),
-                    StartWorkers(Run(2), Wid(2), workers_config(2, runner)),
-                ]
-            },
-            [TestExitWithoutErr(Sid(2))],
-        )
-        .step(
-            [StopWorkers(Wid(2))],
-            [WorkerExitStatus(
-                Wid(2),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
-        )
-        .test();
-}
-
-#[test]
-fn native_runner_returns_manifest_failure() {
+fn native_runner_fails_due_to_manifest_failure() {
     let manifest = ManifestMessage::new_failure(OutOfBandError {
         message: "1 != 2".to_owned(),
         backtrace: Some(vec!["cmp.x".to_string(), "add.x".to_string()]),
@@ -1249,28 +958,17 @@ fn native_runner_returns_manifest_failure() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
 
     TestBuilder::default()
-        .step(
-            [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [TestExit(Sid(1), &|result| {
-                let err = result.as_ref().unwrap_err();
-                assert!(matches!(err, invoke::Error::TestResultError(TestResultError::TestCommandError(..))));
-                let msg = err.to_string();
-                insta::assert_snapshot!(msg, @r###"
-                The given test command failed to be executed by all workers. The recorded error message is:
-                1 != 2
-
-                CompareException at cmp.x[10:15]
-                cmp.x
-                add.x
-                "###);
-            })],
-        )
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExitStatus(Wid(1), Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error {..}))))],
+            [WorkerExitStatus(
+                Wid(1),
+                Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
+            )],
         )
         .test();
 }
@@ -1293,14 +991,15 @@ fn multiple_tests_per_work_id_reported() {
     );
 
     TestBuilder::default()
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
+            [StopWorkers(Wid(1))],
             [
-                RunTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
+                TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
                     let results = sort_results(&mut results);
                     results
@@ -1313,14 +1012,11 @@ fn multiple_tests_per_work_id_reported() {
                             (1, "echo6"),
                         ]
                 }),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
             ],
-        )
-        .step(
-            [StopWorkers(Wid(1))],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
         )
         .test();
 }
@@ -1337,111 +1033,15 @@ fn runner_panic_stops_worker() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Panic, Box::new(manifest));
 
     TestBuilder::default()
-        .step(
-            [
-                StartTest(Run(1), Sid(1), SupervisorConfig::new()),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [WaitForWorkerDead(Wid(1))],
-        )
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner),
+        )])
         .step(
             [StopWorkers(Wid(1))],
             [WorkerResultStatus(Wid(1), &|e| {
-                assert!(matches!(e, WorkersResult::Panic))
-            })],
-        )
-        .test();
-}
-
-#[test]
-#[with_protocol_version]
-#[timeout(1000)] // 1 second
-#[traced_test]
-fn multiple_workers_start_before_supervisor() {
-    let manifest = ManifestMessage::new(Manifest::new(
-        [
-            echo_test(proto, "echo1".to_string()),
-            echo_test(proto, "echo2".to_string()),
-        ],
-        Default::default(),
-    ));
-
-    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
-
-    TestBuilder::default()
-        .act([
-            Spawn(
-                SpawnId(1),
-                Box::new(StartWorkers(
-                    Run(1),
-                    Wid(1),
-                    workers_config(1, runner.clone()),
-                )),
-            ),
-            Spawn(
-                SpawnId(2),
-                Box::new(StartWorkers(Run(1), Wid(2), workers_config(2, runner))),
-            ),
-        ])
-        .step(
-            [RunTest(Run(1), Sid(1), SupervisorConfig::new())],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results(&mut results);
-                    results == [(1, "echo1"), (1, "echo2")]
-                }),
-            ],
-        )
-        .act([Join(SpawnId(1)), Join(SpawnId(2))])
-        .step(
-            [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
-            [
-                WorkerExitStatus(
-                    Wid(1),
-                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-                ),
-                WorkerExitStatus(
-                    Wid(2),
-                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-                ),
-            ],
-        )
-        .test();
-
-    // Should log how long these workers were idle before manifest
-    // Should log how long these worker took
-    assert_scoped_log(
-        "abq_queue::worker_timings",
-        "worker pre-manifest idle seconds",
-    );
-    assert_scoped_log(
-        "abq_queue::worker_timings",
-        "worker post completion idle seconds",
-    );
-}
-
-#[test]
-#[with_protocol_version]
-#[timeout(1000)] // 1 second
-fn timeout_with_slower_poll_timeout_than_tick_interval() {
-    // We should see the supervisor time out, even though the tick interval yields far more often
-    // than the timeout interval.
-    let config = SupervisorConfig::new()
-        .with_tick_interval(Duration::from_micros(10))
-        .with_timeout(Duration::from_micros(1000));
-
-    TestBuilder::default()
-        .step(
-            [RunTest(Run(1), Sid(1), config)],
-            [TestExit(Sid(1), &|result| {
-                assert!(matches!(
-                    result,
-                    Err(invoke::Error::TestResultError(TestResultError::TimedOut(
-                        ..
-                    )))
-                ))
+                assert!(matches!(e, WorkersExitKind::Panic))
             })],
         )
         .test();
@@ -1468,8 +1068,6 @@ fn many_retries_complete() {
         Box::new(manifest),
     );
 
-    let supervisor_config = SupervisorConfig::new().with_retries(3);
-
     let mut expected_results = vec![];
     for attempt in 1..=4 {
         for t in 1..=4 {
@@ -1483,18 +1081,16 @@ fn many_retries_complete() {
 
     TestBuilder::default()
         .step(
-            [
-                RunTest(Run(1), Sid(1), supervisor_config),
-                StartWorkers(Run(1), Wid(1), workers_config(1, runner)),
-            ],
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results_owned(&mut results);
-                    results == expected_results
-                }),
-            ],
+            [StartWorkers(
+                Run(1),
+                Wid(1),
+                WorkersConfigBuilder::new(1, runner),
+            )],
+            [TestResults(Run(1), &|results| {
+                let mut results = results.to_vec();
+                let results = sort_results_owned(&mut results);
+                results == expected_results
+            })],
         )
         .step(
             [StopWorkers(Wid(1))],
@@ -1542,16 +1138,14 @@ fn many_retries_many_workers_complete() {
         Box::new(manifest),
     );
 
-    let supervisor_config = SupervisorConfig::new().with_retries(3);
-
-    let mut start_actions = vec![RunTest(Run(1), Sid(1), supervisor_config)];
+    let mut start_actions = vec![];
     let mut end_workers_actions = vec![];
     let mut end_workers_asserts = vec![];
     for i in 1..=num_workers {
         start_actions.push(StartWorkers(
             Run(1),
             Wid(i),
-            workers_config(i as u32, runner.clone()),
+            WorkersConfigBuilder::new(i as u32, runner.clone()),
         ));
         end_workers_actions.push(StopWorkers(Wid(i)));
         end_workers_asserts.push(WorkerExitStatus(
@@ -1563,14 +1157,11 @@ fn many_retries_many_workers_complete() {
     TestBuilder::default()
         .step(
             start_actions,
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results_owned(&mut results);
-                    results == expected_results
-                }),
-            ],
+            [TestResults(Run(1), &|results| {
+                let mut results = results.to_vec();
+                let results = sort_results_owned(&mut results);
+                results == expected_results
+            })],
         )
         .step(end_workers_actions, end_workers_asserts)
         .test();
@@ -1674,15 +1265,13 @@ fn many_retries_many_workers_complete_native() {
         extra_env: Default::default(),
     });
 
-    let supervisor_config = SupervisorConfig::new().with_retries(3);
-
-    let mut start_actions = vec![RunTest(Run(1), Sid(1), supervisor_config)];
+    let mut start_actions = vec![];
     let mut end_workers_actions = vec![];
     for i in 1..=num_workers {
         start_actions.push(StartWorkers(
             Run(1),
             Wid(i),
-            workers_config(i as u32, runner.clone()),
+            WorkersConfigBuilder::new(i as u32, runner.clone()),
         ));
         end_workers_actions.push(StopWorkers(Wid(i)));
     }
@@ -1690,14 +1279,11 @@ fn many_retries_many_workers_complete_native() {
     TestBuilder::default()
         .step(
             start_actions,
-            [
-                TestExitWithoutErr(Sid(1)),
-                TestResults(Sid(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results_owned(&mut results);
-                    results == expected_results
-                }),
-            ],
+            [TestResults(Run(1), &|results| {
+                let mut results = results.to_vec();
+                let results = sort_results_owned(&mut results);
+                results == expected_results
+            })],
         )
         .act(end_workers_actions)
         .test();

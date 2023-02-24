@@ -110,7 +110,6 @@ pub(crate) struct AbqInstance {
 
 enum AbqLocator {
     Remote {
-        server_addr: SocketAddr,
         queue_negotiator: QueueNegotiatorHandle,
     },
     Local(Abq),
@@ -135,13 +134,6 @@ impl std::fmt::Display for AbqInstanceError {
 }
 
 impl AbqInstance {
-    pub fn server_addr(&self) -> SocketAddr {
-        match &self.locator {
-            AbqLocator::Remote { server_addr, .. } => *server_addr,
-            AbqLocator::Local(abq) => abq.server_addr(),
-        }
-    }
-
     pub fn negotiator_handle(&self) -> QueueNegotiatorHandle {
         match &self.locator {
             AbqLocator::Remote {
@@ -201,10 +193,7 @@ impl AbqInstance {
             deprecations,
         )?;
 
-        let abq = AbqLocator::Remote {
-            server_addr: queue_addr,
-            queue_negotiator,
-        };
+        let abq = AbqLocator::Remote { queue_negotiator };
 
         Ok(AbqInstance {
             locator: abq,

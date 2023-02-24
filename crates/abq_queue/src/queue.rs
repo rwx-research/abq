@@ -15,8 +15,7 @@ use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::Entity;
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResults, CancelReason, InvokerTestData, NativeRunnerInfo, NegotiatorInfo,
-    Request, RunStartData, TestSpec,
+    AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request, TestSpec,
 };
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
 use abq_utils::net_protocol::work_server;
@@ -28,15 +27,15 @@ use abq_utils::net_protocol::{
     queue::{InvokeWork, Message},
     workers::{NextWork, RunId},
 };
-use abq_utils::net_protocol::{client, meta, publicize_addr};
-use abq_utils::shutdown::{RetirementCell, ShutdownManager, ShutdownReceiver};
+use abq_utils::net_protocol::{meta, publicize_addr};
+use abq_utils::shutdown::{ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::{atomic, log_assert};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
 };
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
@@ -46,12 +45,13 @@ use crate::active_state::{ActiveRunState, RunStateCache};
 use crate::attempts::AttemptsCounter;
 use crate::connections::{self, ConnectedWorkers};
 use crate::prelude::*;
-use crate::supervisor_responder::{BufferedResults, SupervisorResponder};
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
 use crate::worker_timings::{
     log_workers_idle_after_completion_latency, log_workers_waited_for_manifest_latency,
     new_worker_timings, WorkerTimings,
 };
+
+pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Default, Debug)]
 struct JobQueue {
@@ -77,25 +77,13 @@ impl JobQueue {
 
 #[derive(Debug)]
 enum RunState {
-    /// Supervisor has not yet connected, but workers may be asking about this run.
-    WaitingForSupervisor {
-        /// For the purposes of analytics, records timings of when workers connect prior to the
-        /// test run being kicked off by a supervisor.
-        worker_connection_times: WorkerTimings,
-    },
-    /// Supervisor has connected, but first worker has not connected for manifest generation.
-    WaitingForFirstWorker {
-        /// For the purposes of analytics, records timings of when workers connect prior to the
-        /// manifest being generated.
-        worker_connection_times: WorkerTimings,
-    },
-    /// Supervisor and first worker has connected. Waiting for manifest.
+    /// First worker has connected. Waiting for manifest.
     WaitingForManifest {
         /// For the purposes of analytics, records timings of when workers connect prior to the
         /// manifest being generated.
         worker_connection_times: WorkerTimings,
     },
-    /// The active state of the test suite run. The queue is populated and a supervisor, worker is
+    /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
     HasWork {
         queue: JobQueue,
@@ -135,6 +123,7 @@ struct RunData {
 static_assertions::assert_eq_size!(RunData, (u64, Duration, bool));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
+#[allow(unused)] // FIXME(ayaz) start using this
 const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
 
 /// A individual test run ever invoked on the queue.
@@ -175,6 +164,8 @@ struct AllRuns {
     num_active: AtomicU64,
 }
 
+type RunsWriteGuard<'a> = RwLockWriteGuard<'a, HashMap<RunId, Mutex<Run>>>;
+
 #[derive(Default, Clone)]
 struct SharedRuns(Arc<AllRuns>);
 
@@ -184,15 +175,6 @@ impl Deref for SharedRuns {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
-}
-
-/// A reason a new queue for a run could not be created.
-#[derive(Debug)]
-enum NewQueueError {
-    /// The run ID has an active run.
-    RunIdAlreadyInProgress,
-    /// The run ID was previously completed.
-    RunIdPreviouslyCompleted,
 }
 
 enum AssignedRunLookup {
@@ -264,79 +246,35 @@ enum AddedManifest {
 }
 
 impl AllRuns {
-    /// Attempts to create a new queue for a run.
+    /// Finds a queue for a run, or creates a new one if the run is observed as fresh.
     /// If the given run ID already has an associated queue, an error is returned.
-    pub fn create_queue(
+    #[must_use]
+    pub fn find_or_create_run(
         &self,
-        run_id: RunId,
+        run_id: &RunId,
         batch_size_hint: NonZeroU64,
-        max_run_attempt: u32,
         last_test_timeout: Duration,
-    ) -> Result<(), NewQueueError> {
-        // Take an exclusive lock over the run state for the entirety of the update.
-        let mut runs = self.runs.write();
-
-        let worker_timings;
-        match runs.get(&run_id) {
-            Some(state) => match &mut state.lock().state {
-                RunState::WaitingForFirstWorker { .. }
-                | RunState::WaitingForManifest { .. }
-                | RunState::HasWork { .. } => return Err(NewQueueError::RunIdAlreadyInProgress),
-                RunState::Done { .. } | RunState::Cancelled { .. } => {
-                    return Err(NewQueueError::RunIdPreviouslyCompleted)
-                }
-                RunState::WaitingForSupervisor {
-                    worker_connection_times,
-                } => worker_timings = std::mem::take(worker_connection_times),
-            },
-            None => {
-                worker_timings = new_worker_timings();
-            }
-        }
-
-        // NB: Always add first for conversative estimation.
-        self.num_active.fetch_add(1, atomic::ORDERING);
-
-        // The run ID is fresh; create a new queue for it.
-        let run = Run {
-            state: RunState::WaitingForFirstWorker {
-                worker_connection_times: worker_timings,
-            },
-            data: Some(RunData {
-                batch_size_hint,
-                last_test_timeout,
-                max_attempt_no: max_run_attempt,
-            }),
-        };
-        let old_run = runs.insert(run_id, Mutex::new(run));
-
-        debug_assert!(
-            old_run.is_none()
-                || matches!(old_run, Some(e) if matches!(e.lock().state, RunState::WaitingForSupervisor {..}))
-        );
-
-        Ok(())
-    }
-
-    // Chooses a run for a set of workers to attach to. Returns `None` if an appropriate run is not
-    // found.
-    pub fn find_run_for_worker(&self, run_id: &RunId, worker_entity: Entity) -> AssignedRunLookup {
+        worker_entity: Entity,
+    ) -> AssignedRunLookup {
         {
             if self.runs.read().get(run_id).is_none() {
-                let mut runs = self.runs.write();
+                let runs = self.runs.write();
+
                 // Possible TOCTOU race here, so we must check whether the run is still missing
-                // before we insert a waiting-for-supervisor marker.
+                // before we create a fresh queue.
+                //
                 // If the run state is now populated, defer to that, since it can only
                 // monotonically advance the state machine (run states move forward and are
                 // never removed).
                 if !runs.contains_key(run_id) {
-                    let run = Run {
-                        state: RunState::WaitingForSupervisor {
-                            worker_connection_times: new_worker_timings(),
-                        },
-                        data: None,
-                    };
-                    runs.insert(run_id.clone(), Mutex::new(run));
+                    return Self::create_fresh_run(
+                        runs,
+                        &self.num_active,
+                        worker_entity,
+                        run_id.clone(),
+                        batch_size_hint,
+                        last_test_timeout,
+                    );
                 }
             };
         }
@@ -370,14 +308,6 @@ impl AllRuns {
                         exit_code: ExitCode::CANCELLED,
                     }
                 }
-                RunState::WaitingForSupervisor {
-                    worker_connection_times,
-                } => {
-                    if !worker_connection_times.contains(&worker_entity) {
-                        worker_connection_times.insert(worker_entity, time::Instant::now());
-                    }
-                    return AssignedRunLookup::NotFound;
-                }
                 st => {
                     tracing::error!(
                         run_state=?st,
@@ -392,18 +322,6 @@ impl AllRuns {
         };
 
         let assigned_run = match &mut run.state {
-            RunState::WaitingForFirstWorker {
-                worker_connection_times,
-            } => {
-                // This is the first worker to attach; ask it to generate the manifest.
-                run.state = RunState::WaitingForManifest {
-                    worker_connection_times: std::mem::take(worker_connection_times),
-                };
-                AssignedRun {
-                    run_id: run_id.clone(),
-                    should_generate_manifest: true,
-                }
-            }
             // Otherwise we are already waiting for the manifest, or already have it; just tell
             // the worker what runner it should set up.
             RunState::WaitingForManifest {
@@ -427,6 +345,43 @@ impl AllRuns {
         AssignedRunLookup::Some(assigned_run)
     }
 
+    #[must_use]
+    fn create_fresh_run(
+        mut runs: RunsWriteGuard<'_>,
+        num_active: &AtomicU64,
+        worker_entity: Entity,
+        run_id: RunId,
+        batch_size_hint: NonZeroU64,
+        last_test_timeout: Duration,
+    ) -> AssignedRunLookup {
+        let mut worker_timings = new_worker_timings();
+        worker_timings.insert(worker_entity, time::Instant::now());
+
+        // NB: Always add first for conversative estimation.
+        num_active.fetch_add(1, atomic::ORDERING);
+
+        // The run ID is fresh; create a new queue for it.
+        let run = Run {
+            state: RunState::WaitingForManifest {
+                worker_connection_times: worker_timings,
+            },
+            data: Some(RunData {
+                // TODO guard against MAX_BATCH_SIZE
+                batch_size_hint,
+                last_test_timeout,
+                // TODO remove
+                max_attempt_no: 1,
+            }),
+        };
+        let old_run = runs.insert(run_id.clone(), Mutex::new(run));
+        log_assert!(old_run.is_none(), "can only be called when run is fresh!");
+
+        AssignedRunLookup::Some(AssignedRun {
+            run_id,
+            should_generate_manifest: true,
+        })
+    }
+
     /// Adds the initial manifest for an ABQ test suite run.
     pub fn add_manifest(
         &self,
@@ -445,10 +400,7 @@ impl AllRuns {
                 // expected state, pass through
                 std::mem::take(worker_connection_times)
             }
-            RunState::WaitingForSupervisor { .. }
-            | RunState::WaitingForFirstWorker { .. }
-            | RunState::HasWork { .. }
-            | RunState::Done { .. } => {
+            RunState::HasWork { .. } | RunState::Done { .. } => {
                 unreachable!(
                     "Invalid state - can only provide manifest while waiting for manifest"
                 );
@@ -491,13 +443,7 @@ impl AllRuns {
         let run = runs.get(&run_id).expect("no run recorded").lock();
 
         match &run.state {
-            RunState::WaitingForSupervisor { .. } => {
-                tracing::error!("illegal state - worker may not request initialization metadata until run is known");
-                InitMetadata::WaitingForManifest
-            }
-            RunState::WaitingForFirstWorker { .. } | RunState::WaitingForManifest { .. } => {
-                InitMetadata::WaitingForManifest
-            }
+            RunState::WaitingForManifest { .. } => InitMetadata::WaitingForManifest,
             RunState::HasWork { init_metadata, .. } => {
                 InitMetadata::Metadata(init_metadata.clone())
             }
@@ -521,15 +467,13 @@ impl AllRuns {
             } => {
                 Self::determine_next_work(queue, *batch_size_hint, *last_test_timeout, attempts_counter)
             }
-             RunState::Done { .. } | RunState::Cancelled {..} => {
+            RunState::Done { .. } | RunState::Cancelled {..} => {
                 // Let the worker know that we've reached the end of the queue.
                 NextWorkResult::Present {
                     bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
                     status: PulledTestsStatus::QueueWasEmpty
                 }
             }
-            RunState::WaitingForSupervisor { .. } |
-            RunState::WaitingForFirstWorker {..} |
             RunState::WaitingForManifest {..} => unreachable!("Invalid state - work can only be requested after initialization metadata, at which point the manifest is known.")
         }
     }
@@ -623,10 +567,7 @@ impl AllRuns {
                 // Cancellation always takes priority over completeness.
                 return;
             }
-            RunState::WaitingForSupervisor { .. }
-            | RunState::WaitingForFirstWorker { .. }
-            | RunState::WaitingForManifest { .. }
-            | RunState::Done { .. } => {
+            RunState::WaitingForManifest { .. } | RunState::Done { .. } => {
                 unreachable!("Invalid state");
             }
         }
@@ -654,10 +595,7 @@ impl AllRuns {
                 // No-op, since the run was already cancelled.
                 return;
             }
-            RunState::WaitingForSupervisor { .. }
-            | RunState::WaitingForFirstWorker { .. }
-            | RunState::HasWork { .. }
-            | RunState::Done { .. } => {
+            RunState::HasWork { .. } | RunState::Done { .. } => {
                 unreachable!("Invalid state - can only fail to start while waiting for manifest");
             }
         }
@@ -686,10 +624,7 @@ impl AllRuns {
                 // No-op, since the run was already cancelled.
                 return;
             }
-            RunState::WaitingForSupervisor { .. }
-            | RunState::WaitingForFirstWorker { .. }
-            | RunState::HasWork { .. }
-            | RunState::Done { .. } => {
+            RunState::HasWork { .. } | RunState::Done { .. } => {
                 unreachable!("Invalid state - can only mark complete due to manifest while waiting for manifest");
             }
         }
@@ -711,10 +646,9 @@ impl AllRuns {
         let mut run = runs.get(run_id).expect("no run recorded").lock();
 
         // Cancellation can happen at any time, including after the test run is determined to have
-        // completed with a particular success status by one party, because that observation may
-        // not have been shared with a test supervisor prior to their cancellation of a test run.
+        // completed by us (the queue).
         //
-        // We prefer the observation of the test supervisor, so test cancellation is always marked
+        // We prefer the observation of the test workers, so test cancellation is always marked
         // as a failure.
         run.state = RunState::Cancelled { reason };
 
@@ -732,10 +666,7 @@ impl AllRuns {
         let run = runs.get(run_id)?.lock();
 
         match run.state {
-            RunState::WaitingForSupervisor { .. } => None,
-            RunState::WaitingForFirstWorker { .. }
-            | RunState::WaitingForManifest { .. }
-            | RunState::HasWork { .. } => Some(RunLive::Active),
+            RunState::WaitingForManifest { .. } | RunState::HasWork { .. } => Some(RunLive::Active),
             RunState::Done => Some(RunLive::Done),
             RunState::Cancelled { .. } => Some(RunLive::Cancelled),
         }
@@ -746,6 +677,7 @@ impl AllRuns {
     }
 
     #[cfg(test)]
+    #[allow(unused)] // FIXME(ayaz) only for now
     fn set_state(&self, run_id: RunId, state: RunState) -> Option<Mutex<Run>> {
         let mut runs = self.runs.write();
         runs.insert(run_id, Mutex::new(Run { state, data: None }))
@@ -963,8 +895,16 @@ fn start_queue(config: QueueConfig) -> Abq {
     // queues indefinitely.
     let choose_run_for_worker = {
         let queues = queues.clone();
-        move |wanted_run_id: &RunId, entity: Entity| {
-            let opt_assigned = { queues.find_run_for_worker(wanted_run_id, entity) };
+        move |entity: Entity, invoke_work: &InvokeWork| {
+            let InvokeWork {
+                run_id,
+                batch_size_hint,
+                test_results_timeout,
+            } = invoke_work;
+
+            let opt_assigned = {
+                queues.find_or_create_run(run_id, *batch_size_hint, *test_results_timeout, entity)
+            };
             match opt_assigned {
                 AssignedRunLookup::Some(assigned) => AssignedRunStatus::Run(assigned),
                 AssignedRunLookup::NotFound => AssignedRunStatus::RunUnknown,
@@ -1002,8 +942,8 @@ fn start_queue(config: QueueConfig) -> Abq {
     }
 }
 
-/// run ID -> result responder
-type ActiveRunRespondersInner = HashMap<RunId, tokio::sync::Mutex<SupervisorResponder>>;
+/// TODO get rid of this, right now it's around only guard when handling cancellation
+type ActiveRunRespondersInner = HashMap<RunId, tokio::sync::Mutex<()>>;
 
 /// Shared responders.
 type ActiveRunResponders = Arc<
@@ -1034,14 +974,6 @@ pub enum QueueServerError {
     Other(#[from] AnyError),
 }
 
-/// An error that occurs when an abq client attempts to re-connect to the queue.
-#[derive(Debug, Error, PartialEq)]
-enum ClientReconnectionError {
-    /// The client sent an initial test run request to the queue.
-    #[error("{0} was never used to invoke work on the queue")]
-    NeverInvoked(RunId),
-}
-
 #[derive(Clone)]
 struct QueueServerCtx {
     queues: SharedRuns,
@@ -1064,10 +996,6 @@ struct QueueServerCtx {
     /// As such, we maintain a pointer so we can stop all remaining tasks when we receive a final
     /// test result.
     worker_next_tests_tasks: ConnectedWorkers,
-
-    /// Holds state on whether the queue is retired, and records retirement if the queue is asked
-    /// to retire by a privileged process.
-    retirement: RetirementCell,
 }
 
 impl QueueServer {
@@ -1112,8 +1040,6 @@ impl QueueServer {
 
                 worker_results_tasks: Default::default(),
                 worker_next_tests_tasks,
-
-                retirement: shutdown.get_retirement_cell(),
             };
 
             enum Task {
@@ -1216,17 +1142,6 @@ impl QueueServer {
                 log_deprecations(entity, run_id, deprecations);
                 Self::handle_negotiator_info(entity, stream, ctx.public_negotiator_addr).await
             }
-            Message::InvokeWork(invoke_work) => {
-                Self::handle_invoked_work(
-                    ctx.active_runs,
-                    ctx.queues,
-                    ctx.retirement,
-                    entity,
-                    stream,
-                    invoke_work,
-                )
-                .await
-            }
             Message::CancelRun(run_id) => {
                 // Immediately ACK the cancellation and drop the stream
                 net_protocol::async_write(
@@ -1236,7 +1151,8 @@ impl QueueServer {
                 .await
                 .located(here!())
                 .entity(entity)?;
-                // Supervisor connection might exit without FIN ACK - allow disconnect here.
+
+                // cancellation connection might exit without FIN ACK - allow disconnect here.
                 let _shutdown = stream.shutdown().await;
                 drop(stream);
 
@@ -1248,9 +1164,6 @@ impl QueueServer {
                     run_id,
                 )
                 .await
-            }
-            Message::Reconnect(run_id) => {
-                Self::handle_invoker_reconnection(ctx.active_runs, entity, stream, run_id).await
             }
             Message::ManifestResult(run_id, manifest_result) => {
                 Self::handle_manifest_result(
@@ -1330,8 +1243,6 @@ impl QueueServer {
             Message::RequestTotalRunResult(run_id) => {
                 Self::handle_total_run_result_request(ctx.queues, run_id, entity, stream).await
             }
-
-            Message::Retire => Self::handle_retirement(ctx.retirement, entity, stream).await,
         };
 
         result.map_err(|error| EntityfulError {
@@ -1385,125 +1296,7 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(active_runs, queues, stream))]
-    async fn handle_invoked_work(
-        active_runs: ActiveRunResponders,
-        queues: SharedRuns,
-        retirement: RetirementCell,
-        entity: Entity,
-        mut stream: Box<dyn net_async::ServerStream>,
-        invoke_work: InvokeWork,
-    ) -> OpaqueResult<()> {
-        Self::reject_if_retired(&entity, retirement).located(here!())?;
-
-        let InvokeWork {
-            run_id,
-            batch_size_hint,
-            max_run_attempt,
-            test_results_timeout,
-        } = invoke_work;
-
-        tracing::info!(
-            ?entity,
-            ?run_id,
-            batch_size_hint,
-            test_results_timeout_seconds = test_results_timeout.as_secs(),
-            max_run_attempt,
-            "new invoked work"
-        );
-
-        let batch_size_hint = if batch_size_hint > MAX_BATCH_SIZE {
-            tracing::warn!(
-                ?run_id,
-                ?batch_size_hint,
-                ?MAX_BATCH_SIZE,
-                "invocation parameters exceed max batch size"
-            );
-            MAX_BATCH_SIZE
-        } else {
-            batch_size_hint
-        };
-
-        let could_create_queue = queues.create_queue(
-            run_id.clone(),
-            batch_size_hint,
-            max_run_attempt,
-            test_results_timeout,
-        );
-
-        match could_create_queue {
-            Ok(()) => {
-                {
-                    tracing::info!(?run_id, ?entity, "created new queue");
-
-                    // Only after telling the client that we are ready for it to move into listing
-                    // for test results, associate the results responder.
-                    //
-                    // NB: an exclusive lock here is important! As unlikely as it may be, sharing the
-                    // responder before the response message is sent may result in test results being
-                    // sent *before* this response message is sent.
-                    let mut active_runs = active_runs.write().await;
-
-                    // TODO: if this write fails, we will be in an inconsistent state and have leaked a
-                    // run ID - there will be an active queue, but no active responder for when test
-                    // results start streaming back in.
-                    // If this run fails, we should switch the queue state to a mode where we say
-                    // "something has went wrong" and disallow workers to pull tests until either the
-                    // invoker re-invokes the run, or the run gets deleted.
-                    net_protocol::async_write(
-                        &mut stream,
-                        &net_protocol::queue::InvokeWorkResponse::Success,
-                    )
-                    .await
-                    .located(here!())?;
-
-                    // TODO: we could determine a more optimal sizing of the test results buffer by
-                    // e.g. considering the size of the test manifest.
-                    let results_buffering_size = BufferedResults::DEFAULT_SIZE;
-
-                    let results_responder =
-                        SupervisorResponder::new(stream, results_buffering_size);
-                    let old_responder =
-                        active_runs.insert(run_id, tokio::sync::Mutex::new(results_responder));
-                    debug_assert!(
-                        old_responder.is_none(),
-                        "Existing stream for expected unique run id"
-                    );
-                }
-
-                Ok(())
-            }
-            Err(err) => {
-                tracing::info!(
-                    ?run_id,
-                    ?entity,
-                    "failed to create new queue for invocation"
-                );
-
-                let failure_reason = match err {
-                    NewQueueError::RunIdAlreadyInProgress => {
-                        net_protocol::queue::InvokeFailureReason::DuplicateRunId {
-                            recently_completed: false,
-                        }
-                    }
-                    NewQueueError::RunIdPreviouslyCompleted => {
-                        net_protocol::queue::InvokeFailureReason::DuplicateRunId {
-                            recently_completed: true,
-                        }
-                    }
-                };
-                let failure_msg = net_protocol::queue::InvokeWorkResponse::Failure(failure_reason);
-
-                net_protocol::async_write(&mut stream, &failure_msg)
-                    .await
-                    .located(here!())?;
-
-                Ok(())
-            }
-        }
-    }
-
-    /// A supervisor cancels a test run.
+    /// A worker requests cancellation of a test run.
     #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
     async fn handle_run_cancellation(
         queues: SharedRuns,
@@ -1512,7 +1305,7 @@ impl QueueServer {
         entity: Entity,
         run_id: RunId,
     ) -> OpaqueResult<()> {
-        tracing::info!(?run_id, ?entity, "test supervisor cancelled a test run");
+        tracing::info!(?run_id, ?entity, "worker cancelled a test run");
 
         // IFTTT: handle_manifest_*, handle_worker_results
         //
@@ -1521,7 +1314,7 @@ impl QueueServer {
         let mut active_runs = active_runs.write().await;
 
         {
-            // The supervisor does not need any extra information, so drop the responder.
+            // Drop the active state.
             active_runs.remove(&run_id);
         }
 
@@ -1537,45 +1330,6 @@ impl QueueServer {
         }
 
         Ok(())
-    }
-
-    #[instrument(level = "trace", skip(active_runs, new_stream))]
-    async fn handle_invoker_reconnection(
-        active_runs: ActiveRunResponders,
-        entity: Entity,
-        new_stream: Box<dyn net_async::ServerStream>,
-        run_id: RunId,
-    ) -> OpaqueResult<()> {
-        use std::collections::hash_map::Entry;
-
-        // When an abq client loses connection with the queue, they may attempt to reconnect.
-        // We'll need to update the connection from streaming results to the client to the new one.
-        let mut active_runs = active_runs.write().await;
-        let active_conn_entry = active_runs.entry(run_id.clone());
-        match active_conn_entry {
-            Entry::Occupied(mut occupied) => {
-                let new_stream_addr = new_stream.peer_addr();
-
-                occupied
-                    .get_mut()
-                    .lock()
-                    .await
-                    .update_connection_to(new_stream)
-                    .await;
-
-                tracing::debug!(
-                    "rerouted connection for {:?} to {:?}",
-                    run_id,
-                    new_stream_addr
-                );
-
-                Ok(())
-            }
-            Entry::Vacant(_) => {
-                // There was never a connection for this run ID!
-                Err(ClientReconnectionError::NeverInvoked(run_id)).located(here!())
-            }
-        }
     }
 
     #[instrument(
@@ -1677,7 +1431,7 @@ impl QueueServer {
         // This avoids blocking start of workers for the test run, but will force
         // consumption of the test-start information before any test results.
         let active_runs = active_runs.read().await;
-        let opt_responder = match active_runs.get(&run_id) {
+        let _opt_responder = match active_runs.get(&run_id) {
             None => None,
             Some(responder) => Some(responder.lock().await),
         };
@@ -1685,25 +1439,12 @@ impl QueueServer {
         let total_work = flat_manifest.len();
         let added_manifest = queues.add_manifest(&run_id, flat_manifest.clone(), init_metadata);
 
-        // Since the supervisor doesn't need to know about the native runner that'll be running the
-        // current test suite as soon as the test run starts, only let it know about the runner
-        // after we've unblocked the workers.
         match added_manifest {
             AddedManifest::Added {
                 worker_connection_times,
             } => {
                 let run_state = ActiveRunState::new(total_work);
                 state_cache.lock().insert(run_id.clone(), run_state);
-
-                let mut responder = opt_responder
-                    .expect("illegal state - run is active, but supervisor responder is missing");
-
-                responder
-                    .send_run_start_info(RunStartData {
-                        native_runner_info,
-                        manifest: flat_manifest,
-                    })
-                    .await;
 
                 log_workers_waited_for_manifest_latency(
                     &run_id,
@@ -1765,61 +1506,8 @@ impl QueueServer {
             debug_assert!(!state_cache.lock().contains_key(&run_id));
         }
 
-        let mut responder = {
-            // Remove and take over the responder; since the manifest is not known, we should be the
-            // only task that ever communicates with the client.
-            let responder = active_runs.write().await.remove(&run_id).unwrap();
-            responder.into_inner()
-        };
-
-        // Tell the client that the tests are done or that the test runners have failed, as
-        // appropriate.
-        let final_message = match manifest_result {
-            Ok(native_runner_info) => {
-                // The native runner info must arrive before any notification that the supervisor
-                // should close.
-                responder
-                    .send_run_start_info(RunStartData {
-                        native_runner_info,
-                        manifest: vec![],
-                    })
-                    .await;
-
-                InvokerTestData::EndOfResults
-            }
-            Err((opaque_manifest_generation_error, captured_output)) => {
-                InvokerTestData::TestCommandError {
-                    error: opaque_manifest_generation_error,
-                    captured: captured_output,
-                }
-            }
-        };
-
-        match responder {
-            SupervisorResponder::DirectStream { mut stream, buffer } => {
-                debug_assert!(buffer.is_empty(), "messages before manifest received");
-
-                net_protocol::async_write(&mut stream, &final_message)
-                    .await
-                    .located(here!())?;
-
-                drop(stream);
-            }
-            SupervisorResponder::Disconnected {
-                results,
-                buffer_size: _,
-                pending_start_info: _,
-            } => {
-                // Unfortunately, since we still don't have an active connection to the abq
-                // client, we can't do anything here.
-                // To avoid leaking memory we assume the client is dead and drop the results.
-                //
-                // TODO: rather than dropping the failure message, consider attaching it back
-                // to the queue. If the client re-connects, we'll let them know that the test
-                // has failed to startup.
-                let _ = results;
-            }
-        }
+        // Remove the active run state.
+        active_runs.write().await.remove(&run_id);
 
         if is_empty_manifest {
             queues.mark_empty_manifest_complete(run_id);
@@ -1857,22 +1545,8 @@ impl QueueServer {
         let num_results = results.len();
 
         {
-            // First up, chuck the test result back over to `abq test`. Make sure we don't steal
-            // the lock on active_runs for any longer than it takes to send that request.
-            let active_runs = active_runs.read().await;
-
-            let invoker_stream = match active_runs.get(&run_id) {
-                Some(stream) => stream,
-                None => {
-                    tracing::info!(
-                        ?run_id,
-                        "got test result for no-longer active (cancelled) run"
-                    );
-                    return Err("run no longer active").located(here!());
-                }
-            };
-
-            invoker_stream.lock().await.send_test_results(results).await;
+            // TODO do something with the results, eventually!
+            let _ = results;
         }
 
         let no_more_work = {
@@ -1932,109 +1606,18 @@ impl QueueServer {
         let run_complete_span = tracing::info_span!("run end of work", ?run_id, ?entity);
         let _run_complete_enter = run_complete_span.enter();
 
-        // First up, exclusively grab our supervisor responder. We can't have anyone else talk to
-        // the supervisor until we determine whether the run should keep going or shutdown.
-        //
-        // We don't need an exclusive lock to update the active_runs yet, but we do take a read
-        // guard to prevent cancellation during this path.
-        //
-        // IFTTT: handle_run_cancellation - cancellation requires an exclusive lock over all active
-        // runs.
-        let active_runs_guard = active_runs.read().await;
-        let responder = active_runs_guard.get(&run_id);
-        let responder = match responder {
-            Some(responder) => responder,
-            None => {
-                // The run must have been cancelled between the time we handled the last result,
-                // and now when we've started the completion procedure.
-                assert!(matches!(
-                    queues.get_run_liveness(&run_id),
-                    Some(RunLive::Cancelled)
-                ));
-                tracing::info!(?run_id, "run cancelled while handling run completion");
-                return Ok(());
-            }
-        };
-        let mut responder = responder.lock().await;
+        // TODO(ayaz) inline the below
 
-        responder.flush_results().await;
-
-        match &mut *responder {
-            SupervisorResponder::DirectStream { stream, buffer } => {
-                assert!(
-                    buffer.is_empty(),
-                    "no results should be buffered after drainage"
-                );
-
-                net_protocol::async_write(stream, &InvokerTestData::EndOfResults)
-                    .await
-                    .located(here!())?;
-                let response: client::EndOfResultsResponse =
-                    net_protocol::async_read(stream).await.located(here!())?;
-
-                match response {
-                    client::EndOfResultsResponse::AckEnd { exit_code } => {
-                        // The supervisor may have closed the socket immediately acknowledgement,
-                        // so our shutdown failing is not an error.
-                        let _ = stream.shutdown().await;
-                        drop(responder);
-
-                        // Release the read guard over the active runs; the supervisor has just
-                        // confirmed completion, so re-entry will not need to worry about
-                        // cancellation.
-                        // XREF: drop-active-run-after-confirmation
-                        drop(active_runs_guard);
-
-                        tracing::info!(?run_id, "closed supervisor responder on ACK run end");
-
-                        Self::handle_test_run_completion(
-                            queues,
-                            active_runs,
-                            state_cache,
-                            &run_id,
-                            entity,
-                            exit_code,
-                            worker_results_tasks,
-                            worker_next_tests_tasks,
-                        )
-                        .await
-                    }
-                }
-            }
-            SupervisorResponder::Disconnected {
-                results: _,
-                buffer_size: _,
-                pending_start_info: _,
-            } => {
-                tracing::warn!(?run_id, "dropping disconnected results responder");
-
-                // Unfortunately, since we still don't have an active connection to the abq
-                // client, we can't send any buffered test results or end-of-tests anywhere.
-                // To avoid leaking memory we assume the client is dead and drop the results.
-                //
-                // TODO: rather than dropping any pending results, consider attaching any
-                // pending results back to the queue. If the client re-connects, send them all
-                // back at that point. The queue can run a weep to cleanup any uncolleted
-                // results on some time interval.
-                drop(responder);
-                drop(active_runs_guard);
-
-                // Suppose failure, since the supervisor is disconnected.
-                let exit_code = ExitCode::FAILURE;
-
-                Self::handle_test_run_completion(
-                    queues,
-                    active_runs,
-                    state_cache,
-                    &run_id,
-                    entity,
-                    exit_code,
-                    worker_results_tasks,
-                    worker_next_tests_tasks,
-                )
-                .await
-            }
-        }
+        Self::handle_test_run_completion(
+            queues,
+            active_runs,
+            state_cache,
+            &run_id,
+            entity,
+            worker_results_tasks,
+            worker_next_tests_tasks,
+        )
+        .await
     }
 
     #[instrument(
@@ -2053,15 +1636,11 @@ impl QueueServer {
         state_cache: RunStateCache,
         run_id: &RunId,
         entity: Entity,
-        exit_code: ExitCode,
         worker_results_tasks: ConnectedWorkers,
         worker_next_tests_tasks: ConnectedWorkers,
     ) -> OpaqueResult<()> {
         // This run should indeed be terminated; drop all remaining state.
 
-        // The supervisor has acknowledged exit by this branch, so we can now exclusively
-        // drop the responder without worry of TOCTOU due to cancellation.
-        // XREF: drop-active-run-after-confirmation
         active_runs.write().await.remove(run_id);
 
         let run_state = state_cache.lock().remove(run_id);
@@ -2174,61 +1753,9 @@ impl QueueServer {
 
         tracing::info!(?run_id, timeout=?after, "timing out active test run");
 
-        // Remove the responder, and notify the supervisor that this run has timed out.
-        let opt_responder = locked_active_runs.remove(&run_id);
+        let opt_run_state = locked_active_runs.remove(&run_id);
 
-        Self::check_responder_after_timeout_precondition(&run_id, opt_responder.is_some(), reason);
-
-        if let Some(responder) = opt_responder {
-            let mut responder = responder.into_inner();
-
-            // Flush all test results still pending prior to the timeout.
-            responder.flush_results().await;
-
-            match responder {
-                SupervisorResponder::DirectStream { mut stream, buffer } => {
-                    assert!(
-                        buffer.is_empty(),
-                        "no results should be buffered after drainage"
-                    );
-
-                    net_protocol::async_write(&mut stream, &InvokerTestData::TimedOut { after })
-                        .await
-                        .located(here!())?;
-
-                    // To avoid a race between perceived cancellation by the supervisor and perceived
-                    // timeout by the queue, require an ACK for the induced timeout notification. If
-                    // instead the supervisor cancels prior to an ACK, this stream will break before
-                    // the ACK is fulfilled, and the cancellation will be recorded.
-                    let response: client::EndOfResultsResponse =
-                        net_protocol::async_read(&mut stream)
-                            .await
-                            .located(here!())?;
-
-                    log_assert!(
-                        matches!(response, client::EndOfResultsResponse::AckEnd { .. }),
-                        "supervisor may only acknowledge completion after a timeout"
-                    );
-
-                    drop(stream);
-
-                    tracing::info!(?run_id, "closed connected results responder");
-                }
-                SupervisorResponder::Disconnected {
-                    results: _,
-                    buffer_size: _,
-                    pending_start_info: _,
-                } => {
-                    tracing::error!(
-                        ?run_id,
-                        "dropping disconnected results responder after timeout"
-                    );
-
-                    // Unfortunately, nothing more we can do at this point, since
-                    // the supervisor has been lost!
-                }
-            }
-        }
+        Self::check_responder_after_timeout_precondition(&run_id, opt_run_state.is_some(), reason);
 
         // Store the cancellation state
         queues.mark_cancelled(&run_id, reason.into());
@@ -2349,41 +1876,6 @@ impl QueueServer {
             .located(here!())?;
 
         Ok(())
-    }
-
-    #[instrument(level = "trace", skip(stream))]
-    async fn handle_retirement(
-        retirement: RetirementCell,
-        entity: Entity,
-        mut stream: Box<dyn net_async::ServerStream>,
-    ) -> OpaqueResult<()> {
-        if !stream.role().is_admin() {
-            tracing::warn!(?entity, "rejecting underprivileged request for retirement");
-            return Err("rejecting underprivileged request for retirement").located(here!());
-        }
-
-        retirement.notify_asked_to_retire();
-
-        net_protocol::async_write(&mut stream, &net_protocol::queue::AckRetirement {})
-            .await
-            .located(here!())?;
-
-        Ok(())
-    }
-
-    fn reject_if_retired(entity: &Entity, retirement: RetirementCell) -> io::Result<()> {
-        if !retirement.is_retired() {
-            return Ok(());
-        }
-
-        tracing::warn!(
-            ?entity,
-            "rejecting request not permissible during retirement"
-        );
-        Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            "queue is retiring",
-        ))
     }
 }
 
@@ -2650,20 +2142,17 @@ mod test {
     use std::{
         collections::HashMap,
         io,
-        net::SocketAddr,
         sync::Arc,
-        thread::{self, JoinHandle},
+        thread::{self},
     };
 
-    use super::{RunState, RunStateCache};
+    use super::{RunStateCache, DEFAULT_CLIENT_POLL_TIMEOUT};
     use crate::{
         connections::ConnectedWorkers,
-        invoke::DEFAULT_CLIENT_POLL_TIMEOUT,
         queue::{
-            ActiveRunResponders, AddedManifest, AssignedRunLookup, BufferedResults, CancelReason,
-            QueueServer, RunLive, SharedRuns, WorkScheduler,
+            ActiveRunResponders, AddedManifest, CancelReason, QueueServer, RunLive, SharedRuns,
+            WorkScheduler,
         },
-        supervisor_responder::SupervisorResponder,
         timeout::{RunTimeoutManager, RunTimeoutStrategy},
     };
     use abq_run_n_times::n_times;
@@ -2676,35 +2165,21 @@ mod test {
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
             self,
-            client::AckTestResults,
             entity::Entity,
             queue::{
-                AckManifest, AssociatedTestResults, InvokeWork, InvokerTestData, NativeRunnerInfo,
-                NegotiatorInfo, TestSpec,
+                AckManifest, AssociatedTestResults, NativeRunnerInfo, NegotiatorInfo, TestSpec,
             },
             runners::{NativeRunnerSpecification, TestCase, TestResult},
             work_server,
-            workers::{RunId, WorkId, INIT_RUN_NUMBER},
+            workers::{RunId, WorkId},
         },
         shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;
     use parking_lot as pl;
-    use tokio::{
-        io::AsyncWriteExt,
-        sync::{Mutex, RwLock},
-    };
+    use tokio::sync::{Mutex, RwLock};
     use tracing_test::traced_test;
-
-    fn faux_invoke_work() -> InvokeWork {
-        InvokeWork {
-            run_id: RunId::unique(),
-            batch_size_hint: one_nonzero(),
-            test_results_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
-            max_run_attempt: INIT_RUN_NUMBER,
-        }
-    }
 
     fn build_random_strategies() -> (
         ServerAuthStrategy,
@@ -2712,33 +2187,6 @@ mod test {
         ClientAuthStrategy<Admin>,
     ) {
         build_strategies(UserToken::new_random(), AdminToken::new_random())
-    }
-
-    fn create_queue_server(
-        server_auth: ServerAuthStrategy,
-    ) -> (JoinHandle<()>, ShutdownManager, SocketAddr) {
-        let server_opts = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls());
-        let server = server_opts.bind("0.0.0.0:0").unwrap();
-        let server_addr = server.local_addr().unwrap();
-
-        let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
-
-        let queue_server = QueueServer {
-            queues: Default::default(),
-            public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
-        };
-        let server_thread = thread::spawn(|| {
-            queue_server
-                .start_on(
-                    server,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
-        });
-
-        (server_thread, shutdown_tx, server_addr)
     }
 
     #[test]
@@ -2775,250 +2223,6 @@ mod test {
         server_thread.join().unwrap();
 
         assert_scoped_log("abq_queue::queue", "error handling connection");
-    }
-
-    #[tokio::test]
-    async fn invoker_reconnection_succeeds() {
-        let run_id = RunId::unique();
-        let active_runs = ActiveRunResponders::default();
-
-        let server_opts =
-            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
-        let client_opts =
-            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
-
-        // Set up an initial connection for streaming test results targeting the given run ID
-        let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
-        let fake_server_addr = fake_server.local_addr().unwrap();
-
-        let client = client_opts.build_async().unwrap();
-
-        {
-            // Register the initial connection
-            let (client_res, server_res) = futures::join!(
-                client.connect(fake_server_addr),
-                accept_handshake(&*fake_server)
-            );
-            let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-
-            let mut active_runs = active_runs.write().await;
-            active_runs.insert(
-                run_id.clone(),
-                Mutex::new(SupervisorResponder::DirectStream {
-                    stream: server_conn,
-                    buffer: BufferedResults::new(5),
-                }),
-            );
-            // Drop the connection
-            drop(client_conn);
-        };
-
-        // Attempt to reconnect
-        let (client_res, server_res) = futures::join!(
-            client.connect(fake_server_addr),
-            accept_handshake(&*fake_server)
-        );
-        let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-        let new_conn_addr = client_conn.local_addr().unwrap();
-
-        let reconnection_result = QueueServer::handle_invoker_reconnection(
-            Arc::clone(&active_runs),
-            Entity::supervisor(),
-            server_conn,
-            run_id.clone(),
-        )
-        .await;
-
-        // Validate that the reconnection was granted
-        assert!(reconnection_result.is_ok());
-        let active_conn_addr = {
-            let mut active_runs = active_runs.write().await;
-            let responder = active_runs.remove(&run_id).unwrap().into_inner();
-            match responder {
-                SupervisorResponder::DirectStream { stream, .. } => stream.peer_addr().unwrap(),
-                SupervisorResponder::Disconnected { .. } => unreachable!(),
-            }
-        };
-        assert_eq!(active_conn_addr, new_conn_addr);
-    }
-
-    #[tokio::test]
-    async fn invoker_reconnection_fails_never_invoked() {
-        let run_id = RunId::unique();
-        let active_runs = ActiveRunResponders::default();
-
-        let server_opts =
-            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
-        let client_opts =
-            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
-
-        let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
-        let fake_server_addr = fake_server.local_addr().unwrap();
-
-        let client = client_opts.build_async().unwrap();
-
-        let (client_res, server_res) = futures::join!(
-            client.connect(fake_server_addr),
-            accept_handshake(&*fake_server)
-        );
-        let (_client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-
-        let reconnection_result = QueueServer::handle_invoker_reconnection(
-            Arc::clone(&active_runs),
-            Entity::supervisor(),
-            server_conn,
-            run_id.clone(),
-        )
-        .await;
-
-        // Validate that the reconnection was granted
-        assert!(reconnection_result.is_err());
-        let err = reconnection_result.unwrap_err();
-        assert!(err
-            .error
-            .to_string()
-            .contains("never used to invoke work on the queue"));
-    }
-
-    #[tokio::test]
-    async fn client_disconnect_then_connect_gets_buffered_results() {
-        let run_id = RunId::unique();
-        let active_runs = ActiveRunResponders::default();
-        let run_queues = SharedRuns::default();
-        let run_state = RunStateCache::default();
-        let worker_results_tasks = ConnectedWorkers::default();
-        let worker_next_tests_tasks = ConnectedWorkers::default();
-
-        // Pretend we have infinite work so the queue always streams back results to the client.
-        run_state
-            .lock()
-            .insert(run_id.clone(), super::ActiveRunState::new(usize::MAX));
-
-        let server_opts =
-            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
-        let client_opts =
-            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
-
-        let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
-        let fake_server_addr = fake_server.local_addr().unwrap();
-
-        let client = client_opts.build_async().unwrap();
-
-        {
-            // Register the initial connection
-            let (client_res, server_res) = futures::join!(
-                client.connect(fake_server_addr),
-                accept_handshake(&*fake_server)
-            );
-            let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-
-            let mut active_runs = active_runs.write().await;
-            let _responder = active_runs.insert(
-                run_id.clone(),
-                Mutex::new(SupervisorResponder::DirectStream {
-                    stream: server_conn,
-                    buffer: BufferedResults::new(0),
-                }),
-            );
-
-            // Drop the client connection
-            drop(client_conn);
-        };
-
-        let buffered_work_id = WorkId::new();
-        {
-            // Send a test result, will force the responder to go into disconnected mode
-            let result = AssociatedTestResults::fake(buffered_work_id, vec![TestResult::fake()]);
-            QueueServer::handle_worker_results(
-                run_queues.clone(),
-                Arc::clone(&active_runs),
-                Arc::clone(&run_state),
-                worker_results_tasks.clone(),
-                worker_next_tests_tasks.clone(),
-                Entity::runner(0, 1),
-                run_id.clone(),
-                vec![result],
-            )
-            .await
-            .unwrap();
-
-            // Check the internal state of the responder - it should be in disconnected mode.
-            let responders = active_runs.write().await;
-            let responder = responders.get(&run_id).unwrap().lock().await;
-            match &*responder {
-                SupervisorResponder::Disconnected { results, .. } => {
-                    assert_eq!(results.len(), 1)
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        // Reconnect back to the queue
-        let (client_res, server_res) = futures::join!(
-            client.connect(fake_server_addr),
-            accept_handshake(&*fake_server)
-        );
-        let (mut client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-
-        {
-            let reconnection_future = QueueServer::handle_invoker_reconnection(
-                Arc::clone(&active_runs),
-                Entity::runner(0, 1),
-                server_conn,
-                run_id.clone(),
-            );
-
-            let read_results_future = async {
-                let AssociatedTestResults { work_id, .. } =
-                    match net_protocol::async_read(&mut client_conn).await.unwrap() {
-                        InvokerTestData::Results(mut results) => results.pop().unwrap(),
-                        _ => panic!(),
-                    };
-
-                net_protocol::async_write(&mut client_conn, &AckTestResults {})
-                    .await
-                    .unwrap();
-
-                assert_eq!(work_id, buffered_work_id);
-            };
-
-            let (reconnection_result, ()) = tokio::join!(reconnection_future, read_results_future);
-            assert!(reconnection_result.is_ok());
-        }
-
-        {
-            // Make sure that new test results also get send to the new client connectiion.
-            let second_work_id = WorkId::new();
-            let associated_result =
-                AssociatedTestResults::fake(second_work_id, vec![TestResult::fake()]);
-            let worker_result_future = QueueServer::handle_worker_results(
-                run_queues,
-                Arc::clone(&active_runs),
-                run_state,
-                worker_results_tasks.clone(),
-                worker_next_tests_tasks.clone(),
-                Entity::runner(0, 1),
-                run_id,
-                vec![associated_result],
-            );
-
-            let read_results_future = async {
-                let AssociatedTestResults { work_id, .. } =
-                    match net_protocol::async_read(&mut client_conn).await.unwrap() {
-                        InvokerTestData::Results(mut results) => results.pop().unwrap(),
-                        _ => panic!(),
-                    };
-
-                net_protocol::async_write(&mut client_conn, &AckTestResults {})
-                    .await
-                    .unwrap();
-
-                assert_eq!(work_id, second_work_id);
-            };
-
-            let (worker_result_end, ()) = tokio::join!(worker_result_future, read_results_future);
-            assert!(worker_result_end.is_ok());
-        }
     }
 
     #[test]
@@ -3333,38 +2537,17 @@ mod test {
 
     #[test]
     #[with_protocol_version]
-    fn active_runs_when_some_waiting_on_workers() {
-        let queues = SharedRuns::default();
-
-        queues
-            .create_queue(
-                RunId::unique(),
-                one_nonzero(),
-                INIT_RUN_NUMBER,
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-            )
-            .unwrap();
-
-        assert_eq!(queues.estimate_num_active_runs(), 1);
-    }
-
-    #[test]
-    #[with_protocol_version]
     fn active_runs_when_some_waiting_on_manifest() {
         let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
-        queues
-            .create_queue(
-                run_id.clone(),
-                one_nonzero(),
-                INIT_RUN_NUMBER,
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-            )
-            .unwrap();
-
-        queues.find_run_for_worker(&run_id, Entity::local_client());
+        let _ = queues.find_or_create_run(
+            &run_id,
+            one_nonzero(),
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+            Entity::local_client(),
+        );
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
     }
@@ -3376,16 +2559,12 @@ mod test {
 
         let run_id = RunId::unique();
 
-        queues
-            .create_queue(
-                run_id.clone(),
-                one_nonzero(),
-                INIT_RUN_NUMBER,
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-            )
-            .unwrap();
-
-        queues.find_run_for_worker(&run_id, Entity::local_client());
+        let _ = queues.find_or_create_run(
+            &run_id,
+            one_nonzero(),
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+            Entity::local_client(),
+        );
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
 
@@ -3399,16 +2578,12 @@ mod test {
 
         let run_id = RunId::unique();
 
-        queues
-            .create_queue(
-                run_id.clone(),
-                one_nonzero(),
-                INIT_RUN_NUMBER,
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-            )
-            .unwrap();
-
-        queues.find_run_for_worker(&run_id, Entity::local_client());
+        let _ = queues.find_or_create_run(
+            &run_id,
+            one_nonzero(),
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+            Entity::local_client(),
+        );
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
         queues.mark_complete(&run_id);
@@ -3428,16 +2603,12 @@ mod test {
         let expected_active = 2;
 
         for run_id in [&run_id1, &run_id2, &run_id3, &run_id4] {
-            queues
-                .create_queue(
-                    run_id.clone(),
-                    one_nonzero(),
-                    INIT_RUN_NUMBER,
-                    DEFAULT_CLIENT_POLL_TIMEOUT,
-                )
-                .unwrap();
-
-            queues.find_run_for_worker(run_id, Entity::local_client());
+            let _ = queues.find_or_create_run(
+                run_id,
+                one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                Entity::local_client(),
+            );
         }
 
         for run_id in [&run_id1, &run_id2, &run_id4] {
@@ -3454,47 +2625,17 @@ mod test {
 
     #[test]
     #[with_protocol_version]
-    fn mark_cancellation_when_waiting_on_workers() {
-        let queues = SharedRuns::default();
-        let run_id = RunId::unique();
-
-        queues
-            .create_queue(
-                run_id.clone(),
-                one_nonzero(),
-                INIT_RUN_NUMBER,
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-            )
-            .unwrap();
-
-        assert_eq!(queues.estimate_num_active_runs(), 1);
-
-        queues.mark_cancelled(&run_id, CancelReason::User);
-
-        assert_eq!(queues.estimate_num_active_runs(), 0);
-        assert!(matches!(
-            queues.get_run_liveness(&run_id).unwrap(),
-            RunLive::Cancelled
-        ));
-    }
-
-    #[test]
-    #[with_protocol_version]
     fn mark_cancellation_when_some_waiting_on_manifest() {
         let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
-        queues
-            .create_queue(
-                run_id.clone(),
-                one_nonzero(),
-                INIT_RUN_NUMBER,
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-            )
-            .unwrap();
-
-        queues.find_run_for_worker(&run_id, Entity::local_client());
+        let _ = queues.find_or_create_run(
+            &run_id,
+            one_nonzero(),
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+            Entity::local_client(),
+        );
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
@@ -3514,16 +2655,13 @@ mod test {
 
         let run_id = RunId::unique();
 
-        queues
-            .create_queue(
-                run_id.clone(),
-                one_nonzero(),
-                INIT_RUN_NUMBER,
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-            )
-            .unwrap();
+        let _ = queues.find_or_create_run(
+            &run_id,
+            one_nonzero(),
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+            Entity::local_client(),
+        );
 
-        queues.find_run_for_worker(&run_id, Entity::local_client());
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
 
@@ -3535,75 +2673,6 @@ mod test {
         assert!(matches!(
             queues.get_run_liveness(&run_id).unwrap(),
             RunLive::Cancelled
-        ));
-    }
-
-    #[test]
-    #[with_protocol_version]
-    fn mark_worker_waiting_for_supervisor() {
-        let queues = SharedRuns::default();
-
-        let run_id = RunId::unique();
-
-        let assigned_run = queues.find_run_for_worker(&run_id, Entity::local_client());
-        assert!(matches!(assigned_run, AssignedRunLookup::NotFound));
-
-        assert_eq!(queues.estimate_num_active_runs(), 0);
-        assert!(queues.get_run_liveness(&run_id).is_none());
-    }
-
-    #[test]
-    #[with_protocol_version]
-    #[n_times(1_000)]
-    fn mark_worker_waiting_for_supervisor_and_supervisor_connects_always_creates_run() {
-        // Tests that if a worker connects, around the same time the supervisor connects to create
-        // a test run queue, we always end up in the state where the run has been created, and not
-        // in the waiting-for-supervisor state.
-
-        let queues = SharedRuns::default();
-        let run_id = RunId::unique();
-
-        let create_queue_task = {
-            let queues = queues.clone();
-            let run_id = run_id.clone();
-            move || {
-                queues
-                    .create_queue(
-                        run_id,
-                        one_nonzero(),
-                        INIT_RUN_NUMBER,
-                        DEFAULT_CLIENT_POLL_TIMEOUT,
-                    )
-                    .unwrap();
-            }
-        };
-
-        let find_run_for_worker_task = {
-            let queues = queues.clone();
-            let run_id = run_id.clone();
-            move || {
-                queues.find_run_for_worker(&run_id, Entity::local_client());
-            }
-        };
-
-        let (create_queue_handle, find_run_handle) = (
-            thread::spawn(create_queue_task),
-            thread::spawn(find_run_for_worker_task),
-        );
-        create_queue_handle.join().unwrap();
-        find_run_handle.join().unwrap();
-
-        assert_eq!(queues.estimate_num_active_runs(), 1);
-        assert!(matches!(
-            queues.get_run_liveness(&run_id),
-            Some(RunLive::Active)
-        ));
-        // Either the supervisor should have set the final state and said we're waiting for the
-        // first worker, or the worker connected after the queue creation, so we're waiting for the
-        // manifest.
-        assert!(matches!(
-            queues.0.runs.read().get(&run_id).unwrap().lock().state,
-            RunState::WaitingForFirstWorker { .. } | RunState::WaitingForManifest { .. }
         ));
     }
 
@@ -3620,34 +2689,21 @@ mod test {
 
         let client = client_opts.build_async().unwrap();
 
-        // Register the invoker connection
-        let (client_res, server_res) = futures::join!(
-            client.connect(fake_server_addr),
-            accept_handshake(&*fake_server)
-        );
-        let (mut client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-
         // Build up our initial state - run is registered, no manifest yet
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            queues
-                .create_queue(
-                    run_id.clone(),
-                    one_nonzero(),
-                    INIT_RUN_NUMBER,
-                    DEFAULT_CLIENT_POLL_TIMEOUT,
-                )
-                .unwrap();
-            queues.find_run_for_worker(&run_id, Entity::local_client());
+            let _ = queues.find_or_create_run(
+                &run_id,
+                one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                Entity::local_client(),
+            );
             queues
         };
         let active_runs: ActiveRunResponders = {
             let mut map = HashMap::default();
-            map.insert(
-                run_id.clone(),
-                Mutex::new(SupervisorResponder::new(server_conn, 1)),
-            );
+            map.insert(run_id.clone(), Mutex::new(()));
             Arc::new(RwLock::new(map))
         };
         let state_cache: RunStateCache = {
@@ -3669,12 +2725,9 @@ mod test {
                 entity,
                 run_id.clone(),
             );
-            let client_exit_fut = client_conn.shutdown();
 
-            let (cancellation_end, client_exit_end) =
-                futures::join!(cancellation_fut, client_exit_fut);
+            let cancellation_end = cancellation_fut.await;
             assert!(cancellation_end.is_ok());
-            assert!(client_exit_end.is_ok());
         }
 
         // Toss the manifest over to the queue. It should be accepted but not cause any deviation
@@ -3737,34 +2790,21 @@ mod test {
 
         let client = client_opts.build_async().unwrap();
 
-        // Register the invoker connection
-        let (client_res, server_res) = futures::join!(
-            client.connect(fake_server_addr),
-            accept_handshake(&*fake_server)
-        );
-        let (mut client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-
         // Build up our initial state - run is registered, no manifest yet
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            queues
-                .create_queue(
-                    run_id.clone(),
-                    one_nonzero(),
-                    INIT_RUN_NUMBER,
-                    DEFAULT_CLIENT_POLL_TIMEOUT,
-                )
-                .unwrap();
-            queues.find_run_for_worker(&run_id, Entity::local_client());
+            let _ = queues.find_or_create_run(
+                &run_id,
+                one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                Entity::local_client(),
+            );
             queues
         };
         let active_runs: ActiveRunResponders = {
             let mut map = HashMap::default();
-            map.insert(
-                run_id.clone(),
-                Mutex::new(SupervisorResponder::new(server_conn, 1)),
-            );
+            map.insert(run_id.clone(), Mutex::new(()));
             Arc::new(RwLock::new(map))
         };
         let state_cache: RunStateCache = {
@@ -3786,12 +2826,9 @@ mod test {
                 entity,
                 run_id.clone(),
             );
-            let client_exit_fut = client_conn.shutdown();
 
-            let (cancellation_end, client_exit_end) =
-                futures::future::join(cancellation_fut, client_exit_fut).await;
+            let cancellation_end = cancellation_fut.await;
             assert!(cancellation_end.is_ok());
-            assert!(client_exit_end.is_ok());
         };
 
         // Toss the manifest over to the queue. It should be accepted but not cause any deviation
@@ -3855,45 +2892,22 @@ mod test {
     #[n_times(1_000)]
     #[with_protocol_version]
     async fn receiving_cancellation_during_last_test_results_is_cancellation() {
-        let server_opts =
-            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
-        let client_opts =
-            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
-
-        let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
-        let fake_server_addr = fake_server.local_addr().unwrap();
-
-        let client = client_opts.build_async().unwrap();
-
-        // Register the initial connection
-        let (client_res, server_res) = futures::join!(
-            client.connect(fake_server_addr),
-            accept_handshake(&*fake_server)
-        );
-        let (mut client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            queues
-                .create_queue(
-                    run_id.clone(),
-                    one_nonzero(),
-                    INIT_RUN_NUMBER,
-                    DEFAULT_CLIENT_POLL_TIMEOUT,
-                )
-                .unwrap();
-            queues.find_run_for_worker(&run_id, Entity::local_client());
+            let _ = queues.find_or_create_run(
+                &run_id,
+                one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                Entity::local_client(),
+            );
             let added = queues.add_manifest(&run_id, vec![], Default::default());
             assert!(matches!(added, AddedManifest::Added { .. }));
             queues
         };
         let active_runs: ActiveRunResponders = {
             let mut map = HashMap::default();
-            map.insert(
-                run_id.clone(),
-                Mutex::new(SupervisorResponder::new(server_conn, 1)),
-            );
+            map.insert(run_id.clone(), Mutex::new(()));
             Arc::new(RwLock::new(map))
         };
         let state_cache: RunStateCache = {
@@ -3924,14 +2938,12 @@ mod test {
             entity,
             run_id.clone(),
         );
-        let client_exit_fut = client_conn.shutdown();
 
-        let (send_last_result_end, cancellation_end, client_exit_end) =
-            futures::join!(send_last_result_fut, cancellation_fut, client_exit_fut);
+        let (send_last_result_end, cancellation_end) =
+            futures::join!(send_last_result_fut, cancellation_fut);
 
         assert!(send_last_result_end.is_ok());
         assert!(cancellation_end.is_ok());
-        assert!(client_exit_end.is_ok());
 
         assert!(matches!(
             queues.get_run_liveness(&run_id).unwrap(),
@@ -3941,91 +2953,6 @@ mod test {
         assert!(!state_cache.lock().contains_key(&run_id));
         assert!(!worker_results_tasks.has_tasks_for(&run_id));
         assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
-    }
-
-    #[test]
-    #[with_protocol_version]
-    fn accept_retirement_request() {
-        use net_protocol::queue;
-
-        let (server_auth, client_auth, admin_auth) = build_random_strategies();
-
-        let (queue_thread, mut queue_shutdown, server_addr) = create_queue_server(server_auth);
-
-        {
-            let admin = ClientOptions::new(admin_auth, ClientTlsStrategy::no_tls())
-                .build()
-                .unwrap();
-            let mut conn = admin.connect(server_addr).unwrap();
-
-            net_protocol::write(
-                &mut conn,
-                queue::Request {
-                    entity: Entity::local_client(),
-                    message: net_protocol::queue::Message::Retire,
-                },
-            )
-            .unwrap();
-            let ack = net_protocol::read(&mut conn).unwrap();
-
-            assert!(matches!(ack, queue::AckRetirement {}));
-            assert!(queue_shutdown.is_retired());
-        }
-
-        // Retirement should now reject new test run connections.
-        {
-            let client = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
-                .build()
-                .unwrap();
-            let mut conn = client.connect(server_addr).unwrap();
-
-            net_protocol::write(
-                &mut conn,
-                queue::Request {
-                    entity: Entity::local_client(),
-                    message: queue::Message::InvokeWork(faux_invoke_work()),
-                },
-            )
-            .unwrap();
-
-            let result: Result<queue::InvokeWorkResponse, _> = net_protocol::read(&mut conn);
-
-            assert!(result.is_err());
-        }
-
-        queue_shutdown.shutdown_immediately().unwrap();
-        queue_thread.join().unwrap();
-    }
-
-    #[test]
-    fn reject_retirement_request_from_non_admin() {
-        use net_protocol::queue;
-
-        let (server_auth, client_auth, _admin_auth) = build_random_strategies();
-
-        let (queue_thread, mut queue_shutdown, server_addr) = create_queue_server(server_auth);
-
-        let non_admin = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
-            .build()
-            .unwrap();
-        let mut conn = non_admin.connect(server_addr).unwrap();
-
-        net_protocol::write(
-            &mut conn,
-            queue::Request {
-                entity: Entity::local_client(),
-                message: net_protocol::queue::Message::Retire,
-            },
-        )
-        .unwrap();
-
-        let result: Result<queue::AckRetirement, _> = net_protocol::read(&mut conn);
-
-        assert!(result.is_err());
-        assert!(!queue_shutdown.is_retired());
-
-        queue_shutdown.shutdown_immediately().unwrap();
-        queue_thread.join().unwrap();
     }
 }
 

@@ -1,6 +1,9 @@
 use thiserror::Error;
 
-use abq_utils::net_protocol::{client::ReportedResult, queue::NativeRunnerInfo};
+use abq_utils::net_protocol::{
+    queue::NativeRunnerInfo,
+    runners::{CapturedOutput, TestResult},
+};
 
 pub mod colors;
 pub mod output;
@@ -21,6 +24,22 @@ pub enum ReportingError {
     FailedToWrite,
     #[error("{0}")]
     Io(#[from] std::io::Error),
+}
+
+pub struct ReportedResult {
+    pub output_before: Option<CapturedOutput>,
+    pub test_result: TestResult,
+    pub output_after: Option<CapturedOutput>,
+}
+
+impl ReportedResult {
+    pub fn no_captures(test_result: TestResult) -> Self {
+        Self {
+            output_before: Default::default(),
+            test_result,
+            output_after: Default::default(),
+        }
+    }
 }
 
 /// A [`Reporter`] defines a way to emit abq test results.

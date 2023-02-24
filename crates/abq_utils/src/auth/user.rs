@@ -1,4 +1,4 @@
-//! Utilities for getting and validating worker/supervisor authz credentials for
+//! Utilities for getting and validating worker authz credentials for
 //! requests to, and accepted by, abq servers.
 
 use core::fmt;
@@ -11,7 +11,7 @@ use super::token::{RawToken, TokenError};
 const USER_DISPLAY_PREFIX: &str = "abqs_";
 
 /// A token representing a "user" role for authz against a server.
-/// A user is an ABQ worker or supervisor, which can communicate freely with an ABQ queue server
+/// A user is an ABQ worker, which can communicate freely with an ABQ queue server
 /// in all regards except admin requests.
 ///
 /// The token is GitHub's model - we take 30 bits from the ASCII alphanumeric alphabet [a, z] U [A, Z] U [0, 9].

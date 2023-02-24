@@ -1,5 +1,3 @@
-mod summary;
-
 use std::{
     fmt::Display,
     io::{self},
@@ -11,18 +9,12 @@ use std::{
 use abq_dot_reporter::DotReporter;
 use abq_line_reporter::LineReporter;
 use abq_progress_reporter::ProgressReporter;
-use abq_queue::invoke::{self};
-use abq_reporting::{colors::ColorProvider, CompletedSummary, ReportingError};
+use abq_reporting::{colors::ColorProvider, CompletedSummary, ReportedResult, ReportingError};
 use abq_reporting::{
     output::{format_short_suite_summary, ShortSummary},
     Reporter,
 };
-use abq_utils::{
-    exit::ExitCode,
-    net_protocol::{
-        client::ReportedResult, queue::TestSpec, runners::TestRuntime, workers::WorkId,
-    },
-};
+use abq_utils::{exit::ExitCode, net_protocol::runners::TestRuntime};
 use indicatif::ProgressDrawTarget;
 use termcolor::{ColorChoice, StandardStream};
 
@@ -293,105 +285,6 @@ pub fn reporter_from_kind(
             path,
             collector: abq_rwx_v1_json::Collector::default(),
         }),
-    }
-}
-
-pub(crate) struct SuiteReporters {
-    reporters: Vec<Box<dyn Reporter>>,
-    overall_tracker: summary::SuiteTracker,
-}
-
-impl SuiteReporters {
-    pub fn new(
-        reporter_kinds: Vec<ReporterKind>,
-        stdout_preferences: StdoutPreferences,
-        test_suite_name: &str,
-        manifest: Vec<TestSpec>,
-    ) -> Self {
-        Self {
-            reporters: reporter_kinds
-                .into_iter()
-                .map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
-                .collect(),
-            overall_tracker: summary::SuiteTracker::new(manifest),
-        }
-    }
-
-    fn push_result(
-        &mut self,
-        work_id: WorkId,
-        run_number: u32,
-        result: &ReportedResult,
-    ) -> Result<(), Vec<ReportingError>> {
-        let errors: Vec<_> = self
-            .reporters
-            .iter_mut()
-            .filter_map(|reporter| reporter.push_result(run_number, result).err())
-            .collect();
-
-        self.overall_tracker
-            .account_result(work_id, run_number, &result.test_result);
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    fn do_tick(&mut self) {
-        self.reporters
-            .iter_mut()
-            .for_each(|reporter| reporter.tick());
-    }
-
-    pub fn after_all_results(&mut self) {
-        self.reporters
-            .iter_mut()
-            .for_each(|reporter| reporter.after_all_results());
-    }
-
-    pub fn finish(self, summary: &CompletedSummary) -> (SuiteResult, Vec<ReportingError>) {
-        let Self {
-            reporters,
-            overall_tracker,
-        } = self;
-
-        let overall_result = overall_tracker.suite_result();
-
-        let errors: Vec<_> = reporters
-            .into_iter()
-            .filter_map(|reporter| reporter.finish(summary).err())
-            .collect();
-
-        (overall_result, errors)
-    }
-}
-
-impl invoke::ResultHandler for SuiteReporters {
-    type InitData = (Vec<ReporterKind>, StdoutPreferences, String);
-
-    fn create(manifest: Vec<TestSpec>, init: Self::InitData) -> Self {
-        let (reporter_kinds, stdout_preferences, test_suite_name) = init;
-        Self::new(
-            reporter_kinds,
-            stdout_preferences,
-            &test_suite_name,
-            manifest,
-        )
-    }
-
-    fn on_result(&mut self, work_id: WorkId, run_number: u32, result: ReportedResult) {
-        // TODO: is there a reasonable way to surface the error?
-        let _opt_error = self.push_result(work_id, run_number, &result);
-    }
-
-    fn get_exit_code(&self) -> ExitCode {
-        self.overall_tracker.exit_code()
-    }
-
-    fn tick(&mut self) {
-        self.do_tick()
     }
 }
 

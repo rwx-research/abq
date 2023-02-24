@@ -1,4 +1,3 @@
-// NB(ayaz): this is duplicated for the supervisor currently. Get rid of that one soon.
 // NB(ayaz): i think i want to rip this out and move it one level lower, to happen in the
 // individual workers. We probably will need a mutex over writing retry entries and fetching the
 // retry manifest for each worker, and moreover there is no reason all workers need to synchronize
