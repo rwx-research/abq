@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use abq_native_runner_simulation::pack_msgs_to_disk;
 use abq_queue::{
     queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT},
     timeout::{RunTimeoutStrategy, TimeoutReason},
@@ -150,11 +151,10 @@ fn native_runner_simulation_bin() -> String {
 type GetConn<'a> = &'a dyn Fn() -> Box<dyn ClientStream>;
 
 enum Action {
-    CancelTest(Run),
-
     // TODO: consolidate start/stop workers by making worker pools async by default
     StartWorkers(Run, Wid, WorkersConfigBuilder),
     StopWorkers(Wid),
+    CancelWorkers(Wid),
 
     /// Make a connection to the work server, the callback will test a request.
     WSRunRequest(Run, Box<dyn Fn(GetConn, RunId) + Send + Sync>),
@@ -254,8 +254,6 @@ fn action_to_fut(
     }
 
     match action {
-        CancelTest(_n) => async move { todo!() }.boxed(),
-
         StartWorkers(n, worker_id, workers_config_builder) => {
             let run_id = get_run_id!(n);
             let run_results = get_run_results!(n);
@@ -309,6 +307,18 @@ fn action_to_fut(
                     Err(_) => WorkersExitKind::Panic,
                 };
             worker_exit_kinds.lock().insert(n, workers_result);
+        }
+        .boxed(),
+
+        CancelWorkers(worker_id) => async move {
+            let worker_pool = workers.lock().await.remove(&worker_id).unwrap();
+
+            let workers_result =
+                match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.cancel())) {
+                    Ok(exit) => WorkersExitKind::Exit(exit),
+                    Err(_) => WorkersExitKind::Panic,
+                };
+            worker_exit_kinds.lock().insert(worker_id, workers_result);
         }
         .boxed(),
 
@@ -728,7 +738,7 @@ fn get_init_context_from_work_server_active() {
                             assert_eq!(init_meta, expected_init_meta);
                             return;
                         }
-                        InitContextResponse::RunAlreadyCompleted => unreachable!(),
+                        InitContextResponse::RunAlreadyCompleted { .. } => unreachable!(),
                     }
                 }
             }),
@@ -780,9 +790,10 @@ fn get_init_context_after_run_already_completed() {
 
                 let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
 
-                dbg!(&response);
-
-                assert!(matches!(response, InitContextResponse::RunAlreadyCompleted));
+                assert!(matches!(
+                    response,
+                    InitContextResponse::RunAlreadyCompleted { cancelled: false }
+                ));
             }),
         )])
         .test();
@@ -844,7 +855,6 @@ fn getting_run_after_work_is_complete_returns_nothing() {
 
 #[test]
 #[with_protocol_version]
-#[ignore = "TODO(1.3) implement cancel in new model"]
 fn test_cancellation_drops_remaining_work() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
@@ -862,7 +872,7 @@ fn test_cancellation_drops_remaining_work() {
             WorkersConfigBuilder::new(1, runner.clone()),
         )])
         .step(
-            [CancelTest(Run(1)), StopWorkers(Wid(1))],
+            [CancelWorkers(Wid(1))],
             [WorkerExitStatus(
                 Wid(1),
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
@@ -870,13 +880,13 @@ fn test_cancellation_drops_remaining_work() {
         )
         .act([StartWorkers(
             Run(1),
-            Wid(1),
+            Wid(2),
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [StopWorkers(Wid(2))],
             [WorkerExitStatus(
-                Wid(1),
+                Wid(2),
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
             )],
         )
@@ -1286,5 +1296,90 @@ fn many_retries_many_workers_complete_native() {
             })],
         )
         .act(end_workers_actions)
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+#[timeout(2000)] // 2 seconds
+fn cancellation_native() {
+    use abq_native_runner_simulation::{legal_spawned_message, pack, Msg::*};
+
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1".to_string()),
+            echo_test(proto, "echo2".to_string()),
+            echo_test(proto, "echo3".to_string()),
+            echo_test(proto, "echo4".to_string()),
+        ],
+        Default::default(),
+    ));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![
+                OpaqueWrite(pack(&manifest)),
+                Stdout(b"hello from manifest stdout".to_vec()),
+                Stderr(b"hello from manifest stderr".to_vec()),
+            ],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                //
+                // Sleep forever
+                Sleep(Duration::from_secs(600)),
+            ],
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+    let simulation = pack_msgs_to_disk(simulation);
+
+    let runner = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+        cmd: native_runner_simulation_bin(),
+        args: vec![simulation.path.display().to_string()],
+        extra_env: Default::default(),
+    });
+
+    TestBuilder::default()
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner.clone()),
+        )])
+        .step(
+            [CancelWorkers(Wid(1))],
+            [
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+                ),
+                TestResults(Run(1), &|results| results.is_empty()),
+            ],
+        )
+        // A second pair of workers must also be cancelled.
+        .act([StartWorkers(
+            Run(1),
+            Wid(2),
+            WorkersConfigBuilder::new(1, runner),
+        )])
+        .step(
+            [StopWorkers(Wid(2))],
+            [WorkerExitStatus(
+                Wid(2),
+                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+            )],
+        )
         .test();
 }

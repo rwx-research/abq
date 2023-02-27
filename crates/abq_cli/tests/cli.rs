@@ -2,8 +2,12 @@
 // For convenience in tests.
 #![allow(clippy::useless_format)]
 
+use abq_native_runner_simulation::{pack, pack_msgs, pack_msgs_to_disk, Msg::*};
 use abq_test_utils::{artifacts_dir, sanitize_output, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
+use abq_utils::net_protocol::runners::{
+    AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, Status, Test, TestOrGroup,
+};
 use abq_utils::net_protocol::runners::{
     NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
 };
@@ -12,6 +16,7 @@ use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
 use std::process::{ExitStatus, Output};
+use std::time::Duration;
 use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -152,7 +157,7 @@ impl Abq {
 
         cmd.envs(env);
 
-        if debug_log_for_local_run() {
+        if debug_log_for_local_run() && name.contains("_queue") {
             cmd.env("ABQ_LOGFILE", format!("{name}.debug"));
             cmd.env("ABQ_LOG", "abq=debug");
         }
@@ -497,97 +502,6 @@ test_all_network_config_options! {
         assert!(worker1_stdout.contains("0 failures"), "STDOUT:\n{worker1_stdout}");
 
         assert_sum_of_run_tests([&worker0_output.stdout, worker1_stdout.as_ref()], 2);
-
-        term_queue(queue_proc);
-    }
-}
-
-test_all_network_config_options! {
-    #[cfg(feature = "test-abq-jest")]
-    #[ignore = "TODO(1.3-cancellation): this test correctly tests that the worker dies on cancellation, but we want to see that for long-lived tests, cancelling a worker cancels the whole run, and subsequent workers exit with a cancel signal."]
-    yarn_jest_cancel_run_before_workers |name, conf: CSConfigOptions| {
-        let server_port = find_free_port();
-        let worker_port = find_free_port();
-        let negotiator_port = find_free_port();
-
-        let queue_addr = format!("0.0.0.0:{server_port}");
-        let run_id = RunId::unique().to_string();
-
-        let npm_jest_project_path = testdata_project("jest/npm-jest-project");
-
-        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = Abq::new(name)
-            .args(conf.extend_args_for_start(vec![
-                format!("start"),
-                format!("--bind=0.0.0.0"),
-                format!("--port={server_port}"),
-                format!("--work-port={worker_port}"),
-                format!("--negotiator-port={negotiator_port}"),
-            ]))
-            .spawn();
-
-        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to start") {
-                    break;
-                }
-            }
-        }
-
-        let working_dir = npm_jest_project_path.display();
-
-        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
-        let test_args = |worker: usize| {
-            let args = vec![
-                format!("test"),
-                format!("--worker={worker}"),
-                format!("--reporter=dot"),
-                format!("--queue-addr={queue_addr}"),
-                format!("--working-dir={working_dir}"),
-                format!("--run-id={run_id}"),
-                format!("--num=cpu-cores"),
-            ];
-            let mut args = conf.extend_args_for_client(args);
-            args.extend([s!("--"), s!("yarn"), s!("jest")]);
-            args
-        };
-
-        let mut worker0 = Abq::new(name.to_string() + "_test0").args(test_args(0)).spawn();
-
-        let worker0_stderr = worker0.stderr.as_mut().unwrap();
-        let mut worker0_reader = BufReader::new(worker0_stderr).lines();
-        // Spin until we know the worker0 is UP
-        loop {
-            if let Some(line) = worker0_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Generic test runner for") {
-                    break;
-                }
-            }
-        }
-
-        use nix::sys::signal;
-        use nix::unistd::Pid;
-
-        // SIGTERM the worker0.
-        signal::kill(Pid::from_raw(worker0.id() as _), signal::Signal::SIGTERM).unwrap();
-
-        let worker0_exit = worker0.wait().unwrap();
-        assert!(!worker0_exit.success());
-
-        // --worker 1
-        let CmdOutput {
-            stdout,
-            stderr,
-            exit_status,
-        } = Abq::new(name.to_string() + "_test1").args(test_args(1)).run();
-
-        // The worker should exit with a failure as well.
-        assert!(!exit_status.success(), "EXIT:\n{:?}\nSTDOUT:\n{}\nSTDERR:\n{}", exit_status, stdout, stderr);
 
         term_queue(queue_proc);
     }
@@ -1436,13 +1350,6 @@ fn retries_smoke() {
         }
     }
 
-    // Create a simulation test run to launch a worker with.
-    use abq_native_runner_simulation::{pack, pack_msgs, Msg::*};
-    use abq_utils::net_protocol::runners::{
-        AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, Status, Test,
-        TestOrGroup,
-    };
-
     let mut manifest = vec![];
 
     for t in 1..=num_tests {
@@ -1548,4 +1455,139 @@ fn retries_smoke() {
     assert!(at_least_one_is_failing);
 
     term_queue(queue_proc);
+}
+
+test_all_network_config_options! {
+    cancellation_of_active_run_for_workers |name, conf: CSConfigOptions| {
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+        let run_id = RunId::unique().to_string();
+
+        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
+        let mut queue_proc = Abq::new(name.to_string() + "_queue")
+            .args(conf.extend_args_for_start(vec![
+                format!("start"),
+                format!("--bind=0.0.0.0"),
+                format!("--port={server_port}"),
+                format!("--work-port={worker_port}"),
+                format!("--negotiator-port={negotiator_port}"),
+            ]))
+            .spawn();
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to start") {
+                    break;
+                }
+            }
+        }
+
+        let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+        // Build a simulation that consists of one test, which hangs.
+        let manifest = vec![TestOrGroup::test(Test::new(
+            proto,
+            "test1".to_string(),
+            [],
+            Default::default(),
+        ))];
+        let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+        let simulation = |hang: bool| [
+            Connect,
+            //
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            //
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![OpaqueWrite(pack(&manifest))],
+                else_do: if hang {
+                    vec![
+                        //
+                        // Read init context message + write ACK
+                        OpaqueRead,
+                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                        //
+                        // Sleep forever
+                        Sleep(Duration::from_secs(600)),
+                    ]
+                } else {
+                    // On the second launch, we should fast-exit.
+                    vec![
+                        //
+                        // Read init context message + write ACK
+                        Exit(1)
+                    ]
+                }
+            },
+            //
+            // Finish
+            Exit(0),
+        ];
+
+        let simulation = [pack_msgs_to_disk(simulation(true)), pack_msgs_to_disk(simulation(false))];
+
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        let test_args = |worker: usize| {
+            let simulator = native_runner_simulation_bin();
+            let simulation = &simulation[worker];
+            let simfile_path = simulation.path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("--num=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        };
+
+        let mut worker0 = Abq::new(name.to_string() + "_test0").args(test_args(0)).spawn();
+
+        let worker0_stderr = std::mem::take(&mut worker0.stderr).unwrap();
+        let mut worker0_reader = BufReader::new(worker0_stderr).lines();
+        // Spin until we know the worker0 is UP
+        loop {
+            if let Some(line) = worker0_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Generic test runner for") {
+                    break;
+                }
+            }
+        }
+
+        use nix::sys::signal;
+        use nix::unistd::Pid;
+
+        // SIGTERM the worker0.
+        signal::kill(Pid::from_raw(worker0.id() as _), signal::Signal::SIGTERM).unwrap();
+
+        let worker0_exit = worker0.wait().unwrap();
+        assert!(!worker0_exit.success());
+        assert_eq!(worker0_exit.code(), Some(1));
+
+        // A second worker should exit immediately with cancellation as well.
+        // --worker 1
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_test1").args(test_args(1)).run();
+
+        assert_eq!(exit_status.code().unwrap(), 1, "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+
+        term_queue(queue_proc);
+    }
 }

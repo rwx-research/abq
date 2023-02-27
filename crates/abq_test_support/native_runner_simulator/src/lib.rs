@@ -11,9 +11,11 @@ use serde_derive::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     io::{self, Write},
+    path::PathBuf,
     process,
     time::Duration,
 };
+use tempfile::TempPath;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
 pub fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessage {
@@ -60,6 +62,22 @@ pub fn pack<S: serde::Serialize>(v: S) -> serde_json::Value {
 pub fn pack_msgs(msgs: impl IntoIterator<Item = Msg>) -> String {
     let msgs: Vec<Msg> = msgs.into_iter().collect();
     serde_json::to_string(&msgs).unwrap()
+}
+
+pub struct PackedFile {
+    _tmpfile: TempPath,
+    pub path: PathBuf,
+}
+
+pub fn pack_msgs_to_disk(msgs: impl IntoIterator<Item = Msg>) -> PackedFile {
+    let simulation_msg = pack_msgs(msgs);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+    PackedFile {
+        _tmpfile: simfile,
+        path: simfile_path,
+    }
 }
 
 pub fn read_msgs(pack: &str) -> Vec<Msg> {

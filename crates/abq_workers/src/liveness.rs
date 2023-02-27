@@ -34,9 +34,9 @@ impl LiveCount {
                     }
                 }
 
-                tx_all_completed
-                    .send(())
-                    .expect("rx_all_completed dropped before handler joined");
+                // NB: the all-completed receiver can be dropped without being awaited; as such, if
+                // there is an error here, swallow it.
+                let _ = tx_all_completed.send(());
             })
         };
 

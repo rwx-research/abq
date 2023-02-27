@@ -40,6 +40,8 @@ pub type GetInitContext =
     Arc<dyn Fn(Entity) -> io::Result<InitContextResult> + Send + Sync + 'static>;
 pub type NotifyManifest = Box<dyn Fn(Entity, &RunId, ManifestResult) + Send + Sync + 'static>;
 
+pub type NotifyCancellation = Box<dyn FnOnce() + Send + Sync + 'static>;
+
 pub type NotifyMaterialTestsAllRun = abq_generic_test_runner::NotifyMaterialTestsAllRun;
 pub type NotifyMaterialTestsAllRunGenerator<'a> =
     &'a (dyn Fn() -> NotifyMaterialTestsAllRun + Send + Sync);
@@ -83,6 +85,8 @@ pub struct WorkerPoolConfig<'a> {
     pub results_handler_generator: ResultsHandlerGenerator<'a>,
     /// How should a runner notify the queue it's run all assigned tests.
     pub notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
+    /// How should the workers notify cancellation.
+    pub notify_cancellation: NotifyCancellation,
     /// How many results should be sent back at a time?
     pub results_batch_size_hint: u64,
     /// Context under which workers should operate.
@@ -108,6 +112,8 @@ pub struct WorkerPool {
     /// `None` if shutdown has already been called.
     runners_shutdown: Option<Vec<OneshotTx>>,
     live_count: LiveCount,
+
+    notify_cancellation: Option<NotifyCancellation>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -124,6 +130,7 @@ impl WorkersExitStatus {
 }
 
 #[derive(Debug)]
+#[must_use]
 pub struct WorkersExit {
     pub status: WorkersExitStatus,
     pub native_runner_info: Option<NativeRunnerInfo>,
@@ -146,6 +153,7 @@ impl WorkerPool {
             results_handler_generator,
             notify_manifest,
             notify_all_tests_run_generator,
+            notify_cancellation,
             worker_context,
             debug_native_runner,
         } = config;
@@ -257,6 +265,7 @@ impl WorkerPool {
             runners,
             runners_shutdown: Some(runners_shutdown),
             live_count,
+            notify_cancellation: Some(notify_cancellation),
         }
     }
 
@@ -270,8 +279,15 @@ impl WorkerPool {
         self.live_count.read() > 0
     }
 
+    pub fn cancel(mut self) -> WorkersExit {
+        let notify_cancellation = std::mem::take(&mut self.notify_cancellation)
+            .expect("illegal state - cannot cancel more than once");
+        notify_cancellation();
+
+        self.shutdown()
+    }
+
     /// Shuts down the worker pool, returning the pool [exit status][WorkersExit].
-    #[must_use]
     pub fn shutdown(&mut self) -> WorkersExit {
         debug_assert!(self.active);
 
@@ -572,9 +588,15 @@ fn start_test_like_runner(
     let init_context = match get_init_context(entity) {
         Ok(context_result) => match context_result {
             Ok(ctx) => ctx,
-            Err(RunAlreadyCompleted {}) => {
+            Err(RunAlreadyCompleted { cancelled }) => {
+                let exit_code = if cancelled {
+                    ExitCode::CANCELLED
+                } else {
+                    ExitCode::SUCCESS
+                };
+
                 return Ok(TestRunnerExit {
-                    exit_code: ExitCode::SUCCESS,
+                    exit_code,
                     manifest_generation_output: None,
                     final_captured_output: CapturedOutput::empty(),
                     native_runner_info: None,
@@ -837,7 +859,7 @@ mod test {
     use tracing_test::traced_test;
 
     use super::{
-        GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyManifest,
+        GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyCancellation, NotifyManifest,
         NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, TestsFetcher, WorkerContext,
         WorkerPool,
     };
@@ -956,6 +978,7 @@ mod test {
         get_next_tests_generator: GetNextTestsGenerator<'a>,
         results_handler_generator: ResultsHandlerGenerator<'a>,
         notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
+        notify_cancellation: NotifyCancellation,
     ) -> (WorkerPoolConfig<'a>, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
 
@@ -969,6 +992,7 @@ mod test {
             runner_kind,
             run_id,
             notify_manifest: Some(notify_manifest),
+            notify_cancellation,
             results_handler_generator,
             notify_all_tests_run_generator,
             worker_context: WorkerContext::AssumeLocal,
@@ -1019,6 +1043,10 @@ mod test {
         }
     }
 
+    fn noop_notify_cancellation() -> NotifyCancellation {
+        Box::new(|| {})
+    }
+
     async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
         let (write_work, get_next_tests) = work_writer();
         let (results, results_handler_generator) = results_collector();
@@ -1041,6 +1069,7 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
+            noop_notify_cancellation(),
         );
 
         let config = WorkerPoolConfig {
@@ -1305,6 +1334,7 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
+            noop_notify_cancellation(),
         );
 
         let mut pool = WorkerPool::new(default_config).await;
@@ -1339,6 +1369,7 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
+            noop_notify_cancellation(),
         );
 
         config.size = NonZeroUsize::new(5).unwrap();
@@ -1373,6 +1404,7 @@ mod test {
             &get_next_tests,
             &results_handler_generator,
             &notify_all_tests_run_generator,
+            noop_notify_cancellation(),
         );
 
         config.size = NonZeroUsize::new(1).unwrap();

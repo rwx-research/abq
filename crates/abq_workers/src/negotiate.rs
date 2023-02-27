@@ -18,9 +18,9 @@ use crate::{
     negotiate, persistent_test_fetcher,
     results_handler::{MultiplexingResultsHandler, QueueResultsSender, ResultsHandlerGenerator},
     workers::{
-        GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyManifest,
-        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, WorkerContext, WorkerPool,
-        WorkerPoolConfig, WorkersExit, WorkersExitStatus,
+        GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyCancellation,
+        NotifyManifest, NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator,
+        WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
     },
 };
 use abq_utils::{
@@ -146,6 +146,18 @@ impl NegotiatedWorkers {
                 native_runner_info: None,
             },
             NegotiatedWorkers::Pool(pool) => pool.shutdown(),
+        }
+    }
+
+    pub fn cancel(self) -> WorkersExit {
+        match self {
+            NegotiatedWorkers::Redundant { exit_code } => WorkersExit {
+                status: WorkersExitStatus::Completed(exit_code),
+                manifest_generation_output: None,
+                final_captured_outputs: Default::default(),
+                native_runner_info: None,
+            },
+            NegotiatedWorkers::Pool(pool) => pool.cancel(),
         }
     }
 
@@ -358,6 +370,12 @@ impl WorkersNegotiator {
             }
         };
 
+        let notify_cancellation: NotifyCancellation = Box::new({
+            let client = client.boxed_clone();
+            let run_id = run_id.clone();
+            move || notify_cancellation(queue_results_addr, &*client, first_runner_entity, run_id)
+        });
+
         let pool_config = WorkerPoolConfig {
             size: num_workers,
             tag,
@@ -371,6 +389,7 @@ impl WorkersNegotiator {
             worker_context,
             run_id,
             notify_manifest,
+            notify_cancellation,
             debug_native_runner,
         };
 
@@ -380,6 +399,32 @@ impl WorkersNegotiator {
 
         Ok(NegotiatedWorkers::Pool(pool))
     }
+}
+
+fn notify_cancellation(
+    queue_addr: SocketAddr,
+    client: &dyn net::ConfiguredClient,
+    entity: Entity,
+    run_id: RunId,
+) {
+    let mut stream = retry_n(5, Duration::from_secs(3), |attempt| {
+        if attempt > 1 {
+            tracing::info!(
+                "reattempting connection to queue for cancellation {}",
+                attempt
+            );
+        }
+        client.connect(queue_addr)
+    })
+    .expect("queue server not available");
+
+    let message = net_protocol::queue::Request {
+        entity,
+        message: net_protocol::queue::Message::CancelRun(run_id),
+    };
+
+    net_protocol::write(&mut stream, &message).unwrap();
+    let net_protocol::queue::AckTestCancellation {} = net_protocol::read(&mut stream).unwrap();
 }
 
 /// Waits to receive worker execution context from a queue negotiator.
@@ -469,7 +514,9 @@ fn wait_for_init_context(
                 continue;
             }
             InitContextResponse::InitContext(init_context) => return Ok(Ok(init_context)),
-            InitContextResponse::RunAlreadyCompleted => return Ok(Err(RunAlreadyCompleted {})),
+            InitContextResponse::RunAlreadyCompleted { cancelled } => {
+                return Ok(Err(RunAlreadyCompleted { cancelled }))
+            }
         }
     }
 }

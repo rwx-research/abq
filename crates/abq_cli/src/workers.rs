@@ -77,6 +77,8 @@ async fn start_standalone_help(
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
 ) -> ! {
+    let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
+
     let context = WorkerContext::AlwaysWorkIn { working_dir };
 
     let (reporting_proxy, reporting_handle) = create_reporting_task(reporters);
@@ -113,8 +115,6 @@ async fn start_standalone_help(
 
     tracing::debug!("Workers attached");
 
-    let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
-
     // Shut down the pool when
     //   - all its workers are done
     //   - we get a signal to shutdown
@@ -124,8 +124,7 @@ async fn start_standalone_help(
                 do_shutdown(worker_pool, reporting_handle, stdout_preferences).await;
             }
             _ = term_signals.next() => {
-                // Shutdown immediately
-                do_forceful_shutdown(worker_pool);
+                do_cancellation_shutdown(worker_pool);
             }
         }
     }
@@ -182,8 +181,17 @@ async fn do_shutdown(
     std::process::exit(exit_code.get());
 }
 
-fn do_forceful_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
-    worker_pool.shutdown();
+fn do_cancellation_shutdown(worker_pool: NegotiatedWorkers) -> ! {
+    let WorkersExit {
+        status: _,
+        native_runner_info: _,
+        manifest_generation_output: _,
+        final_captured_outputs,
+    } = worker_pool.cancel();
+
+    tracing::debug!("Workers cancelled");
+
+    print_final_runner_outputs(final_captured_outputs);
 
     std::process::exit(ExitCode::CANCELLED.get());
 }

@@ -197,7 +197,7 @@ enum RunLive {
 enum InitMetadata {
     Metadata(MetadataMap),
     WaitingForManifest,
-    RunAlreadyCompleted,
+    RunAlreadyCompleted { cancelled: bool },
 }
 
 /// What is the state of the queue of tests for a run after some bundle of tests have been pulled?
@@ -447,7 +447,8 @@ impl AllRuns {
             RunState::HasWork { init_metadata, .. } => {
                 InitMetadata::Metadata(init_metadata.clone())
             }
-            RunState::Done { .. } | RunState::Cancelled { .. } => InitMetadata::RunAlreadyCompleted,
+            RunState::Done { .. } => InitMetadata::RunAlreadyCompleted { cancelled: false },
+            RunState::Cancelled { .. } => InitMetadata::RunAlreadyCompleted { cancelled: true },
         }
     }
 
@@ -2014,7 +2015,9 @@ impl WorkScheduler {
                     InitMetadata::Metadata(init_meta) => {
                         InitContextResponse::InitContext(InitContext { init_meta })
                     }
-                    InitMetadata::RunAlreadyCompleted => InitContextResponse::RunAlreadyCompleted,
+                    InitMetadata::RunAlreadyCompleted { cancelled } => {
+                        InitContextResponse::RunAlreadyCompleted { cancelled }
+                    }
                     InitMetadata::WaitingForManifest => InitContextResponse::WaitingForManifest,
                 };
 

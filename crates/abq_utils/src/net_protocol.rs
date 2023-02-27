@@ -450,7 +450,9 @@ pub mod queue {
     /// A marker that a test run has already completed.
     #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
     #[serde(tag = "type")]
-    pub struct RunAlreadyCompleted {}
+    pub struct RunAlreadyCompleted {
+        pub cancelled: bool,
+    }
 
     /// An ask to run some work by an invoker.
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -634,7 +636,10 @@ pub mod work_server {
         WaitingForManifest,
         InitContext(InitContext),
         /// The run is already done, the worker can exit.
-        RunAlreadyCompleted,
+        RunAlreadyCompleted {
+            /// Was the run cancelled?
+            cancelled: bool,
+        },
     }
 
     /// An ask to get the next test for a particular run from the queue.

@@ -804,10 +804,13 @@ where
                     .send_init_message(&init_context)
                     .await?;
             }
-            Err(RunAlreadyCompleted {}) => {
+            Err(RunAlreadyCompleted { cancelled }) => {
                 // There is nothing more for the native runner to do, so we tell it to
                 // fast-exit and wait for it to terminate.
-                let exit_code = native_runner_handle.send_fast_exit_message().await?;
+                let mut exit_code = native_runner_handle.send_fast_exit_message().await?;
+                if cancelled {
+                    exit_code = exit_code.max(ExitCode::CANCELLED);
+                }
                 return Ok(exit_code);
             }
         };
@@ -1845,7 +1848,7 @@ mod test_abq_jest {
             extra_env: Default::default(),
         };
 
-        let get_init_context = || Ok(Err(RunAlreadyCompleted {}));
+        let get_init_context = || Ok(Err(RunAlreadyCompleted { cancelled: false }));
         let get_next_test = ImmediateTests {
             tests: vec![NextWorkBundle::new(vec![NextWork::Work(WorkerTest {
                 spec: TestSpec {
