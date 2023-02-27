@@ -28,7 +28,7 @@ use abq_utils::net_protocol::{
     workers::{NextWork, RunId},
 };
 use abq_utils::net_protocol::{meta, publicize_addr};
-use abq_utils::shutdown::{ShutdownManager, ShutdownReceiver};
+use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::{atomic, log_assert};
 use abq_workers::negotiate::{
@@ -2173,7 +2173,7 @@ mod test {
             work_server,
             workers::{RunId, WorkId},
         },
-        shutdown::ShutdownManager,
+        server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;

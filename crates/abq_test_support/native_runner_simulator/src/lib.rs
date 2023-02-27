@@ -12,6 +12,7 @@ use std::{
     collections::VecDeque,
     io::{self, Write},
     process,
+    time::Duration,
 };
 use tokio::{io::AsyncWriteExt, net::TcpStream};
 
@@ -38,6 +39,7 @@ pub enum Msg {
     OpaqueRead,
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
+    Sleep(Duration),
     IfGenerateManifest {
         then_do: Vec<Msg>,
         else_do: Vec<Msg>,
@@ -97,6 +99,9 @@ pub async fn run_simulation(msgs: impl IntoIterator<Item = Msg>) {
             Msg::Stderr(bytes) => {
                 io::stderr().write_all(&bytes).unwrap();
                 io::stderr().flush().unwrap();
+            }
+            Msg::Sleep(duration) => {
+                tokio::time::sleep(duration).await;
             }
             Msg::IfGenerateManifest { then_do, else_do } => {
                 let extension = if std::env::var(ABQ_GENERATE_MANIFEST).as_deref() == Ok("1") {

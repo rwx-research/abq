@@ -37,16 +37,14 @@ impl SideChannel {
         channel.buf.clone()
     }
 
-    #[cfg(test)]
-    fn read(&self) -> Vec<u8> {
-        let mut channel = self.0.lock();
-        channel.buf.clone()
-    }
-
     /// Consumes the side channel and returns all remaining output.
     /// Returns an error if the side channel is not exclusively referenced.
-    pub fn finish(self) -> Result<Vec<u8>, Self> {
-        let channel = Arc::try_unwrap(self.0).map_err(Self)?;
+    ///
+    /// It is an error to call `finish` twice. However, `finish` does not take ownership because we
+    /// often spawn multiple sidechannels in the same memory location.
+    pub fn finish(&mut self) -> Result<Vec<u8>, Self> {
+        let channel = std::mem::take(&mut self.0);
+        let channel = Arc::try_unwrap(channel).map_err(Self)?;
         let channel = Mutex::into_inner(channel);
         Ok(channel.buf)
     }
@@ -229,7 +227,7 @@ mod test {
         {
             inc.push_buf(&[1, 2, 3]);
             inc.push_buf(&[4, 5, 6]);
-            wait_until(|| side_channel.read().ends_with(&[6])).await;
+            wait_until(|| side_channel.get_captured_ref().ends_with(&[6])).await;
 
             assert_eq!(side_channel.get_captured(), &[1, 2, 3, 4, 5, 6]);
         }
@@ -243,20 +241,20 @@ mod test {
         let inc = IncrementalReader::default();
         let OutputCapturer {
             copied_all_output,
-            side_channel,
+            mut side_channel,
             _witness,
         } = capture_output(inc.clone());
 
         // First write - should end up in Capture 1
         {
             inc.push_buf(&[1, 2, 3]);
-            wait_until(|| side_channel.read().ends_with(&[3])).await;
+            wait_until(|| side_channel.get_captured_ref().ends_with(&[3])).await;
         }
 
         // Capture 1
         {
             inc.push_buf(&[4, 5, 6]);
-            wait_until(|| side_channel.read().ends_with(&[6])).await;
+            wait_until(|| side_channel.get_captured_ref().ends_with(&[6])).await;
 
             assert_eq!(side_channel.get_captured(), &[1, 2, 3, 4, 5, 6]);
         }
@@ -264,13 +262,13 @@ mod test {
         // write - should end up in Capture 2
         {
             inc.push_buf(&[7, 8, 9]);
-            wait_until(|| side_channel.read().ends_with(&[9])).await;
+            wait_until(|| side_channel.get_captured_ref().ends_with(&[9])).await;
         }
 
         // Capture 2
         {
             inc.push_buf(&[10, 11, 12]);
-            wait_until(|| side_channel.read().ends_with(&[12])).await;
+            wait_until(|| side_channel.get_captured_ref().ends_with(&[12])).await;
 
             assert_eq!(side_channel.get_captured(), &[7, 8, 9, 10, 11, 12]);
         }
@@ -278,7 +276,7 @@ mod test {
         // After all above captures - should be resolved on finish
         {
             inc.push_buf(&[13, 14, 15]);
-            wait_until(|| side_channel.read().ends_with(&[15])).await;
+            wait_until(|| side_channel.get_captured_ref().ends_with(&[15])).await;
         }
 
         inc.finish();

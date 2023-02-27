@@ -8,9 +8,10 @@ pub mod net;
 pub mod net_async;
 pub mod net_opt;
 pub mod net_protocol;
+pub mod oneshot_notify;
 pub mod results_handler;
 pub mod retry;
-pub mod shutdown;
+pub mod server_shutdown;
 pub mod tls;
 pub mod vec_map;
 

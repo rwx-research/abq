@@ -2,11 +2,11 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::panic;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 use std::{sync::mpsc, thread};
 
-use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, GenericTestRunner};
+use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind};
 use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{self, Entity, RunnerMeta, WorkerRunner, WorkerTag};
@@ -22,17 +22,12 @@ use abq_utils::net_protocol::workers::{
     ManifestResult, NativeTestRunnerParams, ReportedManifest, TestLikeRunner, WorkerTest,
 };
 use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind};
+use abq_utils::oneshot_notify::{self, OneshotRx, OneshotTx};
 use abq_utils::results_handler::ResultsHandler;
 
 use crate::liveness::LiveCount;
 use crate::results_handler::ResultsHandlerGenerator;
 use crate::test_like_runner;
-
-enum MessageFromPool {
-    Shutdown,
-}
-
-type MessageFromPoolRx = Arc<Mutex<mpsc::Receiver<MessageFromPool>>>;
 
 pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 
@@ -109,7 +104,9 @@ pub struct WorkerPoolConfig<'a> {
 pub struct WorkerPool {
     active: bool,
     runners: Vec<(RunnerMeta, ThreadWorker)>,
-    worker_msg_tx: mpsc::Sender<MessageFromPool>,
+    /// Transmitters of immediate-shutdown signals to each runner.
+    /// `None` if shutdown has already been called.
+    runners_shutdown: Option<Vec<OneshotTx>>,
     live_count: LiveCount,
 }
 
@@ -159,8 +156,7 @@ impl WorkerPool {
         let (live_count, signal_completed) = LiveCount::new(num_workers).await;
         tracing::debug!(live_count=?live_count.read(), ?results_batch_size, ?run_id, "Starting worker pool");
 
-        let (worker_msg_tx, worker_msg_rx) = mpsc::channel();
-        let shared_worker_msg_rx = Arc::new(Mutex::new(worker_msg_rx));
+        let mut runners_shutdown = Vec::with_capacity(num_workers);
 
         let mark_worker_complete = || {
             let signal_completed = signal_completed.clone();
@@ -176,7 +172,9 @@ impl WorkerPool {
             // Provision the first worker independently, so that if we need to generate a manifest,
             // only it gets the manifest notifier.
             // TODO: consider hiding this behind a macro for code duplication purposes
-            let msg_rx = Arc::clone(&shared_worker_msg_rx);
+            let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+            runners_shutdown.push(shutdown_tx);
+
             let get_init_context = Arc::clone(&get_init_context);
             let mark_worker_complete = mark_worker_complete();
 
@@ -189,7 +187,7 @@ impl WorkerPool {
             let worker_env = RunnerEnv {
                 entity,
                 runner_meta,
-                msg_from_pool_rx: msg_rx,
+                shutdown_immediately: shutdown_rx,
                 run_id: run_id.clone(),
                 get_init_context,
                 tests_fetcher: get_next_tests_generator(entity),
@@ -215,7 +213,9 @@ impl WorkerPool {
 
         // Provision the rest of the workers.
         for runner_id in 1..num_workers {
-            let msg_rx = Arc::clone(&shared_worker_msg_rx);
+            let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+            runners_shutdown.push(shutdown_tx);
+
             let get_init_context = Arc::clone(&get_init_context);
             let mark_worker_complete = mark_worker_complete();
 
@@ -228,7 +228,7 @@ impl WorkerPool {
             let worker_env = RunnerEnv {
                 entity,
                 runner_meta,
-                msg_from_pool_rx: msg_rx,
+                shutdown_immediately: shutdown_rx,
                 run_id: run_id.clone(),
                 get_init_context,
                 tests_fetcher: get_next_tests_generator(entity),
@@ -255,7 +255,7 @@ impl WorkerPool {
         Self {
             active: true,
             runners,
-            worker_msg_tx,
+            runners_shutdown: Some(runners_shutdown),
             live_count,
         }
     }
@@ -277,10 +277,12 @@ impl WorkerPool {
 
         self.active = false;
 
-        for _ in 0..self.runners.len() {
-            // It's possible the worker already exited if it couldn't connect to the queue; in that
-            // case, we won't be able to send across the channel, but that's okay.
-            let _ = self.worker_msg_tx.send(MessageFromPool::Shutdown);
+        if let Some(runners_shutdown) = std::mem::take(&mut self.runners_shutdown) {
+            for tx_shutdown in runners_shutdown {
+                // It's possible the runner already exited, for example if it already finished, or
+                // errored early. In that case, we won't be able to send across the channel, but that's okay.
+                let _ = tx_shutdown.notify();
+            }
         }
 
         let mut errors = vec![];
@@ -379,7 +381,7 @@ type AttemptResult = Result<Vec<String>, AttemptError>;
 struct RunnerEnv {
     entity: Entity,
     runner_meta: RunnerMeta,
-    msg_from_pool_rx: MessageFromPoolRx,
+    shutdown_immediately: OneshotRx,
     run_id: RunId,
     notify_manifest: Option<NotifyManifest>,
     get_init_context: GetInitContext,
@@ -434,7 +436,7 @@ fn start_generic_test_runner(
         notify_all_tests_run,
         results_batch_size,
         context,
-        msg_from_pool_rx,
+        shutdown_immediately,
         debug_native_runner,
     } = env;
 
@@ -456,24 +458,18 @@ fn start_generic_test_runner(
 
     let get_next_tests_bundle: abq_generic_test_runner::GetNextTests = tests_fetcher;
 
-    let polling_should_shutdown = || {
-        matches!(
-            msg_from_pool_rx.lock().unwrap().try_recv(),
-            Ok(MessageFromPool::Shutdown)
-        )
-    };
-
     let working_dir = match context {
         WorkerContext::AssumeLocal => std::env::current_dir().unwrap(),
         WorkerContext::AlwaysWorkIn { working_dir } => working_dir,
     };
 
-    GenericTestRunner::run(
+    // Running in its own thread.
+    abq_generic_test_runner::run_sync(
         entity,
         runner_meta,
         native_runner_params,
-        &working_dir,
-        polling_should_shutdown,
+        working_dir,
+        shutdown_immediately,
         results_batch_size,
         notify_manifest,
         get_init_context,
@@ -518,7 +514,7 @@ fn start_test_like_runner(
     let RunnerEnv {
         entity,
         runner_meta,
-        msg_from_pool_rx,
+        mut shutdown_immediately,
         mut tests_fetcher,
         get_init_context,
         run_id,
@@ -602,11 +598,10 @@ fn start_test_like_runner(
         .unwrap();
 
     'tests_done: loop {
-        // First, check if we have a message from our owner.
-        let parent_message = msg_from_pool_rx.lock().unwrap().try_recv();
-
-        let bundle = match parent_message {
-            Ok(MessageFromPool::Shutdown) => {
+        // First, check if we have been asked to shutdown.
+        // TODO: wrap the whole test-like runner loop as async
+        let bundle = match shutdown_immediately.try_recv() {
+            Ok(()) => {
                 if matches!(&runner, TestLikeRunner::NeverReturnOnTest(..)) {
                     return Err(GenericRunnerError::no_captures(
                         io::Error::new(io::ErrorKind::Unsupported, "will not return test")
@@ -832,7 +827,7 @@ mod test {
         WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::{NotifyResults, ResultsHandler};
-    use abq_utils::shutdown::ShutdownManager;
+    use abq_utils::server_shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{atomic, net_protocol};
     use abq_with_protocol_version::with_protocol_version;
@@ -1314,6 +1309,7 @@ mod test {
 
         let mut pool = WorkerPool::new(default_config).await;
 
+        pool.wait().await;
         let pool_exit = pool.shutdown();
 
         assert!(matches!(pool_exit.status, WorkersExitStatus::Error { .. }));

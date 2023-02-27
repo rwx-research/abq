@@ -810,7 +810,7 @@ impl InitSuccessMessage {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CapturedOutput {
     pub stderr: Vec<u8>,
     pub stdout: Vec<u8>,
@@ -822,6 +822,15 @@ impl CapturedOutput {
             stderr: Default::default(),
             stdout: Default::default(),
         }
+    }
+}
+
+impl std::fmt::Debug for CapturedOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedOutput")
+            .field("stderr", &String::from_utf8_lossy(&self.stderr))
+            .field("stdout", &&String::from_utf8_lossy(&self.stdout))
+            .finish()
     }
 }
 

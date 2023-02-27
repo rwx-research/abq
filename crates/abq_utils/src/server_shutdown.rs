@@ -1,3 +1,5 @@
+//! Utilities for managing shutdown of ABQ servers.
+
 use std::{
     io,
     sync::{atomic::AtomicBool, Arc},

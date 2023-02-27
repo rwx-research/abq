@@ -39,7 +39,7 @@ use abq_utils::{
     },
     results_handler::SharedResultsHandler,
     retry::{async_retry_n, retry_n},
-    shutdown::ShutdownReceiver,
+    server_shutdown::ShutdownReceiver,
 };
 
 // TODO: send negotiation protocol versions
@@ -820,7 +820,7 @@ mod test {
         TestLikeRunner, WorkId, WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::NoopResultsHandler;
-    use abq_utils::shutdown::ShutdownManager;
+    use abq_utils::server_shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{net, net_protocol};
     use abq_with_protocol_version::with_protocol_version;

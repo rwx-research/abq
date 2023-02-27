@@ -1,10 +1,11 @@
+use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
-use abq_generic_test_runner::{GenericRunnerError, GenericTestRunner, GetNextTests, TestsFetcher};
+use abq_generic_test_runner::{GenericRunnerError, GetNextTests, TestsFetcher};
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
-use abq_utils::atomic;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
 use abq_utils::net_protocol::queue::{AssociatedTestResults, TestSpec};
@@ -18,12 +19,15 @@ use abq_utils::net_protocol::workers::{
     ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, WorkId, WorkerTest,
     INIT_RUN_NUMBER,
 };
-use abq_utils::results_handler::StaticResultsHandler;
+use abq_utils::oneshot_notify::OneshotTx;
+use abq_utils::results_handler::{SharedAssociatedTestResults, StaticResultsHandler};
+use abq_utils::{atomic, oneshot_notify};
 
 use abq_with_protocol_version::with_protocol_version;
 use async_trait::async_trait;
 use futures::FutureExt;
 use parking_lot::Mutex;
+use tempfile::{NamedTempFile, TempPath};
 
 fn native_runner_simulation_bin() -> String {
     artifacts_dir()
@@ -48,6 +52,79 @@ fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessag
 
 const NO_GENERATE_MANIFEST: Option<fn(ManifestResult)> = None;
 
+struct RunnerState {
+    _simfile: TempPath,
+    shutdown: OneshotTx,
+    all_results: SharedAssociatedTestResults,
+    all_tests_run: Arc<AtomicBool>,
+}
+
+fn get_simulated_runner<SendManifest: FnMut(ManifestResult)>(
+    simulation: impl IntoIterator<Item = Msg>,
+    with_manifest: Option<SendManifest>,
+    get_next_test: GetNextTests,
+) -> (
+    impl Future<Output = abq_generic_test_runner::Outcome>,
+    RunnerState,
+) {
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+    let input = NativeTestRunnerParams {
+        cmd: native_runner_simulation_bin(),
+        args: vec![simfile_path.display().to_string()],
+        extra_env: Default::default(),
+    };
+
+    let all_results: SharedAssociatedTestResults = Default::default();
+    let all_tests_run = Arc::new(AtomicBool::new(false));
+
+    let get_init_context = || {
+        Ok(Ok(InitContext {
+            init_meta: Default::default(),
+        }))
+    };
+    let results_handler = Box::new(StaticResultsHandler::new(all_results.clone()));
+
+    let notify_all_tests_run = {
+        let all_run = all_tests_run.clone();
+        move |_| {
+            async move {
+                all_run.store(true, atomic::ORDERING);
+            }
+            .boxed()
+        }
+    };
+
+    let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+
+    let runner_task = abq_generic_test_runner::run_async(
+        Entity::runner(0, 1),
+        RunnerMeta::fake(),
+        input,
+        std::env::current_dir().unwrap(),
+        shutdown_rx,
+        5,
+        with_manifest,
+        get_init_context,
+        get_next_test,
+        results_handler,
+        Box::new(notify_all_tests_run),
+        false,
+    );
+
+    let state = RunnerState {
+        _simfile: simfile,
+        shutdown: shutdown_tx,
+        all_results,
+        all_tests_run,
+    };
+
+    (runner_task, state)
+}
+
 fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     simulation: impl IntoIterator<Item = Msg>,
     with_manifest: Option<SendManifest>,
@@ -58,67 +135,31 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     CapturedOutput,
     bool,
 ) {
-    let simulation_msg = pack_msgs(simulation);
-    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let simfile_path = simfile.to_path_buf();
-    std::fs::write(&simfile_path, simulation_msg).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
-    let input = NativeTestRunnerParams {
-        cmd: native_runner_simulation_bin(),
-        args: vec![simfile_path.display().to_string()],
-        extra_env: Default::default(),
-    };
+    let (runner_task, state) = get_simulated_runner(simulation, with_manifest, get_next_test);
 
-    let get_init_context = || {
-        Ok(Ok(InitContext {
-            init_meta: Default::default(),
-        }))
-    };
-    let all_results: Arc<Mutex<Vec<AssociatedTestResults>>> = Default::default();
-
-    let results_handler = Box::new(StaticResultsHandler::new(all_results.clone()));
-
-    let all_test_run = Arc::new(AtomicBool::new(false));
-    let notify_all_tests_run = {
-        let all_run = all_test_run.clone();
-        move |_| {
-            async move {
-                all_run.store(true, atomic::ORDERING);
-            }
-            .boxed()
-        }
-    };
+    let runner_result = rt.block_on(runner_task);
 
     let TestRunnerExit {
         final_captured_output,
         manifest_generation_output,
         exit_code,
         native_runner_info: _,
-    } = GenericTestRunner::run(
-        Entity::runner(0, 1),
-        RunnerMeta::fake(),
-        input,
-        &std::env::current_dir().unwrap(),
-        || false,
-        5,
-        with_manifest,
-        get_init_context,
-        get_next_test,
-        results_handler,
-        Box::new(notify_all_tests_run),
-        false,
-    )
-    .unwrap();
+    } = runner_result.unwrap();
 
     assert_eq!(exit_code, ExitCode::SUCCESS);
 
     (
-        Arc::try_unwrap(all_results)
+        Arc::try_unwrap(state.all_results)
             .expect("outstanding refs to all results")
             .into_inner(),
         manifest_generation_output,
         final_captured_output,
-        all_test_run.load(atomic::ORDERING),
+        state.all_tests_run.load(atomic::ORDERING),
     )
 }
 
@@ -158,12 +199,14 @@ fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
         }
     };
 
-    let err = GenericTestRunner::run(
+    let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+
+    let err = abq_generic_test_runner::run_sync(
         Entity::runner(0, 1),
         RunnerMeta::fake(),
         input,
-        &std::env::current_dir().unwrap(),
-        || false,
+        std::env::current_dir().unwrap(),
+        shutdown_rx,
         5,
         with_manifest,
         get_init_context,
@@ -652,4 +695,57 @@ fn native_runner_fails_while_executing_tests() {
         Please see worker 0, runner 1 for more details.
         "###);
     }
+}
+
+#[tokio::test]
+#[with_protocol_version]
+async fn cancellation_of_native_runner_succeeds() {
+    use Msg::*;
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Read init context message + write ACK
+        OpaqueRead,
+        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+        //
+        // Sleep forever
+        Sleep(Duration::from_secs(600)),
+    ];
+
+    fn work_bundle(proto: ProtocolWitness) -> NextWorkBundle {
+        NextWorkBundle::new(vec![
+            NextWork::Work(WorkerTest {
+                spec: TestSpec {
+                    test_case: TestCase::new(proto, "test1", Default::default()),
+                    work_id: WorkId([1; 16]),
+                },
+                run_number: INIT_RUN_NUMBER,
+            }),
+            NextWork::EndOfWork,
+        ])
+    }
+    let get_next_tests = ImmediateTests {
+        tests: vec![work_bundle(proto)],
+    };
+
+    let (run_tests_task, state) =
+        get_simulated_runner(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
+
+    let runner_handle = tokio::spawn(run_tests_task);
+    state.shutdown.notify().unwrap();
+    let runner_result = runner_handle.await.unwrap();
+    let TestRunnerExit {
+        exit_code,
+        native_runner_info: _,
+        manifest_generation_output: _,
+        final_captured_output: _,
+    } = runner_result.unwrap();
+    assert_eq!(exit_code, ExitCode::CANCELLED);
+
+    assert!(state.all_results.lock().is_empty());
+    assert!(!state.all_tests_run.load(atomic::ORDERING));
 }

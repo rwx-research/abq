@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use abq_utils::error::{here, ErrorLocation, LocatedError, ResultLocation};
 use abq_utils::exit::ExitCode;
+use abq_utils::oneshot_notify::{self, OneshotRx};
 use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
@@ -21,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, ChildStderr, ChildStdout};
 
 use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
-use abq_utils::net_protocol::queue::{AssociatedTestResults, RunAlreadyCompleted, TestSpec};
+use abq_utils::net_protocol::queue::{self, AssociatedTestResults, RunAlreadyCompleted, TestSpec};
 use abq_utils::net_protocol::runners::{
     CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
     NativeRunnerSpawnedMessage, NativeRunnerSpecification, OutOfBandError, ProtocolWitness,
@@ -153,59 +154,27 @@ macro_rules! try_setup {
     };
 }
 
-pub async fn wait_for_manifest(mut runner_conn: RunnerConnection) -> io::Result<ManifestMessage> {
+pub async fn wait_for_manifest(runner_conn: &mut RunnerConnection) -> io::Result<ManifestMessage> {
     let manifest: ManifestMessage = runner_conn.read().await?;
 
     Ok(manifest)
 }
 
 /// Retrieves the test manifest from native test runner.
-#[instrument(level = "trace", skip(additional_env, working_dir))]
+#[instrument(level = "trace", skip(native_runner))]
 async fn retrieve_manifest<'a>(
-    cmd: &str,
-    args: &[String],
-    additional_env: impl IntoIterator<Item = (&'a String, &'a String)>,
-    working_dir: &Path,
-    protocol_version_timeout: Duration,
+    native_runner: &mut NativeRunnerHandle<'a>,
 ) -> Result<(ReportedManifest, CapturedOutput), GenericRunnerError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
-    let (runner_info, manifest, captured_output) = {
-        let mut our_listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
-        let our_addr = try_setup!(our_listener.local_addr());
+    let (manifest, captured_output) = {
+        let manifest_result = retrieve_manifest_help(native_runner).await;
 
-        let mut native_runner = process::Command::new(cmd);
-        native_runner.args(args);
-        native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
-        native_runner.env(ABQ_GENERATE_MANIFEST, "1");
-        native_runner.envs(additional_env);
-        native_runner.current_dir(working_dir);
-
-        native_runner.stdout(Stdio::piped());
-        native_runner.stderr(Stdio::piped());
-
-        let mut native_runner_handle = try_setup!(native_runner.spawn());
-
-        let capture_pipes = {
-            let child_stdout = native_runner_handle.stdout.take().expect("just spawned");
-            let child_stderr = native_runner_handle.stderr.take().expect("just spawned");
-            CapturePipes::new(child_stdout, child_stderr)
-        };
-
-        let manifest_result = retrieve_manifest_help(
-            &mut our_listener,
-            &mut native_runner_handle,
-            protocol_version_timeout,
-        )
-        .await;
-
-        let captured_output = try_setup!(capture_pipes.finish().await);
+        let captured_output = try_setup!(native_runner.capture_pipes.finish().await);
 
         match manifest_result {
-            Ok((runner_info, ManifestMessage::Success(manifest))) => {
-                (runner_info, manifest.manifest, captured_output)
-            }
-            Ok((_, ManifestMessage::Failure(failure))) => {
+            Ok(ManifestMessage::Success(manifest)) => (manifest.manifest, captured_output),
+            Ok(ManifestMessage::Failure(failure)) => {
                 let error = NativeTestRunnerError::from(failure.error).located(here!());
                 return Err(GenericRunnerError {
                     error,
@@ -223,33 +192,23 @@ async fn retrieve_manifest<'a>(
 
     let manifest = ReportedManifest {
         manifest,
-        native_runner_protocol: runner_info.protocol.get_version(),
-        native_runner_specification: Box::new(runner_info.specification),
+        native_runner_protocol: native_runner.runner_info.protocol.get_version(),
+        native_runner_specification: Box::new(native_runner.runner_info.specification.clone()),
     };
     Ok((manifest, captured_output))
 }
 
 async fn retrieve_manifest_help(
-    listener: &mut TcpListener,
-    native_runner_handle: &mut process::Child,
-    protocol_version_timeout: Duration,
-) -> Result<(NativeRunnerInfo, ManifestMessage), LocatedError> {
-    let native_runner_died = async {
-        let _ = native_runner_handle.wait().await;
-    };
+    native_runner: &mut NativeRunnerHandle<'_>,
+) -> Result<ManifestMessage, LocatedError> {
+    let manifest_message = wait_for_manifest(&mut native_runner.state.conn)
+        .await
+        .located(here!())?;
 
-    // Wait for and validate the protocol version message, channel must always come first.
-    let (runner_info, runner_conn) =
-        open_native_runner_connection(listener, protocol_version_timeout, native_runner_died)
-            .await
-            .located(here!())?;
-
-    let manifest_message = wait_for_manifest(runner_conn).await.located(here!())?;
-
-    let status = native_runner_handle.wait().await.located(here!())?;
+    let status = native_runner.child.wait().await.located(here!())?;
     debug_assert!(status.success());
 
-    Ok((runner_info, manifest_message))
+    Ok(manifest_message)
 }
 
 #[derive(Debug, Error)]
@@ -309,46 +268,45 @@ pub trait TestsFetcher {
 
 pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 
-impl GenericTestRunner {
-    pub fn run<ShouldShutdown, SendManifest, GetInitContext>(
-        runner_entity: Entity,
-        runner_meta: RunnerMeta,
-        input: NativeTestRunnerParams,
-        working_dir: &Path,
-        polling_should_shutdown: ShouldShutdown,
-        results_batch_size: u64,
-        send_manifest: Option<SendManifest>,
-        get_init_context: GetInitContext,
-        get_next_test_bundle: GetNextTests,
-        results_handler: ResultsHandler,
-        notify_all_tests_run: NotifyMaterialTestsAllRun,
-        debug_native_runner: bool,
-    ) -> Result<TestRunnerExit, GenericRunnerError>
-    where
-        ShouldShutdown: Fn() -> bool,
-        // TODO: make both of these async!
-        SendManifest: FnMut(ManifestResult),
-        GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
-    {
-        let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build());
+pub type Outcome = Result<TestRunnerExit, GenericRunnerError>;
 
-        rt.block_on(run(
-            runner_entity,
-            runner_meta,
-            input,
-            working_dir,
-            polling_should_shutdown,
-            results_batch_size,
-            send_manifest,
-            get_init_context,
-            get_next_test_bundle,
-            results_handler,
-            notify_all_tests_run,
-            debug_native_runner,
-        ))
-    }
+pub fn run_sync<SendManifest, GetInitContext>(
+    runner_entity: Entity,
+    runner_meta: RunnerMeta,
+    input: NativeTestRunnerParams,
+    working_dir: PathBuf,
+    shutdown_immediately: OneshotRx,
+    results_batch_size: u64,
+    send_manifest: Option<SendManifest>,
+    get_init_context: GetInitContext,
+    get_next_test_bundle: GetNextTests,
+    results_handler: ResultsHandler,
+    notify_all_tests_run: NotifyMaterialTestsAllRun,
+    debug_native_runner: bool,
+) -> Result<TestRunnerExit, GenericRunnerError>
+where
+    // TODO: make both of these async!
+    SendManifest: FnMut(ManifestResult),
+    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
+{
+    let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build());
+
+    rt.block_on(run_async(
+        runner_entity,
+        runner_meta,
+        input,
+        working_dir,
+        shutdown_immediately,
+        results_batch_size,
+        send_manifest,
+        get_init_context,
+        get_next_test_bundle,
+        results_handler,
+        notify_all_tests_run,
+        debug_native_runner,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -364,6 +322,7 @@ struct NativeRunnerState {
     capture_pipes: CapturePipes,
     conn: RunnerConnection,
     runner_info: NativeRunnerInfo,
+    for_manifest_generation: bool,
 }
 
 /// Representation of a native runner between one or more test suite runs.
@@ -397,11 +356,17 @@ impl<'a> NativeRunnerHandle<'a> {
     async fn new(
         mut listener: TcpListener,
         args: NativeRunnerArgs<'a>,
+        should_generate_manifest: bool,
         protocol_version_timeout: Duration,
     ) -> Result<NativeRunnerHandle<'a>, GenericRunnerError> {
         let run_number = INIT_RUN_NUMBER;
-        let native_runner_state =
-            Self::new_native_runner(&mut listener, args, protocol_version_timeout).await?;
+        let native_runner_state = Self::new_native_runner(
+            &mut listener,
+            args,
+            should_generate_manifest,
+            protocol_version_timeout,
+        )
+        .await?;
         Ok(Self {
             listener,
             protocol_version_timeout,
@@ -438,6 +403,7 @@ impl<'a> NativeRunnerHandle<'a> {
     async fn new_native_runner(
         listener: &mut TcpListener,
         args: NativeRunnerArgs<'a>,
+        should_generate_manifest: bool,
         protocol_version_timeout: Duration,
     ) -> Result<NativeRunnerState, GenericRunnerError> {
         let our_addr = try_setup!(listener.local_addr());
@@ -452,12 +418,20 @@ impl<'a> NativeRunnerHandle<'a> {
         let mut native_runner = process::Command::new(program);
         native_runner.args(args);
         native_runner.env(ABQ_SOCKET, format!("{}", our_addr));
+        if should_generate_manifest {
+            native_runner.env(ABQ_GENERATE_MANIFEST, "1");
+        }
         native_runner.envs(env);
         native_runner.current_dir(working_dir);
 
         // The stdout/stderr will be captured manually below.
         native_runner.stdout(Stdio::piped());
         native_runner.stderr(Stdio::piped());
+
+        // Make sure that the native runner is SIGKILLed if the handle is dropped.
+        // In the happy path we should never reach this, but upon cancellation, we not have access
+        // to the runner handle. In that case, we must make sure the runner does not hang around.
+        native_runner.kill_on_drop(true);
 
         // If launching the native runner fails here, it should have failed during manifest
         // generation as well (unless this is a flakey error in the underlying test runner, channel
@@ -469,7 +443,7 @@ impl<'a> NativeRunnerHandle<'a> {
         // Set up capturing of the native runner's stdout/stderr.
         // We want both standard pipes of the child to point to managed buffers from which
         // we'll extract output when an individual test completes.
-        let capture_pipes = {
+        let mut capture_pipes = {
             let child_stdout = child.stdout.take().expect("just spawned");
             let child_stderr = child.stderr.take().expect("just spawned");
             CapturePipes::new(child_stdout, child_stderr)
@@ -501,6 +475,7 @@ impl<'a> NativeRunnerHandle<'a> {
             capture_pipes,
             conn: runner_conn,
             runner_info,
+            for_manifest_generation: should_generate_manifest,
         })
     }
 
@@ -539,6 +514,24 @@ impl<'a> NativeRunnerHandle<'a> {
         Ok(exit_status.into())
     }
 
+    /// If the currently-configured native runner was created for manifest generation, re-spawn it;
+    /// otherwise, nothing is done.
+    async fn reconcile_for_start_of_run(&mut self) -> Result<(), GenericRunnerError> {
+        if !self.state.for_manifest_generation {
+            return Ok(());
+        }
+
+        self.state = Self::new_native_runner(
+            &mut self.listener,
+            self.args,
+            false,
+            self.protocol_version_timeout,
+        )
+        .await?;
+
+        Ok(())
+    }
+
     /// If the run number exceeds the currently-configured native runner's run number, allocate a
     /// new native runner for the new suite run.
     async fn reconcile_run_number(
@@ -563,10 +556,14 @@ impl<'a> NativeRunnerHandle<'a> {
         let _captures = self.state.capture_pipes.get_captured();
 
         // Prime the new runner.
-        self.state =
-            Self::new_native_runner(&mut self.listener, self.args, self.protocol_version_timeout)
-                .await
-                .map_err(|e| e.error)?;
+        self.state = Self::new_native_runner(
+            &mut self.listener,
+            self.args,
+            false,
+            self.protocol_version_timeout,
+        )
+        .await
+        .map_err(|e| e.error)?;
         self.run_number = new_run_number;
 
         // Send the initialization message.
@@ -576,14 +573,21 @@ impl<'a> NativeRunnerHandle<'a> {
 
         Ok(())
     }
+
+    fn get_native_runner_info(self) -> queue::NativeRunnerInfo {
+        queue::NativeRunnerInfo {
+            protocol_version: self.state.runner_info.protocol.get_version(),
+            specification: self.state.runner_info.specification,
+        }
+    }
 }
 
-async fn run<ShouldShutdown, SendManifest, GetInitContext>(
+pub async fn run_async<SendManifest, GetInitContext>(
     runner_entity: Entity,
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
-    working_dir: &Path,
-    _polling_should_shutdown: ShouldShutdown,
+    working_dir: PathBuf,
+    shutdown_immediately: OneshotRx,
     results_batch_size: u64,
     send_manifest: Option<SendManifest>,
     get_init_context: GetInitContext,
@@ -593,7 +597,6 @@ async fn run<ShouldShutdown, SendManifest, GetInitContext>(
     _debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError>
 where
-    ShouldShutdown: Fn() -> bool,
     SendManifest: FnMut(ManifestResult),
     GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
 {
@@ -606,20 +609,89 @@ where
     // TODO: get from runner params
     let protocol_version_timeout = Duration::from_secs(60);
 
+    let native_runner_args = NativeRunnerArgs {
+        program: &cmd,
+        args: &args,
+        env: &additional_env,
+        working_dir: &working_dir,
+    };
+
+    let listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
+    let opt_native_runner_handle = NativeRunnerHandle::new(
+        listener,
+        native_runner_args,
+        send_manifest.is_some(),
+        protocol_version_timeout,
+    )
+    .await;
+
+    let run_to_completion_task = run_help(
+        send_manifest,
+        opt_native_runner_handle,
+        get_init_context,
+        results_batch_size,
+        get_next_test_bundle,
+        results_handler,
+        notify_all_tests_run,
+        runner_entity,
+        runner_meta,
+    );
+
+    tokio::select! {
+        result = run_to_completion_task => {
+            result
+        }
+        shutdown_result = shutdown_immediately => {
+            assert!(shutdown_result.is_ok(), "somehow, shutdown-immediate resolved with an error prior to the native runner dying. This means the parent lost ownership of the runner prior to shutdown.");
+
+            // TODO: is there a reasonable way we can capture the output of the native runner after
+            // cancellation here?
+            Ok(TestRunnerExit {
+                exit_code: ExitCode::CANCELLED,
+                native_runner_info: None,
+                manifest_generation_output: None,
+                final_captured_output: CapturedOutput::empty(),
+            })
+        }
+    }
+}
+
+async fn run_help<SendManifest, GetInitContext>(
+    send_manifest: Option<SendManifest>,
+    opt_native_runner_handle: Result<NativeRunnerHandle<'_>, GenericRunnerError>,
+    get_init_context: GetInitContext,
+    results_batch_size: u64,
+    get_next_test_bundle: GetNextTests,
+    results_handler: ResultsHandler,
+    notify_all_tests_run: NotifyMaterialTestsAllRun,
+    runner_entity: Entity,
+    runner_meta: RunnerMeta,
+    // TODO this is already on the handle
+) -> Result<TestRunnerExit, GenericRunnerError>
+where
+    SendManifest: FnMut(ManifestResult),
+    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
+{
     // If we need to retrieve the manifest, do that first.
+    // If the native runner is erroring and we are generating the manigest,
+    // the error will be attached to the generated manifest; otherwise, bail out.
+    let mut native_runner_handle;
     let mut manifest_generation_output = None;
+
     if let Some(mut send_manifest) = send_manifest {
-        let manifest_or_error = retrieve_manifest(
-            &cmd,
-            &args,
-            &additional_env,
-            working_dir,
-            protocol_version_timeout,
-        )
-        .await;
+        let manifest_or_error = match opt_native_runner_handle {
+            Ok(mut handle) => {
+                // Package the native runner handle into the result, so that we can initialize it
+                // prior to running all tests below.
+                let retrieved = retrieve_manifest(&mut handle).await;
+                retrieved.map(|result| (result, handle))
+            }
+            Err(err) => Err(err),
+        };
 
         match manifest_or_error {
-            Ok((manifest, captured_output)) => {
+            Ok(((manifest, captured_output), handle)) => {
+                native_runner_handle = handle;
                 manifest_generation_output = Some(captured_output);
                 send_manifest(ManifestResult::Manifest(manifest));
             }
@@ -631,20 +703,15 @@ where
                 return Err(err);
             }
         }
+    } else {
+        // No manifest to generate; populate the native runner handle or bail if needed.
+        native_runner_handle = opt_native_runner_handle?;
     }
 
-    let native_runner_args = NativeRunnerArgs {
-        program: &cmd,
-        args: &args,
-        env: &additional_env,
-        working_dir,
-    };
+    // If we generated a manifest, now restart the native runner before we begin executing tests.
+    native_runner_handle.reconcile_for_start_of_run().await?;
 
-    let listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
-    let mut native_runner_handle =
-        NativeRunnerHandle::new(listener, native_runner_args, protocol_version_timeout).await?;
-
-    let opt_err = run_help(
+    let opt_err = execute_all_tests(
         &mut native_runner_handle,
         get_init_context,
         results_batch_size,
@@ -653,7 +720,6 @@ where
         notify_all_tests_run,
         runner_entity,
         runner_meta,
-        native_runner_args,
     )
     .await;
 
@@ -665,23 +731,12 @@ where
         .unwrap_or_else(|_| CapturedOutput::empty());
 
     match opt_err {
-        Ok(exit) => {
-            let native_runner_info = abq_utils::net_protocol::queue::NativeRunnerInfo {
-                protocol_version: native_runner_handle
-                    .state
-                    .runner_info
-                    .protocol
-                    .get_version(),
-                specification: native_runner_handle.state.runner_info.specification,
-            };
-
-            Ok(TestRunnerExit {
-                exit_code: exit,
-                native_runner_info: Some(native_runner_info),
-                manifest_generation_output,
-                final_captured_output: output,
-            })
-        }
+        Ok(exit) => Ok(TestRunnerExit {
+            exit_code: exit,
+            native_runner_info: Some(native_runner_handle.get_native_runner_info()),
+            manifest_generation_output,
+            final_captured_output: output,
+        }),
         Err(err) => Err(GenericRunnerError { error: err, output }),
     }
 }
@@ -713,7 +768,7 @@ async fn try_send_result_to_channel(
     Ok(())
 }
 
-async fn run_help<'a, GetInitContext>(
+async fn execute_all_tests<'a, GetInitContext>(
     native_runner_handle: &mut NativeRunnerHandle<'a>,
     get_init_context: GetInitContext,
     results_batch_size: u64,
@@ -722,7 +777,6 @@ async fn run_help<'a, GetInitContext>(
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     runner_entity: Entity,
     runner_meta: RunnerMeta,
-    native_runner_args: NativeRunnerArgs<'a>,
 ) -> Result<ExitCode, LocatedError>
 where
     GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
@@ -829,7 +883,7 @@ where
                         handle_native_runner_failure(
                             runner_meta,
                             &results_tx,
-                            native_runner_args,
+                            native_runner_handle.args,
                             final_output,
                             estimated_runtime,
                             work_id,
@@ -940,17 +994,17 @@ impl CapturePipes {
         CapturedOutput { stderr, stdout }
     }
 
-    async fn finish(self) -> io::Result<CapturedOutput> {
+    async fn finish(&mut self) -> io::Result<CapturedOutput> {
         let OutputCapturer {
             copied_all_output: copied_stdout,
             side_channel: side_stdout,
             ..
-        } = self.stdout;
+        } = &mut self.stdout;
         let OutputCapturer {
             copied_all_output: copied_stderr,
             side_channel: side_stderr,
             ..
-        } = self.stderr;
+        } = &mut self.stderr;
         copied_stdout.await.unwrap()?;
         copied_stderr.await.unwrap()?;
         let stdout = side_stdout
@@ -1304,12 +1358,14 @@ pub fn execute_wrapped_runner(
 
     let results_handler = Box::new(StaticResultsHandler::new(test_results.clone()));
 
-    let _opt_exit_error = GenericTestRunner::run(
+    let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+
+    let _opt_exit_error = run_sync(
         Entity::runner(0, 1),
         RunnerMeta::fake(),
         native_runner_params,
-        &working_dir,
-        || false,
+        working_dir,
+        shutdown_rx,
         5,
         Some(send_manifest),
         get_init_context,
@@ -1582,8 +1638,7 @@ fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
 #[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
-    use crate::{execute_wrapped_runner, notify_all_tests_run, GenericTestRunner, ImmediateTests};
-    use abq_utils::atomic;
+    use crate::{execute_wrapped_runner, notify_all_tests_run, run_sync, ImmediateTests};
     use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
     use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
@@ -1593,6 +1648,7 @@ mod test_abq_jest {
         WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::{NoopResultsHandler, StaticResultsHandler};
+    use abq_utils::{atomic, oneshot_notify};
     use abq_with_protocol_version::with_protocol_version;
 
     use parking_lot::Mutex;
@@ -1641,12 +1697,14 @@ mod test_abq_jest {
         let results_handler = Box::new(StaticResultsHandler::new(test_results.clone()));
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
-        GenericTestRunner::run(
+        let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+
+        run_sync(
             Entity::runner(0, 1),
             RunnerMeta::fake(),
             input,
-            &npm_jest_project_path(),
-            || false,
+            npm_jest_project_path(),
+            shutdown_rx,
             5,
             Some(send_manifest),
             get_init_context,
@@ -1801,12 +1859,14 @@ mod test_abq_jest {
 
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
-        let runner_result = GenericTestRunner::run::<_, fn(ManifestResult), _>(
+        let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+
+        let runner_result = run_sync::<fn(ManifestResult), _>(
             Entity::runner(0, 1),
             RunnerMeta::fake(),
             input,
-            &npm_jest_project_path(),
-            || false,
+            npm_jest_project_path(),
+            shutdown_rx,
             5,
             None,
             get_init_context,
@@ -1827,14 +1887,14 @@ mod test_abq_jest {
 
 #[cfg(test)]
 mod test_invalid_command {
-    use crate::{notify_all_tests_run, GenericRunnerError, GenericTestRunner, ImmediateTests};
-    use abq_utils::atomic;
+    use crate::{notify_all_tests_run, run_sync, GenericRunnerError, ImmediateTests};
     use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle,
     };
     use abq_utils::results_handler::NoopResultsHandler;
+    use abq_utils::{atomic, oneshot_notify};
 
     #[test]
     fn invalid_command_yields_error() {
@@ -1859,12 +1919,14 @@ mod test_invalid_command {
 
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
 
-        let runner_result = GenericTestRunner::run(
+        let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+
+        let runner_result = run_sync(
             Entity::runner(0, 1),
             RunnerMeta::fake(),
             input,
-            &std::env::current_dir().unwrap(),
-            || false,
+            std::env::current_dir().unwrap(),
+            shutdown_rx,
             5,
             Some(send_manifest),
             get_init_context,
