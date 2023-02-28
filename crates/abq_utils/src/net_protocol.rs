@@ -353,7 +353,7 @@ pub mod workers {
         }
     }
 
-    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
     pub struct WorkerTest {
         pub spec: TestSpec,
         /// The identity of the serial test suite run this test is a part of. Always starts at
@@ -374,7 +374,7 @@ pub mod workers {
     pub const INIT_RUN_NUMBER: u32 = 1;
 
     /// A unit of work sent to a worker to be run.
-    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
     pub enum NextWork {
         Work(WorkerTest),
         EndOfWork,
@@ -658,8 +658,6 @@ pub mod work_server {
     pub enum NextTestResponse {
         /// The set of tests to run next
         Bundle(workers::NextWorkBundle),
-        /// There are more tests, but they are not yet known.
-        Pending,
     }
 }
 

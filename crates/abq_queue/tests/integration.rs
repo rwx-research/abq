@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    iter::once,
     num::{NonZeroU64, NonZeroUsize},
     panic,
     pin::Pin,
@@ -29,7 +30,9 @@ use abq_utils::{
             TestResultSpec,
         },
         work_server::{InitContext, InitContextResponse},
-        workers::{NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId},
+        workers::{
+            NativeTestRunnerParams, RunId, RunnerKind, TestLikeRunner, WorkId, INIT_RUN_NUMBER,
+        },
     },
     results_handler::{NoopResultsHandler, SharedAssociatedTestResults, StaticResultsHandler},
     tls::ClientTlsStrategy,
@@ -106,6 +109,7 @@ impl WorkersConfigBuilder {
         let config = WorkersConfig {
             tag: tag.into(),
             num_workers: 2.try_into().unwrap(),
+            max_run_number: INIT_RUN_NUMBER,
             runner_kind,
             local_results_handler: Box::new(NoopResultsHandler),
             worker_context: WorkerContext::AssumeLocal,
@@ -117,6 +121,11 @@ impl WorkersConfigBuilder {
             batch_size_hint: one_nonzero(),
             test_results_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
         }
+    }
+
+    fn with_max_run_number(mut self, max_run_number: u32) -> Self {
+        self.config.max_run_number = max_run_number;
+        self
     }
 
     fn with_num_workers(mut self, num_workers: NonZeroUsize) -> Self {
@@ -396,7 +405,7 @@ fn run_test(servers: Servers, steps: Steps) {
                             )
                             .collect();
 
-                        assert!(check(&flattened_results), "{:?}", results);
+                        assert!(check(&flattened_results));
                     }
 
                     QueryRunStatus(_) => todo!(),
@@ -1061,7 +1070,6 @@ fn runner_panic_stops_worker() {
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)]
-#[ignore = "TODO(1.3-retries)"]
 fn many_retries_complete() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
@@ -1078,6 +1086,8 @@ fn many_retries_complete() {
         Box::new(manifest),
     );
 
+    let workers_config = WorkersConfigBuilder::new(1, runner).with_max_run_number(4);
+
     let mut expected_results = vec![];
     for attempt in 1..=4 {
         for t in 1..=4 {
@@ -1090,24 +1100,20 @@ fn many_retries_complete() {
     }
 
     TestBuilder::default()
-        .step(
-            [StartWorkers(
-                Run(1),
-                Wid(1),
-                WorkersConfigBuilder::new(1, runner),
-            )],
-            [TestResults(Run(1), &|results| {
-                let mut results = results.to_vec();
-                let results = sort_results_owned(&mut results);
-                results == expected_results
-            })],
-        )
+        .act([StartWorkers(Run(1), Wid(1), workers_config)])
         .step(
             [StopWorkers(Wid(1))],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
+            [
+                TestResults(Run(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results_owned(&mut results);
+                    results == expected_results
+                }),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+            ],
         )
         .test();
 }
@@ -1116,7 +1122,6 @@ fn many_retries_complete() {
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)]
-#[ignore = "TODO(1.3-retries)"]
 fn many_retries_many_workers_complete() {
     let attempts = 4;
     let num_tests = 64;
@@ -1131,7 +1136,7 @@ fn many_retries_many_workers_complete() {
                 manifest.push(echo_test(proto, format!("echo{t}")));
             }
 
-            if attempt < 4 {
+            if attempt < attempts {
                 expected_results.push((attempt, "INDUCED FAIL".to_string()));
             } else {
                 expected_results.push((attempt, format!("echo{t}")));
@@ -1144,7 +1149,7 @@ fn many_retries_many_workers_complete() {
     let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
 
     let runner = RunnerKind::TestLikeRunner(
-        TestLikeRunner::FailUntilAttemptNumber(4),
+        TestLikeRunner::FailUntilAttemptNumber(attempts),
         Box::new(manifest),
     );
 
@@ -1152,11 +1157,10 @@ fn many_retries_many_workers_complete() {
     let mut end_workers_actions = vec![];
     let mut end_workers_asserts = vec![];
     for i in 1..=num_workers {
-        start_actions.push(StartWorkers(
-            Run(1),
-            Wid(i),
-            WorkersConfigBuilder::new(i as u32, runner.clone()),
-        ));
+        let workers_config =
+            WorkersConfigBuilder::new(1, runner.clone()).with_max_run_number(attempts);
+        start_actions.push(StartWorkers(Run(1), Wid(i), workers_config));
+
         end_workers_actions.push(StopWorkers(Wid(i)));
         end_workers_asserts.push(WorkerExitStatus(
             Wid(i),
@@ -1165,23 +1169,24 @@ fn many_retries_many_workers_complete() {
     }
 
     TestBuilder::default()
+        .act(start_actions)
         .step(
-            start_actions,
-            [TestResults(Run(1), &|results| {
-                let mut results = results.to_vec();
-                let results = sort_results_owned(&mut results);
-                results == expected_results
-            })],
+            end_workers_actions,
+            end_workers_asserts
+                .into_iter()
+                .chain(once(TestResults(Run(1), &|results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results_owned(&mut results);
+                    results == expected_results
+                }))),
         )
-        .step(end_workers_actions, end_workers_asserts)
         .test();
 }
 
 #[test]
 #[with_protocol_version]
 #[serial]
-#[timeout(2000)] // 2 seconds
-#[ignore = "TODO(1.3-retries)"]
+#[timeout(2000)]
 fn many_retries_many_workers_complete_native() {
     let attempts = 4;
     let num_tests = 64;
@@ -1278,24 +1283,22 @@ fn many_retries_many_workers_complete_native() {
     let mut start_actions = vec![];
     let mut end_workers_actions = vec![];
     for i in 1..=num_workers {
-        start_actions.push(StartWorkers(
-            Run(1),
-            Wid(i),
-            WorkersConfigBuilder::new(i as u32, runner.clone()),
-        ));
+        let config =
+            WorkersConfigBuilder::new(i as u32, runner.clone()).with_max_run_number(attempts);
+        start_actions.push(StartWorkers(Run(1), Wid(i), config));
         end_workers_actions.push(StopWorkers(Wid(i)));
     }
 
     TestBuilder::default()
+        .act(start_actions)
         .step(
-            start_actions,
+            end_workers_actions,
             [TestResults(Run(1), &|results| {
                 let mut results = results.to_vec();
                 let results = sort_results_owned(&mut results);
                 results == expected_results
             })],
         )
-        .act(end_workers_actions)
         .test();
 }
 

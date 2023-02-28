@@ -7,7 +7,7 @@ use abq_generic_test_runner::{GenericRunnerError, GetNextTests, TestsFetcher};
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
 use abq_utils::exit::ExitCode;
-use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
+use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, TestSpec};
 use abq_utils::net_protocol::runners::{
     CapturedOutput, InitSuccessMessage, Manifest, ManifestMessage, NativeRunnerSpecification,
@@ -90,7 +90,7 @@ fn get_simulated_runner<SendManifest: FnMut(ManifestResult)>(
 
     let notify_all_tests_run = {
         let all_run = all_tests_run.clone();
-        move |_| {
+        move || {
             async move {
                 all_run.store(true, atomic::ORDERING);
             }
@@ -101,7 +101,6 @@ fn get_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
     let runner_task = abq_generic_test_runner::run_async(
-        Entity::runner(0, 1),
         RunnerMeta::fake(),
         input,
         std::env::current_dir().unwrap(),
@@ -191,7 +190,7 @@ fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
     let all_test_run = Arc::new(AtomicBool::new(false));
     let notify_all_tests_run = {
         let all_run = all_test_run.clone();
-        move |_| {
+        move || {
             async move {
                 all_run.store(true, atomic::ORDERING);
             }
@@ -202,7 +201,6 @@ fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
     let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
     let err = abq_generic_test_runner::run_sync(
-        Entity::runner(0, 1),
         RunnerMeta::fake(),
         input,
         std::env::current_dir().unwrap(),

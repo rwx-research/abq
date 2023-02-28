@@ -1,10 +1,9 @@
 //! Implements a persistent test-fetching connection from workers to the queue.
 
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, net::SocketAddr};
 
 use crate::workers::TestsFetcher;
 use abq_utils::{
-    decay::ExpDecay,
     net_async::{ClientStream, ConfiguredClient},
     net_protocol::{
         self,
@@ -16,15 +15,9 @@ use async_trait::async_trait;
 
 const DEFAULT_MAX_ATTEMPTS_IN_CYCLE: usize = 3;
 
-// If the next tests are pending, use a quadratic decay in waiting for them to populate.
-// This is because we might be at the very tail of the job queue, and waiting for any
-// retries (if they exist) to re-populate, which may happen very quickly.
-const DEFAULT_DECAY_ON_PENDING_TESTS_NOTIFICATION: ExpDecay =
-    ExpDecay::quadratic(Duration::from_millis(20), Duration::from_secs(3));
-
 /// Returns a [GetNextTests] implementation which operates by keeping a persistent connection to fetch
 /// next tests open with the work server.
-pub(crate) fn start(
+pub fn start(
     entity: Entity,
     work_server_addr: SocketAddr,
     client: Box<dyn ConfiguredClient>,
@@ -36,18 +29,16 @@ pub(crate) fn start(
         client,
         run_id,
         DEFAULT_MAX_ATTEMPTS_IN_CYCLE,
-        DEFAULT_DECAY_ON_PENDING_TESTS_NOTIFICATION,
     )
 }
 
-pub(crate) struct PersistedTestsFetcher {
+pub struct PersistedTestsFetcher {
     entity: Entity,
     work_server_addr: SocketAddr,
     client: Box<dyn ConfiguredClient>,
     conn: PersistedConnection,
     run_id: RunId,
     max_attempts_in_cycle: usize,
-    decay_on_pending_tests_notification: ExpDecay,
 }
 
 type PersistedConnection = Option<Box<dyn ClientStream>>;
@@ -59,7 +50,6 @@ impl PersistedTestsFetcher {
         client: Box<dyn ConfiguredClient>,
         run_id: RunId,
         max_attempts_in_cycle: usize,
-        decay_on_pending_tests_notification: ExpDecay,
     ) -> Self {
         Self {
             entity,
@@ -68,7 +58,6 @@ impl PersistedTestsFetcher {
             conn: Default::default(),
             run_id,
             max_attempts_in_cycle,
-            decay_on_pending_tests_notification,
         }
     }
 }
@@ -112,23 +101,13 @@ impl PersistedTestsFetcher {
     async fn try_request(&mut self) -> Result<NextWorkBundle, io::Error> {
         use net_protocol::work_server::NextTestResponse;
 
-        let mut decay = self.decay_on_pending_tests_notification;
+        // Make sure that if our connection is closed, we re-open it.
+        let conn = self.ensure_persistent_conn().await?;
 
-        loop {
-            // Make sure that if our connection is closed, we re-open it.
-            let conn = self.ensure_persistent_conn().await?;
-
-            let next_test_request = net_protocol::work_server::NextTestRequest {};
-            net_protocol::async_write(&mut *conn, &next_test_request).await?;
-            match net_protocol::async_read(&mut *conn).await? {
-                NextTestResponse::Bundle(bundle) => return Ok(bundle),
-                NextTestResponse::Pending => {
-                    tracing::debug!(entity=?self.entity, "waiting for pending next tests");
-
-                    // Sleep, then try again, since we were told to wait.
-                    tokio::time::sleep(decay.next_duration()).await;
-                }
-            }
+        let next_test_request = net_protocol::work_server::NextTestRequest {};
+        net_protocol::async_write(&mut *conn, &next_test_request).await?;
+        match net_protocol::async_read(&mut *conn).await? {
+            NextTestResponse::Bundle(bundle) => Ok(bundle),
         }
     }
 
@@ -153,28 +132,24 @@ impl PersistedTestsFetcher {
 }
 
 #[cfg(test)]
-mod test {
-    use std::time::Duration;
-
+pub mod test {
     use abq_utils::{
         auth::{ClientAuthStrategy, ServerAuthStrategy},
-        decay::ExpDecay,
-        net_async::ServerListener,
+        net_async::{ServerListener, ServerStream},
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
             async_read, async_write,
             entity::Entity,
             work_server::{NextTestRequest, NextTestResponse},
-            workers::{NextWorkBundle, RunId},
+            workers::{NextWork, NextWorkBundle, RunId},
         },
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
 
     use super::PersistedTestsFetcher;
 
-    async fn scaffold(
+    pub async fn scaffold_server(
         max_attempts_in_cycle: usize,
-        decay_on_pending_tests: ExpDecay,
     ) -> (Box<dyn ServerListener>, PersistedTestsFetcher) {
         let server_opts =
             ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
@@ -191,47 +166,34 @@ mod test {
             client,
             RunId::unique(),
             max_attempts_in_cycle,
-            decay_on_pending_tests,
         );
 
         (listener, fetcher)
     }
 
-    #[tokio::test]
-    async fn wait_while_pending_tests_notification() {
-        let (server, mut fetcher) =
-            scaffold(1, ExpDecay::constant(Duration::from_micros(10))).await;
+    pub async fn server_send_bundle(
+        conn: &mut Box<dyn ServerStream>,
+        bundle: impl IntoIterator<Item = NextWork>,
+    ) {
+        let NextTestRequest {} = async_read(conn).await.unwrap();
+        async_write(
+            conn,
+            &NextTestResponse::Bundle(NextWorkBundle {
+                work: bundle.into_iter().collect(),
+            }),
+        )
+        .await
+        .unwrap();
+    }
 
-        let server_task = async move {
-            let (conn, _) = server.accept().await.unwrap();
-            let mut conn = server.handshake_ctx().handshake(conn).await.unwrap();
-            for _ in 0..10 {
-                let NextTestRequest {} = async_read(&mut conn).await.unwrap();
-                async_write(&mut conn, &NextTestResponse::Pending)
-                    .await
-                    .unwrap();
-            }
-
-            let NextTestRequest {} = async_read(&mut conn).await.unwrap();
-            async_write(
-                &mut conn,
-                &NextTestResponse::Bundle(NextWorkBundle::new(vec![])),
-            )
-            .await
-            .unwrap();
-        };
-
-        let client_task = async move {
-            let bundle = fetcher.wait_for_next_work_bundle().await.unwrap();
-            assert!(bundle.work.is_empty());
-        };
-
-        let ((), ()) = tokio::join!(server_task, client_task);
+    pub async fn server_establish(server: &dyn ServerListener) -> Box<dyn ServerStream> {
+        let (conn, _) = server.accept().await.unwrap();
+        server.handshake_ctx().handshake(conn).await.unwrap()
     }
 
     #[tokio::test]
     async fn retry_on_connection_failure_finally_succeeds() {
-        let (server, mut fetcher) = scaffold(3, ExpDecay::constant(Duration::MAX)).await;
+        let (server, mut fetcher) = scaffold_server(3).await;
 
         let server_task = async move {
             // Accept, then drop the connection
@@ -241,15 +203,8 @@ mod test {
             }
 
             // The third time, let it through
-            let (conn, _) = server.accept().await.unwrap();
-            let mut conn = server.handshake_ctx().handshake(conn).await.unwrap();
-            let NextTestRequest {} = async_read(&mut conn).await.unwrap();
-            async_write(
-                &mut conn,
-                &NextTestResponse::Bundle(NextWorkBundle::new(vec![])),
-            )
-            .await
-            .unwrap();
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(&mut conn, []).await;
         };
 
         let client_task = async move {
@@ -262,7 +217,7 @@ mod test {
 
     #[tokio::test]
     async fn retry_on_connection_failure_finally_fails() {
-        let (server, mut fetcher) = scaffold(3, ExpDecay::constant(Duration::MAX)).await;
+        let (server, mut fetcher) = scaffold_server(3).await;
 
         let server_task = async move {
             // Accept, then drop the connection all three times.
@@ -278,47 +233,5 @@ mod test {
         };
 
         let ((), ()) = tokio::join!(server_task, client_task);
-    }
-
-    #[tokio::test]
-    async fn wait_while_pending_tests_notification_uses_fresh_decay() {
-        let decay = ExpDecay::quadratic(Duration::from_micros(10), Duration::from_micros(640));
-        let (server, mut fetcher) = scaffold(1, decay).await;
-
-        let server_task = async move {
-            let (conn, _) = server.accept().await.unwrap();
-            let mut conn = server.handshake_ctx().handshake(conn).await.unwrap();
-            for _ in 0..2 {
-                let NextTestRequest {} = async_read(&mut conn).await.unwrap();
-                async_write(&mut conn, &NextTestResponse::Pending)
-                    .await
-                    .unwrap();
-            }
-
-            let NextTestRequest {} = async_read(&mut conn).await.unwrap();
-            async_write(
-                &mut conn,
-                &NextTestResponse::Bundle(NextWorkBundle::new(vec![])),
-            )
-            .await
-            .unwrap();
-        };
-
-        let client_task = async move {
-            let bundle = fetcher.wait_for_next_work_bundle().await.unwrap();
-            assert!(bundle.work.is_empty());
-            fetcher
-        };
-
-        let ((), mut fetcher) = tokio::join!(server_task, client_task);
-
-        // Decay should still be at the starting state.
-        assert_eq!(
-            fetcher
-                .decay_on_pending_tests_notification
-                .next_duration()
-                .as_micros(),
-            10
-        );
     }
 }

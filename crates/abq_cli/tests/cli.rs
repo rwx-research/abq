@@ -431,6 +431,20 @@ fn assert_sum_of_run_test_failures<'a>(
     assert_sum_of_re(outputs, re_run, expected);
 }
 
+fn assert_sum_of_run_test_retries<'a>(outputs: impl IntoIterator<Item = &'a str>, expected: usize) {
+    let re = regex::Regex::new(r"\d+ tests, \d+ failures, (\d+) retried").unwrap();
+    let mut total_run = 0;
+    for output in outputs {
+        let tests: usize = re
+            .captures(output)
+            .and_then(|m| m.get(1))
+            .and_then(|m| m.as_str().parse().ok())
+            .unwrap_or(0);
+        total_run += tests;
+    }
+    assert_eq!(total_run, expected);
+}
+
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_separate_queue_numbered_workers_test_without_failure |name, conf: CSConfigOptions| {
@@ -1308,7 +1322,6 @@ For a reason explainable only by a backtrace
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore = "TODO(1.3-retries)"]
 fn retries_smoke() {
     // Smoke test for retries, that runs a number of tests on a number of workers and makes sure
     // nothing blows up.
@@ -1421,7 +1434,7 @@ fn retries_smoke() {
         args
     };
 
-    let other_workers: Vec<_> = (1..num_workers)
+    let workers: Vec<_> = (0..num_workers)
         .map(|i| {
             Abq::new(format!("{name}_worker{i}"))
                 .args(test_args(i))
@@ -1429,30 +1442,18 @@ fn retries_smoke() {
         })
         .collect();
 
-    // Start the worker0 and run to completion.
-    {
-        let CmdOutput {
-            stdout,
-            stderr,
-            exit_status,
-        } = Abq::new(name.to_string() + "_worker0")
-            .args(test_args(0))
-            .run();
-
-        assert_eq!(exit_status.code().unwrap(), 1);
-        assert!(
-            stdout.contains("64 tests, 64 failures, 64 retried"),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        )
-    }
-
     let mut at_least_one_is_failing = false;
-    for worker in other_workers {
-        let Output { status, .. } = worker.wait_with_output().unwrap();
+    let mut stdouts = vec![];
+    for worker in workers {
+        let Output { status, stdout, .. } = worker.wait_with_output().unwrap();
+        stdouts.push(String::from_utf8_lossy(&stdout).to_string());
         at_least_one_is_failing = at_least_one_is_failing || status.code().unwrap() == 1;
     }
 
     assert!(at_least_one_is_failing);
+    assert_sum_of_run_tests(stdouts.iter().map(|s| s.as_str()), 64);
+    assert_sum_of_run_test_failures(stdouts.iter().map(|s| s.as_str()), 64);
+    assert_sum_of_run_test_retries(stdouts.iter().map(|s| s.as_str()), 64);
 
     term_queue(queue_proc);
 }

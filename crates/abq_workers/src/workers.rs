@@ -26,14 +26,15 @@ use abq_utils::oneshot_notify::{self, OneshotRx, OneshotTx};
 use abq_utils::results_handler::ResultsHandler;
 
 use crate::liveness::LiveCount;
-use crate::results_handler::ResultsHandlerGenerator;
-use crate::test_like_runner;
+use crate::runner_strategy::RunnerStrategy;
+use crate::{runner_strategy, test_like_runner};
 
 pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
 
+pub use abq_generic_test_runner::GetNextTests;
+pub use abq_generic_test_runner::NotifyMaterialTestsAllRun;
 pub use abq_generic_test_runner::TestsFetcher;
 
-pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 pub type GetNextTestsGenerator<'a> = &'a (dyn Fn(Entity) -> GetNextTests + Send + Sync);
 
 pub type GetInitContext =
@@ -42,7 +43,6 @@ pub type NotifyManifest = Box<dyn Fn(Entity, &RunId, ManifestResult) + Send + Sy
 
 pub type NotifyCancellation = Box<dyn FnOnce() + Send + Sync + 'static>;
 
-pub type NotifyMaterialTestsAllRun = abq_generic_test_runner::NotifyMaterialTestsAllRun;
 pub type NotifyMaterialTestsAllRunGenerator<'a> =
     &'a (dyn Fn() -> NotifyMaterialTestsAllRun + Send + Sync);
 
@@ -79,12 +79,8 @@ pub struct WorkerPoolConfig<'a> {
     pub notify_manifest: Option<NotifyManifest>,
     /// How should workers initialize their native test runners?
     pub get_init_context: GetInitContext,
-    /// How should a worker get the next unit of work it needs to run?
-    pub get_next_tests_generator: GetNextTestsGenerator<'a>,
-    /// How should results be communicated back?
-    pub results_handler_generator: ResultsHandlerGenerator<'a>,
-    /// How should a runner notify the queue it's run all assigned tests.
-    pub notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
+    /// How runners should communicate.
+    pub runner_strategy_generator: &'a dyn runner_strategy::StrategyGenerator,
     /// How should the workers notify cancellation.
     pub notify_cancellation: NotifyCancellation,
     /// How many results should be sent back at a time?
@@ -148,11 +144,9 @@ impl WorkerPool {
             runner_kind,
             run_id,
             get_init_context,
-            get_next_tests_generator,
             results_batch_size_hint: results_batch_size,
-            results_handler_generator,
+            runner_strategy_generator,
             notify_manifest,
-            notify_all_tests_run_generator,
             notify_cancellation,
             worker_context,
             debug_native_runner,
@@ -190,6 +184,12 @@ impl WorkerPool {
             let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(1));
             let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
 
+            let RunnerStrategy {
+                get_next_tests,
+                results_handler,
+                notify_all_tests_run,
+            } = runner_strategy_generator.generate(entity);
+
             debug_assert_eq!(entity.tag, entity::Tag::Runner(runner));
 
             let worker_env = RunnerEnv {
@@ -198,12 +198,12 @@ impl WorkerPool {
                 shutdown_immediately: shutdown_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                tests_fetcher: get_next_tests_generator(entity),
+                tests_fetcher: get_next_tests,
                 results_batch_size,
-                results_handler: results_handler_generator(entity),
+                results_handler,
                 context: worker_context.clone(),
                 notify_manifest,
-                notify_all_tests_run: notify_all_tests_run_generator(),
+                notify_all_tests_run,
                 debug_native_runner,
             };
 
@@ -233,16 +233,22 @@ impl WorkerPool {
             let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
             debug_assert!(!is_singleton_runner);
 
+            let RunnerStrategy {
+                get_next_tests,
+                results_handler,
+                notify_all_tests_run,
+            } = runner_strategy_generator.generate(entity);
+
             let worker_env = RunnerEnv {
                 entity,
                 runner_meta,
                 shutdown_immediately: shutdown_rx,
                 run_id: run_id.clone(),
                 get_init_context,
-                tests_fetcher: get_next_tests_generator(entity),
+                tests_fetcher: get_next_tests,
                 results_batch_size,
-                results_handler: results_handler_generator(entity),
-                notify_all_tests_run: notify_all_tests_run_generator(),
+                results_handler,
+                notify_all_tests_run,
                 context: worker_context.clone(),
                 notify_manifest: None,
                 debug_native_runner,
@@ -481,7 +487,6 @@ fn start_generic_test_runner(
 
     // Running in its own thread.
     abq_generic_test_runner::run_sync(
-        entity,
         runner_meta,
         native_runner_params,
         working_dir,
@@ -719,7 +724,7 @@ fn start_test_like_runner(
         }
     }
 
-    rt.block_on(notify_all_tests_run(entity));
+    rt.block_on(notify_all_tests_run());
 
     Ok(TestRunnerExit {
         exit_code: ExitCode::SUCCESS,
@@ -865,6 +870,7 @@ mod test {
     };
     use crate::negotiate::QueueNegotiator;
     use crate::results_handler::ResultsHandlerGenerator;
+    use crate::runner_strategy::{self, RunnerStrategy};
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
     use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkId};
 
@@ -952,7 +958,7 @@ mod test {
                 let atomic = Arc::new(AtomicBool::new(false));
                 all.lock().unwrap().push(atomic.clone());
 
-                let notifier = move |_| {
+                let notifier = move || {
                     async move {
                         atomic.store(true, atomic::ORDERING);
                     }
@@ -971,13 +977,27 @@ mod test {
         }))
     }
 
+    struct StaticRunnerStrategy<'a> {
+        get_next_tests_generator: GetNextTestsGenerator<'a>,
+        results_handler_generator: ResultsHandlerGenerator<'a>,
+        notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
+    }
+
+    impl<'a> runner_strategy::StrategyGenerator for StaticRunnerStrategy<'a> {
+        fn generate(&self, runner_entity: Entity) -> RunnerStrategy {
+            RunnerStrategy {
+                get_next_tests: (self.get_next_tests_generator)(runner_entity),
+                results_handler: (self.results_handler_generator)(runner_entity),
+                notify_all_tests_run: (self.notify_all_tests_run_generator)(),
+            }
+        }
+    }
+
     fn setup_pool<'a>(
         runner_kind: RunnerKind,
         worker_pool_tag: WorkerTag,
         run_id: RunId,
-        get_next_tests_generator: GetNextTestsGenerator<'a>,
-        results_handler_generator: ResultsHandlerGenerator<'a>,
-        notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
+        runner_strategy_generator: &'a StaticRunnerStrategy<'a>,
         notify_cancellation: NotifyCancellation,
     ) -> (WorkerPoolConfig<'a>, ManifestCollector) {
         let (manifest_collector, notify_manifest) = manifest_collector();
@@ -986,15 +1006,13 @@ mod test {
             size: NonZeroUsize::new(1).unwrap(),
             tag: worker_pool_tag,
             first_runner_entity: Entity::first_runner(worker_pool_tag),
-            get_next_tests_generator,
             get_init_context: Arc::new(empty_init_context),
             results_batch_size_hint: 5,
             runner_kind,
+            runner_strategy_generator,
             run_id,
             notify_manifest: Some(notify_manifest),
             notify_cancellation,
-            results_handler_generator,
-            notify_all_tests_run_generator,
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
         };
@@ -1062,13 +1080,17 @@ mod test {
         });
         let manifest = ManifestMessage::new(Manifest::new(tests, Default::default()));
 
+        let runner_strategy = StaticRunnerStrategy {
+            get_next_tests_generator: &get_next_tests,
+            results_handler_generator: &results_handler_generator,
+            notify_all_tests_run_generator: &notify_all_tests_run_generator,
+        };
+
         let (default_config, manifest_collector) = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
             WorkerTag::new(0),
             run_id,
-            &get_next_tests,
-            &results_handler_generator,
-            &notify_all_tests_run_generator,
+            &runner_strategy,
             noop_notify_cancellation(),
         );
 
@@ -1322,6 +1344,13 @@ mod test {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
+
+        let runner_strategy = StaticRunnerStrategy {
+            get_next_tests_generator: &get_next_tests,
+            results_handler_generator: &results_handler_generator,
+            notify_all_tests_run_generator: &notify_all_tests_run_generator,
+        };
+
         let (default_config, _manifest_collector) = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
                 // This command should cause the worker to error, since it can't even be executed
@@ -1331,9 +1360,7 @@ mod test {
             }),
             WorkerTag::new(0),
             RunId::unique(),
-            &get_next_tests,
-            &results_handler_generator,
-            &notify_all_tests_run_generator,
+            &runner_strategy,
             noop_notify_cancellation(),
         );
 
@@ -1355,6 +1382,12 @@ mod test {
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
 
+        let runner_strategy = StaticRunnerStrategy {
+            get_next_tests_generator: &get_next_tests,
+            results_handler_generator: &results_handler_generator,
+            notify_all_tests_run_generator: &notify_all_tests_run_generator,
+        };
+
         let writefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let writefile_path = writefile.to_path_buf();
 
@@ -1366,9 +1399,7 @@ mod test {
             }),
             WorkerTag::new(0),
             RunId::unique(),
-            &get_next_tests,
-            &results_handler_generator,
-            &notify_all_tests_run_generator,
+            &runner_strategy,
             noop_notify_cancellation(),
         );
 
@@ -1393,6 +1424,12 @@ mod test {
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
 
+        let runner_strategy = StaticRunnerStrategy {
+            get_next_tests_generator: &get_next_tests,
+            results_handler_generator: &results_handler_generator,
+            notify_all_tests_run_generator: &notify_all_tests_run_generator,
+        };
+
         let manifest = ManifestMessage::new(Manifest::new(
             [echo_test(proto, "test1".to_string())],
             Default::default(),
@@ -1401,9 +1438,7 @@ mod test {
             RunnerKind::TestLikeRunner(TestLikeRunner::ExitWith(27), Box::new(manifest)),
             WorkerTag::new(0),
             RunId::unique(),
-            &get_next_tests,
-            &results_handler_generator,
-            &notify_all_tests_run_generator,
+            &runner_strategy,
             noop_notify_cancellation(),
         );
 

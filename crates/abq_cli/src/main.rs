@@ -277,7 +277,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
         }
         Command::Test {
             worker,
-            retries: _,
+            retries,
             args,
             working_dir,
             run_id,
@@ -339,10 +339,13 @@ fn abq_main() -> anyhow::Result<ExitCode> {
 
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
 
+            let max_run_number = 1 + retries;
+
             workers::start_workers_standalone(
                 run_id,
                 WorkerTag::new(worker as _),
                 num_runners,
+                max_run_number,
                 runner,
                 working_dir,
                 reporters,

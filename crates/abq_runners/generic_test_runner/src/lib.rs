@@ -21,7 +21,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, ChildStderr, ChildStdout};
 
-use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
+use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{self, AssociatedTestResults, RunAlreadyCompleted, TestSpec};
 use abq_utils::net_protocol::runners::{
     CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
@@ -258,7 +258,7 @@ impl GenericRunnerError {
 /// executed.
 /// In cases where the runner exits before all assigned tests were completed (due to unrecoverable fault),
 /// or the runner exited early due to a finished test run, this is never called.
-pub type NotifyMaterialTestsAllRun = Box<dyn FnOnce(Entity) -> BoxFuture<'static, ()> + Send>;
+pub type NotifyMaterialTestsAllRun = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
 
 /// Asynchronously fetch a bundle of tests.
 #[async_trait]
@@ -271,7 +271,6 @@ pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 pub type Outcome = Result<TestRunnerExit, GenericRunnerError>;
 
 pub fn run_sync<SendManifest, GetInitContext>(
-    runner_entity: Entity,
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
     working_dir: PathBuf,
@@ -294,7 +293,6 @@ where
         .build());
 
     rt.block_on(run_async(
-        runner_entity,
         runner_meta,
         input,
         working_dir,
@@ -583,7 +581,6 @@ impl<'a> NativeRunnerHandle<'a> {
 }
 
 pub async fn run_async<SendManifest, GetInitContext>(
-    runner_entity: Entity,
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
     working_dir: PathBuf,
@@ -633,7 +630,6 @@ where
         get_next_test_bundle,
         results_handler,
         notify_all_tests_run,
-        runner_entity,
         runner_meta,
     );
 
@@ -664,7 +660,6 @@ async fn run_help<SendManifest, GetInitContext>(
     get_next_test_bundle: GetNextTests,
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
-    runner_entity: Entity,
     runner_meta: RunnerMeta,
     // TODO this is already on the handle
 ) -> Result<TestRunnerExit, GenericRunnerError>
@@ -718,7 +713,6 @@ where
         get_next_test_bundle,
         results_handler,
         notify_all_tests_run,
-        runner_entity,
         runner_meta,
     )
     .await;
@@ -775,7 +769,6 @@ async fn execute_all_tests<'a, GetInitContext>(
     test_fetcher: GetNextTests,
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
-    runner_entity: Entity,
     runner_meta: RunnerMeta,
 ) -> Result<ExitCode, LocatedError>
 where
@@ -908,7 +901,7 @@ where
         }
 
         drop(results_tx);
-        let ((), exit_status) = tokio::join!(notify_all_tests_run(runner_entity), async {
+        let ((), exit_status) = tokio::join!(notify_all_tests_run(), async {
             native_runner_handle
                 .conn
                 .stream
@@ -1364,7 +1357,6 @@ pub fn execute_wrapped_runner(
     let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
     let _opt_exit_error = run_sync(
-        Entity::runner(0, 1),
         RunnerMeta::fake(),
         native_runner_params,
         working_dir,
@@ -1374,7 +1366,7 @@ pub fn execute_wrapped_runner(
         get_init_context,
         get_next_test,
         results_handler,
-        Box::new(|_| async {}.boxed()),
+        Box::new(|| async {}.boxed()),
         false,
     );
 
@@ -1627,7 +1619,7 @@ fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
     let all_test_run = Arc::new(AtomicBool::new(false));
     let notify_all_tests_run = {
         let all_run = all_test_run.clone();
-        move |_| {
+        move || {
             async move {
                 all_run.store(true, atomic::ORDERING);
             }
@@ -1642,7 +1634,7 @@ fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
     use crate::{execute_wrapped_runner, notify_all_tests_run, run_sync, ImmediateTests};
-    use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
+    use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
     use abq_utils::net_protocol::work_server::InitContext;
@@ -1703,7 +1695,6 @@ mod test_abq_jest {
         let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
         run_sync(
-            Entity::runner(0, 1),
             RunnerMeta::fake(),
             input,
             npm_jest_project_path(),
@@ -1865,7 +1856,6 @@ mod test_abq_jest {
         let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
         let runner_result = run_sync::<fn(ManifestResult), _>(
-            Entity::runner(0, 1),
             RunnerMeta::fake(),
             input,
             npm_jest_project_path(),
@@ -1891,7 +1881,7 @@ mod test_abq_jest {
 #[cfg(test)]
 mod test_invalid_command {
     use crate::{notify_all_tests_run, run_sync, GenericRunnerError, ImmediateTests};
-    use abq_utils::net_protocol::entity::{Entity, RunnerMeta};
+    use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle,
@@ -1925,7 +1915,6 @@ mod test_invalid_command {
         let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
         let runner_result = run_sync(
-            Entity::runner(0, 1),
             RunnerMeta::fake(),
             input,
             std::env::current_dir().unwrap(),

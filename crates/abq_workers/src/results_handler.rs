@@ -12,6 +12,8 @@ use abq_utils::{
 use async_trait::async_trait;
 use tracing::instrument;
 
+use crate::test_fetching;
+
 /// A way to get a new [NotifyResults] value for a unique test run.
 pub type ResultsHandlerGenerator<'a> = &'a (dyn Fn(Entity) -> ResultsHandler + Send + Sync);
 
@@ -19,13 +21,19 @@ pub type ResultsHandlerGenerator<'a> = &'a (dyn Fn(Entity) -> ResultsHandler + S
 pub(crate) struct MultiplexingResultsHandler {
     remote_handler: QueueResultsSender,
     local_handler: SharedResultsHandler,
+    results_retry_tracker: test_fetching::ResultsTracker,
 }
 
 impl MultiplexingResultsHandler {
-    pub fn new(remote_handler: QueueResultsSender, local_handler: SharedResultsHandler) -> Self {
+    pub fn new(
+        remote_handler: QueueResultsSender,
+        local_handler: SharedResultsHandler,
+        results_retry_tracker: test_fetching::ResultsTracker,
+    ) -> Self {
         Self {
             remote_handler,
             local_handler,
+            results_retry_tracker,
         }
     }
 }
@@ -34,7 +42,8 @@ impl MultiplexingResultsHandler {
 impl NotifyResults for MultiplexingResultsHandler {
     #[instrument(level="trace", skip_all, fields(results=results.len()))]
     async fn send_results(&mut self, results: Vec<AssociatedTestResults>) {
-        tokio::join!(
+        self.results_retry_tracker.account_results(results.iter());
+        let ((), ()) = tokio::join!(
             self.remote_handler.send_results(results.clone()),
             self.local_handler.send_results(results)
         );

@@ -42,7 +42,6 @@ use tokio::sync::oneshot;
 use tracing::instrument;
 
 use crate::active_state::{ActiveRunState, RunStateCache};
-use crate::attempts::AttemptsCounter;
 use crate::connections::{self, ConnectedWorkers};
 use crate::prelude::*;
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
@@ -98,10 +97,6 @@ enum RunState {
 
         /// The timeout for the last test result.
         last_test_timeout: Duration,
-
-        /// How many attempts of the test suite have been made.
-        /// The test suite is seen as complete when the end of the queue is at the max attempt number.
-        attempts_counter: AttemptsCounter,
     },
     Done {
         /// The exit code for the test run that should be yielded by a new worker connecting.
@@ -118,12 +113,10 @@ struct RunData {
     batch_size_hint: NonZeroU64,
     /// The timeout for the last test result.
     last_test_timeout: Duration,
-    /// The maximum attempt number of the test suite. Always >= [INIT_RUN_NUMBER]
-    max_attempt_no: u32,
 }
 
 // Just the stack size of the RunData, the closure of RunData may be much larger.
-static_assertions::assert_eq_size!(RunData, (u64, Duration, bool));
+static_assertions::assert_eq_size!(RunData, (u64, Duration));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 #[allow(unused)] // FIXME(ayaz) start using this
@@ -233,8 +226,6 @@ enum NextWorkResult {
         bundle: NextWorkBundle,
         status: PulledTestsStatus,
     },
-    /// Tests will be available, but they are not yet known.
-    Pending,
 }
 
 #[derive(Debug)]
@@ -374,8 +365,6 @@ impl AllRuns {
                 // TODO guard against MAX_BATCH_SIZE
                 batch_size_hint,
                 last_test_timeout,
-                // TODO remove
-                max_attempt_no: 1,
             }),
         };
         let old_run = runs.insert(run_id.clone(), Mutex::new(run));
@@ -434,7 +423,6 @@ impl AllRuns {
             batch_size_hint: run_data.batch_size_hint,
             init_metadata,
             last_test_timeout: run_data.last_test_timeout,
-            attempts_counter: AttemptsCounter::new(run_data.max_attempt_no),
         };
 
         AddedManifest::Added {
@@ -468,10 +456,9 @@ impl AllRuns {
                 queue,
                 batch_size_hint,
                 last_test_timeout,
-                attempts_counter,
                 ..
             } => {
-                Self::determine_next_work(queue, *batch_size_hint, *last_test_timeout, attempts_counter)
+                Self::determine_next_work(queue, *batch_size_hint, *last_test_timeout)
             }
             RunState::Done { .. } | RunState::Cancelled {..} => {
                 // Let the worker know that we've reached the end of the queue.
@@ -488,7 +475,6 @@ impl AllRuns {
         queue: &mut JobQueue,
         batch_size_hint: NonZeroU64,
         last_test_timeout: Duration,
-        attempts_counter: &mut AttemptsCounter,
     ) -> NextWorkResult {
         // NB: in the future, the batch size is likely to be determined intelligently, i.e.
         // from off-line timing data. But for now, we use the hint the client provided.
@@ -513,33 +499,16 @@ impl AllRuns {
             //     tests compose it. In this case, we must tell the requester to yield
             //     until those results arrive.
             match bundle.last() {
-                Some(NextWork::Work(test)) => {
-                    // We just pulled the last test for the given attempt.
-                    // If that was also the last attempt, we're all done. Otherwise, we will
-                    // eventually have more attempts to run.
-                    attempts_counter.account_last_of_attempt(test.run_number);
-
-                    if attempts_counter.completed_all_attempts() {
-                        pulled_tests_status =
-                            PulledTestsStatus::PulledLastTest { last_test_timeout };
-                    } else {
-                        pulled_tests_status = PulledTestsStatus::MoreTestsRemaining;
-                    }
+                Some(NextWork::Work(_)) => {
+                    pulled_tests_status = PulledTestsStatus::PulledLastTest { last_test_timeout };
                 }
                 Some(NextWork::EndOfWork) => {
                     // To avoid additional allocation and moves when we pop the queue, we built
                     // `bundle` as NextWork above, but it only consists of `NextWork::Work` variants.
-                    unreachable!(
-                        "illegal state - EndOfWork variant is not available at this point."
-                    )
+                    unreachable!("illegal state - EndOfWork variant must not exist at this point.")
                 }
                 None => {
-                    if attempts_counter.completed_all_attempts() {
-                        pulled_tests_status = PulledTestsStatus::QueueWasEmpty;
-                    } else {
-                        // There are more tests in
-                        return NextWorkResult::Pending;
-                    }
+                    pulled_tests_status = PulledTestsStatus::QueueWasEmpty;
                 }
             }
         } else {
@@ -2123,16 +2092,6 @@ impl WorkScheduler {
                         return Ok(());
                     }
                 }
-                NextWorkResult::Pending => {
-                    tracing::debug!(
-                        ?run_id, entity_id=%entity.display_id(), entity_tag=%entity.tag,
-                        "pending next tests in job queue"
-                    );
-
-                    net_protocol::async_write(&mut conn, &NextTestResponse::Pending)
-                        .await
-                        .located(here!())?;
-                }
             }
         }
     }
@@ -2979,61 +2938,9 @@ mod test_pull_work {
     use abq_utils::net_protocol::workers::{NextWork, RunId, WorkerTest};
     use abq_with_protocol_version::with_protocol_version;
 
-    use crate::{
-        attempts::AttemptsCounter,
-        queue::{
-            fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunLive, RunState,
-            SharedRuns,
-        },
+    use crate::queue::{
+        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunLive, RunState, SharedRuns,
     };
-
-    #[test]
-    #[with_protocol_version]
-    fn pull_last_tests_for_non_final_test_run_attempt_shows_tests_pending() {
-        let mut queue = JobQueue::default();
-        queue.add_batch_work([WorkerTest {
-            spec: fake_test_spec(proto),
-            run_number: 1,
-        }]);
-
-        let has_work = RunState::HasWork {
-            queue,
-            init_metadata: Default::default(),
-            batch_size_hint: one_nonzero(),
-            last_test_timeout: Duration::ZERO,
-            attempts_counter: AttemptsCounter::new(4),
-        };
-
-        let run_id = RunId::unique();
-        let queues = SharedRuns::default();
-        queues.set_state(run_id.clone(), has_work);
-
-        // First worker pulls to the end of the queue, but there should be additional attempts
-        // following it.
-        let next_work = queues.next_work(&run_id);
-
-        assert!(
-            matches!(next_work, NextWorkResult::Present { bundle, status }
-            if bundle.work.len() == 1 && matches!(status, PulledTestsStatus::MoreTestsRemaining)
-            )
-        );
-
-        assert!(matches!(
-            queues.get_run_liveness(&run_id),
-            Some(RunLive::Active)
-        ));
-
-        // Now, if another worker pulls work it should get nothing, but be told the remaining work
-        // is pending.
-        let next_work = queues.next_work(&run_id);
-
-        assert!(matches!(next_work, NextWorkResult::Pending));
-
-        assert!(matches!(
-            queues.get_run_liveness(&run_id),
-            Some(RunLive::Active)
-        ));
-    }
 
     #[test]
     #[with_protocol_version]
@@ -3052,14 +2959,12 @@ mod test_pull_work {
         ]);
 
         let batch_size_hint = one_nonzero();
-        let attempts_counter = AttemptsCounter::new(2);
 
         let has_work = RunState::HasWork {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
             last_test_timeout: Duration::ZERO,
-            attempts_counter,
         };
 
         let run_id = RunId::unique();

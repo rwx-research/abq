@@ -1,6 +1,5 @@
 //! Module negotiate helps worker pools attach to queues.
 
-use futures::FutureExt;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -16,12 +15,10 @@ use tracing::{error, instrument};
 
 use crate::{
     negotiate,
-    results_handler::{MultiplexingResultsHandler, QueueResultsSender, ResultsHandlerGenerator},
-    test_fetching,
+    runner_strategy::RunnerStrategyGenerator,
     workers::{
-        GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyCancellation,
-        NotifyManifest, NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator,
-        WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
+        GetInitContext, InitContextResult, NotifyCancellation, NotifyManifest, WorkerContext,
+        WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
     },
 };
 use abq_utils::{
@@ -39,7 +36,7 @@ use abq_utils::{
         workers::{RunId, RunnerKind},
     },
     results_handler::SharedResultsHandler,
-    retry::{async_retry_n, retry_n},
+    retry::retry_n,
     server_shutdown::ShutdownReceiver,
 };
 
@@ -115,6 +112,8 @@ pub struct WorkersConfig {
     pub debug_native_runner: bool,
     /// Hint for how many test results should be sent back in a batch.
     pub results_batch_size_hint: u64,
+    /// Max number of test suite run attempts
+    pub max_run_number: u32,
 }
 
 #[derive(Debug, Error)]
@@ -249,26 +248,17 @@ impl WorkersNegotiator {
             worker_context,
             debug_native_runner,
             results_batch_size_hint,
+            max_run_number,
         } = workers_config;
 
-        let results_handler_generator: ResultsHandlerGenerator = {
-            let client = async_client.boxed_clone();
-            let run_id = run_id.clone();
-            let local_results_handler = local_results_handler.boxed_clone();
-            &move |entity| {
-                let queue_handler = QueueResultsSender::new(
-                    client.boxed_clone(),
-                    queue_results_addr,
-                    entity,
-                    run_id.clone(),
-                );
-                let notifier = MultiplexingResultsHandler::new(
-                    queue_handler,
-                    local_results_handler.boxed_clone(),
-                );
-                Box::new(notifier)
-            }
-        };
+        let runner_strategy_generator = RunnerStrategyGenerator::new(
+            async_client.boxed_clone(),
+            run_id.clone(),
+            queue_results_addr,
+            work_server_addr,
+            local_results_handler,
+            max_run_number,
+        );
 
         let get_init_context: GetInitContext = Arc::new({
             let client = client.boxed_clone();
@@ -281,20 +271,6 @@ impl WorkersNegotiator {
                 wait_for_init_context(entity, &*client, work_server_addr, run_id.clone())
             }
         });
-
-        // A function to generate a [GetNextTests] closure.
-        let get_next_tests_generator: GetNextTestsGenerator = {
-            let async_client = async_client.boxed_clone();
-            let run_id = run_id.clone();
-            &move |entity| {
-                Box::new(test_fetching::Fetcher::new(
-                    entity,
-                    work_server_addr,
-                    async_client.boxed_clone(),
-                    run_id.clone(),
-                ))
-            }
-        };
 
         let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
             Some(Box::new({
@@ -332,45 +308,6 @@ impl WorkersNegotiator {
             None
         };
 
-        let notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator = {
-            let run_id = run_id.clone();
-            &move || {
-                let async_client = async_client.boxed_clone();
-                let run_id = run_id.clone();
-                let notifier: NotifyMaterialTestsAllRun = Box::new(move |entity| {
-                    async move {
-                        let async_client_ref = &async_client;
-                        let mut stream =
-                            async_retry_n(5, Duration::from_secs(3), |attempt| async move {
-                                if attempt > 1 {
-                                    tracing::info!(
-                                        "reattempting connection to results server {}",
-                                        attempt
-                                    );
-                                }
-                                async_client_ref.connect(queue_results_addr).await
-                            })
-                            .await
-                            .expect("results server not available");
-
-                        let message = net_protocol::queue::Request {
-                            entity,
-                            message: net_protocol::queue::Message::WorkerRanAllTests(run_id),
-                        };
-
-                        net_protocol::async_write(&mut stream, &message)
-                            .await
-                            .unwrap();
-                        let net_protocol::queue::AckWorkerRanAllTests {} =
-                            net_protocol::async_read(&mut stream).await.unwrap();
-                    }
-                    .boxed()
-                });
-
-                notifier
-            }
-        };
-
         let notify_cancellation: NotifyCancellation = Box::new({
             let client = client.boxed_clone();
             let run_id = run_id.clone();
@@ -382,10 +319,8 @@ impl WorkersNegotiator {
             tag,
             first_runner_entity,
             runner_kind,
-            get_next_tests_generator,
             get_init_context,
-            results_handler_generator,
-            notify_all_tests_run_generator,
+            runner_strategy_generator: &runner_strategy_generator,
             results_batch_size_hint,
             worker_context,
             run_id,
@@ -1116,6 +1051,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
             results_batch_size_hint: 1,
+            max_run_number: INIT_RUN_NUMBER,
         };
 
         let invoke_data = InvokeWork {

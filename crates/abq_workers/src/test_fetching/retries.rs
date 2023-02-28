@@ -1,6 +1,4 @@
-#![allow(unused)] // for now
-
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use abq_utils::{
     log_assert,
@@ -10,6 +8,7 @@ use abq_utils::{
         workers::{NextWork, WorkId, WorkerTest, INIT_RUN_NUMBER},
     },
 };
+use parking_lot::Mutex;
 
 struct RetryManifestTracker {
     // Since we need to preserve insertion order of the manifest, keep a hashmap for faster
@@ -42,12 +41,16 @@ struct TestEntry {
 }
 
 /// The assembled retry manifest can be in one of the following states.
+#[derive(Debug, PartialEq, Eq)]
 enum AssembledState {
     /// The retry manifest has not started populating any entries for the retry manifest.
     NotStarted,
     /// The retry manifest started hydrating entries of the manifest, but has not wholly
     /// hydrated it yet. It is waiting for an end-of-test marker to delimit the size of the manifest.
-    WaitingForEndOfHydration { last_seen_work_name: WorkId },
+    WaitingForEndOfHydration {
+        last_seen_work_name: WorkId,
+        processed_last_seen_work_result: bool,
+    },
     /// The retry manifest has been fully hydrated with entries of the manifest.
     /// We are now tracking whether the current attempt's last result has been seen.
     /// A retry manifest for an attempts can only be fetched once the results for all tests in an
@@ -58,12 +61,25 @@ enum AssembledState {
     },
 }
 
+/// The status of the retry manifest after inserting some manifest entries.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub enum HydrationStatus {
+    /// End of manifest has not yet been reached.
+    StillHydrating,
+    /// The manifest is empty; there is nothing to test or retry.
+    EmptyManifest,
+    /// The end of the manifest was reached.
+    EndOfManifest,
+}
+
 impl AssembledState {
     fn note_seen_manifest_item(&mut self, work_id: WorkId) {
         use AssembledState::*;
         let next_state = match self {
             NotStarted | WaitingForEndOfHydration { .. } => WaitingForEndOfHydration {
                 last_seen_work_name: work_id,
+                processed_last_seen_work_result: false,
             },
             Hydrated { .. } => {
                 unreachable!("cannot see new manifest items after hydration is complete")
@@ -72,22 +88,24 @@ impl AssembledState {
         *self = next_state;
     }
 
-    fn note_end_of_manifest(&mut self) {
-        let next_state = match self {
-            AssembledState::NotStarted => unreachable!(
-                "empty manifests should never be reachable here, as they should exit early"
-            ),
+    fn note_end_of_manifest(&mut self) -> HydrationStatus {
+        match self {
+            AssembledState::NotStarted => HydrationStatus::EmptyManifest,
             AssembledState::WaitingForEndOfHydration {
                 last_seen_work_name,
-            } => AssembledState::Hydrated {
-                last_work_name: *last_seen_work_name,
-                processed_last_work_result: false,
-            },
+                processed_last_seen_work_result,
+            } => {
+                let last_work_name = *last_seen_work_name;
+                *self = AssembledState::Hydrated {
+                    last_work_name,
+                    processed_last_work_result: *processed_last_seen_work_result,
+                };
+                HydrationStatus::EndOfManifest
+            }
             AssembledState::Hydrated { .. } => {
                 unreachable!("cannot reach end of manifest again after hydration was completed")
             }
-        };
-        *self = next_state;
+        }
     }
 
     fn note_accounted_result(&mut self, work_id: WorkId) {
@@ -95,17 +113,17 @@ impl AssembledState {
             AssembledState::NotStarted => unreachable!(
                 "should never start accounting results before any manifest entry was hydrated"
             ),
-            AssembledState::WaitingForEndOfHydration { .. } => {
-                // do nothing, we are incrementally filling results in we're populating the
-                // manifest.
+            AssembledState::WaitingForEndOfHydration {
+                last_seen_work_name: last_work_name,
+                processed_last_seen_work_result: processed_last_work_result,
             }
-            AssembledState::Hydrated {
+            | AssembledState::Hydrated {
                 last_work_name,
                 processed_last_work_result,
             } => {
                 let just_accounted_last_work_result = work_id == *last_work_name;
                 debug_assert!(
-                    !(just_accounted_last_work_result && *processed_last_work_result),
+                    !*processed_last_work_result || just_accounted_last_work_result,
                     "must not see last work result without resetting for a next attempt"
                 );
                 *processed_last_work_result = just_accounted_last_work_result;
@@ -115,7 +133,7 @@ impl AssembledState {
 }
 
 impl RetryManifestTracker {
-    pub fn new(max_run_number: u32) -> Self {
+    fn new(max_run_number: u32) -> Self {
         Self {
             entry_indices: Default::default(),
             entries: Default::default(),
@@ -125,12 +143,11 @@ impl RetryManifestTracker {
         }
     }
 
-    /// Hydrates the retry manifest tracker with a slice of items from the manifest. The slice
-    /// order is preserved, and is expected to be the order provided by the queue.
-    ///
-    /// Calling [Self::account_results] before the corresponding manifest entries are accounted is
-    /// a bug.
-    pub fn hydrate_ordered_manifest_slice(&mut self, slice: impl IntoIterator<Item = NextWork>) {
+    fn hydrate_ordered_manifest_slice(
+        &mut self,
+        slice: impl IntoIterator<Item = NextWork>,
+    ) -> HydrationStatus {
+        let mut status = HydrationStatus::StillHydrating;
         for item in slice {
             match item {
                 NextWork::Work(WorkerTest { spec, run_number }) => {
@@ -138,10 +155,12 @@ impl RetryManifestTracker {
                     self.hydrate_ordered_manifest_item(spec);
                 }
                 NextWork::EndOfWork => {
-                    self.assembled_state.note_end_of_manifest();
+                    debug_assert_eq!(status, HydrationStatus::StillHydrating);
+                    status = self.assembled_state.note_end_of_manifest();
                 }
             }
         }
+        status
     }
 
     #[inline]
@@ -166,7 +185,7 @@ impl RetryManifestTracker {
         self.entries.push(entry);
     }
 
-    pub fn account_results<'a>(
+    fn account_results<'a>(
         &mut self,
         results: impl IntoIterator<Item = &'a AssociatedTestResults>,
     ) {
@@ -214,6 +233,90 @@ impl RetryManifestTracker {
         }
     }
 
+    fn try_assemble_retry_manifest(&mut self) -> Option<Vec<NextWork>> {
+        debug_assert!(self.current_run_number <= self.max_run_number);
+
+        if self.current_run_number == self.max_run_number {
+            return Some(vec![NextWork::EndOfWork]);
+        }
+
+        match &mut self.assembled_state {
+            AssembledState::NotStarted | AssembledState::WaitingForEndOfHydration { .. } => None,
+            AssembledState::Hydrated {
+                last_work_name,
+                processed_last_work_result,
+            } => {
+                if !*processed_last_work_result {
+                    return None;
+                }
+
+                let next_run_number = self.current_run_number + 1;
+
+                let failing_subset: Vec<_> = failing_subset(&self.entries, self.current_run_number)
+                    .map(|spec| {
+                        NextWork::Work(WorkerTest {
+                            spec,
+                            run_number: next_run_number,
+                        })
+                    })
+                    .collect();
+
+                match failing_subset.last() {
+                    Some(NextWork::Work(test)) => {
+                        *last_work_name = test.spec.work_id;
+                        *processed_last_work_result = false;
+                        self.current_run_number = next_run_number;
+                        Some(failing_subset)
+                    }
+                    None => {
+                        // No more retries
+                        Some(vec![NextWork::EndOfWork])
+                    }
+
+                    Some(NextWork::EndOfWork) => {
+                        unreachable!("failing_subset consists only of material work at this point")
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn failing_subset(entries: &[TestEntry], run_number: u32) -> impl Iterator<Item = TestSpec> + '_ {
+    entries.iter().filter_map(move |entry| match entry.status {
+        Status::HasNonFailingAttempt => None,
+        Status::AlwaysFailedOn { last } => {
+            debug_assert!(entry.spec.test_case.has_focus());
+            if last == run_number {
+                Some(entry.spec.clone())
+            } else {
+                None
+            }
+        }
+    })
+}
+
+// TODO investigate async mutex?
+type SharedRetryManifestTracker = Arc<Mutex<RetryManifestTracker>>;
+
+/// A handle to register manifest entries and assemble retry manifest from an underlying
+/// retry-manifest tracker.
+#[repr(transparent)]
+pub struct RetryTracker(SharedRetryManifestTracker);
+
+impl RetryTracker {
+    /// Hydrates the retry manifest tracker with a slice of items from the manifest. The slice
+    /// order is preserved, and is expected to be the order provided by the queue.
+    ///
+    /// Calling [ResultsTracker::account_results] before the corresponding manifest entries are accounted is
+    /// a bug.
+    pub fn hydrate_ordered_manifest_slice(
+        &mut self,
+        slice: impl IntoIterator<Item = NextWork>,
+    ) -> HydrationStatus {
+        self.0.lock().hydrate_ordered_manifest_slice(slice)
+    }
+
     /// Assemble a subset of the manifest consisting only of entries that failed for the current
     /// test suite run attempt number.
     /// The retrieved manifest is in the same order as the manifest this tracker was constructed
@@ -224,70 +327,46 @@ impl RetryManifestTracker {
     ///
     /// If all attempts have been exhausted, a list of [NextWork::EndOfWork] markers is returned.
     pub fn try_assemble_retry_manifest(&mut self) -> Option<Vec<NextWork>> {
-        debug_assert!(self.current_run_number <= self.max_run_number);
-
-        if self.current_run_number == self.max_run_number {
-            return Some(vec![NextWork::EndOfWork]);
-        }
-
-        match &mut self.assembled_state {
-            AssembledState::NotStarted | AssembledState::WaitingForEndOfHydration { .. } => None,
-            AssembledState::Hydrated {
-                last_work_name: _,
-                processed_last_work_result,
-            } => {
-                if !*processed_last_work_result {
-                    return None;
-                }
-
-                let current_run_number = self.current_run_number;
-                let next_run_number = current_run_number + 1;
-                self.current_run_number = next_run_number;
-
-                *processed_last_work_result = false;
-
-                let failing_subset: Vec<_> = self
-                    .failing_subset(current_run_number)
-                    .map(|spec| {
-                        NextWork::Work(WorkerTest {
-                            spec,
-                            run_number: next_run_number,
-                        })
-                    })
-                    .collect();
-
-                Some(failing_subset)
-            }
-        }
-    }
-
-    fn failing_subset(&self, run_number: u32) -> impl Iterator<Item = TestSpec> + '_ {
-        self.entries
-            .iter()
-            .filter_map(move |entry| match entry.status {
-                Status::HasNonFailingAttempt => None,
-                Status::AlwaysFailedOn { last } => {
-                    debug_assert!(entry.spec.test_case.has_focus());
-                    if last == run_number {
-                        Some(entry.spec.clone())
-                    } else {
-                        None
-                    }
-                }
-            })
+        self.0.lock().try_assemble_retry_manifest()
     }
 }
 
+/// A handle to insert results into the retry manifest tracker.
+#[repr(transparent)]
+pub struct ResultsTracker(SharedRetryManifestTracker);
+
+impl ResultsTracker {
+    /// Accounts results for tests that are part of the local manifest.
+    ///
+    /// Calling this method before the corresponding manifest entries are
+    /// [accounted][RetryTracker::hydrate_ordered_manifest_slice] is a bug.
+    pub fn account_results<'a>(
+        &mut self,
+        results: impl IntoIterator<Item = &'a AssociatedTestResults>,
+    ) {
+        self.0.lock().account_results(results)
+    }
+}
+
+pub fn build_tracking_pair(max_run_number: u32) -> (RetryTracker, ResultsTracker) {
+    let retry_manifest_tracker = RetryManifestTracker::new(max_run_number);
+    let shared = Arc::new(Mutex::new(retry_manifest_tracker));
+
+    (RetryTracker(shared.clone()), ResultsTracker(shared))
+}
+
 #[cfg(test)]
-mod test {
+pub mod test {
     use abq_run_n_times::n_times;
     use abq_utils::net_protocol::{
         queue::{AssociatedTestResults, TestSpec},
-        runners::{CapturedOutput, Status, Test, TestCase, TestId, TestResult},
+        runners::{CapturedOutput, Status, TestCase, TestId, TestResult},
         workers::{NextWork, WorkId, WorkerTest, INIT_RUN_NUMBER},
     };
     use abq_with_protocol_version::with_protocol_version;
     use rand::distributions::{Alphanumeric, DistString};
+
+    use crate::test_fetching::retries::{failing_subset, AssembledState, HydrationStatus};
 
     use super::RetryManifestTracker;
 
@@ -305,7 +384,9 @@ mod test {
             work_id: WorkId::new(),
         });
 
-        assert!(tracker.failing_subset(INIT_RUN_NUMBER).next().is_none());
+        assert!(failing_subset(&tracker.entries, INIT_RUN_NUMBER)
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -337,7 +418,8 @@ mod test {
         tracker.account_failure(id3, INIT_RUN_NUMBER, "test3".to_string());
         tracker.account_failure(id1, INIT_RUN_NUMBER, "test1".to_string());
 
-        let failing_manifest = tracker.failing_subset(INIT_RUN_NUMBER).collect::<Vec<_>>();
+        let failing_manifest =
+            failing_subset(&tracker.entries, INIT_RUN_NUMBER).collect::<Vec<_>>();
         let expected = vec![
             {
                 let mut spec1 = spec1;
@@ -400,7 +482,8 @@ mod test {
         tracker.account_failure(id5, INIT_RUN_NUMBER + 1, "test5".to_string());
         tracker.account_failure(id1, INIT_RUN_NUMBER + 1, "test1".to_string());
 
-        let failing_manifest: Vec<_> = tracker.failing_subset(INIT_RUN_NUMBER + 1).collect();
+        let failing_manifest: Vec<_> =
+            failing_subset(&tracker.entries, INIT_RUN_NUMBER + 1).collect();
         let expected = vec![
             {
                 let mut spec1 = spec1;
@@ -450,7 +533,7 @@ mod test {
             }
         }
 
-        let failing_manifest = tracker.failing_subset(INIT_RUN_NUMBER);
+        let failing_manifest = failing_subset(&tracker.entries, INIT_RUN_NUMBER);
         let failing_ids: Vec<_> = failing_manifest.into_iter().map(|e| e.work_id).collect();
         assert_eq!(failing_ids, expected_failing_ids);
     }
@@ -461,26 +544,26 @@ mod test {
         assert_eq!(tracker.try_assemble_retry_manifest(), None);
     }
 
-    const SUCCESS: Status = Status::Success;
-    const FAILURE: Status = Status::Failure {
+    pub const SUCCESS: Status = Status::Success;
+    pub const FAILURE: Status = Status::Failure {
         exception: None,
         backtrace: None,
     };
 
-    fn result(test_id: impl Into<TestId>, status: Status) -> TestResult {
+    pub fn result(test_id: impl Into<TestId>, status: Status) -> TestResult {
         let mut result = TestResult::fake();
         result.result.id = test_id.into();
         result.result.status = status;
         result
     }
 
-    fn with_focus(test_spec: impl Into<TestSpec>, focus: impl Into<TestId>) -> TestSpec {
+    pub fn with_focus(test_spec: impl Into<TestSpec>, focus: impl Into<TestId>) -> TestSpec {
         let mut test_spec = test_spec.into();
         test_spec.test_case.add_test_focus(focus.into());
         test_spec
     }
 
-    fn associated_results(
+    pub fn associated_results(
         work_id: WorkId,
         run_number: u32,
         results: impl IntoIterator<Item = TestResult>,
@@ -492,6 +575,15 @@ mod test {
             before_any_test: CapturedOutput::empty(),
             after_all_tests: None,
         }
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn hydrate_empty_manifest() {
+        let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
+
+        let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::EndOfWork]);
+        assert_eq!(hydrated, HydrationStatus::EmptyManifest);
     }
 
     #[test]
@@ -516,11 +608,12 @@ mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
 
-        tracker.hydrate_ordered_manifest_slice([
+        let hydrated = tracker.hydrate_ordered_manifest_slice([
             NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
         ]);
+        assert_eq!(hydrated, HydrationStatus::StillHydrating);
 
         tracker.account_results([
             &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
@@ -553,12 +646,13 @@ mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
 
-        tracker.hydrate_ordered_manifest_slice([
+        let hydrated = tracker.hydrate_ordered_manifest_slice([
             NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
             NextWork::EndOfWork,
         ]);
+        assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
             &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
@@ -590,12 +684,13 @@ mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        tracker.hydrate_ordered_manifest_slice([
+        let hydrated = tracker.hydrate_ordered_manifest_slice([
             NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
             NextWork::EndOfWork,
         ]);
+        assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
             &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
@@ -660,12 +755,13 @@ mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        tracker.hydrate_ordered_manifest_slice([
+        let hydrated = tracker.hydrate_ordered_manifest_slice([
             NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
             NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
             NextWork::EndOfWork,
         ]);
+        assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
             &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
@@ -696,10 +792,104 @@ mod test {
 
     #[test]
     #[with_protocol_version]
-    fn fetching_retry_manifest_is_empty_after_all_retries_exhausted() {
+    fn fetching_retry_manifest_when_no_failures() {
         let id1 = WorkId::new();
         let id2 = WorkId::new();
-        let id3 = WorkId::new();
+
+        let spec1 = TestSpec {
+            test_case: TestCase::new(proto, "test1", Default::default()),
+            work_id: id1,
+        };
+        let spec2 = TestSpec {
+            test_case: TestCase::new(proto, "test2", Default::default()),
+            work_id: id2,
+        };
+
+        let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
+
+        let hydrated = tracker.hydrate_ordered_manifest_slice([
+            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
+            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
+            NextWork::EndOfWork,
+        ]);
+        assert_eq!(hydrated, HydrationStatus::EndOfManifest);
+
+        tracker.account_results([
+            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", SUCCESS)]),
+            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", SUCCESS)]),
+        ]);
+
+        let manifest = tracker.try_assemble_retry_manifest();
+        assert!(manifest.is_some());
+
+        let manifest = manifest.unwrap();
+        assert_eq!(manifest.len(), 1);
+
+        assert_eq!(manifest[0], NextWork::EndOfWork);
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn fetching_retry_manifest_updates_last_work() {
+        let id1 = WorkId::new();
+        let id2 = WorkId::new();
+
+        let spec1 = TestSpec {
+            test_case: TestCase::new(proto, "test1", Default::default()),
+            work_id: id1,
+        };
+        let spec2 = TestSpec {
+            test_case: TestCase::new(proto, "test2", Default::default()),
+            work_id: id2,
+        };
+
+        let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
+
+        let hydrated = tracker.hydrate_ordered_manifest_slice([
+            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
+            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
+            NextWork::EndOfWork,
+        ]);
+        assert_eq!(hydrated, HydrationStatus::EndOfManifest);
+
+        tracker.account_results([
+            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
+            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", SUCCESS)]),
+        ]);
+
+        let manifest = tracker.try_assemble_retry_manifest();
+        assert!(manifest.is_some());
+
+        let manifest = manifest.unwrap();
+        assert_eq!(manifest.len(), 1);
+
+        assert_eq!(
+            manifest[0],
+            NextWork::Work(WorkerTest::new(
+                with_focus(spec1.clone(), "test1"),
+                INIT_RUN_NUMBER + 1
+            ))
+        );
+
+        assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER + 1);
+
+        // Getting the retry manifest again should return nothing, since we should now be waiting
+        // for the next state.
+        assert_eq!(tracker.try_assemble_retry_manifest(), None);
+
+        assert_eq!(
+            tracker.assembled_state,
+            AssembledState::Hydrated {
+                last_work_name: id1,
+                processed_last_work_result: false
+            }
+        );
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn fetching_retry_manifest_is_empty_after_all_retries_exhausted() {
+        let id1 = WorkId::new();
 
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
@@ -708,10 +898,11 @@ mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        tracker.hydrate_ordered_manifest_slice([
+        let hydrated = tracker.hydrate_ordered_manifest_slice([
             NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
             NextWork::EndOfWork,
         ]);
+        assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         // First retry
         {
@@ -806,6 +997,99 @@ mod test {
             assert_eq!(manifest[0], NextWork::EndOfWork);
 
             assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER);
+        }
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn accounting_results_while_hydrating_preserves_state() {
+        let id1 = WorkId::new();
+        let id2 = WorkId::new();
+
+        let spec1 = TestSpec {
+            test_case: TestCase::new(proto, "test1", Default::default()),
+            work_id: id1,
+        };
+        let spec2 = TestSpec {
+            test_case: TestCase::new(proto, "test2", Default::default()),
+            work_id: id2,
+        };
+
+        let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
+
+        // Hydrate with first test
+        {
+            let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::Work(
+                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
+            )]);
+            assert_eq!(hydrated, HydrationStatus::StillHydrating);
+            assert_eq!(
+                tracker.assembled_state,
+                AssembledState::WaitingForEndOfHydration {
+                    last_seen_work_name: id1,
+                    processed_last_seen_work_result: false
+                }
+            );
+        }
+
+        // Account first test result
+        {
+            tracker.account_results([&associated_results(
+                id1,
+                INIT_RUN_NUMBER,
+                [result("test1", FAILURE)],
+            )]);
+            assert_eq!(
+                tracker.assembled_state,
+                AssembledState::WaitingForEndOfHydration {
+                    last_seen_work_name: id1,
+                    processed_last_seen_work_result: true
+                }
+            );
+        }
+
+        // Hydrate with second test
+        {
+            let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::Work(
+                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
+            )]);
+            assert_eq!(hydrated, HydrationStatus::StillHydrating);
+            assert_eq!(
+                tracker.assembled_state,
+                AssembledState::WaitingForEndOfHydration {
+                    last_seen_work_name: id2,
+                    processed_last_seen_work_result: false
+                }
+            );
+        }
+
+        // Account second test result
+        {
+            tracker.account_results([&associated_results(
+                id2,
+                INIT_RUN_NUMBER,
+                [result("test2", SUCCESS)],
+            )]);
+            assert_eq!(
+                tracker.assembled_state,
+                AssembledState::WaitingForEndOfHydration {
+                    last_seen_work_name: id2,
+                    processed_last_seen_work_result: true
+                }
+            );
+        }
+
+        // Hydrate end-of-work
+        {
+            let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::EndOfWork]);
+            assert_eq!(hydrated, HydrationStatus::EndOfManifest);
+            assert_eq!(
+                tracker.assembled_state,
+                AssembledState::Hydrated {
+                    last_work_name: id2,
+                    processed_last_work_result: true
+                }
+            );
         }
     }
 }

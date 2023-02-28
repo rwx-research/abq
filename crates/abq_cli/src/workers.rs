@@ -31,6 +31,7 @@ pub fn start_workers_standalone(
     run_id: RunId,
     tag: WorkerTag,
     num_workers: NonZeroUsize,
+    max_run_number: u32,
     runner_kind: RunnerKind,
     working_dir: PathBuf,
     reporter_kinds: Vec<ReporterKind>,
@@ -52,6 +53,7 @@ pub fn start_workers_standalone(
         run_id,
         tag,
         num_workers,
+        max_run_number,
         runner_kind,
         working_dir,
         reporters,
@@ -67,6 +69,7 @@ async fn start_standalone_help(
     run_id: RunId,
     tag: WorkerTag,
     num_workers: NonZeroUsize,
+    max_run_number: u32,
     runner_kind: RunnerKind,
     working_dir: PathBuf,
     reporters: Vec<Box<dyn Reporter>>,
@@ -90,6 +93,7 @@ async fn start_standalone_help(
         worker_context: context,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
         results_batch_size_hint: batch_size.get(),
+        max_run_number,
     };
 
     tracing::debug!(

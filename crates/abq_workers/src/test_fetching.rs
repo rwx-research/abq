@@ -1,20 +1,22 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use abq_generic_test_runner::TestsFetcher;
 use abq_utils::{
     net_async::ConfiguredClient,
     net_protocol::{
         entity::Entity,
-        workers::{NextWorkBundle, RunId},
+        workers::{NextWork, NextWorkBundle, RunId},
     },
 };
 use async_trait::async_trait;
 use tracing::instrument;
 
-use self::persistent_test_fetcher::PersistedTestsFetcher;
+use self::{persistent_test_fetcher::PersistedTestsFetcher, retries::RetryTracker};
 
 mod persistent_test_fetcher;
 mod retries;
+
+pub use retries::ResultsTracker;
 
 /// The provider of tests to an ABQ runner on a worker node.
 ///
@@ -32,10 +34,13 @@ mod retries;
 ///
 /// NEW_PROCESS_RETRY: takes the place of FRESH if this is a re-run of a previously-completed
 /// execution of a test suite by a worker. Not yet implemented.
-#[repr(transparent)]
 pub struct Fetcher {
-    initial_source: InitialSource,
+    initial_source: Option<InitialSource>,
+    retry_source: RetryTracker,
+    pending_retry_manifest_wait_time: Duration,
 }
+
+const DEFAULT_PENDING_RETRY_MANIFEST_WAIT_TIME: Duration = Duration::from_millis(100);
 
 impl Fetcher {
     pub fn new(
@@ -43,15 +48,34 @@ impl Fetcher {
         work_server_addr: SocketAddr,
         client: Box<dyn ConfiguredClient>,
         run_id: RunId,
-    ) -> Self {
-        Self {
-            initial_source: InitialSource::Fresh(persistent_test_fetcher::start(
-                entity,
-                work_server_addr,
-                client,
-                run_id,
-            )),
-        }
+        max_run_number: u32,
+    ) -> (Self, ResultsTracker) {
+        let initial_source = InitialSource::Fresh(persistent_test_fetcher::start(
+            entity,
+            work_server_addr,
+            client,
+            run_id,
+        ));
+
+        Self::new_help(
+            initial_source,
+            max_run_number,
+            DEFAULT_PENDING_RETRY_MANIFEST_WAIT_TIME,
+        )
+    }
+
+    fn new_help(
+        initial_source: InitialSource,
+        max_run_number: u32,
+        pending_retry_manifest_wait_time: Duration,
+    ) -> (Self, ResultsTracker) {
+        let (retry_source, results_tracker) = retries::build_tracking_pair(max_run_number);
+        let me = Self {
+            initial_source: Some(initial_source),
+            retry_source,
+            pending_retry_manifest_wait_time,
+        };
+        (me, results_tracker)
     }
 }
 
@@ -61,12 +85,365 @@ enum InitialSource {
     // TODO: NEW_PROCESS_RETRY
 }
 
+impl Fetcher {
+    async fn fetch_next_tests(&mut self) -> NextWorkBundle {
+        // Test fetching works in two phases:
+        //
+        //   1. Fetch the schedule of the manifest to be run by the worker from the queue, either
+        //      online (FRESH) or offline (NEW_PROCESS_RETRY).
+        //      This schedule is used to hydrate the retry manifest tracker as it comes in.
+        //   2. After the full manifest has been pulled, defer to the manifest tracker to supply
+        //      all tests that should be re-run.
+        //      This phase consists only of retries, and supplies tests to be run only once all
+        //      test results in the last suite run attempt have been accounted for.
+        //      One the retry manifest issues [NextWork::EndOfWork], there are no more tests to be
+        //      run.
+        loop {
+            match &mut self.initial_source {
+                Some(InitialSource::Fresh(fetcher)) => {
+                    let mut tests = fetcher.get_next_tests().await;
+                    let hydration_status = self
+                        .retry_source
+                        .hydrate_ordered_manifest_slice(tests.work.clone());
+
+                    match hydration_status {
+                        retries::HydrationStatus::StillHydrating => {
+                            return tests;
+                        }
+                        retries::HydrationStatus::EmptyManifest => {
+                            debug_assert!(matches!(tests.work.last(), Some(NextWork::EndOfWork)));
+                            return tests;
+                        }
+                        retries::HydrationStatus::EndOfManifest => {
+                            // Remove the EndOfWork marker from the last test so that the worker returns
+                            // for the retry manifest, rather than finishing at this point.
+                            debug_assert!(matches!(tests.work.last(), Some(NextWork::EndOfWork)));
+                            tests.work.pop();
+
+                            self.initial_source = None;
+
+                            if tests.work.is_empty() {
+                                // This is a non-empty manifest but there is no work in this batch;
+                                // that means all work must have already been handed out.
+                                // Move into waiting for the retry manifest, which will resolve
+                                // once we've handled all test results.
+                                continue;
+                            } else {
+                                return tests;
+                            }
+                        }
+                    }
+                }
+                None => {
+                    loop {
+                        match self.retry_source.try_assemble_retry_manifest() {
+                            Some(work) => {
+                                return NextWorkBundle { work };
+                            }
+                            // The retry manifest is not yet ready; we must be waiting for more results
+                            // to come in, before we know the status of the retry manifest.
+                            //
+                            // TODO do something smarter than spinning here. For example we can pass
+                            // down a notifier of when we should be awoken.
+                            None => tokio::time::sleep(self.pending_retry_manifest_wait_time).await,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl TestsFetcher for Fetcher {
     #[instrument(level = "trace", skip(self))]
     async fn get_next_tests(&mut self) -> NextWorkBundle {
-        match &mut self.initial_source {
-            InitialSource::Fresh(fetcher) => fetcher.get_next_tests().await,
+        self.fetch_next_tests().await
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use abq_generic_test_runner::TestsFetcher;
+    use abq_utils::net_protocol::{
+        queue::TestSpec,
+        runners::{ProtocolWitness, TestCase, TestId},
+        workers::{NextWork, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
+    };
+    use abq_with_protocol_version::with_protocol_version;
+
+    use crate::test_fetching::retries::test::{
+        associated_results, result, with_focus, FAILURE, SUCCESS,
+    };
+
+    use super::{
+        persistent_test_fetcher::test::{scaffold_server, server_establish, server_send_bundle},
+        Fetcher, InitialSource,
+    };
+
+    #[tokio::test]
+    async fn empty_manifest() {
+        let (server, queue_fetcher) = scaffold_server(1).await;
+        let (mut fetcher, _results) = Fetcher::new_help(
+            InitialSource::Fresh(queue_fetcher),
+            INIT_RUN_NUMBER,
+            Duration::MAX,
+        );
+
+        let server_task = async move {
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(&mut conn, [NextWork::EndOfWork]).await;
+        };
+
+        let ((), bundle) = tokio::join!(server_task, fetcher.get_next_tests());
+
+        let NextWorkBundle { work } = bundle;
+
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0], NextWork::EndOfWork);
+    }
+
+    use NextWork::*;
+
+    fn wid(id: usize) -> WorkId {
+        WorkId([id as u8; 16])
+    }
+
+    fn test(id: usize) -> TestId {
+        format!("test{id}")
+    }
+
+    fn spec(proto: ProtocolWitness, id: usize) -> TestSpec {
+        TestSpec {
+            test_case: TestCase::new(proto, test(id), Default::default()),
+            work_id: wid(id),
         }
+    }
+
+    fn worker_test(spec: TestSpec, run_number: u32) -> NextWork {
+        Work(WorkerTest::new(spec, run_number))
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn fetch_incremental_from_queue() {
+        let (server, queue_fetcher) = scaffold_server(1).await;
+        let (mut fetcher, _results) = Fetcher::new_help(
+            InitialSource::Fresh(queue_fetcher),
+            INIT_RUN_NUMBER,
+            Duration::MAX,
+        );
+
+        let server_task = async move {
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(
+                &mut conn,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                ],
+            )
+            .await;
+
+            server_send_bundle(
+                &mut conn,
+                [
+                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                    EndOfWork,
+                ],
+            )
+            .await;
+        };
+
+        let fetch_task = async move {
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                ],
+            );
+
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [
+                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                ],
+            );
+        };
+
+        let ((), ()) = tokio::join!(server_task, fetch_task);
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn fetch_from_queue_then_no_retries() {
+        let (server, queue_fetcher) = scaffold_server(1).await;
+        let (mut fetcher, _results) = Fetcher::new_help(
+            InitialSource::Fresh(queue_fetcher),
+            INIT_RUN_NUMBER,
+            Duration::MAX,
+        );
+
+        let server_task = async move {
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(
+                &mut conn,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    EndOfWork,
+                ],
+            )
+            .await;
+        };
+
+        let fetch_task = async move {
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                ],
+            );
+
+            assert_eq!(fetcher.get_next_tests().await.work, [EndOfWork],);
+        };
+
+        let ((), ()) = tokio::join!(server_task, fetch_task);
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn fetch_from_queue_then_multiple_retries() {
+        let (server, queue_fetcher) = scaffold_server(1).await;
+        let (mut fetcher, mut results_tracker) = Fetcher::new_help(
+            InitialSource::Fresh(queue_fetcher),
+            INIT_RUN_NUMBER + 2,
+            Duration::MAX,
+        );
+
+        let server_task = async move {
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(
+                &mut conn,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                    EndOfWork,
+                ],
+            )
+            .await;
+        };
+
+        let fetch_task = async move {
+            // Attempt 1, from online
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                ],
+            );
+
+            results_tracker.account_results([
+                &associated_results(wid(1), INIT_RUN_NUMBER, [result(test(1), FAILURE)]),
+                &associated_results(wid(2), INIT_RUN_NUMBER, [result(test(2), FAILURE)]),
+                &associated_results(wid(3), INIT_RUN_NUMBER, [result(test(3), SUCCESS)]),
+            ]);
+
+            // Attempt 2
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [
+                    worker_test(with_focus(spec(proto, 1), test(1)), INIT_RUN_NUMBER + 1),
+                    worker_test(with_focus(spec(proto, 2), test(2)), INIT_RUN_NUMBER + 1),
+                ],
+            );
+
+            results_tracker.account_results([
+                &associated_results(wid(1), INIT_RUN_NUMBER + 1, [result(test(1), FAILURE)]),
+                &associated_results(wid(2), INIT_RUN_NUMBER + 1, [result(test(2), SUCCESS)]),
+            ]);
+
+            // Attempt 3
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [worker_test(
+                    with_focus(spec(proto, 1), test(1)),
+                    INIT_RUN_NUMBER + 2
+                ),],
+            );
+
+            results_tracker.account_results([&associated_results(
+                wid(1),
+                INIT_RUN_NUMBER + 2,
+                [result(test(1), FAILURE)],
+            )]);
+
+            // Done, even though we had failures
+            assert_eq!(fetcher.get_next_tests().await.work, [EndOfWork]);
+        };
+
+        let ((), ()) = tokio::join!(server_task, fetch_task);
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn fetch_from_queue_followed_by_end_of_work_waits_for_retries() {
+        let (server, queue_fetcher) = scaffold_server(1).await;
+        let (mut fetcher, mut results_tracker) = Fetcher::new_help(
+            InitialSource::Fresh(queue_fetcher),
+            INIT_RUN_NUMBER + 1,
+            Duration::MAX,
+        );
+
+        let server_task = async move {
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(&mut conn, [worker_test(spec(proto, 1), INIT_RUN_NUMBER)]).await;
+            server_send_bundle(&mut conn, [EndOfWork]).await;
+        };
+
+        let fetch_task = async move {
+            // Attempt 1, from online
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [worker_test(spec(proto, 1), INIT_RUN_NUMBER),],
+            );
+
+            // Attempt 2 will need to fetch from retries of attempt 1.
+
+            results_tracker.account_results([&associated_results(
+                wid(1),
+                INIT_RUN_NUMBER,
+                [result(test(1), FAILURE)],
+            )]);
+
+            // Attempt 2
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [worker_test(
+                    with_focus(spec(proto, 1), test(1)),
+                    INIT_RUN_NUMBER + 1
+                ),],
+            );
+
+            results_tracker.account_results([&associated_results(
+                wid(1),
+                INIT_RUN_NUMBER + 1,
+                [result(test(1), FAILURE)],
+            )]);
+
+            // Done, even though we had failures
+            assert_eq!(fetcher.get_next_tests().await.work, [EndOfWork]);
+        };
+
+        let ((), ()) = tokio::join!(server_task, fetch_task);
     }
 }

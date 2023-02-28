@@ -3,7 +3,6 @@
 mod prelude;
 
 mod active_state;
-mod attempts;
 mod connections;
 pub mod queue;
 pub mod timeout;

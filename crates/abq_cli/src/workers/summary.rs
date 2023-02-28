@@ -116,8 +116,6 @@ impl SuiteTracker {
         self.total_attempts += 1;
 
         if !self.tests.contains_key(&test_result.id) {
-            // TODO(ayaz) turn this assertion back on when worker-local retries are supported.
-            // debug_assert_eq!(run_number, INIT_RUN_NUMBER);
             self.tests.insert(
                 test_result.id.clone(),
                 OverallStatus::new(NeverFailed, false),
@@ -148,12 +146,6 @@ impl SuiteTracker {
             _ => { /* no update */ }
         }
         entry.retried = run_number > INIT_RUN_NUMBER;
-
-        // TODO(ayaz): rip this out, move it to a lower level in the workers
-        // if is_fail_like {
-        //     self.manifest
-        //         .account_failure(work_id, run_number, test_result.id.clone());
-        // }
     }
 
     fn load_aggregated_metrics(&self) -> AggregatedMetrics {
