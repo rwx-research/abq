@@ -5,15 +5,12 @@ use std::{cell::Cell, collections::HashMap, time::Instant};
 use abq_utils::{
     exit::ExitCode,
     net_protocol::{
-        queue::TestSpec,
         runners::{Status, TestId, TestResult, TestRuntime},
         workers::INIT_RUN_NUMBER,
     },
 };
 
 use crate::reporting::SuiteResult;
-
-use super::retry_manifest_tracker::RetryManifestTracker;
 
 /// Status of a test, possibly across multiple attempts.
 enum StatusTag {
@@ -88,8 +85,6 @@ pub(super) struct SuiteTracker {
 
     tests: HashMap<TestId, OverallStatus>,
 
-    manifest: RetryManifestTracker,
-
     // (total_attempts, aggregated metrics)
     // Need to re-calculate every time the total attempts change.
     cached_aggregated_metric: Cell<Option<(u64, AggregatedMetrics)>>,
@@ -111,15 +106,8 @@ impl SuiteTracker {
 
             tests: HashMap::new(),
 
-            manifest: RetryManifestTracker::default(),
-
             cached_aggregated_metric: Cell::new(None),
         }
-    }
-
-    #[allow(unused)] // for now
-    fn account_ordered_manifest_entry(&mut self, spec: TestSpec) {
-        self.manifest.account_ordered_manifest_entry(spec)
     }
 
     pub fn account_result(&mut self, run_number: u32, test_result: &TestResult) {
@@ -364,9 +352,6 @@ mod test {
 
         let mut tracker = SuiteTracker::new();
 
-        for spec in manifest {
-            tracker.account_ordered_manifest_entry(spec);
-        }
         for (_work_id, run_number, result) in results_to_inject {
             tracker.account_result(run_number, &result);
         }

@@ -363,6 +363,12 @@ pub mod workers {
         pub run_number: u32,
     }
 
+    impl WorkerTest {
+        pub fn new(spec: TestSpec, run_number: u32) -> Self {
+            Self { spec, run_number }
+        }
+    }
+
     /// The initial test suite run number.
     /// Higher run numbers are reserved for retries of test suites.
     pub const INIT_RUN_NUMBER: u32 = 1;

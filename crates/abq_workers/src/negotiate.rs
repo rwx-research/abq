@@ -15,8 +15,9 @@ use thiserror::Error;
 use tracing::{error, instrument};
 
 use crate::{
-    negotiate, persistent_test_fetcher,
+    negotiate,
     results_handler::{MultiplexingResultsHandler, QueueResultsSender, ResultsHandlerGenerator},
+    test_fetching,
     workers::{
         GetInitContext, GetNextTestsGenerator, InitContextResult, NotifyCancellation,
         NotifyManifest, NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator,
@@ -286,12 +287,12 @@ impl WorkersNegotiator {
             let async_client = async_client.boxed_clone();
             let run_id = run_id.clone();
             &move |entity| {
-                persistent_test_fetcher::start(
+                Box::new(test_fetching::Fetcher::new(
                     entity,
                     work_server_addr,
                     async_client.boxed_clone(),
                     run_id.clone(),
-                )
+                ))
             }
         };
 

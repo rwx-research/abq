@@ -2,7 +2,7 @@
 
 use std::{io, net::SocketAddr, time::Duration};
 
-use crate::workers::{GetNextTests, TestsFetcher};
+use crate::workers::TestsFetcher;
 use abq_utils::{
     decay::ExpDecay,
     net_async::{ClientStream, ConfiguredClient},
@@ -29,15 +29,15 @@ pub(crate) fn start(
     work_server_addr: SocketAddr,
     client: Box<dyn ConfiguredClient>,
     run_id: RunId,
-) -> GetNextTests {
-    Box::new(PersistedTestsFetcher::new(
+) -> PersistedTestsFetcher {
+    PersistedTestsFetcher::new(
         entity,
         work_server_addr,
         client,
         run_id,
         DEFAULT_MAX_ATTEMPTS_IN_CYCLE,
         DEFAULT_DECAY_ON_PENDING_TESTS_NOTIFICATION,
-    ))
+    )
 }
 
 pub(crate) struct PersistedTestsFetcher {

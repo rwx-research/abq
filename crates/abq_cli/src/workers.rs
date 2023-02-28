@@ -14,7 +14,6 @@ use abq_workers::negotiate::{
 use abq_workers::workers::{WorkerContext, WorkersExit, WorkersExitStatus};
 
 mod reporting;
-mod retry_manifest_tracker;
 mod summary;
 
 use futures::stream::StreamExt;

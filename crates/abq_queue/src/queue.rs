@@ -103,7 +103,10 @@ enum RunState {
         /// The test suite is seen as complete when the end of the queue is at the max attempt number.
         attempts_counter: AttemptsCounter,
     },
-    Done,
+    Done {
+        /// The exit code for the test run that should be yielded by a new worker connecting.
+        new_worker_exit_code: ExitCode,
+    },
     Cancelled {
         #[allow(unused)] // yet
         reason: CancelReason,
@@ -296,11 +299,13 @@ impl AllRuns {
             // however, if the run state is known to be complete, the run data will already
             // have been pruned, and the worker should not be given a run.
             match &mut run.state {
-                RunState::Done => {
+                RunState::Done {
+                    new_worker_exit_code,
+                } => {
                     // The worker should exit successfully locally, regardless of what the overall
                     // code was.
                     return AssignedRunLookup::AlreadyDone {
-                        exit_code: ExitCode::SUCCESS,
+                        exit_code: *new_worker_exit_code,
                     };
                 }
                 RunState::Cancelled { .. } => {
@@ -555,7 +560,7 @@ impl AllRuns {
         }
     }
 
-    pub fn mark_complete(&self, run_id: &RunId) {
+    pub fn mark_complete(&self, run_id: &RunId, new_worker_exit_code: ExitCode) {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").lock();
@@ -573,7 +578,9 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Done;
+        run.state = RunState::Done {
+            new_worker_exit_code,
+        };
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -601,7 +608,9 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Done;
+        run.state = RunState::Done {
+            new_worker_exit_code: ExitCode::FAILURE,
+        };
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -631,7 +640,9 @@ impl AllRuns {
         }
 
         // Trivially successful
-        run.state = RunState::Done;
+        run.state = RunState::Done {
+            new_worker_exit_code: ExitCode::SUCCESS,
+        };
 
         // Drop the run data, since we no longer need it.
         debug_assert!(run.data.is_some());
@@ -668,7 +679,7 @@ impl AllRuns {
 
         match run.state {
             RunState::WaitingForManifest { .. } | RunState::HasWork { .. } => Some(RunLive::Active),
-            RunState::Done => Some(RunLive::Done),
+            RunState::Done { .. } => Some(RunLive::Done),
             RunState::Cancelled { .. } => Some(RunLive::Cancelled),
         }
     }
@@ -1646,7 +1657,7 @@ impl QueueServer {
 
         let run_state = state_cache.lock().remove(run_id);
 
-        queues.mark_complete(run_id);
+        queues.mark_complete(run_id, ExitCode::SUCCESS);
 
         let (opt_worker_results_tasks_err, opt_worker_next_tests_tasks_err) = tokio::join!(
             Self::shutdown_persisted_worker_connection_tasks(
@@ -2165,6 +2176,7 @@ mod test {
             build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
             UserToken,
         },
+        exit::ExitCode,
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
             self,
@@ -2589,7 +2601,7 @@ mod test {
         );
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
-        queues.mark_complete(&run_id);
+        queues.mark_complete(&run_id, ExitCode::SUCCESS);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
@@ -2620,7 +2632,7 @@ mod test {
         }
 
         for run_id in [run_id1, run_id2] {
-            queues.mark_complete(&run_id);
+            queues.mark_complete(&run_id, ExitCode::SUCCESS);
         }
 
         assert_eq!(queues.estimate_num_active_runs(), expected_active);
