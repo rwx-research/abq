@@ -1734,9 +1734,7 @@ impl QueueServer {
 
         tracing::info!(?run_id, timeout=?after, "timing out active test run");
 
-        let opt_run_state = locked_active_runs.remove(&run_id);
-
-        Self::check_responder_after_timeout_precondition(&run_id, opt_run_state.is_some(), reason);
+        locked_active_runs.remove(&run_id);
 
         // Store the cancellation state
         queues.mark_cancelled(&run_id, reason.into());
@@ -1747,24 +1745,6 @@ impl QueueServer {
         let _ = locked_active_runs; // make sure the lock isn't dropped before here
 
         Ok(())
-    }
-
-    fn check_responder_after_timeout_precondition(
-        run_id: &RunId,
-        responder_present: bool,
-        timeout_reason: TimeoutReason,
-    ) {
-        if matches!(
-            (responder_present, timeout_reason),
-            (false, TimeoutReason::ResultNotReceived)
-        ) {
-            tracing::error!(
-                ?run_id,
-                ?timeout_reason,
-                responder_present,
-                "illegal state - run responder not aligned with liveness"
-            );
-        }
     }
 
     #[instrument(level = "trace", skip(state_cache))]

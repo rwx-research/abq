@@ -23,7 +23,7 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::{Entity, RunnerMeta, WorkerTag},
-        queue::{AssociatedTestResults, InvokeWork},
+        queue::{self, AssociatedTestResults, InvokeWork},
         runners::{
             InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
             ProtocolWitness, RawTestResultMessage, Status, Test, TestOrGroup, TestResult,
@@ -165,6 +165,8 @@ enum Action {
     StopWorkers(Wid),
     CancelWorkers(Wid),
 
+    WaitForCompletedRun(Run),
+
     /// Make a connection to the work server, the callback will test a request.
     WSRunRequest(Run, Box<dyn Fn(GetConn, RunId) + Send + Sync>),
 }
@@ -174,7 +176,6 @@ type FlatResult<'a> = (WorkId, u32, &'a TestResult);
 #[allow(clippy::type_complexity)]
 enum Assert<'a> {
     TestResults(Run, &'a dyn Fn(&[FlatResult<'_>]) -> bool),
-    QueryRunStatus(Run),
 
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, Box<dyn Fn(&WorkersExitStatus)>),
@@ -331,6 +332,32 @@ fn action_to_fut(
         }
         .boxed(),
 
+        WaitForCompletedRun(n) => {
+            let run_id = get_run_id!(n);
+            let queue_addr = queue.server_addr();
+            let client = client_opts.build_async().unwrap();
+            async move {
+                loop {
+                    let mut conn = client.connect(queue_addr).await.unwrap();
+                    net_protocol::async_write(
+                        &mut conn,
+                        &queue::Request {
+                            entity: Entity::local_client(),
+                            message: queue::Message::RequestTotalRunResult(run_id.clone()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                    match net_protocol::async_read(&mut conn).await.unwrap() {
+                        queue::TotalRunResult::Pending => continue,
+                        queue::TotalRunResult::Completed => break,
+                    }
+                }
+            }
+            .boxed()
+        }
+
         WSRunRequest(n, callback) => {
             let run_id = get_run_id!(n);
             let work_scheduler_addr = queue.work_server_addr();
@@ -407,8 +434,6 @@ fn run_test(servers: Servers, steps: Steps) {
 
                         assert!(check(&flattened_results));
                     }
-
-                    QueryRunStatus(_) => todo!(),
 
                     WorkersAreRedundant(n) => {
                         assert!(workers_redundant.lock().get(&n).unwrap());
@@ -927,19 +952,20 @@ fn failure_to_run_worker_command_exits_gracefully() {
 }
 
 #[test]
+#[traced_test]
 #[with_protocol_version]
-#[ignore = "TODO(1.3) implement query for run status"]
 fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
-    let manifest = ManifestMessage::new(Manifest::new(
-        [echo_test(proto, "echo1".to_string())],
-        Default::default(),
-    ));
-    let runner = RunnerKind::TestLikeRunner(
-        TestLikeRunner::NeverReturnOnTest("echo1".to_owned()),
-        Box::new(manifest),
-    );
-
-    let workers_config = WorkersConfigBuilder::new(1, runner).with_num_workers(one_nonzero_usize());
+    let workers_config = || {
+        let manifest = ManifestMessage::new(Manifest::new(
+            [echo_test(proto, "echo1".to_string())],
+            Default::default(),
+        ));
+        let runner = RunnerKind::TestLikeRunner(
+            TestLikeRunner::NeverReturnOnTest("echo1".to_owned()),
+            Box::new(manifest),
+        );
+        WorkersConfigBuilder::new(1, runner).with_num_workers(one_nonzero_usize())
+    };
 
     fn zero(_: TimeoutReason) -> Duration {
         Duration::ZERO
@@ -949,14 +975,20 @@ fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
         timeout_strategy: RunTimeoutStrategy::constant(zero),
         ..Default::default()
     }))
+    .act([
+        // After pulling the only test, the queue should time us out.
+        StartWorkers(Run(1), Wid(1), workers_config()),
+    ])
+    .act([StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))])
+    // Second worker to connect should exit as cancelled immediately
+    .act([StartWorkers(Run(1), Wid(2), workers_config())])
     .step(
-        [
-            // After pulling the only test, the queue should time us out.
-            StartWorkers(Run(1), Wid(1), workers_config),
-        ],
-        [QueryRunStatus(Run(1))],
+        [StopWorkers(Wid(2))],
+        [WorkerExitStatus(
+            Wid(2),
+            Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+        )],
     )
-    .act([StopWorkers(Wid(1))])
     .test();
 }
 
