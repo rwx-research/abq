@@ -4,6 +4,7 @@ mod prelude;
 
 mod active_state;
 mod connections;
+mod job_queue;
 pub mod queue;
 pub mod timeout;
 mod worker_timings;

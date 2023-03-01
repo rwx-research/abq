@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, num::NonZeroU64, path::PathBuf};
+use std::{
+    io,
+    net::SocketAddr,
+    num::{NonZeroU64, NonZeroUsize},
+    path::PathBuf,
+};
 
 use abq_utils::net_async;
 
@@ -42,6 +47,10 @@ pub fn assert_scoped_logs(scope: &str, f: impl Fn(&[&str]) -> bool) {
 }
 
 pub fn one_nonzero() -> NonZeroU64 {
+    1.try_into().unwrap()
+}
+
+pub fn one_nonzero_usize() -> NonZeroUsize {
     1.try_into().unwrap()
 }
 

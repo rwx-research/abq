@@ -1,6 +1,6 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -45,6 +45,7 @@ use tracing::instrument;
 
 use crate::active_state::RunStateCache;
 use crate::connections::{self, ConnectedWorkers};
+use crate::job_queue::JobQueue;
 use crate::prelude::*;
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
 use crate::worker_timings::{
@@ -54,35 +55,13 @@ use crate::worker_timings::{
 
 pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-#[derive(Default, Debug)]
-struct JobQueue {
-    queue: VecDeque<WorkerTest>,
-}
-
-impl JobQueue {
-    fn add_batch_work(&mut self, work: impl IntoIterator<Item = WorkerTest>) {
-        self.queue.extend(work.into_iter());
-    }
-
-    fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    fn get_work(&mut self, n: NonZeroU64) -> impl Iterator<Item = WorkerTest> + '_ {
-        // We'll give back the number of tests that were asked for, or everything if there aren't
-        // that many tests left.
-        let chop_off = std::cmp::min(self.queue.len(), n.get() as usize);
-        self.queue.drain(..chop_off)
-    }
-}
-
 #[derive(Debug)]
 enum RunState {
     /// First worker has connected. Waiting for manifest.
     WaitingForManifest {
         /// For the purposes of analytics, records timings of when workers connect prior to the
         /// manifest being generated.
-        worker_connection_times: WorkerTimings,
+        worker_connection_times: Mutex<WorkerTimings>,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -95,7 +74,7 @@ enum RunState {
         /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
         // Co-locate this here so that we don't have to index `run_data` when grabbing a
         // test.
-        batch_size_hint: NonZeroU64,
+        batch_size_hint: NonZeroUsize,
 
         /// The timeout for the last test result.
         last_test_timeout: Duration,
@@ -103,7 +82,7 @@ enum RunState {
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
         /// Some(time) if they have already completed, None if they are still active.
-        active_workers: VecMap<Entity, Option<Instant>>,
+        active_workers: Mutex<VecMap<Entity, Option<Instant>>>,
     },
     /// All items in the manifest have been handed out.
     /// Workers may still be executing locally, for example in-band retries.
@@ -112,7 +91,7 @@ enum RunState {
         new_worker_exit_code: ExitCode,
 
         /// Workers that are still actively executing tests.
-        active_workers: VecSet<Entity>,
+        active_workers: Mutex<VecSet<Entity>>,
     },
     Cancelled {
         #[allow(unused)] // yet
@@ -122,7 +101,7 @@ enum RunState {
 
 struct RunData {
     /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
-    batch_size_hint: NonZeroU64,
+    batch_size_hint: NonZeroUsize,
     /// The timeout for the last test result.
     last_test_timeout: Duration,
 }
@@ -131,8 +110,7 @@ struct RunData {
 static_assertions::assert_eq_size!(RunData, (u64, Duration));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
-#[allow(unused)] // FIXME(ayaz) start using this
-const MAX_BATCH_SIZE: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(100) };
+const MAX_BATCH_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(100) };
 
 /// A individual test run ever invoked on the queue.
 struct Run {
@@ -147,15 +125,26 @@ struct Run {
 /// Sync-safe storage of all runs ever invoked on the queue.
 #[derive(Default)]
 struct AllRuns {
-    /// Representation:
-    ///   - read/write lock to insert and access runs. Insertion of runs is monotonically increasing,
-    ///     and reading of run state is far more common than writing a new run.
-    ///   - mutex to access run data. Writes are far more common during an active test run as
-    ///     workers move the active test pointer.
-    ///     TODO: switch to RwLock for #185
+    /// Shared runs are represented as a two-tiered read/write lock.
+    ///
+    /// RwLock => Map<RunId, // layer 1
+    ///     RwLock => [Run]> // layer 2
+    ///
+    ///   Layer 1: read/write lock to insert and access runs. Insertion of a new run happens only once
+    ///      per run, but access of run state is very common.
+    ///   Layer 2: read/write lock to access the run information.
+    ///      We only need to write to the run when it's transitioning between states - for example,
+    ///      into [RunState::HasWork] or [RunState::Cancelled].
+    ///      The hottest regions of operations are those over [RunState::HasWork], for which we
+    ///      want minimal synchronization. [RunState::HasWork] is organized to only require minimal
+    ///      atomic synchronization when accessing work; see its description and [JobQueue] for details.
     runs: RwLock<
-        //
-        HashMap<RunId, Mutex<Run>>,
+        // layer1
+        HashMap<
+            RunId,
+            // layer2
+            RwLock<Run>,
+        >,
     >,
     /// An intentionally-conservative estimation of the number of active runs, possibly
     /// over-estimating the number of active runs. The exact behavior is as follows:
@@ -172,7 +161,7 @@ struct AllRuns {
     num_active: AtomicU64,
 }
 
-type RunsWriteGuard<'a> = RwLockWriteGuard<'a, HashMap<RunId, Mutex<Run>>>;
+type RunsWriteGuard<'a> = RwLockWriteGuard<'a, HashMap<RunId, RwLock<Run>>>;
 
 #[derive(Default, Clone)]
 struct SharedRuns(Arc<AllRuns>);
@@ -252,7 +241,7 @@ impl AllRuns {
     pub fn find_or_create_run(
         &self,
         run_id: &RunId,
-        batch_size_hint: NonZeroU64,
+        batch_size_hint: NonZeroUsize,
         last_test_timeout: Duration,
         entity: Entity,
     ) -> AssignedRunLookup {
@@ -280,8 +269,8 @@ impl AllRuns {
         }
 
         let runs = self.runs.read();
-        let mut run = match runs.get(run_id) {
-            Some(st) => st.lock(),
+        let run = match runs.get(run_id) {
+            Some(st) => st.read(),
             None => {
                 tracing::error!(
                     ?run_id,
@@ -291,10 +280,11 @@ impl AllRuns {
             }
         };
 
-        match &mut run.state {
+        match &run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
             } => {
+                let mut worker_connection_times = worker_connection_times.lock();
                 let old = worker_connection_times.insert(entity, time::Instant::now());
                 log_assert!(
                     old.is_none(),
@@ -307,6 +297,7 @@ impl AllRuns {
                 })
             }
             RunState::HasWork { active_workers, .. } => {
+                let mut active_workers = active_workers.lock();
                 let old = active_workers.insert(entity, None);
                 log_assert!(
                     old.is_none(),
@@ -347,7 +338,7 @@ impl AllRuns {
         num_active: &AtomicU64,
         worker_entity: Entity,
         run_id: RunId,
-        batch_size_hint: NonZeroU64,
+        batch_size_hint: NonZeroUsize,
         last_test_timeout: Duration,
     ) -> AssignedRunLookup {
         let mut worker_timings = new_worker_timings();
@@ -359,15 +350,14 @@ impl AllRuns {
         // The run ID is fresh; create a new queue for it.
         let run = Run {
             state: RunState::WaitingForManifest {
-                worker_connection_times: worker_timings,
+                worker_connection_times: Mutex::new(worker_timings),
             },
             data: Some(RunData {
-                // TODO guard against MAX_BATCH_SIZE
                 batch_size_hint,
                 last_test_timeout,
             }),
         };
-        let old_run = runs.insert(run_id, Mutex::new(run));
+        let old_run = runs.insert(run_id, RwLock::new(run));
         log_assert!(old_run.is_none(), "can only be called when run is fresh!");
 
         AssignedRunLookup::Some(AssignedRun {
@@ -384,14 +374,14 @@ impl AllRuns {
     ) -> AddedManifest {
         let runs = self.runs.read();
 
-        let mut run = runs.get(run_id).expect("no run recorded").lock();
+        let mut run = runs.get(run_id).expect("no run recorded").write();
 
         let worker_connection_times = match &mut run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
             } => {
                 // expected state, pass through
-                std::mem::take(worker_connection_times)
+                Mutex::into_inner(std::mem::take(worker_connection_times))
             }
             RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
                 unreachable!(
@@ -409,8 +399,7 @@ impl AllRuns {
             run_number: INIT_RUN_NUMBER,
         });
 
-        let mut queue = JobQueue::default();
-        queue.add_batch_work(work_from_manifest);
+        let queue = JobQueue::new(work_from_manifest.collect());
 
         let run_data = run
             .data
@@ -427,7 +416,7 @@ impl AllRuns {
             batch_size_hint: run_data.batch_size_hint,
             init_metadata,
             last_test_timeout: run_data.last_test_timeout,
-            active_workers,
+            active_workers: Mutex::new(active_workers),
         };
 
         AddedManifest::Added {
@@ -438,7 +427,7 @@ impl AllRuns {
     pub fn init_metadata(&self, run_id: RunId) -> InitMetadata {
         let runs = self.runs.read();
 
-        let run = runs.get(&run_id).expect("no run recorded").lock();
+        let run = runs.get(&run_id).expect("no run recorded").read();
 
         match &run.state {
             RunState::WaitingForManifest { .. } => InitMetadata::WaitingForManifest,
@@ -455,9 +444,9 @@ impl AllRuns {
     pub fn next_work(&self, run_id: &RunId) -> NextWorkResult {
         let runs = self.runs.read();
 
-        let mut run = runs.get(run_id).expect("no run recorded").lock();
+        let run = runs.get(run_id).expect("no run recorded").read();
 
-        match &mut run.state
+        match &run.state
         {
             RunState::HasWork {
                 queue,
@@ -479,8 +468,8 @@ impl AllRuns {
     }
 
     fn determine_next_work(
-        queue: &mut JobQueue,
-        batch_size_hint: NonZeroU64,
+        queue: &JobQueue,
+        batch_size_hint: NonZeroUsize,
         last_test_timeout: Duration,
     ) -> NextWorkResult {
         // NB: in the future, the batch size is likely to be determined intelligently, i.e.
@@ -493,7 +482,7 @@ impl AllRuns {
 
         let pulled_tests_status;
 
-        if queue.is_empty() {
+        if queue.is_at_end() {
             // If the queue is empty, there are one of the following states:
             //   - We just popped the last test for the last test run attempt. Account for
             //     the latest test run attempt being resolved.
@@ -539,8 +528,8 @@ impl AllRuns {
     pub fn mark_worker_complete(&self, run_id: &RunId, entity: Entity, notification_time: Instant) {
         let runs = self.runs.read();
 
-        let mut run = match runs.get(run_id) {
-            Some(run) => run.lock(),
+        let run = match runs.get(run_id) {
+            Some(run) => run.read(),
             None => {
                 log_assert!(
                     false,
@@ -551,7 +540,7 @@ impl AllRuns {
             }
         };
 
-        match &mut run.state {
+        match &run.state {
             RunState::WaitingForManifest { .. } => {
                 log_assert!(
                     false,
@@ -560,6 +549,7 @@ impl AllRuns {
                 );
             }
             RunState::HasWork { active_workers, .. } => {
+                let mut active_workers = active_workers.lock();
                 let old = active_workers.insert(entity, Some(notification_time));
                 log_assert!(
                     old == Some(None),
@@ -569,6 +559,7 @@ impl AllRuns {
                 );
             }
             RunState::InitialManifestDone { active_workers, .. } => {
+                let mut active_workers = active_workers.lock();
                 let was_present = active_workers.remove(entity);
                 log_assert!(
                     was_present,
@@ -576,7 +567,6 @@ impl AllRuns {
                 );
             }
             RunState::Cancelled { .. } => {
-
                 // cancelled, nothing to do
             }
         }
@@ -586,7 +576,7 @@ impl AllRuns {
     pub fn mark_complete(&self, run_id: &RunId, new_worker_exit_code: ExitCode) -> WorkerTimings {
         let runs = self.runs.read();
 
-        let mut run = runs.get(run_id).expect("no run recorded").lock();
+        let mut run = runs.get(run_id).expect("no run recorded").write();
 
         let active_worker_timings = match &mut run.state {
             RunState::HasWork {
@@ -594,8 +584,8 @@ impl AllRuns {
                 active_workers: this_active_workers,
                 ..
             } => {
-                log_assert!(queue.is_empty(), "Invalid state - queue is not complete!");
-                std::mem::take(this_active_workers)
+                log_assert!(queue.is_at_end(), "Invalid state - queue is not complete!");
+                Mutex::into_inner(std::mem::take(this_active_workers))
             }
             RunState::Cancelled { .. } => {
                 // Cancellation always takes priority over completeness.
@@ -622,7 +612,7 @@ impl AllRuns {
 
         run.state = RunState::InitialManifestDone {
             new_worker_exit_code,
-            active_workers: still_active_workers,
+            active_workers: Mutex::new(still_active_workers),
         };
 
         // Drop the run data, since we no longer need it.
@@ -638,7 +628,7 @@ impl AllRuns {
     pub fn mark_failed_to_start(&self, run_id: RunId) {
         let runs = self.runs.read();
 
-        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+        let mut run = runs.get(&run_id).expect("no run recorded").write();
 
         match run.state {
             RunState::WaitingForManifest { .. } => {
@@ -670,7 +660,7 @@ impl AllRuns {
     pub fn mark_empty_manifest_complete(&self, run_id: RunId) {
         let runs = self.runs.read();
 
-        let mut run = runs.get(&run_id).expect("no run recorded").lock();
+        let mut run = runs.get(&run_id).expect("no run recorded").write();
 
         match run.state {
             RunState::WaitingForManifest { .. } => {
@@ -702,7 +692,7 @@ impl AllRuns {
     pub fn mark_cancelled(&self, run_id: &RunId, reason: CancelReason) {
         let runs = self.runs.read();
 
-        let mut run = runs.get(run_id).expect("no run recorded").lock();
+        let mut run = runs.get(run_id).expect("no run recorded").write();
 
         // Cancellation can happen at any time, including after the test run is determined to have
         // completed by us (the queue).
@@ -722,7 +712,7 @@ impl AllRuns {
     fn get_run_status(&self, run_id: &RunId) -> Option<RunStatus> {
         let runs = self.runs.read();
 
-        let run = runs.get(run_id)?.lock();
+        let run = runs.get(run_id)?.read();
 
         match &run.state {
             RunState::WaitingForManifest { .. } | RunState::HasWork { .. } => {
@@ -730,7 +720,7 @@ impl AllRuns {
             }
             RunState::InitialManifestDone { active_workers, .. } => {
                 Some(RunStatus::InitialManifestDone {
-                    num_active_workers: active_workers.len(),
+                    num_active_workers: active_workers.lock().len(),
                 })
             }
             RunState::Cancelled { .. } => Some(RunStatus::Cancelled),
@@ -741,19 +731,20 @@ impl AllRuns {
     fn get_active_workers(&self, run_id: &RunId) -> Vec<Entity> {
         let runs = self.runs.read();
 
-        let run = runs.get(run_id).expect("no such run").lock();
+        let run = runs.get(run_id).expect("no such run").read();
 
         match &run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
-            } => worker_connection_times.iter().map(|p| p.0).collect(),
+            } => worker_connection_times.lock().iter().map(|p| p.0).collect(),
             RunState::HasWork { active_workers, .. } => active_workers
+                .lock()
                 .iter()
                 .filter(|p| p.1.is_none())
                 .map(|p| p.0)
                 .collect(),
             RunState::InitialManifestDone { active_workers, .. } => {
-                active_workers.iter().copied().collect()
+                active_workers.lock().iter().copied().collect()
             }
             RunState::Cancelled { .. } => Default::default(),
         }
@@ -764,9 +755,9 @@ impl AllRuns {
     }
 
     #[cfg(test)]
-    fn set_state(&self, run_id: RunId, state: RunState) -> Option<Mutex<Run>> {
+    fn set_state(&self, run_id: RunId, state: RunState) -> Option<RwLock<Run>> {
         let mut runs = self.runs.write();
-        runs.insert(run_id, Mutex::new(Run { state, data: None }))
+        runs.insert(run_id, RwLock::new(Run { state, data: None }))
     }
 }
 
@@ -988,8 +979,17 @@ fn start_queue(config: QueueConfig) -> Abq {
                 test_results_timeout,
             } = invoke_work;
 
+            let batch_size_hint = if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
+                MAX_BATCH_SIZE
+            } else {
+                NonZeroUsize::new(batch_size_hint.get().try_into().expect(
+                    "u64 batch size must fit into a usize batch size less than MAX_BATCH_SIZE",
+                ))
+                .unwrap()
+            };
+
             let opt_assigned = {
-                queues.find_or_create_run(run_id, *batch_size_hint, *test_results_timeout, entity)
+                queues.find_or_create_run(run_id, batch_size_hint, *test_results_timeout, entity)
             };
             match opt_assigned {
                 AssignedRunLookup::Some(assigned) => AssignedRunStatus::Run(assigned),
@@ -2160,7 +2160,7 @@ mod test {
         timeout::{RunTimeoutManager, RunTimeoutStrategy},
     };
     use abq_run_n_times::n_times;
-    use abq_test_utils::{accept_handshake, assert_scoped_log, one_nonzero};
+    use abq_test_utils::{accept_handshake, assert_scoped_log, one_nonzero_usize};
     use abq_utils::{
         auth::{
             build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
@@ -2549,7 +2549,7 @@ mod test {
 
         let _ = queues.find_or_create_run(
             &run_id,
-            one_nonzero(),
+            one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
             Entity::local_client(),
         );
@@ -2566,7 +2566,7 @@ mod test {
 
         let _ = queues.find_or_create_run(
             &run_id,
-            one_nonzero(),
+            one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
             Entity::local_client(),
         );
@@ -2585,7 +2585,7 @@ mod test {
 
         let _ = queues.find_or_create_run(
             &run_id,
-            one_nonzero(),
+            one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
             Entity::local_client(),
         );
@@ -2610,7 +2610,7 @@ mod test {
         for run_id in [&run_id1, &run_id2, &run_id3, &run_id4] {
             let _ = queues.find_or_create_run(
                 run_id,
-                one_nonzero(),
+                one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
                 Entity::local_client(),
             );
@@ -2637,7 +2637,7 @@ mod test {
 
         let _ = queues.find_or_create_run(
             &run_id,
-            one_nonzero(),
+            one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
             Entity::local_client(),
         );
@@ -2662,7 +2662,7 @@ mod test {
 
         let _ = queues.find_or_create_run(
             &run_id,
-            one_nonzero(),
+            one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
             Entity::local_client(),
         );
@@ -2696,7 +2696,7 @@ mod test {
         {
             let assigned_lookup = queues.find_or_create_run(
                 &run_id,
-                one_nonzero(),
+                one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
                 worker0,
             );
@@ -2714,7 +2714,7 @@ mod test {
         {
             let assigned_lookup = queues.find_or_create_run(
                 &run_id,
-                one_nonzero(),
+                one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
                 worker1,
             );
@@ -2740,7 +2740,7 @@ mod test {
         {
             let assigned_lookup = queues.find_or_create_run(
                 &run_id,
-                one_nonzero(),
+                one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
                 worker2,
             );
@@ -2820,7 +2820,7 @@ mod test {
             let queues = SharedRuns::default();
             let _ = queues.find_or_create_run(
                 &run_id,
-                one_nonzero(),
+                one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
                 Entity::local_client(),
             );
@@ -2921,7 +2921,7 @@ mod test {
             let queues = SharedRuns::default();
             let _ = queues.find_or_create_run(
                 &run_id,
-                one_nonzero(),
+                one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
                 Entity::local_client(),
             );
@@ -3022,7 +3022,7 @@ mod test {
             let queues = SharedRuns::default();
             let _ = queues.find_or_create_run(
                 &run_id,
-                one_nonzero(),
+                one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
                 Entity::local_client(),
             );
@@ -3085,7 +3085,7 @@ mod test {
 mod test_pull_work {
     use std::time::Duration;
 
-    use abq_test_utils::one_nonzero;
+    use abq_test_utils::one_nonzero_usize;
     use abq_utils::net_protocol::workers::{NextWork, RunId, WorkerTest};
     use abq_with_protocol_version::with_protocol_version;
 
@@ -3098,8 +3098,7 @@ mod test_pull_work {
     #[with_protocol_version]
     fn pull_last_tests_for_final_test_run_attempt_shows_tests_complete() {
         // Set up the queue so only one test is pulled, and there are a total of two attempts.
-        let mut queue = JobQueue::default();
-        queue.add_batch_work([
+        let queue = JobQueue::new(vec![
             WorkerTest {
                 spec: fake_test_spec(proto),
                 run_number: 1,
@@ -3110,7 +3109,7 @@ mod test_pull_work {
             },
         ]);
 
-        let batch_size_hint = one_nonzero();
+        let batch_size_hint = one_nonzero_usize();
 
         let has_work = RunState::HasWork {
             queue,
