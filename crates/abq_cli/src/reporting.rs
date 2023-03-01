@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::{
     fmt::Display,
     io::{self},
@@ -111,10 +112,17 @@ pub(crate) struct SuiteResult {
     pub wall_time: Duration,
     /// Runtime of the test suite, as accounted for in the actual time in tests.
     pub test_time: TestRuntime,
+    /// File paths of test failures, one entry per failure.
+    pub failed_file_paths: Vec<String>,
 }
 
 impl SuiteResult {
     pub fn write_short_summary_lines(&self, w: &mut impl termcolor::WriteColor) -> io::Result<()> {
+        let mut failures_per_file = HashMap::new();
+        for file in &self.failed_file_paths {
+            *failures_per_file.entry(file.clone()).or_insert(0) += 1;
+        }
+
         format_short_suite_summary(
             w,
             ShortSummary {
@@ -123,6 +131,7 @@ impl SuiteResult {
                 num_tests: self.count,
                 num_failing: self.count_failed,
                 num_retried: self.tests_retried,
+                failures_per_file,
             },
         )
     }
@@ -444,6 +453,7 @@ mod suite {
             tests_retried: 0,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
+            failed_file_paths: vec![],
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         Finished in 78.00 seconds (70.20 seconds spent in test code)
@@ -460,6 +470,7 @@ mod suite {
             tests_retried: 0,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
+            failed_file_paths: vec![],
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         Finished in 78.00 seconds (70.20 seconds spent in test code)
@@ -476,6 +487,7 @@ mod suite {
             tests_retried: 3,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
+            failed_file_paths: vec![],
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         Finished in 78.00 seconds (70.20 seconds spent in test code)

@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::HashMap,
     io::{self},
     ops::Deref,
     time::Duration,
@@ -335,6 +336,7 @@ pub struct ShortSummary {
     pub num_tests: u64,
     pub num_failing: u64,
     pub num_retried: u64,
+    pub failures_per_file: HashMap<String, u64>,
 }
 
 pub fn format_short_suite_summary(
@@ -350,6 +352,7 @@ pub fn format_short_suite_summary(
         num_tests,
         num_failing,
         num_retried,
+        failures_per_file,
     } = summary;
 
     with_color_spec(writer, &bold_spec(), |w| {
@@ -373,6 +376,21 @@ pub fn format_short_suite_summary(
         })?;
     }
     writeln!(writer)?;
+
+    if !failures_per_file.is_empty() {
+        writeln!(writer)?;
+        writeln!(writer, "Failures:")?;
+
+        let mut ordered_files: Vec<String> = failures_per_file.keys().map(Into::into).collect();
+        ordered_files.sort();
+
+        for file in ordered_files {
+            write!(writer, " {: >5}", failures_per_file.get(&file).unwrap())?;
+            write!(writer, "   ")?;
+            writeln!(writer, "{file}")?;
+        }
+    }
+
     Ok(())
 }
 
@@ -546,7 +564,7 @@ mod test {
         format_duration, format_duration_to_partial_seconds, format_result_dot, format_result_line,
         format_short_suite_summary, format_test_result_summary, ShortSummary,
     };
-    use std::{io, time::Duration};
+    use std::{collections::HashMap, io, time::Duration};
 
     #[allow(clippy::identity_op)]
     fn default_result() -> TestResultSpec {
@@ -1141,25 +1159,33 @@ mod test {
 
     test_format!(
         format_short_suite_summary_with_failing_and_retried, format_short_suite_summary,
-        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 10, num_retried: 15 },
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 12, num_retried: 15, failures_per_file: HashMap::from([("file2.rs".to_owned(), 10), ("file1.rs".to_owned(), 2)]) },
         @r###"
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
-    <bold-green>100 tests<reset>, <bold-red>10 failures<reset>, <bold-yellow>15 retried<reset>
+    <bold-green>100 tests<reset>, <bold-red>12 failures<reset>, <bold-yellow>15 retried<reset>
+
+    Failures:
+         2   file1.rs
+        10   file2.rs
     "###
     );
 
     test_format!(
         format_short_suite_summary_with_failing_without_retried, format_short_suite_summary,
-        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 10, num_retried: 0 },
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 10, num_retried: 0, failures_per_file: HashMap::from([("file2.rs".to_owned(), 6), ("file1.rs".to_owned(), 4)]) },
         @r###"
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
     <bold-green>100 tests<reset>, <bold-red>10 failures<reset>
+
+    Failures:
+         4   file1.rs
+         6   file2.rs
     "###
     );
 
     test_format!(
         format_short_suite_summary_with_no_failing_no_retried, format_short_suite_summary,
-        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 0 },
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 0, failures_per_file: HashMap::default() },
         @r###"
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
     <bold-green>100 tests<reset>, <>0 failures<reset>
@@ -1168,7 +1194,7 @@ mod test {
 
     test_format!(
         format_short_suite_summary_with_no_failing_but_retried, format_short_suite_summary,
-        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 10 },
+        ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 10, failures_per_file: HashMap::default() },
         @r###"
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
     <bold-green>100 tests<reset>, <>0 failures<reset>, <bold-yellow>10 retried<reset>

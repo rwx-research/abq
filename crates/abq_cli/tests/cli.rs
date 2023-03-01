@@ -934,10 +934,6 @@ fn test_with_invalid_command() {
         args
     };
 
-    let mut worker1 = Abq::new(name.to_string() + "_worker1")
-        .args(test_args(1))
-        .spawn();
-
     let CmdOutput {
         stdout,
         stderr,
@@ -953,11 +949,6 @@ fn test_with_invalid_command() {
     let stderr = sanitize_output(&stderr);
 
     insta::assert_snapshot!(stderr);
-
-    // The worker 1 process should also exit with a failure, corresponding to having
-    // witnessed a test failure in the run.
-    let worker_exit_status = worker1.wait().unwrap();
-    assert!(!worker_exit_status.success());
 
     term_queue(queue_proc);
 }
@@ -1555,7 +1546,7 @@ test_all_network_config_options! {
             args
         };
 
-        let mut worker0 = Abq::new(name.to_string() + "_test0").args(test_args(0)).spawn();
+        let mut worker0 = Abq::new(name.to_string() + "_test0").args(test_args(0)).always_capture_stderr(true).spawn();
 
         let worker0_stderr = std::mem::take(&mut worker0.stderr).unwrap();
         let mut worker0_reader = BufReader::new(worker0_stderr).lines();

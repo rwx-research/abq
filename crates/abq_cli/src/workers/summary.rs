@@ -40,6 +40,20 @@ impl OverallStatus {
     }
 }
 
+struct TestStatus {
+    overall_status: OverallStatus,
+    file_path: Option<String>,
+}
+
+impl TestStatus {
+    const fn new(overall_status: OverallStatus, file_path: Option<String>) -> Self {
+        Self {
+            overall_status,
+            file_path,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AggregatedMetrics {
     failed: u64,
@@ -83,7 +97,7 @@ pub(super) struct SuiteTracker {
     test_time: TestRuntime,
     total_attempts: u64,
 
-    tests: HashMap<TestId, OverallStatus>,
+    tests: HashMap<TestId, TestStatus>,
 
     // (total_attempts, aggregated metrics)
     // Need to re-calculate every time the total attempts change.
@@ -118,7 +132,10 @@ impl SuiteTracker {
         if !self.tests.contains_key(&test_result.id) {
             self.tests.insert(
                 test_result.id.clone(),
-                OverallStatus::new(NeverFailed, false),
+                TestStatus::new(
+                    OverallStatus::new(NeverFailed, false),
+                    test_result.location.as_ref().map(|l| l.file.clone()),
+                ),
             );
         }
 
@@ -126,33 +143,34 @@ impl SuiteTracker {
 
         let is_fail_like = test_result.status.is_fail_like();
 
-        match entry.tag {
+        match entry.overall_status.tag {
             NeverFailed if is_fail_like => {
                 if run_number == INIT_RUN_NUMBER {
-                    entry.tag = AlwaysFailed {
+                    entry.overall_status.tag = AlwaysFailed {
                         internal_error: matches!(
                             test_result.status,
                             Status::PrivateNativeRunnerError
                         ),
                     };
                 } else {
-                    entry.tag = UltimatelyFailed;
+                    entry.overall_status.tag = UltimatelyFailed;
                 }
             }
             AlwaysFailed { .. } if !is_fail_like => {
                 debug_assert!(run_number > INIT_RUN_NUMBER);
-                entry.tag = UltimatelySucceeded;
+                entry.overall_status.tag = UltimatelySucceeded;
             }
             _ => { /* no update */ }
         }
-        entry.retried = run_number > INIT_RUN_NUMBER;
+        entry.overall_status.retried = run_number > INIT_RUN_NUMBER;
     }
 
     fn load_aggregated_metrics(&self) -> AggregatedMetrics {
         match self.cached_aggregated_metric.get() {
             Some((dirty_bit, metrics)) if dirty_bit == self.total_attempts => metrics,
             _ => {
-                let metric = AggregatedMetrics::new(self.tests.values());
+                let metric =
+                    AggregatedMetrics::new(self.tests.values().map(|ts| &ts.overall_status));
                 self.cached_aggregated_metric
                     .set(Some((self.total_attempts, metric)));
                 metric
@@ -176,6 +194,16 @@ impl SuiteTracker {
             retried,
         } = self.load_aggregated_metrics();
 
+        let failed_file_paths = tests
+            .values()
+            .filter_map(|ts| match ts.overall_status.tag {
+                StatusTag::AlwaysFailed { internal_error } if !internal_error => {
+                    ts.file_path.clone()
+                }
+                _ => None,
+            })
+            .collect();
+
         SuiteResult {
             suggested_exit_code,
             count,
@@ -183,6 +211,7 @@ impl SuiteTracker {
             tests_retried: retried,
             wall_time: start_time.elapsed(),
             test_time: *test_time,
+            failed_file_paths,
         }
     }
 }
@@ -366,6 +395,7 @@ mod test {
                     tests_retried,
                     wall_time: _,
                     test_time: _,
+                    failed_file_paths: _,
                 } = tracker.suite_result();
 
                 assert_eq!(suggested_exit_code, $expect_exit);
