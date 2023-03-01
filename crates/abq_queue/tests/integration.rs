@@ -343,15 +343,19 @@ fn action_to_fut(
                         &mut conn,
                         &queue::Request {
                             entity: Entity::local_client(),
-                            message: queue::Message::RequestTotalRunResult(run_id.clone()),
+                            message: queue::Message::RunStatus(run_id.clone()),
                         },
                     )
                     .await
                     .unwrap();
 
+                    use queue::RunStatus::*;
                     match net_protocol::async_read(&mut conn).await.unwrap() {
-                        queue::TotalRunResult::Pending => continue,
-                        queue::TotalRunResult::Completed => break,
+                        InitialManifestDone {
+                            num_active_workers: 0,
+                        } => break,
+                        Cancelled => break,
+                        Active | InitialManifestDone { .. } => continue,
                     }
                 }
             }

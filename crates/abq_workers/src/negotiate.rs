@@ -529,9 +529,8 @@ pub enum QueueNegotiateError {
 }
 
 /// The test run a worker should ask for work on.
+#[derive(Debug, PartialEq, Eq)]
 pub struct AssignedRun {
-    // TODO(ayaz): we can get rid of this!
-    pub run_id: RunId,
     pub should_generate_manifest: bool,
 }
 
@@ -708,7 +707,6 @@ impl QueueNegotiator {
                 use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
                     Run(AssignedRun {
-                        run_id,
                         should_generate_manifest,
                     }) => {
                         tracing::debug!(
@@ -957,10 +955,12 @@ mod test {
                     );
                     net_protocol::write(&mut client, net_protocol::queue::AckManifest {}).unwrap();
                 }
-                net_protocol::queue::Message::RequestTotalRunResult(_) => {
+                net_protocol::queue::Message::RunStatus(_) => {
                     net_protocol::write(
                         &mut client,
-                        net_protocol::queue::TotalRunResult::Completed,
+                        net_protocol::queue::RunStatus::InitialManifestDone {
+                            num_active_workers: 0,
+                        },
                     )
                     .unwrap();
                 }
@@ -1024,9 +1024,8 @@ mod test {
             Default::default(),
         ));
 
-        let get_assigned_run = move |_entity, data: &InvokeWork| {
+        let get_assigned_run = move |_entity, _data: &InvokeWork| {
             AssignedRunStatus::Run(AssignedRun {
-                run_id: data.run_id.clone(),
                 should_generate_manifest: true,
             })
         };
@@ -1107,7 +1106,6 @@ mod test {
             "0.0.0.0:0".parse().unwrap(),
             move |_, _| {
                 AssignedRunStatus::Run(AssignedRun {
-                    run_id: RunId::unique(),
                     should_generate_manifest: true,
                 })
             },

@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{io, time};
 
 use abq_utils::auth::ServerAuthStrategy;
@@ -24,12 +24,14 @@ use abq_utils::net_protocol::workers::{
 };
 use abq_utils::net_protocol::{
     self,
-    queue::{InvokeWork, Message},
+    queue::{InvokeWork, Message, RunStatus},
     workers::{NextWork, RunId},
 };
 use abq_utils::net_protocol::{meta, publicize_addr};
 use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
+use abq_utils::vec_map::VecMap;
+use abq_utils::vec_set::VecSet;
 use abq_utils::{atomic, log_assert};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
@@ -97,10 +99,20 @@ enum RunState {
 
         /// The timeout for the last test result.
         last_test_timeout: Duration,
+
+        /// Workers that have connected to execute tests, and whether they are still executing
+        /// tests.
+        /// Some(time) if they have already completed, None if they are still active.
+        active_workers: VecMap<Entity, Option<Instant>>,
     },
-    Done {
+    /// All items in the manifest have been handed out.
+    /// Workers may still be executing locally, for example in-band retries.
+    InitialManifestDone {
         /// The exit code for the test run that should be yielded by a new worker connecting.
         new_worker_exit_code: ExitCode,
+
+        /// Workers that are still actively executing tests.
+        active_workers: VecSet<Entity>,
     },
     Cancelled {
         #[allow(unused)] // yet
@@ -173,6 +185,7 @@ impl Deref for SharedRuns {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum AssignedRunLookup {
     Some(AssignedRun),
     /// There is no associated run yet known.
@@ -181,13 +194,6 @@ enum AssignedRunLookup {
     AlreadyDone {
         exit_code: ExitCode,
     },
-}
-
-#[derive(Debug, Clone, Copy)]
-enum RunLive {
-    Active,
-    Done,
-    Cancelled,
 }
 
 enum InitMetadata {
@@ -248,7 +254,7 @@ impl AllRuns {
         run_id: &RunId,
         batch_size_hint: NonZeroU64,
         last_test_timeout: Duration,
-        worker_entity: Entity,
+        entity: Entity,
     ) -> AssignedRunLookup {
         {
             if self.runs.read().get(run_id).is_none() {
@@ -264,7 +270,7 @@ impl AllRuns {
                     return Self::create_fresh_run(
                         runs,
                         &self.num_active,
-                        worker_entity,
+                        entity,
                         run_id.clone(),
                         batch_size_hint,
                         last_test_timeout,
@@ -285,60 +291,54 @@ impl AllRuns {
             }
         };
 
-        if run.data.is_none() {
-            // If there is an active run, then the run data exists iff the run state exists;
-            // however, if the run state is known to be complete, the run data will already
-            // have been pruned, and the worker should not be given a run.
-            match &mut run.state {
-                RunState::Done {
-                    new_worker_exit_code,
-                } => {
-                    // The worker should exit successfully locally, regardless of what the overall
-                    // code was.
-                    return AssignedRunLookup::AlreadyDone {
-                        exit_code: *new_worker_exit_code,
-                    };
-                }
-                RunState::Cancelled { .. } => {
-                    return AssignedRunLookup::AlreadyDone {
-                        exit_code: ExitCode::CANCELLED,
-                    }
-                }
-                st => {
-                    tracing::error!(
-                        run_state=?st,
-                        "run data is missing, but run state is present and not marked as Done"
-                    );
-                    unreachable!(
-                        "run state should only be `Done` if data is missing, but it was {:?}",
-                        st
-                    );
-                }
-            }
-        };
-
-        let assigned_run = match &mut run.state {
-            // Otherwise we are already waiting for the manifest, or already have it; just tell
-            // the worker what runner it should set up.
+        match &mut run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
             } => {
-                // Record the time this worker connected, if this is its first time.
-                if !worker_connection_times.contains(&worker_entity) {
-                    worker_connection_times.insert(worker_entity, time::Instant::now());
-                }
-                AssignedRun {
-                    run_id: run_id.clone(),
+                let old = worker_connection_times.insert(entity, time::Instant::now());
+                log_assert!(
+                    old.is_none(),
+                    ?entity,
+                    "same worker connecting twice for manifest"
+                );
+
+                AssignedRunLookup::Some(AssignedRun {
                     should_generate_manifest: false,
+                })
+            }
+            RunState::HasWork { active_workers, .. } => {
+                let old = active_workers.insert(entity, None);
+                log_assert!(
+                    old.is_none(),
+                    ?entity,
+                    "same worker connecting twice at run head"
+                );
+
+                AssignedRunLookup::Some(AssignedRun {
+                    should_generate_manifest: false,
+                })
+            }
+            RunState::InitialManifestDone {
+                new_worker_exit_code,
+                ..
+            } => {
+                let exit_code = *new_worker_exit_code;
+                log_assert!(run.data.is_none(), "run data exists after completed run");
+
+                // The worker should exit successfully locally, regardless of what the overall
+                // code was.
+                //
+                // TODO: support out-of-process retries.
+                AssignedRunLookup::AlreadyDone { exit_code }
+            }
+            RunState::Cancelled { .. } => {
+                log_assert!(run.data.is_none(), "run data exists after cancelled run");
+
+                AssignedRunLookup::AlreadyDone {
+                    exit_code: ExitCode::CANCELLED,
                 }
             }
-            _ => AssignedRun {
-                run_id: run_id.clone(),
-                should_generate_manifest: false,
-            },
-        };
-
-        AssignedRunLookup::Some(assigned_run)
+        }
     }
 
     #[must_use]
@@ -367,11 +367,10 @@ impl AllRuns {
                 last_test_timeout,
             }),
         };
-        let old_run = runs.insert(run_id.clone(), Mutex::new(run));
+        let old_run = runs.insert(run_id, Mutex::new(run));
         log_assert!(old_run.is_none(), "can only be called when run is fresh!");
 
         AssignedRunLookup::Some(AssignedRun {
-            run_id,
             should_generate_manifest: true,
         })
     }
@@ -394,7 +393,7 @@ impl AllRuns {
                 // expected state, pass through
                 std::mem::take(worker_connection_times)
             }
-            RunState::HasWork { .. } | RunState::Done { .. } => {
+            RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
                 unreachable!(
                     "Invalid state - can only provide manifest while waiting for manifest"
                 );
@@ -418,11 +417,17 @@ impl AllRuns {
             .as_ref()
             .expect("illegal state - run data must exist at this step");
 
+        let active_workers = worker_connection_times
+            .iter()
+            .map(|(entity, _)| (*entity, None))
+            .collect();
+
         run.state = RunState::HasWork {
             queue,
             batch_size_hint: run_data.batch_size_hint,
             init_metadata,
             last_test_timeout: run_data.last_test_timeout,
+            active_workers,
         };
 
         AddedManifest::Added {
@@ -440,7 +445,9 @@ impl AllRuns {
             RunState::HasWork { init_metadata, .. } => {
                 InitMetadata::Metadata(init_metadata.clone())
             }
-            RunState::Done { .. } => InitMetadata::RunAlreadyCompleted { cancelled: false },
+            RunState::InitialManifestDone { .. } => {
+                InitMetadata::RunAlreadyCompleted { cancelled: false }
+            }
             RunState::Cancelled { .. } => InitMetadata::RunAlreadyCompleted { cancelled: true },
         }
     }
@@ -460,7 +467,7 @@ impl AllRuns {
             } => {
                 Self::determine_next_work(queue, *batch_size_hint, *last_test_timeout)
             }
-            RunState::Done { .. } | RunState::Cancelled {..} => {
+            RunState::InitialManifestDone { .. } | RunState::Cancelled {..} => {
                 // Let the worker know that we've reached the end of the queue.
                 NextWorkResult::Present {
                     bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
@@ -529,26 +536,93 @@ impl AllRuns {
         }
     }
 
-    pub fn mark_complete(&self, run_id: &RunId, new_worker_exit_code: ExitCode) {
+    pub fn mark_worker_complete(&self, run_id: &RunId, entity: Entity, notification_time: Instant) {
+        let runs = self.runs.read();
+
+        let mut run = match runs.get(run_id) {
+            Some(run) => run.lock(),
+            None => {
+                log_assert!(
+                    false,
+                    ?entity,
+                    "should never mark completed worker for non-existent run"
+                );
+                return;
+            }
+        };
+
+        match &mut run.state {
+            RunState::WaitingForManifest { .. } => {
+                log_assert!(
+                    false,
+                    ?entity,
+                    "should never mark completed worker while still waiting for manifest"
+                );
+            }
+            RunState::HasWork { active_workers, .. } => {
+                let old = active_workers.insert(entity, Some(notification_time));
+                log_assert!(
+                    old == Some(None),
+                    ?entity,
+                    ?old,
+                    "worker was not seen as active before completion notification"
+                );
+            }
+            RunState::InitialManifestDone { active_workers, .. } => {
+                let was_present = active_workers.remove(entity);
+                log_assert!(
+                    was_present,
+                    "worker was not seen as active before completion notification"
+                );
+            }
+            RunState::Cancelled { .. } => {
+
+                // cancelled, nothing to do
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn mark_complete(&self, run_id: &RunId, new_worker_exit_code: ExitCode) -> WorkerTimings {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").lock();
 
-        match &mut run.state {
-            RunState::HasWork { queue, .. } => {
-                assert!(queue.is_empty(), "Invalid state - queue is not complete!");
+        let active_worker_timings = match &mut run.state {
+            RunState::HasWork {
+                queue,
+                active_workers: this_active_workers,
+                ..
+            } => {
+                log_assert!(queue.is_empty(), "Invalid state - queue is not complete!");
+                std::mem::take(this_active_workers)
             }
             RunState::Cancelled { .. } => {
                 // Cancellation always takes priority over completeness.
-                return;
+                return Default::default();
             }
-            RunState::WaitingForManifest { .. } | RunState::Done { .. } => {
+            RunState::WaitingForManifest { .. } | RunState::InitialManifestDone { .. } => {
                 unreachable!("Invalid state");
+            }
+        };
+
+        let mut still_active_workers = VecSet::default();
+        let mut completed_worker_timings = VecMap::with_capacity(active_worker_timings.len());
+
+        for (worker, opt_completed) in active_worker_timings {
+            match opt_completed {
+                Some(timing) => {
+                    completed_worker_timings.insert(worker, timing);
+                }
+                None => {
+                    still_active_workers.insert(worker);
+                }
             }
         }
 
-        run.state = RunState::Done {
+        run.state = RunState::InitialManifestDone {
             new_worker_exit_code,
+            active_workers: still_active_workers,
         };
 
         // Drop the run data, since we no longer need it.
@@ -557,6 +631,8 @@ impl AllRuns {
 
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
+
+        completed_worker_timings
     }
 
     pub fn mark_failed_to_start(&self, run_id: RunId) {
@@ -572,13 +648,14 @@ impl AllRuns {
                 // No-op, since the run was already cancelled.
                 return;
             }
-            RunState::HasWork { .. } | RunState::Done { .. } => {
+            RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
                 unreachable!("Invalid state - can only fail to start while waiting for manifest");
             }
         }
 
-        run.state = RunState::Done {
+        run.state = RunState::InitialManifestDone {
             new_worker_exit_code: ExitCode::FAILURE,
+            active_workers: Default::default(),
         };
 
         // Drop the run data, since we no longer need it.
@@ -603,14 +680,15 @@ impl AllRuns {
                 // No-op, since the run was already cancelled.
                 return;
             }
-            RunState::HasWork { .. } | RunState::Done { .. } => {
+            RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
                 unreachable!("Invalid state - can only mark complete due to manifest while waiting for manifest");
             }
         }
 
         // Trivially successful
-        run.state = RunState::Done {
+        run.state = RunState::InitialManifestDone {
             new_worker_exit_code: ExitCode::SUCCESS,
+            active_workers: Default::default(),
         };
 
         // Drop the run data, since we no longer need it.
@@ -641,15 +719,43 @@ impl AllRuns {
         self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
-    fn get_run_liveness(&self, run_id: &RunId) -> Option<RunLive> {
+    fn get_run_status(&self, run_id: &RunId) -> Option<RunStatus> {
         let runs = self.runs.read();
 
         let run = runs.get(run_id)?.lock();
 
-        match run.state {
-            RunState::WaitingForManifest { .. } | RunState::HasWork { .. } => Some(RunLive::Active),
-            RunState::Done { .. } => Some(RunLive::Done),
-            RunState::Cancelled { .. } => Some(RunLive::Cancelled),
+        match &run.state {
+            RunState::WaitingForManifest { .. } | RunState::HasWork { .. } => {
+                Some(RunStatus::Active)
+            }
+            RunState::InitialManifestDone { active_workers, .. } => {
+                Some(RunStatus::InitialManifestDone {
+                    num_active_workers: active_workers.len(),
+                })
+            }
+            RunState::Cancelled { .. } => Some(RunStatus::Cancelled),
+        }
+    }
+
+    #[cfg(test)]
+    fn get_active_workers(&self, run_id: &RunId) -> Vec<Entity> {
+        let runs = self.runs.read();
+
+        let run = runs.get(run_id).expect("no such run").lock();
+
+        match &run.state {
+            RunState::WaitingForManifest {
+                worker_connection_times,
+            } => worker_connection_times.iter().map(|p| p.0).collect(),
+            RunState::HasWork { active_workers, .. } => active_workers
+                .iter()
+                .filter(|p| p.1.is_none())
+                .map(|p| p.0)
+                .collect(),
+            RunState::InitialManifestDone { active_workers, .. } => {
+                active_workers.iter().copied().collect()
+            }
+            RunState::Cancelled { .. } => Default::default(),
         }
     }
 
@@ -658,7 +764,6 @@ impl AllRuns {
     }
 
     #[cfg(test)]
-    #[allow(unused)] // FIXME(ayaz) only for now
     fn set_state(&self, run_id: RunId, state: RunState) -> Option<Mutex<Run>> {
         let mut runs = self.runs.write();
         runs.insert(run_id, Mutex::new(Run { state, data: None }))
@@ -1203,7 +1308,7 @@ impl QueueServer {
                 drop(stream);
 
                 Self::handle_worker_ran_all_tests_notification(
-                    ctx.state_cache,
+                    ctx.queues,
                     run_id,
                     entity,
                     notification_time,
@@ -1221,7 +1326,7 @@ impl QueueServer {
                 .await
             }
 
-            Message::RequestTotalRunResult(run_id) => {
+            Message::RunStatus(run_id) => {
                 Self::handle_total_run_result_request(ctx.queues, run_id, entity, stream).await
             }
         };
@@ -1624,9 +1729,9 @@ impl QueueServer {
 
         active_runs.write().await.remove(run_id);
 
-        let run_state = state_cache.lock().remove(run_id);
+        let _run_state = state_cache.lock().remove(run_id);
 
-        queues.mark_complete(run_id, ExitCode::SUCCESS);
+        let worker_completed_times = queues.mark_complete(run_id, ExitCode::SUCCESS);
 
         let (opt_worker_results_tasks_err, opt_worker_next_tests_tasks_err) = tokio::join!(
             Self::shutdown_persisted_worker_connection_tasks(
@@ -1641,18 +1746,7 @@ impl QueueServer {
             )
         );
 
-        match run_state {
-            Some(state) => {
-                log_workers_idle_after_completion_latency(
-                    run_id,
-                    state.worker_completed_times(),
-                    entity,
-                );
-            }
-            None => {
-                tracing::error!(?run_id, "run state missing for active run upon completion");
-            }
-        }
+        log_workers_idle_after_completion_latency(run_id, worker_completed_times, entity);
 
         opt_worker_results_tasks_err.or(opt_worker_next_tests_tasks_err)
     }
@@ -1714,12 +1808,12 @@ impl QueueServer {
         // NB: taking a persistent lock on the queue or state cache is not necessary,
         // since we've already guarded against other modification above.
         // By not blocking the queue we allow other work to continue freely.
-        match queues.get_run_liveness(&run_id) {
+        match queues.get_run_status(&run_id) {
             Some(liveness) => match (liveness, reason) {
-                (RunLive::Active, TimeoutReason::ResultNotReceived) => {
+                (RunStatus::Active, TimeoutReason::ResultNotReceived) => {
                     // pass through, the run needs to be timed out.
                 }
-                (RunLive::Done {}, _) | (RunLive::Cancelled, _) => {
+                (RunStatus::InitialManifestDone { .. }, _) | (RunStatus::Cancelled, _) => {
                     return Ok(()); // run was already complete, disregard the timeout
                 }
             },
@@ -1747,47 +1841,14 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(state_cache))]
+    #[instrument(level = "trace", skip(queues))]
     async fn handle_worker_ran_all_tests_notification(
-        state_cache: RunStateCache,
+        queues: SharedRuns,
         run_id: RunId,
         entity: Entity,
         notification_time: time::Instant,
     ) -> OpaqueResult<()> {
-        let old_notification = {
-            match state_cache.lock().get_mut(&run_id) {
-                Some(active_run) => active_run.insert_worker_completed(entity, notification_time),
-                None => {
-                    // The active state may be missing in a few reasonable situations:
-                    // - For the worker that sends the ran-all-tests notification after it sends
-                    //   the last test result, since we steal the active state during completion of the
-                    //   test run. Note that in that case, the ran-all-tests notification for the
-                    //   relevant worker is assumed to be at the moment the test result in question is
-                    //   returned.
-                    // - Workers that finish around the same time as the final test result's worker. In
-                    //   this case, their completion notification can race with the completion of the
-                    //   test run.
-                    //
-                    // In both those situations, workers have completed near the time the whole suite
-                    // completed, and we gain little by tracking their time deltas. To avoid slowing
-                    // down the overall test suite, and because we don't know exactly how many workers
-                    // we may need to wait around for, admit notifications that hit such races.
-                    tracing::info!(
-                        ?run_id,
-                        ?entity,
-                        "worker-ran-all-tests notification after test run seen as completed"
-                    );
-                    return Ok(());
-                }
-            }
-        };
-
-        log_assert!(
-            old_notification.is_none(),
-            ?run_id,
-            ?entity,
-            "duplicate worker-ran-all-tests notification received"
-        );
+        queues.mark_worker_complete(&run_id, entity, notification_time);
 
         tracing::debug!(?run_id, ?entity, "worker-ran-all-tests notification");
 
@@ -1817,19 +1878,10 @@ impl QueueServer {
     ) -> OpaqueResult<()> {
         let response = {
             let queues = queues;
-            let liveness = queues
-                .get_run_liveness(&run_id)
+            queues
+                .get_run_status(&run_id)
                 .ok_or("Invalid state: worker is requesting run result for non-existent ID")
-                .located(here!())?;
-
-            match liveness {
-                RunLive::Active => net_protocol::queue::TotalRunResult::Pending,
-                RunLive::Done => {
-                    tracing::info!(?run_id, ?entity, "notifying worker of run exit code");
-                    net_protocol::queue::TotalRunResult::Completed
-                }
-                RunLive::Cancelled => net_protocol::queue::TotalRunResult::Completed,
-            }
+                .located(here!())?
         };
 
         net_protocol::async_write(&mut stream, &response)
@@ -2097,14 +2149,15 @@ mod test {
         io,
         sync::Arc,
         thread::{self},
+        time::Instant,
     };
 
     use super::{RunStateCache, DEFAULT_CLIENT_POLL_TIMEOUT};
     use crate::{
         connections::ConnectedWorkers,
         queue::{
-            ActiveRunResponders, AddedManifest, CancelReason, QueueServer, RunLive, SharedRuns,
-            WorkScheduler,
+            ActiveRunResponders, AddedManifest, AssignedRunLookup, CancelReason, QueueServer,
+            RunStatus, SharedRuns, WorkScheduler,
         },
         timeout::{RunTimeoutManager, RunTimeoutStrategy},
     };
@@ -2131,6 +2184,7 @@ mod test {
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;
+    use abq_workers::negotiate::AssignedRun;
     use parking_lot as pl;
     use tokio::sync::{Mutex, RwLock};
     use tracing_test::traced_test;
@@ -2540,7 +2594,7 @@ mod test {
         );
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
-        queues.mark_complete(&run_id, ExitCode::SUCCESS);
+        let _worker_timings = queues.mark_complete(&run_id, ExitCode::SUCCESS);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
@@ -2571,7 +2625,7 @@ mod test {
         }
 
         for run_id in [run_id1, run_id2] {
-            queues.mark_complete(&run_id, ExitCode::SUCCESS);
+            let _worker_timings = queues.mark_complete(&run_id, ExitCode::SUCCESS);
         }
 
         assert_eq!(queues.estimate_num_active_runs(), expected_active);
@@ -2597,8 +2651,8 @@ mod test {
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
-            queues.get_run_liveness(&run_id).unwrap(),
-            RunLive::Cancelled
+            queues.get_run_status(&run_id).unwrap(),
+            RunStatus::Cancelled
         ));
     }
 
@@ -2625,9 +2679,129 @@ mod test {
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
-            queues.get_run_liveness(&run_id).unwrap(),
-            RunLive::Cancelled
+            queues.get_run_status(&run_id).unwrap(),
+            RunStatus::Cancelled
         ));
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn track_worker_entities_over_run_state() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let worker0 = Entity::local_client();
+        let worker1 = Entity::local_client();
+        let worker2 = Entity::local_client();
+
+        // worker0 creates run
+        {
+            let assigned_lookup = queues.find_or_create_run(
+                &run_id,
+                one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                worker0,
+            );
+            assert_eq!(
+                assigned_lookup,
+                AssignedRunLookup::Some(AssignedRun {
+                    should_generate_manifest: true
+                })
+            );
+            assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
+            assert_eq!(queues.get_active_workers(&run_id), vec![worker0]);
+        }
+
+        // worker1 attaches
+        {
+            let assigned_lookup = queues.find_or_create_run(
+                &run_id,
+                one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                worker1,
+            );
+            assert_eq!(
+                assigned_lookup,
+                AssignedRunLookup::Some(AssignedRun {
+                    should_generate_manifest: false
+                })
+            );
+            assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
+            assert_eq!(queues.get_active_workers(&run_id), vec![worker0, worker1]);
+        }
+
+        // manifest is populated
+        {
+            let added_manifest = queues.add_manifest(&run_id, vec![], Default::default());
+            assert!(matches!(added_manifest, AddedManifest::Added { .. }));
+            assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
+            assert_eq!(queues.get_active_workers(&run_id), vec![worker0, worker1]);
+        }
+
+        // worker2 attaches
+        {
+            let assigned_lookup = queues.find_or_create_run(
+                &run_id,
+                one_nonzero(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                worker2,
+            );
+            assert_eq!(
+                assigned_lookup,
+                AssignedRunLookup::Some(AssignedRun {
+                    should_generate_manifest: false
+                })
+            );
+            assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
+            assert_eq!(
+                queues.get_active_workers(&run_id),
+                vec![worker0, worker1, worker2]
+            );
+        }
+
+        // worker2 done
+        {
+            queues.mark_worker_complete(&run_id, worker2, Instant::now());
+            assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
+            assert_eq!(queues.get_active_workers(&run_id), vec![worker0, worker1]);
+        }
+
+        // whole run done
+        {
+            let _timings = queues.mark_complete(&run_id, ExitCode::SUCCESS);
+            assert_eq!(
+                queues.get_run_status(&run_id),
+                Some(RunStatus::InitialManifestDone {
+                    num_active_workers: 2
+                })
+            );
+            assert_eq!(queues.get_active_workers(&run_id), vec![worker0, worker1]);
+        }
+
+        // worker1 done
+        {
+            queues.mark_worker_complete(&run_id, worker1, Instant::now());
+            assert_eq!(
+                queues.get_run_status(&run_id),
+                Some(RunStatus::InitialManifestDone {
+                    num_active_workers: 1
+                })
+            );
+            assert_eq!(queues.get_active_workers(&run_id), vec![worker0]);
+        }
+
+        // worker0 done
+        {
+            queues.mark_worker_complete(&run_id, worker0, Instant::now());
+            assert_eq!(
+                queues.get_run_status(&run_id),
+                Some(RunStatus::InitialManifestDone {
+                    num_active_workers: 0
+                })
+            );
+            assert_eq!(queues.get_active_workers(&run_id), vec![]);
+        }
     }
 
     #[tokio::test]
@@ -2721,8 +2895,8 @@ mod test {
 
         // Check the run state is cancelled
         assert!(matches!(
-            queues.get_run_liveness(&run_id).unwrap(),
-            RunLive::Cancelled {}
+            queues.get_run_status(&run_id).unwrap(),
+            RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
         assert!(!state_cache.lock().contains_key(&run_id));
@@ -2833,8 +3007,8 @@ mod test {
 
         // Check the run state is cancelled
         assert!(matches!(
-            queues.get_run_liveness(&run_id).unwrap(),
-            RunLive::Cancelled {}
+            queues.get_run_status(&run_id).unwrap(),
+            RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
         assert!(!state_cache.lock().contains_key(&run_id));
@@ -2900,8 +3074,8 @@ mod test {
         assert!(cancellation_end.is_ok());
 
         assert!(matches!(
-            queues.get_run_liveness(&run_id).unwrap(),
-            RunLive::Cancelled {}
+            queues.get_run_status(&run_id).unwrap(),
+            RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
         assert!(!state_cache.lock().contains_key(&run_id));
@@ -2919,7 +3093,8 @@ mod test_pull_work {
     use abq_with_protocol_version::with_protocol_version;
 
     use crate::queue::{
-        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunLive, RunState, SharedRuns,
+        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunState, RunStatus,
+        SharedRuns,
     };
 
     #[test]
@@ -2945,6 +3120,7 @@ mod test_pull_work {
             init_metadata: Default::default(),
             batch_size_hint,
             last_test_timeout: Duration::ZERO,
+            active_workers: Default::default(),
         };
 
         let run_id = RunId::unique();
@@ -2962,8 +3138,8 @@ mod test_pull_work {
             );
 
             assert!(matches!(
-                queues.get_run_liveness(&run_id),
-                Some(RunLive::Active)
+                queues.get_run_status(&run_id),
+                Some(RunStatus::Active)
             ));
         }
 
@@ -2980,8 +3156,8 @@ mod test_pull_work {
             );
 
             assert!(matches!(
-                queues.get_run_liveness(&run_id),
-                Some(RunLive::Active)
+                queues.get_run_status(&run_id),
+                Some(RunStatus::Active)
             ));
         }
 
@@ -2999,8 +3175,8 @@ mod test_pull_work {
             );
 
             assert!(matches!(
-                queues.get_run_liveness(&run_id),
-                Some(RunLive::Active)
+                queues.get_run_status(&run_id),
+                Some(RunStatus::Active)
             ));
         }
     }

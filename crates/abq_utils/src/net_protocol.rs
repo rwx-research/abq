@@ -511,15 +511,16 @@ pub mod queue {
         pub specification: NativeRunnerSpecification,
     }
 
-    /// A response regarding the final result of a given test run, after all tests in the run are
-    /// completed.
-    #[derive(Serialize, Deserialize)]
-    pub enum TotalRunResult {
-        /// The run is still ongoing; the queue will need to be polled again to determine whether
-        /// the result was a success.
-        Pending,
-        /// The result of the run.
-        Completed,
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RunStatus {
+        Active,
+        /// All items in the manifest have been handed out.
+        /// Workers may still be executing locally, for example in-band retries.
+        InitialManifestDone {
+            /// The number of workers that are still seen as active, for example executing retries, if any.
+            num_active_workers: usize,
+        },
+        Cancelled,
     }
 
     /// Notification of how many active test runs are currently being processed by the queue.
@@ -592,10 +593,8 @@ pub mod queue {
         /// Notification from a worker to the queue that it finished running all scheduled tests
         /// for a suite run.
         WorkerRanAllTests(RunId),
-        /// An ask to return information about whether a given test run failed or not.
-        /// A worker issues this request before exiting to determine whether they should exit
-        /// cleanly, or fail.
-        RequestTotalRunResult(RunId),
+        /// Query the queue for the state of a run at a particular moment in time.
+        RunStatus(RunId),
 
         /// A worker is connecting with the intent to hold a persistent connection over which test
         /// results will be communicated back.
