@@ -1,30 +1,60 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicUsize, Arc},
+};
 
-use abq_utils::net_protocol::workers::RunId;
-use parking_lot::Mutex;
-
-pub struct ActiveRunState {
-    /// Amount of work items left for the run.
-    work_left: usize,
-}
-
-impl ActiveRunState {
-    pub fn new(manifest_len: usize) -> Self {
-        Self {
-            work_left: manifest_len,
-        }
-    }
-
-    /// Returns whether any work is left, and the current success status.
-    pub fn account_results(&mut self, num_results: usize) -> bool {
-        // TODO: hedge against underflow here
-        self.work_left -= num_results;
-
-        self.work_left == 0
-    }
-}
+use abq_utils::{atomic, net_protocol::workers::RunId};
+use parking_lot::RwLock;
 
 /// Cache of the current state of active runs and their result, so that we don't have to
 /// lock the run queue to understand what results we are waiting on.
-// TODO: consider using DashMap or RwLock<Map<RunId, Mutex<RunResultState>>>
-pub type RunStateCache = Arc<Mutex<HashMap<RunId, ActiveRunState>>>;
+#[derive(Default, Clone)]
+pub struct RunStateCache(Arc<RwLock<HashMap<RunId, ActiveRunState>>>);
+
+struct ActiveRunState {
+    /// Amount of work items left for the run.
+    work_left: AtomicUsize,
+}
+
+impl RunStateCache {
+    /// Returns `true` if a state was already present.
+    #[must_use]
+    pub fn insert_new(&self, run_id: RunId, manifest_len: usize) -> bool {
+        let mut states = self.0.write();
+        let old = states.insert(
+            run_id,
+            ActiveRunState {
+                work_left: AtomicUsize::new(manifest_len),
+            },
+        );
+        old.is_some()
+    }
+
+    /// Returns `true` if the state was present.
+    #[must_use]
+    pub fn remove(&self, run_id: &RunId) -> bool {
+        let mut states = self.0.write();
+        let old = states.remove(run_id);
+        old.is_some()
+    }
+
+    /// Returns whether any work is left for the given run.
+    /// If the run does not exist, returns `None`.
+    #[must_use]
+    pub fn account_results(&self, run_id: &RunId, num_results: usize) -> Option<bool> {
+        let states = self.0.read();
+        let run_state = states.get(run_id)?;
+
+        let ActiveRunState { work_left } = run_state;
+
+        let old_num_results = work_left.fetch_sub(num_results, atomic::ORDERING);
+
+        let num_left = old_num_results - num_results;
+        Some(num_left == 0)
+    }
+
+    #[must_use]
+    pub fn contains(&self, run_id: &RunId) -> bool {
+        self.0.read().contains_key(run_id)
+    }
+}

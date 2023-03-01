@@ -43,7 +43,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
 use tracing::instrument;
 
-use crate::active_state::{ActiveRunState, RunStateCache};
+use crate::active_state::RunStateCache;
 use crate::connections::{self, ConnectedWorkers};
 use crate::prelude::*;
 use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
@@ -1412,7 +1412,7 @@ impl QueueServer {
 
         {
             // Drop the entry from the state cache
-            state_cache.lock().remove(&run_id);
+            let _was_present = state_cache.remove(&run_id);
         }
 
         Ok(())
@@ -1529,8 +1529,11 @@ impl QueueServer {
             AddedManifest::Added {
                 worker_connection_times,
             } => {
-                let run_state = ActiveRunState::new(total_work);
-                state_cache.lock().insert(run_id.clone(), run_state);
+                let had_old = state_cache.insert_new(run_id.clone(), total_work);
+                log_assert!(
+                    !had_old,
+                    "duplicate run should have been detected before adding state cache entry"
+                );
 
                 log_workers_waited_for_manifest_latency(
                     &run_id,
@@ -1589,7 +1592,7 @@ impl QueueServer {
         {
             // We should not have an entry for the run in the state cache, since we only ever know
             // the initial state of a run after receiving the manifest.
-            debug_assert!(!state_cache.lock().contains_key(&run_id));
+            debug_assert!(!state_cache.contains(&run_id));
         }
 
         // Remove the active run state.
@@ -1635,22 +1638,17 @@ impl QueueServer {
             let _ = results;
         }
 
-        let no_more_work = {
-            // Update the amount of work we have left; again, steal the map of work for only as
-            // long is it takes for us to do that.
-            let mut state_cache = state_cache.lock();
-            let run_state = match state_cache.get_mut(&run_id) {
-                Some(state) => state,
-                None => {
-                    tracing::info!(
-                        ?run_id,
-                        "got test result for no-longer active (cancelled) run"
-                    );
-                    return Err("run no longer active").located(here!());
-                }
-            };
-
-            run_state.account_results(num_results)
+        // Update the amount of work we have left; again, steal the map of work for only as
+        // long is it takes for us to do that.
+        let no_more_work = match state_cache.account_results(&run_id, num_results) {
+            Some(all_done) => all_done,
+            None => {
+                tracing::info!(
+                    ?run_id,
+                    "got test result for no-longer active (cancelled) run"
+                );
+                return Err("run no longer active").located(here!());
+            }
         };
 
         if !no_more_work {
@@ -1729,7 +1727,7 @@ impl QueueServer {
 
         active_runs.write().await.remove(run_id);
 
-        let _run_state = state_cache.lock().remove(run_id);
+        let _had_state = state_cache.remove(run_id);
 
         let worker_completed_times = queues.mark_complete(run_id, ExitCode::SUCCESS);
 
@@ -1834,7 +1832,7 @@ impl QueueServer {
         queues.mark_cancelled(&run_id, reason.into());
 
         // Drop the run from the state cache.
-        state_cache.lock().remove(&run_id);
+        let _was_present = state_cache.remove(&run_id);
 
         let _ = locked_active_runs; // make sure the lock isn't dropped before here
 
@@ -2185,7 +2183,6 @@ mod test {
     };
     use abq_with_protocol_version::with_protocol_version;
     use abq_workers::negotiate::AssignedRun;
-    use parking_lot as pl;
     use tokio::sync::{Mutex, RwLock};
     use tracing_test::traced_test;
 
@@ -2835,9 +2832,9 @@ mod test {
             Arc::new(RwLock::new(map))
         };
         let state_cache: RunStateCache = {
-            let mut cache = HashMap::default();
-            cache.insert(run_id.clone(), super::ActiveRunState::new(1));
-            Arc::new(pl::Mutex::new(cache))
+            let cache = RunStateCache::default();
+            let _ = cache.insert_new(run_id.clone(), 1);
+            cache
         };
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
@@ -2849,7 +2846,7 @@ mod test {
             let cancellation_fut = QueueServer::handle_run_cancellation(
                 queues.clone(),
                 Arc::clone(&active_runs),
-                Arc::clone(&state_cache),
+                state_cache.clone(),
                 entity,
                 run_id.clone(),
             );
@@ -2899,7 +2896,7 @@ mod test {
             RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
-        assert!(!state_cache.lock().contains_key(&run_id));
+        assert!(!state_cache.contains(&run_id));
         assert!(!worker_results_tasks.has_tasks_for(&run_id));
         assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
@@ -2936,9 +2933,9 @@ mod test {
             Arc::new(RwLock::new(map))
         };
         let state_cache: RunStateCache = {
-            let mut cache = HashMap::default();
-            cache.insert(run_id.clone(), super::ActiveRunState::new(1));
-            Arc::new(pl::Mutex::new(cache))
+            let cache = RunStateCache::default();
+            let _ = cache.insert_new(run_id.clone(), 1);
+            cache
         };
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
@@ -2950,7 +2947,7 @@ mod test {
             let cancellation_fut = QueueServer::handle_run_cancellation(
                 queues.clone(),
                 Arc::clone(&active_runs),
-                Arc::clone(&state_cache),
+                state_cache.clone(),
                 entity,
                 run_id.clone(),
             );
@@ -3011,7 +3008,7 @@ mod test {
             RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
-        assert!(!state_cache.lock().contains_key(&run_id));
+        assert!(!state_cache.contains(&run_id));
         assert!(!worker_results_tasks.has_tasks_for(&run_id));
         assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
@@ -3039,9 +3036,9 @@ mod test {
             Arc::new(RwLock::new(map))
         };
         let state_cache: RunStateCache = {
-            let mut cache = HashMap::default();
-            cache.insert(run_id.clone(), super::ActiveRunState::new(1));
-            Arc::new(pl::Mutex::new(cache))
+            let cache = RunStateCache::default();
+            let _ = cache.insert_new(run_id.clone(), 1);
+            cache
         };
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
@@ -3052,7 +3049,7 @@ mod test {
         let send_last_result_fut = QueueServer::handle_worker_results(
             queues.clone(),
             Arc::clone(&active_runs),
-            Arc::clone(&state_cache),
+            state_cache.clone(),
             worker_results_tasks.clone(),
             worker_next_tests_tasks.clone(),
             entity,
@@ -3062,7 +3059,7 @@ mod test {
         let cancellation_fut = QueueServer::handle_run_cancellation(
             queues.clone(),
             Arc::clone(&active_runs),
-            Arc::clone(&state_cache),
+            state_cache.clone(),
             entity,
             run_id.clone(),
         );
@@ -3078,7 +3075,7 @@ mod test {
             RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
-        assert!(!state_cache.lock().contains_key(&run_id));
+        assert!(!state_cache.contains(&run_id));
         assert!(!worker_results_tasks.has_tasks_for(&run_id));
         assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
