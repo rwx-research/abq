@@ -8,7 +8,9 @@ abq_workers = { path = "../abq_workers" }
 abq_utils = { path = "../abq_utils" }
 
 serde.workspace = true
+serde_derive.workspace = true
 serde_json.workspace = true
+
 parking_lot.workspace = true
 
 static_assertions.workspace = true
@@ -18,6 +20,7 @@ tracing.workspace = true
 
 tokio.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 
 anyhow.workspace = true
 

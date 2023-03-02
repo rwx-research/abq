@@ -215,12 +215,8 @@ mod test {
     use std::time::Duration;
 
     use abq_generic_test_runner::TestsFetcher;
-    use abq_utils::net_protocol::{
-        queue::TestSpec,
-        runners::{ProtocolWitness, TestCase, TestId},
-        workers::{NextWork, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
-    };
-    use abq_with_protocol_version::with_protocol_version;
+    use abq_test_utils::{spec, test, wid, worker_test};
+    use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, INIT_RUN_NUMBER};
 
     use crate::test_fetching::retries::test::{
         associated_results, result, with_focus, FAILURE, SUCCESS,
@@ -284,27 +280,7 @@ mod test {
 
     use NextWork::*;
 
-    fn wid(id: usize) -> WorkId {
-        WorkId([id as u8; 16])
-    }
-
-    fn test(id: usize) -> TestId {
-        format!("test{id}")
-    }
-
-    fn spec(proto: ProtocolWitness, id: usize) -> TestSpec {
-        TestSpec {
-            test_case: TestCase::new(proto, test(id), Default::default()),
-            work_id: wid(id),
-        }
-    }
-
-    fn worker_test(spec: TestSpec, run_number: u32) -> NextWork {
-        Work(WorkerTest::new(spec, run_number))
-    }
-
     #[tokio::test]
-    #[with_protocol_version]
     async fn fetch_incremental_from_queue_fresh() {
         use persistent_test_fetcher::test::{
             scaffold_server, server_establish, server_send_bundle,
@@ -322,8 +298,8 @@ mod test {
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(1), INIT_RUN_NUMBER),
+                    worker_test(spec(2), INIT_RUN_NUMBER),
                 ],
             )
             .await;
@@ -331,8 +307,8 @@ mod test {
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                    worker_test(spec(3), INIT_RUN_NUMBER),
+                    worker_test(spec(4), INIT_RUN_NUMBER),
                     EndOfWork,
                 ],
             )
@@ -343,16 +319,16 @@ mod test {
             assert_eq!(
                 fetcher.get_next_tests().await.work,
                 [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(1), INIT_RUN_NUMBER),
+                    worker_test(spec(2), INIT_RUN_NUMBER),
                 ],
             );
 
             assert_eq!(
                 fetcher.get_next_tests().await.work,
                 [
-                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                    worker_test(spec(3), INIT_RUN_NUMBER),
+                    worker_test(spec(4), INIT_RUN_NUMBER),
                 ],
             );
         };
@@ -361,7 +337,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[with_protocol_version]
     async fn fetch_retry_manifest_from_queue() {
         use out_of_process_retry_manifest_fetcher::test::{
             scaffold_server, server_establish, server_send_bundle,
@@ -379,10 +354,10 @@ mod test {
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                    worker_test(spec(1), INIT_RUN_NUMBER),
+                    worker_test(spec(2), INIT_RUN_NUMBER),
+                    worker_test(spec(3), INIT_RUN_NUMBER),
+                    worker_test(spec(4), INIT_RUN_NUMBER),
                     EndOfWork,
                 ],
             )
@@ -393,10 +368,10 @@ mod test {
             assert_eq!(
                 fetcher.get_next_tests().await.work,
                 [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                    worker_test(spec(1), INIT_RUN_NUMBER),
+                    worker_test(spec(2), INIT_RUN_NUMBER),
+                    worker_test(spec(3), INIT_RUN_NUMBER),
+                    worker_test(spec(4), INIT_RUN_NUMBER),
                 ],
             );
         };
@@ -405,7 +380,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[with_protocol_version]
     async fn fetch_from_queue_then_no_retries_fresh() {
         use persistent_test_fetcher::test::{
             scaffold_server, server_establish, server_send_bundle,
@@ -423,8 +397,8 @@ mod test {
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(1), INIT_RUN_NUMBER),
+                    worker_test(spec(2), INIT_RUN_NUMBER),
                     EndOfWork,
                 ],
             )
@@ -435,8 +409,8 @@ mod test {
             assert_eq!(
                 fetcher.get_next_tests().await.work,
                 [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(1), INIT_RUN_NUMBER),
+                    worker_test(spec(2), INIT_RUN_NUMBER),
                 ],
             );
 
@@ -447,7 +421,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[with_protocol_version]
     async fn fetch_from_queue_then_multiple_retries_fresh() {
         macro_rules! go_test {
             ($server:expr, $fetcher:expr, $results_tracker:expr) => {{
@@ -456,9 +429,9 @@ mod test {
                     server_send_bundle(
                         &mut conn,
                         [
-                            worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                            worker_test(spec(proto, 2), INIT_RUN_NUMBER),
-                            worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                            worker_test(spec(1), INIT_RUN_NUMBER),
+                            worker_test(spec(2), INIT_RUN_NUMBER),
+                            worker_test(spec(3), INIT_RUN_NUMBER),
                             EndOfWork,
                         ],
                     )
@@ -470,9 +443,9 @@ mod test {
                     assert_eq!(
                         $fetcher.get_next_tests().await.work,
                         [
-                            worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                            worker_test(spec(proto, 2), INIT_RUN_NUMBER),
-                            worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                            worker_test(spec(1), INIT_RUN_NUMBER),
+                            worker_test(spec(2), INIT_RUN_NUMBER),
+                            worker_test(spec(3), INIT_RUN_NUMBER),
                         ],
                     );
 
@@ -486,8 +459,8 @@ mod test {
                     assert_eq!(
                         $fetcher.get_next_tests().await.work,
                         [
-                            worker_test(with_focus(spec(proto, 1), test(1)), INIT_RUN_NUMBER + 1),
-                            worker_test(with_focus(spec(proto, 2), test(2)), INIT_RUN_NUMBER + 1),
+                            worker_test(with_focus(spec(1), test(1)), INIT_RUN_NUMBER + 1),
+                            worker_test(with_focus(spec(2), test(2)), INIT_RUN_NUMBER + 1),
                         ],
                     );
 
@@ -508,7 +481,7 @@ mod test {
                     assert_eq!(
                         $fetcher.get_next_tests().await.work,
                         [worker_test(
-                            with_focus(spec(proto, 1), test(1)),
+                            with_focus(spec(1), test(1)),
                             INIT_RUN_NUMBER + 2
                         ),],
                     );
@@ -559,7 +532,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[with_protocol_version]
     async fn fetch_from_queue_followed_by_end_of_work_waits_for_retries_fresh() {
         use persistent_test_fetcher::test::{
             scaffold_server, server_establish, server_send_bundle,
@@ -574,7 +546,7 @@ mod test {
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(&mut conn, [worker_test(spec(proto, 1), INIT_RUN_NUMBER)]).await;
+            server_send_bundle(&mut conn, [worker_test(spec(1), INIT_RUN_NUMBER)]).await;
             server_send_bundle(&mut conn, [EndOfWork]).await;
         };
 
@@ -582,7 +554,7 @@ mod test {
             // Attempt 1, from online
             assert_eq!(
                 fetcher.get_next_tests().await.work,
-                [worker_test(spec(proto, 1), INIT_RUN_NUMBER),],
+                [worker_test(spec(1), INIT_RUN_NUMBER),],
             );
 
             // Attempt 2 will need to fetch from retries of attempt 1.
@@ -597,7 +569,7 @@ mod test {
             assert_eq!(
                 fetcher.get_next_tests().await.work,
                 [worker_test(
-                    with_focus(spec(proto, 1), test(1)),
+                    with_focus(spec(1), test(1)),
                     INIT_RUN_NUMBER + 1
                 ),],
             );
@@ -616,7 +588,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[with_protocol_version]
     async fn fetch_from_queue_followed_by_end_of_work_waits_for_retries_out_of_process_retry() {
         use out_of_process_retry_manifest_fetcher::test::{
             scaffold_server, server_establish, server_send_bundle,
@@ -633,7 +604,7 @@ mod test {
             let mut conn = server_establish(&*server).await;
             server_send_bundle(
                 &mut conn,
-                [worker_test(spec(proto, 1), INIT_RUN_NUMBER), EndOfWork],
+                [worker_test(spec(1), INIT_RUN_NUMBER), EndOfWork],
             )
             .await;
         };
@@ -642,7 +613,7 @@ mod test {
             // Attempt 1, from online
             assert_eq!(
                 fetcher.get_next_tests().await.work,
-                [worker_test(spec(proto, 1), INIT_RUN_NUMBER),],
+                [worker_test(spec(1), INIT_RUN_NUMBER),],
             );
 
             // Attempt 2 will need to fetch from retries of attempt 1.
@@ -657,7 +628,7 @@ mod test {
             assert_eq!(
                 fetcher.get_next_tests().await.work,
                 [worker_test(
-                    with_focus(spec(proto, 1), test(1)),
+                    with_focus(spec(1), test(1)),
                     INIT_RUN_NUMBER + 1
                 ),],
             );

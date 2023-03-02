@@ -2,7 +2,7 @@ use std::{cell::Cell, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
 use abq_utils::{
     atomic,
-    net_protocol::{entity::Entity, workers::WorkerTest},
+    net_protocol::{entity::Tag, workers::WorkerTest},
 };
 
 /// Concurrently-accessible job queue for a test suite run.
@@ -13,17 +13,18 @@ pub struct JobQueue {
     queue: Vec<WorkerTest>,
     /// To which worker has each entry in the manifest been assigned to?
     /// Modified as a run progresses, by popping off [Self::get_work]
-    assigned_entities: Vec<EntityCell>,
+    assigned_entities: Vec<TagCell>,
     /// The last item popped off the queue.
     ptr: AtomicUsize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct EntityCell(Cell<Entity>);
+#[repr(transparent)]
+struct TagCell(Cell<Tag>);
 
-impl EntityCell {
-    fn new(entity: Entity) -> Self {
-        Self(Cell::new(entity))
+impl TagCell {
+    fn new(tag: Tag) -> Self {
+        Self(Cell::new(tag))
     }
 }
 
@@ -31,14 +32,14 @@ impl EntityCell {
 /// [JobQueue::get_work], and its access pattern is guarded by the assignment of an uncontested
 /// region of the queue to a thread. As such, there will never be conflating writes to an EntityCell
 /// (though there may conflating write/reads).
-unsafe impl Sync for EntityCell {}
+unsafe impl Sync for TagCell {}
 
 impl JobQueue {
     pub fn new(work: Vec<WorkerTest>) -> Self {
         let work_len = work.len();
         Self {
             queue: work,
-            assigned_entities: vec![EntityCell::new(Entity::DEBUG_FAKE); work_len],
+            assigned_entities: vec![TagCell::new(Tag::ExternalClient); work_len],
             ptr: AtomicUsize::new(0),
         }
     }
@@ -46,7 +47,7 @@ impl JobQueue {
     /// Pops up to the next `n` items in the queue and assigns them to the given `entity`.
     pub fn get_work(
         &self,
-        entity: Entity,
+        entity_tag: Tag,
         n: NonZeroUsize,
     ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
         let n = n.get() as usize;
@@ -77,7 +78,7 @@ impl JobQueue {
         }
 
         for entity_cell in self.assigned_entities[start_idx..end_idx].iter() {
-            entity_cell.0.set(entity);
+            entity_cell.0.set(entity_tag);
         }
 
         self.queue[start_idx..end_idx].iter()
@@ -90,12 +91,12 @@ impl JobQueue {
     /// Gets the subset of the manifest assigned to a given worker.
     pub fn get_partition_for_entity(
         &self,
-        entity: Entity,
+        entity_tag: Tag,
     ) -> impl Iterator<Item = &WorkerTest> + '_ {
         self.assigned_entities
             .iter()
             .enumerate()
-            .filter(move |(_, cell)| cell.0.get() == entity)
+            .filter(move |(_, cell)| cell.0.get() == entity_tag)
             .map(|(i, _)| &self.queue[i])
     }
 }
@@ -147,11 +148,11 @@ mod test {
         for n in 1..=num_threads {
             let queue = queue.clone();
             let num_popped = num_popped.clone();
+            let entity = Entity::runner(n as u32, n as u32);
             let n = NonZeroUsize::try_from(n).unwrap();
-            let entity = Entity::local_client();
-            workers.insert(entity, n);
+            workers.insert(entity.tag, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(entity, n);
+                let popped = queue.get_work(entity.tag, n);
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -220,12 +221,12 @@ mod test {
         for n in 1..=num_threads {
             let queue = queue.clone();
             let num_popped = num_popped.clone();
+            let entity = Entity::runner(n as u32, n as u32);
             let n = NonZeroUsize::try_from(n).unwrap();
-            let entity = Entity::local_client();
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity, n);
+                    let popped = queue.get_work(entity.tag, n);
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
@@ -239,8 +240,10 @@ mod test {
 
         for (entity, handle) in threads {
             let local_manifest = handle.join().unwrap();
-            let queue_seen_manifest: Vec<_> =
-                queue.get_partition_for_entity(entity).cloned().collect();
+            let queue_seen_manifest: Vec<_> = queue
+                .get_partition_for_entity(entity.tag)
+                .cloned()
+                .collect();
             assert_eq!(local_manifest, queue_seen_manifest);
         }
 

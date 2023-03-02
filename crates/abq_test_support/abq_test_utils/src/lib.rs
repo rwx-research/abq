@@ -5,7 +5,14 @@ use std::{
     path::PathBuf,
 };
 
-use abq_utils::net_async;
+use abq_utils::{
+    net_async,
+    net_protocol::{
+        queue::TestSpec,
+        runners::{ProtocolWitness, TestCase, TestId},
+        workers::{NextWork, WorkId, WorkerTest},
+    },
+};
 
 pub const WORKSPACE: &str = env!("ABQ_WORKSPACE_DIR");
 
@@ -75,4 +82,23 @@ pub fn sanitize_output(s: &str) -> String {
     let s = re_generic_runner.replace(&s, "Generic test runner started on <stripped>");
 
     s.into_owned()
+}
+
+pub fn wid(id: usize) -> WorkId {
+    WorkId([id as u8; 16])
+}
+
+pub fn test(id: usize) -> TestId {
+    format!("test{id}")
+}
+
+pub fn spec(id: usize) -> TestSpec {
+    TestSpec {
+        test_case: TestCase::new(ProtocolWitness::TEST, test(id), Default::default()),
+        work_id: wid(id),
+    }
+}
+
+pub fn worker_test(spec: TestSpec, run_number: u32) -> NextWork {
+    NextWork::Work(WorkerTest::new(spec, run_number))
 }

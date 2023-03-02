@@ -142,6 +142,12 @@ pub mod entity {
         ExternalClient,
     }
 
+    impl Tag {
+        pub fn runner(worker: impl Into<WorkerTag>, runner: impl Into<RunnerTag>) -> Self {
+            Tag::Runner(WorkerRunner::new(worker, runner))
+        }
+    }
+
     impl std::fmt::Display for Tag {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
@@ -161,11 +167,6 @@ pub mod entity {
     }
 
     impl Entity {
-        pub const DEBUG_FAKE: Self = Self {
-            id: [0; 16],
-            tag: Tag::ExternalClient,
-        };
-
         pub fn new(tag: Tag) -> Self {
             Self {
                 id: uuid::Uuid::new_v4().into_bytes(),

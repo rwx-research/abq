@@ -495,7 +495,7 @@ impl AllRuns {
         let mut bundle = Vec::with_capacity(batch_size.get() as _);
         bundle.extend(
             queue
-                .get_work(entity, batch_size)
+                .get_work(entity.tag, batch_size)
                 .cloned()
                 .map(NextWork::Work),
         );
@@ -564,7 +564,7 @@ impl AllRuns {
                 // TODO: should we launch discovery of a partition on a blocking async task?
                 // If this ever takes a non-trivial amount of time, consider doing so.
                 let mut manifest: Vec<_> = queue
-                    .get_partition_for_entity(entity)
+                    .get_partition_for_entity(entity.tag)
                     .cloned()
                     .map(NextWork::Work)
                     .collect();

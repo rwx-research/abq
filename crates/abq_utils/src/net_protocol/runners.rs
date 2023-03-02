@@ -78,6 +78,8 @@ impl ProtocolWitness {
 
         [Self(V0_2)].into_iter()
     }
+
+    pub const TEST: Self = ProtocolWitness(PrivProtocolWitness::V0_2);
 }
 
 // NORMALIZE: runner specification 0.2
