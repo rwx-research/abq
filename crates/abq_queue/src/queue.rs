@@ -31,7 +31,6 @@ use abq_utils::net_protocol::{meta, publicize_addr};
 use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::vec_map::VecMap;
-use abq_utils::vec_set::VecSet;
 use abq_utils::{atomic, log_assert};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
@@ -52,6 +51,7 @@ use crate::worker_timings::{
     log_workers_idle_after_completion_latency, log_workers_waited_for_manifest_latency,
     new_worker_timings, WorkerTimings,
 };
+use crate::worker_tracking::WorkerSet;
 
 pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
@@ -82,7 +82,7 @@ enum RunState {
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
         /// Some(time) if they have already completed, None if they are still active.
-        active_workers: Mutex<VecMap<Entity, Option<Instant>>>,
+        active_workers: Mutex<WorkerSet<Option<Instant>>>,
     },
     /// All items in the manifest have been handed out.
     /// Workers may still be executing locally, for example in-band retries.
@@ -91,7 +91,7 @@ enum RunState {
         new_worker_exit_code: ExitCode,
 
         /// Workers that are still actively executing tests.
-        active_workers: Mutex<VecSet<Entity>>,
+        active_workers: Mutex<WorkerSet<()>>,
     },
     Cancelled {
         #[allow(unused)] // yet
@@ -287,7 +287,7 @@ impl AllRuns {
             }
             RunState::HasWork { active_workers, .. } => {
                 let mut active_workers = active_workers.lock();
-                let old_active_worker_info = active_workers.insert(entity, None);
+                let old_active_worker_info = active_workers.insert_by_tag(entity, None);
 
                 match old_active_worker_info {
                     None => {
@@ -296,8 +296,22 @@ impl AllRuns {
                             should_generate_manifest: false,
                         })
                     }
-                    Some(old_finished_state) => {
-                        // This is a worker re-connecting out-of-process, presumably for a retry.
+                    Some((old_entity, old_finished_state)) => {
+                        if old_entity.id == entity.id {
+                            // The same worker entity is connecting twice - this implies that the
+                            // same worker process is asking to find a run more than once, which
+                            // should never happen. Each worker process should be associated with
+                            // exactly one run.
+                            log_assert!(
+                                false,
+                                ?entity,
+                                ?run_id,
+                                "same worker entity connecting to find run more than once"
+                            );
+                        }
+
+                        // The entities are different, but their tags are the same. As such, this
+                        // is a worker re-connecting out-of-process, presumably for a retry.
                         //
                         // Unfortunately, we cannot reliably guard on `old_finished_state`
                         // indicating that the worker sent a finished-all-results notification
@@ -606,9 +620,9 @@ impl AllRuns {
             }
             RunState::HasWork { active_workers, .. } => {
                 let mut active_workers = active_workers.lock();
-                let old = active_workers.insert(entity, Some(notification_time));
+                let old = active_workers.insert_by_tag(entity, Some(notification_time));
                 log_assert!(
-                    old == Some(None),
+                    matches!(old, Some((_, None))),
                     ?entity,
                     ?old,
                     "worker was not seen as active before completion notification"
@@ -616,9 +630,9 @@ impl AllRuns {
             }
             RunState::InitialManifestDone { active_workers, .. } => {
                 let mut active_workers = active_workers.lock();
-                let was_present = active_workers.remove(entity);
+                let was_present = active_workers.remove_by_tag(entity);
                 log_assert!(
-                    was_present,
+                    was_present.is_some(),
                     "worker was not seen as active before completion notification"
                 );
             }
@@ -652,7 +666,7 @@ impl AllRuns {
             }
         };
 
-        let mut still_active_workers = VecSet::default();
+        let mut still_active_workers = WorkerSet::default();
         let mut completed_worker_timings = VecMap::with_capacity(active_worker_timings.len());
 
         for (worker, opt_completed) in active_worker_timings {
@@ -661,7 +675,7 @@ impl AllRuns {
                     completed_worker_timings.insert(worker, timing);
                 }
                 None => {
-                    still_active_workers.insert(worker);
+                    still_active_workers.insert_by_tag(worker, ());
                 }
             }
         }
@@ -800,7 +814,7 @@ impl AllRuns {
                 .map(|p| p.0)
                 .collect(),
             RunState::InitialManifestDone { active_workers, .. } => {
-                active_workers.lock().iter().copied().collect()
+                active_workers.lock().iter().copied().map(|p| p.0).collect()
             }
             RunState::Cancelled { .. } => Default::default(),
         }
@@ -2612,7 +2626,7 @@ mod test {
             &run_id,
             one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::local_client(),
+            Entity::runner(0, 1),
         );
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
@@ -2629,7 +2643,7 @@ mod test {
             &run_id,
             one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::local_client(),
+            Entity::runner(0, 1),
         );
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
@@ -2648,7 +2662,7 @@ mod test {
             &run_id,
             one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::local_client(),
+            Entity::runner(1, 1),
         );
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
@@ -2673,7 +2687,7 @@ mod test {
                 run_id,
                 one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::local_client(),
+                Entity::runner(0, 1),
             );
         }
 
@@ -2700,7 +2714,7 @@ mod test {
             &run_id,
             one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::local_client(),
+            Entity::runner(0, 1),
         );
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
@@ -2725,7 +2739,7 @@ mod test {
             &run_id,
             one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::local_client(),
+            Entity::runner(0, 1),
         );
 
         let added = queues.add_manifest(&run_id, vec![], Default::default());
@@ -2749,9 +2763,9 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let worker0 = Entity::local_client();
-        let worker1 = Entity::local_client();
-        let worker2 = Entity::local_client();
+        let worker0 = Entity::runner(1, 1);
+        let worker1 = Entity::runner(2, 2);
+        let worker2 = Entity::runner(3, 3);
 
         // worker0 creates run
         {
@@ -2883,7 +2897,7 @@ mod test {
                 &run_id,
                 one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::local_client(),
+                Entity::runner(0, 1),
             );
             queues
         };
@@ -2900,7 +2914,7 @@ mod test {
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
-        let entity = Entity::local_client();
+        let entity = Entity::runner(0, 1);
 
         // Cancel the run, make sure we exit smoothly
         {
@@ -2984,7 +2998,7 @@ mod test {
                 &run_id,
                 one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::local_client(),
+                Entity::runner(0, 1),
             );
             queues
         };
@@ -3001,7 +3015,7 @@ mod test {
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
-        let entity = Entity::local_client();
+        let entity = Entity::runner(0, 1);
 
         // Cancel the run, make sure we exit smoothly
         let do_cancellation_fut = async {
@@ -3085,7 +3099,7 @@ mod test {
                 &run_id,
                 one_nonzero_usize(),
                 DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::local_client(),
+                Entity::runner(0, 1),
             );
             let added = queues.add_manifest(&run_id, vec![], Default::default());
             assert!(matches!(added, AddedManifest::Added { .. }));
@@ -3104,7 +3118,7 @@ mod test {
         let worker_results_tasks = ConnectedWorkers::default();
         let worker_next_tests_tasks = ConnectedWorkers::default();
 
-        let entity = Entity::local_client();
+        let entity = Entity::runner(0, 1);
 
         let result = AssociatedTestResults::fake(WorkId::new(), vec![TestResult::fake()]);
         let send_last_result_fut = QueueServer::handle_worker_results(
@@ -3143,6 +3157,60 @@ mod test {
 
     #[test]
     #[with_protocol_version]
+    fn worker_told_to_pull_retry_manifest() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let worker0 = Entity::runner(1, 1);
+        let worker0_shadow = Entity::runner(1, 1);
+        assert_ne!(worker0.id, worker0_shadow.id);
+        assert_eq!(worker0.tag, worker0_shadow.tag);
+
+        let test1 = fake_test_spec(proto);
+        let test2 = fake_test_spec(proto);
+        let test3 = fake_test_spec(proto);
+
+        // Create run, add manifest by worker0
+        {
+            let _ = queues.find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                DEFAULT_CLIENT_POLL_TIMEOUT,
+                worker0,
+            );
+            let _ = queues.add_manifest(
+                &run_id,
+                vec![test1.clone(), test2, test3],
+                Default::default(),
+            );
+        }
+
+        // worker0 pulls tests
+        {
+            let NextWorkResult::Present { bundle, .. } = queues.next_work(worker0, &run_id);
+            assert_eq!(
+                bundle.work,
+                vec![NextWork::Work(WorkerTest::new(
+                    test1.clone(),
+                    INIT_RUN_NUMBER
+                ))]
+            );
+        }
+
+        // Suppose worker0 sporadically dies. Now worker0_shadow should be told to pull a retry
+        // manifest.
+        let assigned = queues.find_or_create_run(
+            &run_id,
+            one_nonzero_usize(),
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+            worker0_shadow,
+        );
+        assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
+    }
+
+    #[test]
+    #[with_protocol_version]
     fn pull_retry_manifest_for_active_work() {
         let queues = SharedRuns::default();
         let run_id = RunId::unique();
@@ -3151,13 +3219,13 @@ mod test {
         let test2 = fake_test_spec(proto);
         let test3 = fake_test_spec(proto);
 
-        let entity = Entity::local_client();
+        let entity = Entity::runner(0, 1);
 
         let _ = queues.find_or_create_run(
             &run_id,
             one_nonzero_usize(),
             DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::local_client(),
+            Entity::runner(0, 1),
         );
         let _ = queues.add_manifest(
             &run_id,
@@ -3291,7 +3359,7 @@ mod test_pull_work {
 
         // First pull. There should be additional tests following it.
         {
-            let next_work = queues.next_work(Entity::local_client(), &run_id);
+            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
             assert!(
                 matches!(next_work, NextWorkResult::Present { bundle, status }
@@ -3307,7 +3375,7 @@ mod test_pull_work {
 
         // Second pull. Now we reach the end of all tests and all test run attempts.
         {
-            let next_work = queues.next_work(Entity::local_client(), &run_id);
+            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
             assert!(
                 matches!(next_work, NextWorkResult::Present { bundle, status }
@@ -3326,7 +3394,7 @@ mod test_pull_work {
         // Now, if another worker pulls work it should get nothing other than an end-of-test marker,
         // and be told we're all done.
         {
-            let next_work = queues.next_work(Entity::local_client(), &run_id);
+            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
             assert!(
                 matches!(next_work, NextWorkResult::Present { bundle, status }

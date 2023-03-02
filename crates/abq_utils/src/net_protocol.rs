@@ -158,11 +158,13 @@ pub mod entity {
         }
     }
 
+    pub type EntityId = [u8; 16];
+
     /// Identifies a unique instance of an entity participating in the ABQ network ecosystem.
     /// The queue, workers, and abq test clients are all entities.
     #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub struct Entity {
-        pub id: [u8; 16],
+        pub id: EntityId,
         pub tag: Tag,
     }
 
