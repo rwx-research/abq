@@ -10,11 +10,8 @@ use std::{
 };
 
 use abq_native_runner_simulation::pack_msgs_to_disk;
-use abq_queue::{
-    queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT},
-    timeout::{RunTimeoutStrategy, TimeoutReason},
-};
-use abq_test_utils::{artifacts_dir, assert_scoped_log};
+use abq_queue::queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT};
+use abq_test_utils::artifacts_dir;
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
     exit::ExitCode,
@@ -165,6 +162,7 @@ enum Action {
     StopWorkers(Wid),
     CancelWorkers(Wid),
 
+    #[allow(unused)] // for now
     WaitForCompletedRun(Run),
 
     /// Make a connection to the work server, the callback will test a request.
@@ -191,13 +189,6 @@ struct TestBuilder<'a> {
 }
 
 impl<'a> TestBuilder<'a> {
-    fn new(servers: Servers) -> Self {
-        Self {
-            servers,
-            steps: Default::default(),
-        }
-    }
-
     fn step(
         mut self,
         actions: impl IntoIterator<Item = Action>,
@@ -353,9 +344,16 @@ fn action_to_fut(
                     match net_protocol::async_read(&mut conn).await.unwrap() {
                         InitialManifestDone {
                             num_active_workers: 0,
-                        } => break,
-                        Cancelled => break,
-                        Active | InitialManifestDone { .. } => continue,
+                        } => {
+                            break;
+                        }
+                        Cancelled => {
+                            break;
+                        }
+                        Active | InitialManifestDone { .. } => {
+                            tokio::time::sleep(Duration::from_micros(500)).await;
+                            continue;
+                        }
                     }
                 }
             }
@@ -487,7 +485,7 @@ fn multiple_jobs_complete() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
                 TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
@@ -501,12 +499,6 @@ fn multiple_jobs_complete() {
             ],
         )
         .test();
-
-    // Should log how long this worker took
-    assert_scoped_log(
-        "abq_queue::worker_timings",
-        "worker post completion idle seconds",
-    );
 }
 
 #[test]
@@ -543,7 +535,11 @@ fn multiple_invokers() {
             StartWorkers(Run(2), Wid(2), WorkersConfigBuilder::new(2, runner2)),
         ])
         .step(
-            [StopWorkers(Wid(1)), StopWorkers(Wid(2))],
+            [
+                StopWorkers(Wid(1)),
+                StopWorkers(Wid(2)),
+                WaitForCompletedRun(Run(1)),
+            ],
             [
                 TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
@@ -593,7 +589,7 @@ fn batch_two_requests_at_a_time() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
                 TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
@@ -621,7 +617,7 @@ fn empty_manifest_exits_gracefully() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
                 TestResults(Run(1), &|results| results.is_empty()),
                 WorkerExitStatus(
@@ -803,7 +799,7 @@ fn get_init_context_after_run_already_completed() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [WorkerExitStatus(
                 Wid(1),
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -858,7 +854,7 @@ fn getting_run_after_work_is_complete_returns_nothing() {
             WorkersConfigBuilder::new(1, runner.clone()),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
                 TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
@@ -882,7 +878,11 @@ fn getting_run_after_work_is_complete_returns_nothing() {
             [WorkersAreRedundant(Wid(2))],
         )
         .step(
-            [StopWorkers(Wid(2))],
+            [
+                StopWorkers(Wid(2)),
+                // Run should still be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [WorkerExitStatus(
                 Wid(2),
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -910,7 +910,11 @@ fn test_cancellation_drops_remaining_work() {
             WorkersConfigBuilder::new(1, runner.clone()),
         )])
         .step(
-            [CancelWorkers(Wid(1))],
+            [
+                CancelWorkers(Wid(1)),
+                // Run should now be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [WorkerExitStatus(
                 Wid(1),
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
@@ -922,7 +926,11 @@ fn test_cancellation_drops_remaining_work() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(2))],
+            [
+                StopWorkers(Wid(2)),
+                // Run should still be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [WorkerExitStatus(
                 Wid(2),
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
@@ -946,54 +954,17 @@ fn failure_to_run_worker_command_exits_gracefully() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [
+                StopWorkers(Wid(1)),
+                // Run should be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [WorkerExitStatus(
                 Wid(1),
                 Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
             )],
         )
         .test();
-}
-
-#[test]
-#[traced_test]
-#[with_protocol_version]
-fn cancel_test_run_upon_timeout_after_last_test_handed_out() {
-    let workers_config = || {
-        let manifest = ManifestMessage::new(Manifest::new(
-            [echo_test(proto, "echo1".to_string())],
-            Default::default(),
-        ));
-        let runner = RunnerKind::TestLikeRunner(
-            TestLikeRunner::NeverReturnOnTest("echo1".to_owned()),
-            Box::new(manifest),
-        );
-        WorkersConfigBuilder::new(1, runner).with_num_workers(one_nonzero_usize())
-    };
-
-    fn zero(_: TimeoutReason) -> Duration {
-        Duration::ZERO
-    }
-
-    TestBuilder::new(Servers::from_config(QueueConfig {
-        timeout_strategy: RunTimeoutStrategy::constant(zero),
-        ..Default::default()
-    }))
-    .act([
-        // After pulling the only test, the queue should time us out.
-        StartWorkers(Run(1), Wid(1), workers_config()),
-    ])
-    .act([StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))])
-    // Second worker to connect should exit as cancelled immediately
-    .act([StartWorkers(Run(1), Wid(2), workers_config())])
-    .step(
-        [StopWorkers(Wid(2))],
-        [WorkerExitStatus(
-            Wid(2),
-            Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
-        )],
-    )
-    .test();
 }
 
 #[test]
@@ -1019,7 +990,11 @@ fn native_runner_fails_due_to_manifest_failure() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [
+                StopWorkers(Wid(1)),
+                // Run should be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [WorkerExitStatus(
                 Wid(1),
                 Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
@@ -1052,7 +1027,11 @@ fn multiple_tests_per_work_id_reported() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1))],
+            [
+                StopWorkers(Wid(1)),
+                // Run should be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [
                 TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
@@ -1138,7 +1117,11 @@ fn many_retries_complete() {
     TestBuilder::default()
         .act([StartWorkers(Run(1), Wid(1), workers_config)])
         .step(
-            [StopWorkers(Wid(1))],
+            [
+                StopWorkers(Wid(1)),
+                // Run should be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [
                 TestResults(Run(1), &|results| {
                     let mut results = results.to_vec();
@@ -1194,7 +1177,7 @@ fn many_retries_many_workers_complete() {
     let mut end_workers_asserts = vec![];
     for i in 1..=num_workers {
         let workers_config =
-            WorkersConfigBuilder::new(1, runner.clone()).with_max_run_number(attempts);
+            WorkersConfigBuilder::new(i as u32, runner.clone()).with_max_run_number(attempts);
         start_actions.push(StartWorkers(Run(1), Wid(i), workers_config));
 
         end_workers_actions.push(StopWorkers(Wid(i)));
@@ -1207,7 +1190,10 @@ fn many_retries_many_workers_complete() {
     TestBuilder::default()
         .act(start_actions)
         .step(
-            end_workers_actions,
+            end_workers_actions.into_iter().chain(once(
+                // Run should be seen as completed
+                WaitForCompletedRun(Run(1)),
+            )),
             end_workers_asserts
                 .into_iter()
                 .chain(once(TestResults(Run(1), &|results| {
@@ -1222,7 +1208,7 @@ fn many_retries_many_workers_complete() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[timeout(2000)]
+#[timeout(3000)]
 fn many_retries_many_workers_complete_native() {
     let attempts = 4;
     let num_tests = 64;
@@ -1325,6 +1311,9 @@ fn many_retries_many_workers_complete_native() {
         end_workers_actions.push(StopWorkers(Wid(i)));
     }
 
+    // Run should be seen as completed
+    end_workers_actions.push(WaitForCompletedRun(Run(1)));
+
     TestBuilder::default()
         .act(start_actions)
         .step(
@@ -1398,7 +1387,11 @@ fn cancellation_native() {
             WorkersConfigBuilder::new(1, runner.clone()),
         )])
         .step(
-            [CancelWorkers(Wid(1))],
+            [
+                CancelWorkers(Wid(1)),
+                // Run should be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [
                 WorkerExitStatus(
                     Wid(1),
@@ -1414,7 +1407,11 @@ fn cancellation_native() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(2))],
+            [
+                StopWorkers(Wid(2)),
+                // Run should still be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
             [WorkerExitStatus(
                 Wid(2),
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),

@@ -3,10 +3,20 @@ use abq_utils::{
     net_protocol::entity::{Entity, Tag},
 };
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WorkerSet<T>(Vec<(Entity, T)>);
 
+impl<T> Default for WorkerSet<T> {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
+
 impl<T> WorkerSet<T> {
+    pub fn with_capacity(cap: usize) -> Self {
+        Self(Vec::with_capacity(cap))
+    }
+
     /// Inserts an entity by its tag.
     /// Returns an old entity with the same tag, if any.
     pub fn insert_by_tag(&mut self, entity: Entity, val: T) -> Option<(Entity, T)> {
@@ -25,6 +35,17 @@ impl<T> WorkerSet<T> {
                 self.0.push((entity, val));
                 None
             }
+        }
+    }
+
+    pub fn insert_by_tag_if_missing(&mut self, entity: Entity, val: T) {
+        log_assert!(
+            matches!(entity.tag, Tag::Runner(..)),
+            ?entity,
+            "somehow, a non-worker entity is being tracked"
+        );
+        if !self.0.iter().any(|(k, _)| k.tag == entity.tag) {
+            self.0.push((entity, val));
         }
     }
 

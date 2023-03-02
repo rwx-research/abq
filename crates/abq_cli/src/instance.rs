@@ -1,4 +1,3 @@
-use abq_queue::timeout::RunTimeoutStrategy;
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::Entity;
@@ -39,7 +38,6 @@ pub fn start_abq_forever(
         work_port,
         negotiator_port,
         server_options,
-        timeout_strategy: RunTimeoutStrategy::RUN_BASED,
     };
     let mut abq = Abq::start(queue_config);
 
@@ -97,7 +95,7 @@ pub fn start_abq_forever(
     term_signals_handle.close();
     listen_for_signals_thread.join().unwrap();
 
-    tracing::debug!("shutting down queue");
+    tracing::debug!("shut down queue");
     abq.shutdown().unwrap();
 
     std::process::exit(0);

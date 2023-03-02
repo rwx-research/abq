@@ -39,18 +39,11 @@ use abq_workers::negotiate::{
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::oneshot;
 use tracing::instrument;
 
-use crate::active_state::RunStateCache;
-use crate::connections::{self, ConnectedWorkers};
 use crate::job_queue::JobQueue;
 use crate::prelude::*;
-use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy, TimedOutRun, TimeoutReason};
-use crate::worker_timings::{
-    log_workers_idle_after_completion_latency, log_workers_waited_for_manifest_latency,
-    new_worker_timings, WorkerTimings,
-};
+use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
 
 pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -61,7 +54,7 @@ enum RunState {
     WaitingForManifest {
         /// For the purposes of analytics, records timings of when workers connect prior to the
         /// manifest being generated.
-        worker_connection_times: Mutex<WorkerTimings>,
+        worker_connection_times: Mutex<WorkerSet<Instant>>,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -75,9 +68,6 @@ enum RunState {
         // Co-locate this here so that we don't have to index `run_data` when grabbing a
         // test.
         batch_size_hint: NonZeroUsize,
-
-        /// The timeout for the last test result.
-        last_test_timeout: Duration,
 
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
@@ -102,12 +92,8 @@ enum RunState {
 struct RunData {
     /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
     batch_size_hint: NonZeroUsize,
-    /// The timeout for the last test result.
-    last_test_timeout: Duration,
 }
 
-// Just the stack size of the RunData, the closure of RunData may be much larger.
-static_assertions::assert_eq_size!(RunData, (u64, Duration));
 static_assertions::assert_eq_size!(Option<RunData>, RunData);
 
 const MAX_BATCH_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(100) };
@@ -187,7 +173,7 @@ enum PulledTestsStatus {
     MoreTestsRemaining,
     /// The bundle of tests just pulled have exhausted the queue of tests.
     /// The last test to be handed out is in this bundle.
-    PulledLastTest { last_test_timeout: Duration },
+    PulledLastTest,
     /// The queue was already empty when tests were pulled.
     QueueWasEmpty,
 }
@@ -204,12 +190,9 @@ impl PulledTestsStatus {
 }
 
 /// Result of trying to pull a batch of tests for a worker.
-enum NextWorkResult {
-    /// A set of tests were found.
-    Present {
-        bundle: NextWorkBundle,
-        status: PulledTestsStatus,
-    },
+struct NextWorkResult {
+    bundle: NextWorkBundle,
+    status: PulledTestsStatus,
 }
 
 #[derive(Debug)]
@@ -231,7 +214,6 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        last_test_timeout: Duration,
         entity: Entity,
     ) -> AssignedRunStatus {
         {
@@ -251,7 +233,6 @@ impl AllRuns {
                         entity,
                         run_id.clone(),
                         batch_size_hint,
-                        last_test_timeout,
                     );
                 }
             };
@@ -274,7 +255,7 @@ impl AllRuns {
                 worker_connection_times,
             } => {
                 let mut worker_connection_times = worker_connection_times.lock();
-                let old = worker_connection_times.insert(entity, time::Instant::now());
+                let old = worker_connection_times.insert_by_tag(entity, time::Instant::now());
                 log_assert!(
                     old.is_none(),
                     ?entity,
@@ -366,10 +347,9 @@ impl AllRuns {
         worker_entity: Entity,
         run_id: RunId,
         batch_size_hint: NonZeroUsize,
-        last_test_timeout: Duration,
     ) -> AssignedRunStatus {
-        let mut worker_timings = new_worker_timings();
-        worker_timings.insert(worker_entity, time::Instant::now());
+        let mut worker_timings = WorkerSet::default();
+        worker_timings.insert_by_tag(worker_entity, time::Instant::now());
 
         // NB: Always add first for conversative estimation.
         num_active.fetch_add(1, atomic::ORDERING);
@@ -379,10 +359,7 @@ impl AllRuns {
             state: RunState::WaitingForManifest {
                 worker_connection_times: Mutex::new(worker_timings),
             },
-            data: Some(RunData {
-                batch_size_hint,
-                last_test_timeout,
-            }),
+            data: Some(RunData { batch_size_hint }),
         };
         let old_run = runs.insert(run_id, RwLock::new(run));
         log_assert!(old_run.is_none(), "can only be called when run is fresh!");
@@ -433,21 +410,22 @@ impl AllRuns {
             .as_ref()
             .expect("illegal state - run data must exist at this step");
 
-        let active_workers = worker_connection_times
-            .iter()
-            .map(|(entity, _)| (*entity, None))
-            .collect();
+        let mut active_workers = WorkerSet::with_capacity(worker_connection_times.len());
+        let mut worker_conn_times = VecMap::with_capacity(worker_connection_times.len());
+        for (worker, time) in worker_connection_times {
+            active_workers.insert_by_tag(worker, None);
+            worker_conn_times.insert(worker, time);
+        }
 
         run.state = RunState::HasWork {
             queue,
             batch_size_hint: run_data.batch_size_hint,
             init_metadata,
-            last_test_timeout: run_data.last_test_timeout,
             active_workers: Mutex::new(active_workers),
         };
 
         AddedManifest::Added {
-            worker_connection_times,
+            worker_connection_times: worker_conn_times,
         }
     }
 
@@ -478,14 +456,34 @@ impl AllRuns {
             RunState::HasWork {
                 queue,
                 batch_size_hint,
-                last_test_timeout,
+                active_workers,
                 ..
             } => {
-                Self::get_next_work_online(queue, entity, *batch_size_hint, *last_test_timeout)
+                active_workers.lock().insert_by_tag_if_missing(entity, None);
+                let result = Self::get_next_work_online(queue, entity, *batch_size_hint);
+                match result.status {
+                    PulledTestsStatus::MoreTestsRemaining => {
+                        result
+                    }
+                    PulledTestsStatus::PulledLastTest { .. } | PulledTestsStatus::QueueWasEmpty => {
+                        drop(run);
+                        drop(runs);
+                        tracing::debug!(?entity, ?run_id, "saw end of manifest for entity");
+                        self.try_mark_reached_end_of_manifest(run_id, ExitCode::SUCCESS);
+                        result
+                    }
+                }
             }
-            RunState::InitialManifestDone { .. } | RunState::Cancelled {..} => {
+            RunState::InitialManifestDone {  active_workers, .. } => {
                 // Let the worker know that we've reached the end of the queue.
-                NextWorkResult::Present {
+                active_workers.lock().insert_by_tag_if_missing(entity, ());
+                NextWorkResult{
+                    bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
+                    status: PulledTestsStatus::QueueWasEmpty
+                }
+            }
+            RunState::Cancelled {..} => {
+                NextWorkResult{
                     bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
                     status: PulledTestsStatus::QueueWasEmpty
                 }
@@ -498,7 +496,6 @@ impl AllRuns {
         queue: &JobQueue,
         entity: Entity,
         batch_size_hint: NonZeroUsize,
-        last_test_timeout: Duration,
     ) -> NextWorkResult {
         // NB: in the future, the batch size is likely to be determined intelligently, i.e.
         // from off-line timing data. But for now, we use the hint the client provided.
@@ -530,7 +527,7 @@ impl AllRuns {
             //     until those results arrive.
             match bundle.last() {
                 Some(NextWork::Work(_)) => {
-                    pulled_tests_status = PulledTestsStatus::PulledLastTest { last_test_timeout };
+                    pulled_tests_status = PulledTestsStatus::PulledLastTest;
                 }
                 Some(NextWork::EndOfWork) => {
                     // To avoid additional allocation and moves when we pop the queue, we built
@@ -553,7 +550,7 @@ impl AllRuns {
 
         let bundle = NextWorkBundle { work: bundle };
 
-        NextWorkResult::Present {
+        NextWorkResult {
             bundle,
             status: pulled_tests_status,
         }
@@ -633,7 +630,8 @@ impl AllRuns {
                 let was_present = active_workers.remove_by_tag(entity);
                 log_assert!(
                     was_present.is_some(),
-                    "worker was not seen as active before completion notification"
+                    ?entity,
+                    "worker was not seen as active before completion notification",
                 );
             }
             RunState::Cancelled { .. } => {
@@ -642,8 +640,7 @@ impl AllRuns {
         }
     }
 
-    #[must_use]
-    pub fn mark_complete(&self, run_id: &RunId, new_worker_exit_code: ExitCode) -> WorkerTimings {
+    fn try_mark_reached_end_of_manifest(&self, run_id: &RunId, new_worker_exit_code: ExitCode) {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
@@ -661,22 +658,22 @@ impl AllRuns {
                 // Cancellation always takes priority over completeness.
                 return Default::default();
             }
-            RunState::WaitingForManifest { .. } | RunState::InitialManifestDone { .. } => {
+            RunState::InitialManifestDone { .. } => {
+                // We already got marked as completed; bail out.
+                return Default::default();
+            }
+            RunState::WaitingForManifest { .. } => {
                 unreachable!("Invalid state");
             }
         };
 
+        tracing::info!(?run_id, "marking end of manifest");
+
         let mut still_active_workers = WorkerSet::default();
-        let mut completed_worker_timings = VecMap::with_capacity(active_worker_timings.len());
 
         for (worker, opt_completed) in active_worker_timings {
-            match opt_completed {
-                Some(timing) => {
-                    completed_worker_timings.insert(worker, timing);
-                }
-                None => {
-                    still_active_workers.insert_by_tag(worker, ());
-                }
+            if opt_completed.is_none() {
+                still_active_workers.insert_by_tag(worker, ());
             }
         }
 
@@ -686,13 +683,11 @@ impl AllRuns {
         };
 
         // Drop the run data, since we no longer need it.
-        debug_assert!(run.data.is_some());
+        log_assert!(run.data.is_some(), "run data missing");
         std::mem::take(&mut run.data);
 
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
-
-        completed_worker_timings
     }
 
     pub fn mark_failed_to_start(&self, run_id: RunId) {
@@ -789,8 +784,9 @@ impl AllRuns {
                 Some(RunStatus::Active)
             }
             RunState::InitialManifestDone { active_workers, .. } => {
+                let active_workers = active_workers.lock();
                 Some(RunStatus::InitialManifestDone {
-                    num_active_workers: active_workers.lock().len(),
+                    num_active_workers: active_workers.len(),
                 })
             }
             RunState::Cancelled { .. } => Some(RunStatus::Cancelled),
@@ -825,9 +821,14 @@ impl AllRuns {
     }
 
     #[cfg(test)]
-    fn set_state(&self, run_id: RunId, state: RunState) -> Option<RwLock<Run>> {
+    fn set_state(
+        &self,
+        run_id: RunId,
+        state: RunState,
+        data: Option<RunData>,
+    ) -> Option<RwLock<Run>> {
         let mut runs = self.runs.write();
-        runs.insert(run_id, RwLock::new(Run { state, data: None }))
+        runs.insert(run_id, RwLock::new(Run { state, data }))
     }
 }
 
@@ -950,8 +951,6 @@ pub struct QueueConfig {
     pub negotiator_port: u16,
     /// How the queue should construct its servers.
     pub server_options: ServerOptions,
-    /// How timeouts for long-lasting runs should be configured.
-    pub timeout_strategy: RunTimeoutStrategy,
 }
 
 impl Default for QueueConfig {
@@ -968,7 +967,6 @@ impl Default for QueueConfig {
                 ServerAuthStrategy::no_auth(),
                 ServerTlsStrategy::no_tls(),
             ),
-            timeout_strategy: RunTimeoutStrategy::RUN_BASED,
         }
     }
 }
@@ -984,7 +982,6 @@ fn start_queue(config: QueueConfig) -> Abq {
         work_port,
         negotiator_port,
         server_options,
-        timeout_strategy,
     } = config;
 
     let mut shutdown_manager = ShutdownManager::default();
@@ -1001,22 +998,10 @@ fn start_queue(config: QueueConfig) -> Abq {
     let negotiator_addr = negotiator_listener.local_addr().unwrap();
     let public_negotiator_addr = publicize_addr(negotiator_addr, public_ip);
 
-    let timeout_manager = RunTimeoutManager::new(timeout_strategy);
-    let worker_next_tests_tasks = ConnectedWorkers::default();
-
     let server_shutdown_rx = shutdown_manager.add_receiver();
     let server_handle = thread::spawn({
         let queue_server = QueueServer::new(queues.clone(), public_negotiator_addr);
-        let timeout_manager = timeout_manager.clone();
-        let worker_next_tests_tasks = worker_next_tests_tasks.clone();
-        move || {
-            queue_server.start_on(
-                server_listener,
-                timeout_manager,
-                server_shutdown_rx,
-                worker_next_tests_tasks,
-            )
-        }
+        move || queue_server.start_on(server_listener, server_shutdown_rx)
     });
 
     let new_work_server = server_options.bind((bind_ip, work_port)).unwrap();
@@ -1027,14 +1012,7 @@ fn start_queue(config: QueueConfig) -> Abq {
         let scheduler = WorkScheduler {
             queues: queues.clone(),
         };
-        move || {
-            scheduler.start_on(
-                new_work_server,
-                timeout_manager,
-                work_scheduler_shutdown_rx,
-                worker_next_tests_tasks,
-            )
-        }
+        move || scheduler.start_on(new_work_server, work_scheduler_shutdown_rx)
     });
 
     // Provide the execution context a set of workers should attach with, if it is known at the
@@ -1046,7 +1024,7 @@ fn start_queue(config: QueueConfig) -> Abq {
             let InvokeWork {
                 run_id,
                 batch_size_hint,
-                test_results_timeout,
+                test_results_timeout: _,
             } = invoke_work;
 
             let batch_size_hint = if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
@@ -1058,7 +1036,7 @@ fn start_queue(config: QueueConfig) -> Abq {
                 .unwrap()
             };
 
-            queues.find_or_create_run(run_id, batch_size_hint, *test_results_timeout, entity)
+            queues.find_or_create_run(run_id, batch_size_hint, entity)
         }
     };
 
@@ -1127,22 +1105,8 @@ struct QueueServerCtx {
     /// When all results for a particular run are communicated, we want to make sure that the
     /// responder thread is closed and that the entry here is dropped.
     active_runs: ActiveRunResponders,
-    state_cache: RunStateCache,
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
-
-    /// Persisted worker connections yielding test results.
-    /// A task is spawned when a worker opens a persistent connection with the
-    /// queue to incrementally stream test results, and the task simply listens
-    /// for new test result messages until the worker notifies completion.
-    worker_results_tasks: ConnectedWorkers,
-
-    /// Persisted worker connections that fetch new tests to run.
-    /// These connections are only created on request to the [WorkScheduler],
-    /// and are only [shutdown][ConnectedWorkers::stop] when a test run completes.
-    /// As such, we maintain a pointer so we can stop all remaining tasks when we receive a final
-    /// test result.
-    worker_next_tests_tasks: ConnectedWorkers,
 }
 
 impl QueueServer {
@@ -1156,9 +1120,7 @@ impl QueueServer {
     fn start_on(
         self,
         server_listener: Box<dyn net::ServerListener>,
-        timeouts: RunTimeoutManager,
         mut shutdown: ShutdownReceiver,
-        worker_next_tests_tasks: ConnectedWorkers,
     ) -> Result<(), QueueServerError> {
         // Create a new tokio runtime solely for handling requests that come into the queue server.
         //
@@ -1181,17 +1143,12 @@ impl QueueServer {
             let ctx = QueueServerCtx {
                 queues,
                 active_runs: Default::default(),
-                state_cache: Default::default(),
                 public_negotiator_addr,
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
-
-                worker_results_tasks: Default::default(),
-                worker_next_tests_tasks,
             };
 
             enum Task {
                 HandleConn(UnverifiedServerStream),
-                HandleTimeout(TimedOutRun),
             }
             use Task::*;
 
@@ -1205,9 +1162,6 @@ impl QueueServer {
                                 continue;
                             }
                         }
-                    }
-                    fired_timeout = timeouts.next_timeout() => {
-                        HandleTimeout(fired_timeout)
                     }
                     _ = shutdown.recv_shutdown_immediately() => {
                         break;
@@ -1224,31 +1178,6 @@ impl QueueServer {
                                     error,
                                     "error handling connection to queue: {}"
                                 )
-                            }
-                        });
-                    }
-                    HandleTimeout(timeout) => {
-                        let ctx = ctx.clone();
-                        tokio::spawn(async move {
-                            let result = Self::handle_fired_timeout(
-                                ctx.queues,
-                                ctx.active_runs,
-                                ctx.state_cache,
-                                timeout,
-                            )
-                            .await;
-                            if let Err(LocatedError {
-                                error,
-                                location: Location { file, line, column },
-                            }) = result
-                            {
-                                tracing::error!(
-                                    file,
-                                    line,
-                                    column,
-                                    "error handling timeout of run: {}",
-                                    error
-                                );
                             }
                         });
                     }
@@ -1303,20 +1232,12 @@ impl QueueServer {
                 let _shutdown = stream.shutdown().await;
                 drop(stream);
 
-                Self::handle_run_cancellation(
-                    ctx.queues,
-                    ctx.active_runs,
-                    ctx.state_cache,
-                    entity,
-                    run_id,
-                )
-                .await
+                Self::handle_run_cancellation(ctx.queues, ctx.active_runs, entity, run_id).await
             }
             Message::ManifestResult(run_id, manifest_result) => {
                 Self::handle_manifest_result(
                     ctx.queues,
                     ctx.active_runs,
-                    ctx.state_cache,
                     entity,
                     run_id,
                     manifest_result,
@@ -1343,17 +1264,7 @@ impl QueueServer {
                 drop(stream);
 
                 // Record the test results and notify the test client out-of-band.
-                Self::handle_worker_results(
-                    ctx.queues,
-                    ctx.active_runs,
-                    ctx.state_cache,
-                    ctx.worker_results_tasks,
-                    ctx.worker_next_tests_tasks,
-                    entity,
-                    run_id,
-                    results,
-                )
-                .await
+                Self::handle_worker_results(ctx.queues, entity, run_id, results).await
             }
 
             Message::WorkerRanAllTests(run_id) => {
@@ -1373,16 +1284,6 @@ impl QueueServer {
                     run_id,
                     entity,
                     notification_time,
-                )
-                .await
-            }
-
-            Message::PersistentWorkerResultsConnection(run_id) => {
-                Self::handle_new_persistent_worker_results_connection(
-                    ctx.worker_results_tasks,
-                    run_id,
-                    entity,
-                    stream,
                 )
                 .await
             }
@@ -1444,11 +1345,10 @@ impl QueueServer {
     }
 
     /// A worker requests cancellation of a test run.
-    #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
+    #[instrument(level = "trace", skip(queues, active_runs))]
     async fn handle_run_cancellation(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
         entity: Entity,
         run_id: RunId,
     ) -> OpaqueResult<()> {
@@ -1471,22 +1371,13 @@ impl QueueServer {
             queues.mark_cancelled(&run_id, CancelReason::User);
         }
 
-        {
-            // Drop the entry from the state cache
-            let _was_present = state_cache.remove(&run_id);
-        }
-
         Ok(())
     }
 
-    #[instrument(
-        level = "trace",
-        skip(queues, active_runs, state_cache, manifest_result, stream)
-    )]
+    #[instrument(level = "trace", skip(queues, active_runs, manifest_result, stream))]
     async fn handle_manifest_result(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
         entity: Entity,
         run_id: RunId,
         manifest_result: ManifestResult,
@@ -1512,7 +1403,6 @@ impl QueueServer {
                     Self::handle_manifest_success(
                         queues,
                         active_runs,
-                        state_cache,
                         entity,
                         run_id,
                         flat_manifest,
@@ -1525,7 +1415,6 @@ impl QueueServer {
                     Self::handle_manifest_empty_or_failure(
                         queues,
                         active_runs,
-                        state_cache,
                         entity,
                         run_id,
                         Ok(native_runner_info),
@@ -1538,7 +1427,6 @@ impl QueueServer {
                 Self::handle_manifest_empty_or_failure(
                     queues,
                     active_runs,
-                    state_cache,
                     entity,
                     run_id,
                     Err((error, output)),
@@ -1549,11 +1437,10 @@ impl QueueServer {
         }
     }
 
-    #[instrument(level = "trace", skip(queues, state_cache, flat_manifest))]
+    #[instrument(level = "trace", skip(queues, flat_manifest))]
     async fn handle_manifest_success(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
         entity: Entity,
         run_id: RunId,
         flat_manifest: Vec<TestSpec>,
@@ -1583,19 +1470,12 @@ impl QueueServer {
             Some(responder) => Some(responder.lock().await),
         };
 
-        let total_work = flat_manifest.len();
         let added_manifest = queues.add_manifest(&run_id, flat_manifest.clone(), init_metadata);
 
         match added_manifest {
             AddedManifest::Added {
                 worker_connection_times,
             } => {
-                let had_old = state_cache.insert_new(run_id.clone(), total_work);
-                log_assert!(
-                    !had_old,
-                    "duplicate run should have been detected before adding state cache entry"
-                );
-
                 log_workers_waited_for_manifest_latency(
                     &run_id,
                     worker_connection_times,
@@ -1612,11 +1492,10 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues, state_cache))]
+    #[instrument(level = "trace", skip(queues))]
     async fn handle_manifest_empty_or_failure(
         queues: SharedRuns,
         active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
         entity: Entity,
         run_id: RunId,
         manifest_result: Result<
@@ -1650,12 +1529,6 @@ impl QueueServer {
             drop(stream);
         }
 
-        {
-            // We should not have an entry for the run in the state cache, since we only ever know
-            // the initial state of a run after receiving the manifest.
-            debug_assert!(!state_cache.contains(&run_id));
-        }
-
         // Remove the active run state.
         active_runs.write().await.remove(&run_id);
 
@@ -1668,234 +1541,23 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(
-        level = "trace",
-        skip(
-            queues,
-            active_runs,
-            state_cache,
-            worker_results_tasks,
-            worker_next_tests_tasks,
-        )
-    )]
+    #[instrument(level = "trace", skip(_queues))]
     async fn handle_worker_results(
-        queues: SharedRuns,
-        active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
-        worker_results_tasks: ConnectedWorkers,
-        worker_next_tests_tasks: ConnectedWorkers,
+        _queues: SharedRuns,
         entity: Entity,
         run_id: RunId,
         results: Vec<AssociatedTestResults>,
     ) -> OpaqueResult<()> {
         // IFTTT: handle_fired_timeout
 
-        tracing::info!("got result");
+        tracing::debug!("got result");
 
-        let num_results = results.len();
+        let _num_results = results.len();
 
         {
             // TODO do something with the results, eventually!
             let _ = results;
         }
-
-        // Update the amount of work we have left; again, steal the map of work for only as
-        // long is it takes for us to do that.
-        let no_more_work = match state_cache.account_results(&run_id, num_results) {
-            Some(all_done) => all_done,
-            None => {
-                tracing::info!(
-                    ?run_id,
-                    "got test result for no-longer active (cancelled) run"
-                );
-                return Err("run no longer active").located(here!());
-            }
-        };
-
-        if !no_more_work {
-            return Ok(());
-        }
-
-        Self::handle_end_of_work(
-            queues,
-            active_runs,
-            state_cache,
-            worker_results_tasks,
-            worker_next_tests_tasks,
-            entity,
-            run_id,
-        )
-        .await
-    }
-
-    #[instrument(
-        level = "trace",
-        skip(
-            queues,
-            active_runs,
-            state_cache,
-            worker_results_tasks,
-            worker_next_tests_tasks,
-        )
-    )]
-    async fn handle_end_of_work(
-        queues: SharedRuns,
-        active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
-        worker_results_tasks: ConnectedWorkers,
-        worker_next_tests_tasks: ConnectedWorkers,
-        entity: Entity,
-        run_id: RunId,
-    ) -> OpaqueResult<()> {
-        // Now, we need to notify the end of the test run and handle resource cleanup.
-        let run_complete_span = tracing::info_span!("run end of work", ?run_id, ?entity);
-        let _run_complete_enter = run_complete_span.enter();
-
-        // TODO(ayaz) inline the below
-
-        Self::handle_test_run_completion(
-            queues,
-            active_runs,
-            state_cache,
-            &run_id,
-            entity,
-            worker_results_tasks,
-            worker_next_tests_tasks,
-        )
-        .await
-    }
-
-    #[instrument(
-        level = "trace",
-        skip(
-            queues,
-            active_runs,
-            state_cache,
-            worker_results_tasks,
-            worker_next_tests_tasks,
-        )
-    )]
-    async fn handle_test_run_completion(
-        queues: SharedRuns,
-        active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
-        run_id: &RunId,
-        entity: Entity,
-        worker_results_tasks: ConnectedWorkers,
-        worker_next_tests_tasks: ConnectedWorkers,
-    ) -> OpaqueResult<()> {
-        // This run should indeed be terminated; drop all remaining state.
-
-        active_runs.write().await.remove(run_id);
-
-        let _had_state = state_cache.remove(run_id);
-
-        let worker_completed_times = queues.mark_complete(run_id, ExitCode::SUCCESS);
-
-        let (opt_worker_results_tasks_err, opt_worker_next_tests_tasks_err) = tokio::join!(
-            Self::shutdown_persisted_worker_connection_tasks(
-                worker_results_tasks,
-                run_id,
-                "failed to successfully stop worker results connection task",
-            ),
-            Self::shutdown_persisted_worker_connection_tasks(
-                worker_next_tests_tasks,
-                run_id,
-                "failed to successfully stop worker next tests connection task",
-            )
-        );
-
-        log_workers_idle_after_completion_latency(run_id, worker_completed_times, entity);
-
-        opt_worker_results_tasks_err.or(opt_worker_next_tests_tasks_err)
-    }
-
-    #[instrument(level = "trace", skip(tasks, fail_msg))]
-    async fn shutdown_persisted_worker_connection_tasks(
-        tasks: ConnectedWorkers,
-        run_id: &RunId,
-        fail_msg: &str,
-    ) -> OpaqueResult<()> {
-        match tasks.stop(run_id).await {
-            connections::StopResult::RunNotAssociated => {
-                // TODO: if we hit this state, it should be an error once we migrate to
-                // persisted connections!
-                Ok(())
-            }
-            connections::StopResult::Stopped(errors) if errors.is_empty() => Ok(()),
-            connections::StopResult::Stopped(mut errors) => {
-                for LocatedError {
-                    error,
-                    location: Location { file, line, column },
-                } in errors.iter()
-                {
-                    tracing::error!(file, line, column, ?error, ?run_id, "{}", fail_msg);
-                }
-                Err(errors.remove(0)).located(here!())
-            }
-        }
-    }
-
-    /// Handles fired timeouts for test results, instuted by a [RunTimeoutManager].
-    /// A timeout is always fired for a test, whether it completes or not. There are two cases:
-    ///
-    /// - The test run completed (successfully or not). In this case the firing of the timeout is
-    ///   benign.
-    /// - The test run is still pending, i.e. we have not yet received all test results. In this
-    ///   case the timeout is material, and we mark the test run as failed due to timeout.
-    #[instrument(level = "trace", skip(queues, active_runs, state_cache))]
-    async fn handle_fired_timeout(
-        queues: SharedRuns,
-        active_runs: ActiveRunResponders,
-        state_cache: RunStateCache,
-        timeout: TimedOutRun,
-    ) -> OpaqueResult<()> {
-        // IFTTT: handle_worker_results
-        //
-        // We must now take exclusive access on `active_runs` - since that is the first thing that
-        // handle_worker_results will lock on, our taking a lock ensures that any test runs that
-        // come in after this timeout will not race.
-        // We must keep this lock alive until the end of this function.
-        let mut locked_active_runs = active_runs.write().await;
-
-        let TimedOutRun {
-            run_id,
-            after,
-            reason,
-        } = timeout;
-
-        // NB: taking a persistent lock on the queue or state cache is not necessary,
-        // since we've already guarded against other modification above.
-        // By not blocking the queue we allow other work to continue freely.
-        match queues.get_run_status(&run_id) {
-            Some(liveness) => match (liveness, reason) {
-                (RunStatus::Active, TimeoutReason::ResultNotReceived) => {
-                    // pass through, the run needs to be timed out.
-                }
-                (RunStatus::InitialManifestDone { .. }, _) | (RunStatus::Cancelled, _) => {
-                    return Ok(()); // run was already complete, disregard the timeout
-                }
-            },
-            None => {
-                tracing::error!(
-                    ?run_id,
-                    "timeout for run was fired, but it's not known in the queue"
-                );
-                return Err("run not known in the queue").located(here!());
-            }
-        }
-
-        tracing::info!(?run_id, timeout=?after, "timing out active test run");
-
-        locked_active_runs.remove(&run_id);
-
-        // Store the cancellation state
-        queues.mark_cancelled(&run_id, reason.into());
-
-        // Drop the run from the state cache.
-        let _was_present = state_cache.remove(&run_id);
-
-        let _ = locked_active_runs; // make sure the lock isn't dropped before here
 
         Ok(())
     }
@@ -1910,20 +1572,6 @@ impl QueueServer {
         queues.mark_worker_complete(&run_id, entity, notification_time);
 
         tracing::debug!(?run_id, ?entity, "worker-ran-all-tests notification");
-
-        Ok(())
-    }
-
-    async fn handle_new_persistent_worker_results_connection(
-        worker_results_tasks: ConnectedWorkers,
-        run_id: RunId,
-        _entity: Entity,
-        _stream: Box<dyn net_async::ServerStream>,
-    ) -> OpaqueResult<()> {
-        worker_results_tasks.insert(run_id, |rx_stop| async move {
-            rx_stop.await.located(here!())?;
-            Ok(())
-        });
 
         Ok(())
     }
@@ -1981,23 +1629,14 @@ pub enum WorkSchedulerError {
 #[derive(Clone)]
 struct SchedulerCtx {
     queues: SharedRuns,
-    timeouts: RunTimeoutManager,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
-
-    /// Persisted worker connections yielding requests for new tests to run.
-    /// A task is spawned when a worker opens a persistent connection with the
-    /// work server to incrementally stream test results, and the task listens
-    /// and responds to new messages until work has been exhausted.
-    worker_next_tests_tasks: ConnectedWorkers,
 }
 
 impl WorkScheduler {
     fn start_on(
         self,
         listener: Box<dyn net::ServerListener>,
-        timeouts: RunTimeoutManager,
         mut shutdown: ShutdownReceiver,
-        worker_next_tests_tasks: ConnectedWorkers,
     ) -> Result<(), WorkSchedulerError> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2009,10 +1648,7 @@ impl WorkScheduler {
             let Self { queues } = self;
             let ctx = SchedulerCtx {
                 queues,
-                timeouts,
                 handshake_ctx: Arc::new(listener.handshake_ctx()),
-
-                worker_next_tests_tasks,
             };
 
             loop {
@@ -2098,17 +1734,9 @@ impl WorkScheduler {
                     .entity(entity)?;
             }
             PersistentWorkerNextTestsConnection(run_id) => {
-                ctx.worker_next_tests_tasks
-                    .insert(run_id.clone(), move |rx_stop| {
-                        Self::start_persistent_next_tests_requests_task(
-                            ctx.queues,
-                            ctx.timeouts,
-                            run_id,
-                            stream,
-                            rx_stop,
-                            entity,
-                        )
-                    });
+                tokio::spawn(Self::start_persistent_next_tests_requests_task(
+                    ctx.queues, run_id, stream, entity,
+                ));
             }
             RetryManifestPartition { run_id, entity } => {
                 use net_protocol::work_server::RetryManifestResponse;
@@ -2131,21 +1759,14 @@ impl WorkScheduler {
 
     async fn start_persistent_next_tests_requests_task(
         queues: SharedRuns,
-        timeouts: RunTimeoutManager,
         run_id: RunId,
         mut conn: Box<dyn net_async::ServerStream>,
-        mut rx_stop: oneshot::Receiver<()>,
         entity: Entity,
     ) -> OpaqueResult<()> {
         use net_protocol::work_server::NextTestRequest;
 
         loop {
             let NextTestRequest {} = tokio::select! {
-                _ = &mut rx_stop => {
-                    tracing::warn!(?run_id, entity_id=%entity.display_id(), entity_tag=%entity.tag,
-                        "Stopping next-tests requests task before connection naturally expired");
-                    return Ok(())
-                }
                 opt_read_error = net_protocol::async_read(&mut conn) => {
                     // If we fail to read or write, simply fall out of the task -
                     // the worker will re-connect as necessary.
@@ -2165,38 +1786,17 @@ impl WorkScheduler {
             // Pull the next bundle of work.
             let next_work_result = queues.next_work(entity, &run_id);
 
-            match next_work_result {
-                NextWorkResult::Present { bundle, status } => {
-                    let response = NextTestResponse::Bundle(bundle);
+            let NextWorkResult { bundle, status } = next_work_result;
 
-                    net_protocol::async_write(&mut conn, &response)
-                        .await
-                        .located(here!())?;
+            let response = NextTestResponse::Bundle(bundle);
 
-                    if let PulledTestsStatus::PulledLastTest { last_test_timeout } = status {
-                        // This was the last test, so start a timeout for the whole test run to
-                        // complete - if it doesn't, we'll fire and timeout the run.
-                        let timeout_spec = timeouts
-                            .strategy()
-                            .timeout_for_last_test_result(last_test_timeout);
+            net_protocol::async_write(&mut conn, &response)
+                .await
+                .located(here!())?;
 
-                        tracing::info!(
-                            ?run_id,
-                            timeout=?timeout_spec.duration(),
-                            entity_id=%entity.display_id(), entity_tag=%entity.tag,
-                            "issued last test in the manifest to a worker"
-                        );
-
-                        timeouts.insert_run(run_id, timeout_spec).await;
-
-                        return Ok(());
-                    }
-
-                    if status.reached_end_of_tests() {
-                        // Exit, since the worker should not ask us for tests again.
-                        return Ok(());
-                    }
-                }
+            if status.reached_end_of_tests() {
+                // Exit, since the worker should not ask us for tests again.
+                return Ok(());
             }
         }
     }
@@ -2225,14 +1825,9 @@ mod test {
         time::Instant,
     };
 
-    use super::{RunStateCache, DEFAULT_CLIENT_POLL_TIMEOUT};
-    use crate::{
-        connections::ConnectedWorkers,
-        queue::{
-            fake_test_spec, ActiveRunResponders, AddedManifest, CancelReason, NextWorkResult,
-            QueueServer, RunStatus, SharedRuns, WorkScheduler,
-        },
-        timeout::{RunTimeoutManager, RunTimeoutStrategy},
+    use crate::queue::{
+        fake_test_spec, ActiveRunResponders, AddedManifest, CancelReason, NextWorkResult,
+        QueueServer, RunStatus, SharedRuns, WorkScheduler,
     };
     use abq_run_n_times::n_times;
     use abq_test_utils::{accept_handshake, assert_scoped_log, one_nonzero_usize};
@@ -2284,14 +1879,7 @@ mod test {
 
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server
-                .start_on(
-                    listener,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            server.start_on(listener, shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2322,14 +1910,7 @@ mod test {
             public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
         };
         let queue_handle = thread::spawn(|| {
-            queue_server
-                .start_on(
-                    server,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    server_shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            queue_server.start_on(server, server_shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2367,14 +1948,7 @@ mod test {
             queues: Default::default(),
         };
         let work_server_handle = thread::spawn(|| {
-            work_scheduler
-                .start_on(
-                    server,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    server_shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            work_scheduler.start_on(server, server_shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2408,14 +1982,7 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server
-                .start_on(
-                    listener,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            server.start_on(listener, shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2444,14 +2011,7 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server
-                .start_on(
-                    listener,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            server.start_on(listener, shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2495,14 +2055,7 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server
-                .start_on(
-                    listener,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            server.start_on(listener, shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2542,14 +2095,7 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server
-                .start_on(
-                    listener,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            server.start_on(listener, shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2584,14 +2130,7 @@ mod test {
         let server_addr = listener.local_addr().unwrap();
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let server_thread = thread::spawn(move || {
-            server
-                .start_on(
-                    listener,
-                    RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                    shutdown_rx,
-                    ConnectedWorkers::default(),
-                )
-                .unwrap();
+            server.start_on(listener, shutdown_rx).unwrap();
         });
 
         let client = client_opts.build().unwrap();
@@ -2622,12 +2161,7 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::runner(0, 1),
-        );
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
     }
@@ -2639,12 +2173,7 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::runner(0, 1),
-        );
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
 
@@ -2658,15 +2187,10 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::runner(1, 1),
-        );
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
-        let _worker_timings = queues.mark_complete(&run_id, ExitCode::SUCCESS);
+        queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
@@ -2683,12 +2207,7 @@ mod test {
         let expected_active = 2;
 
         for run_id in [&run_id1, &run_id2, &run_id3, &run_id4] {
-            let _ = queues.find_or_create_run(
-                run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::runner(0, 1),
-            );
+            let _ = queues.find_or_create_run(run_id, one_nonzero_usize(), Entity::runner(0, 1));
         }
 
         for run_id in [&run_id1, &run_id2, &run_id4] {
@@ -2697,7 +2216,7 @@ mod test {
         }
 
         for run_id in [run_id1, run_id2] {
-            let _worker_timings = queues.mark_complete(&run_id, ExitCode::SUCCESS);
+            queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
         }
 
         assert_eq!(queues.estimate_num_active_runs(), expected_active);
@@ -2710,12 +2229,7 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::runner(0, 1),
-        );
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
@@ -2735,12 +2249,7 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::runner(0, 1),
-        );
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
 
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
@@ -2769,12 +2278,7 @@ mod test {
 
         // worker0 creates run
         {
-            let assigned_lookup = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                worker0,
-            );
+            let assigned_lookup = queues.find_or_create_run(&run_id, one_nonzero_usize(), worker0);
             assert_eq!(
                 assigned_lookup,
                 AssignedRunStatus::Run(AssignedRun::Fresh {
@@ -2787,12 +2291,7 @@ mod test {
 
         // worker1 attaches
         {
-            let assigned_lookup = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                worker1,
-            );
+            let assigned_lookup = queues.find_or_create_run(&run_id, one_nonzero_usize(), worker1);
             assert_eq!(
                 assigned_lookup,
                 AssignedRunStatus::Run(AssignedRun::Fresh {
@@ -2813,12 +2312,7 @@ mod test {
 
         // worker2 attaches
         {
-            let assigned_lookup = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                worker2,
-            );
+            let assigned_lookup = queues.find_or_create_run(&run_id, one_nonzero_usize(), worker2);
             assert_eq!(
                 assigned_lookup,
                 AssignedRunStatus::Run(AssignedRun::Fresh {
@@ -2841,7 +2335,7 @@ mod test {
 
         // whole run done
         {
-            let _timings = queues.mark_complete(&run_id, ExitCode::SUCCESS);
+            queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
             assert_eq!(
                 queues.get_run_status(&run_id),
                 Some(RunStatus::InitialManifestDone {
@@ -2893,12 +2387,7 @@ mod test {
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            let _ = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::runner(0, 1),
-            );
+            let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
             queues
         };
         let active_runs: ActiveRunResponders = {
@@ -2906,13 +2395,6 @@ mod test {
             map.insert(run_id.clone(), Mutex::new(()));
             Arc::new(RwLock::new(map))
         };
-        let state_cache: RunStateCache = {
-            let cache = RunStateCache::default();
-            let _ = cache.insert_new(run_id.clone(), 1);
-            cache
-        };
-        let worker_results_tasks = ConnectedWorkers::default();
-        let worker_next_tests_tasks = ConnectedWorkers::default();
 
         let entity = Entity::runner(0, 1);
 
@@ -2921,7 +2403,6 @@ mod test {
             let cancellation_fut = QueueServer::handle_run_cancellation(
                 queues.clone(),
                 Arc::clone(&active_runs),
-                state_cache.clone(),
                 entity,
                 run_id.clone(),
             );
@@ -2942,7 +2423,6 @@ mod test {
             let handle_manifest_fut = QueueServer::handle_manifest_success(
                 queues.clone(),
                 active_runs.clone(),
-                state_cache.clone(),
                 entity,
                 run_id.clone(),
                 vec![TestSpec {
@@ -2971,9 +2451,6 @@ mod test {
             RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
-        assert!(!state_cache.contains(&run_id));
-        assert!(!worker_results_tasks.has_tasks_for(&run_id));
-        assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
 
     #[tokio::test]
@@ -2994,12 +2471,7 @@ mod test {
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            let _ = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::runner(0, 1),
-            );
+            let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
             queues
         };
         let active_runs: ActiveRunResponders = {
@@ -3007,13 +2479,6 @@ mod test {
             map.insert(run_id.clone(), Mutex::new(()));
             Arc::new(RwLock::new(map))
         };
-        let state_cache: RunStateCache = {
-            let cache = RunStateCache::default();
-            let _ = cache.insert_new(run_id.clone(), 1);
-            cache
-        };
-        let worker_results_tasks = ConnectedWorkers::default();
-        let worker_next_tests_tasks = ConnectedWorkers::default();
 
         let entity = Entity::runner(0, 1);
 
@@ -3022,7 +2487,6 @@ mod test {
             let cancellation_fut = QueueServer::handle_run_cancellation(
                 queues.clone(),
                 Arc::clone(&active_runs),
-                state_cache.clone(),
                 entity,
                 run_id.clone(),
             );
@@ -3043,13 +2507,11 @@ mod test {
             let queues = queues.clone();
             let active_runs = active_runs.clone();
             let run_id = run_id.clone();
-            let state_cache = state_cache.clone();
 
             async move {
                 let handle_manifest_fut = QueueServer::handle_manifest_success(
                     queues,
                     active_runs,
-                    state_cache,
                     entity,
                     run_id,
                     vec![TestSpec {
@@ -3083,9 +2545,6 @@ mod test {
             RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
-        assert!(!state_cache.contains(&run_id));
-        assert!(!worker_results_tasks.has_tasks_for(&run_id));
-        assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
 
     #[tokio::test]
@@ -3095,12 +2554,7 @@ mod test {
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            let _ = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                Entity::runner(0, 1),
-            );
+            let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
             let added = queues.add_manifest(&run_id, vec![], Default::default());
             assert!(matches!(added, AddedManifest::Added { .. }));
             queues
@@ -3110,23 +2564,12 @@ mod test {
             map.insert(run_id.clone(), Mutex::new(()));
             Arc::new(RwLock::new(map))
         };
-        let state_cache: RunStateCache = {
-            let cache = RunStateCache::default();
-            let _ = cache.insert_new(run_id.clone(), 1);
-            cache
-        };
-        let worker_results_tasks = ConnectedWorkers::default();
-        let worker_next_tests_tasks = ConnectedWorkers::default();
 
         let entity = Entity::runner(0, 1);
 
         let result = AssociatedTestResults::fake(WorkId::new(), vec![TestResult::fake()]);
         let send_last_result_fut = QueueServer::handle_worker_results(
             queues.clone(),
-            Arc::clone(&active_runs),
-            state_cache.clone(),
-            worker_results_tasks.clone(),
-            worker_next_tests_tasks.clone(),
             entity,
             run_id.clone(),
             vec![result],
@@ -3134,7 +2577,6 @@ mod test {
         let cancellation_fut = QueueServer::handle_run_cancellation(
             queues.clone(),
             Arc::clone(&active_runs),
-            state_cache.clone(),
             entity,
             run_id.clone(),
         );
@@ -3150,9 +2592,6 @@ mod test {
             RunStatus::Cancelled {}
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
-        assert!(!state_cache.contains(&run_id));
-        assert!(!worker_results_tasks.has_tasks_for(&run_id));
-        assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
 
     #[test]
@@ -3173,12 +2612,7 @@ mod test {
 
         // Create run, add manifest by worker0
         {
-            let _ = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                DEFAULT_CLIENT_POLL_TIMEOUT,
-                worker0,
-            );
+            let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), worker0);
             let _ = queues.add_manifest(
                 &run_id,
                 vec![test1.clone(), test2, test3],
@@ -3188,7 +2622,7 @@ mod test {
 
         // worker0 pulls tests
         {
-            let NextWorkResult::Present { bundle, .. } = queues.next_work(worker0, &run_id);
+            let NextWorkResult { bundle, .. } = queues.next_work(worker0, &run_id);
             assert_eq!(
                 bundle.work,
                 vec![NextWork::Work(WorkerTest::new(
@@ -3200,12 +2634,7 @@ mod test {
 
         // Suppose worker0 sporadically dies. Now worker0_shadow should be told to pull a retry
         // manifest.
-        let assigned = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            DEFAULT_CLIENT_POLL_TIMEOUT,
-            worker0_shadow,
-        );
+        let assigned = queues.find_or_create_run(&run_id, one_nonzero_usize(), worker0_shadow);
         assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
     }
 
@@ -3221,12 +2650,7 @@ mod test {
 
         let entity = Entity::runner(0, 1);
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            DEFAULT_CLIENT_POLL_TIMEOUT,
-            Entity::runner(0, 1),
-        );
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
         let _ = queues.add_manifest(
             &run_id,
             vec![test1.clone(), test2.clone(), test3],
@@ -3235,7 +2659,7 @@ mod test {
 
         // Prime the queue, pulling two entries for the entity
         {
-            let NextWorkResult::Present { bundle, .. } = queues.next_work(entity, &run_id);
+            let NextWorkResult { bundle, .. } = queues.next_work(entity, &run_id);
             assert_eq!(
                 bundle.work,
                 vec![NextWork::Work(WorkerTest::new(
@@ -3245,7 +2669,7 @@ mod test {
             );
         }
         {
-            let NextWorkResult::Present { bundle, .. } = queues.next_work(entity, &run_id);
+            let NextWorkResult { bundle, .. } = queues.next_work(entity, &run_id);
             assert_eq!(
                 bundle.work,
                 vec![NextWork::Work(WorkerTest::new(
@@ -3272,14 +2696,7 @@ mod test {
             let (this_shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
             shutdown_tx = this_shutdown_tx;
             server_thread = thread::spawn(move || {
-                server
-                    .start_on(
-                        listener,
-                        RunTimeoutManager::new(RunTimeoutStrategy::default()),
-                        shutdown_rx,
-                        ConnectedWorkers::default(),
-                    )
-                    .unwrap();
+                server.start_on(listener, shutdown_rx).unwrap();
             });
 
             client = client_opts.build().unwrap();
@@ -3314,7 +2731,6 @@ mod test {
 
 #[cfg(test)]
 mod test_pull_work {
-    use std::time::Duration;
 
     use abq_test_utils::one_nonzero_usize;
     use abq_utils::net_protocol::{
@@ -3324,7 +2740,7 @@ mod test_pull_work {
     use abq_with_protocol_version::with_protocol_version;
 
     use crate::queue::{
-        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunState, RunStatus,
+        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunData, RunState, RunStatus,
         SharedRuns,
     };
 
@@ -3349,23 +2765,20 @@ mod test_pull_work {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
-            last_test_timeout: Duration::ZERO,
             active_workers: Default::default(),
         };
 
         let run_id = RunId::unique();
         let queues = SharedRuns::default();
-        queues.set_state(run_id.clone(), has_work);
+        queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
 
         // First pull. There should be additional tests following it.
         {
             let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
-            assert!(
-                matches!(next_work, NextWorkResult::Present { bundle, status }
-                    if bundle.work.len() == 1 && matches!(status, PulledTestsStatus::MoreTestsRemaining)
-                )
-            );
+            assert!(matches!(next_work, NextWorkResult { bundle, status }
+                if bundle.work.len() == 1 && matches!(status, PulledTestsStatus::MoreTestsRemaining)
+            ));
 
             assert!(matches!(
                 queues.get_run_status(&run_id),
@@ -3377,17 +2790,15 @@ mod test_pull_work {
         {
             let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
-            assert!(
-                matches!(next_work, NextWorkResult::Present { bundle, status }
-                    if bundle.work.len() == 2 // 1 - test, 1 - end of work
-                    && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
-                    && matches!(status, PulledTestsStatus::PulledLastTest { .. })
-                )
-            );
+            assert!(matches!(next_work, NextWorkResult { bundle, status }
+                if bundle.work.len() == 2 // 1 - test, 1 - end of work
+                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
+                && matches!(status, PulledTestsStatus::PulledLastTest { .. })
+            ));
 
             assert!(matches!(
                 queues.get_run_status(&run_id),
-                Some(RunStatus::Active)
+                Some(RunStatus::InitialManifestDone { .. })
             ));
         }
 
@@ -3396,17 +2807,15 @@ mod test_pull_work {
         {
             let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
-            assert!(
-                matches!(next_work, NextWorkResult::Present { bundle, status }
-                    if bundle.work.len() == 1
-                    && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
-                    && matches!(status, PulledTestsStatus::QueueWasEmpty)
-                )
-            );
+            assert!(matches!(next_work, NextWorkResult { bundle, status }
+                if bundle.work.len() == 1
+                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
+                && matches!(status, PulledTestsStatus::QueueWasEmpty)
+            ));
 
             assert!(matches!(
                 queues.get_run_status(&run_id),
-                Some(RunStatus::Active)
+                Some(RunStatus::InitialManifestDone { .. })
             ));
         }
     }

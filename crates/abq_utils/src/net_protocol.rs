@@ -603,10 +603,6 @@ pub mod queue {
         WorkerRanAllTests(RunId),
         /// Query the queue for the state of a run at a particular moment in time.
         RunStatus(RunId),
-
-        /// A worker is connecting with the intent to hold a persistent connection over which test
-        /// results will be communicated back.
-        PersistentWorkerResultsConnection(RunId),
     }
 }
 

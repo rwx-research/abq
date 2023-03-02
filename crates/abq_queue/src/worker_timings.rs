@@ -7,35 +7,8 @@ use abq_utils::{
     vec_map::VecMap,
 };
 
-const ESTIMATED_TYPICAL_NUMBER_OF_WORKERS: usize = 4;
-
 /// Maps a worker's [entity][EntityId] to a moment in time they connected to the queue.
 pub type WorkerTimings = VecMap<Entity, time::Instant>;
-
-pub fn new_worker_timings() -> WorkerTimings {
-    WorkerTimings::with_capacity(ESTIMATED_TYPICAL_NUMBER_OF_WORKERS)
-}
-
-pub fn log_workers_idle_after_completion_latency(
-    run_id: &RunId,
-    mut worker_completed_times: VecMap<Entity, time::Instant>,
-    worker_with_last_result: Entity,
-) {
-    let run_completion_time = time::Instant::now();
-    if !worker_completed_times.contains(&worker_with_last_result) {
-        worker_completed_times.insert(worker_with_last_result, run_completion_time);
-    }
-    for (worker, worker_completion_time) in worker_completed_times {
-        let post_completion_idle_seconds = (run_completion_time - worker_completion_time).as_secs();
-        tracing::info!(
-            entity_id=%worker.display_id(),
-            entity_tag=%worker.tag,
-            %run_id,
-            ?post_completion_idle_seconds,
-            "worker post completion idle seconds"
-        );
-    }
-}
 
 pub fn log_workers_waited_for_manifest_latency(
     run_id: &RunId,

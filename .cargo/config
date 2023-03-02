@@ -7,4 +7,4 @@ ABQ_WORKSPACE_DIR = { value = "", relative = true }
 # Without limiting the number of active threads or sequencing tests, we can
 # easily hit the number of open FDs (especially on MacOS) during our tests.
 # Revisit this when we've made everything async on the worker side.
-RUST_TEST_THREADS = "4"
+RUST_TEST_THREADS = "1"
