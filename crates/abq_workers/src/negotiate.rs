@@ -70,8 +70,8 @@ struct ExecutionContext {
     work_server_addr: SocketAddr,
     /// Where workers should send results to.
     queue_results_addr: SocketAddr,
-    /// Whether the queue wants a worker to generate the work manifest.
-    worker_should_generate_manifest: bool,
+
+    assigned: AssignedRun,
 }
 
 #[allow(clippy::large_enum_variant)] // I believe we can drop this after we upgrade to rust 1.65.0
@@ -85,7 +85,6 @@ enum MessageFromQueueNegotiator {
     /// The context a worker set should execute a run with.
     ExecutionContext(ExecutionContext),
     RunUnknown,
-    RunCompleteButExitCodeNotKnown,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -228,7 +227,7 @@ impl WorkersNegotiator {
         let ExecutionContext {
             work_server_addr,
             queue_results_addr,
-            worker_should_generate_manifest,
+            assigned,
         } = match execution_decision {
             Ok(ctx) => ctx,
             Err(redundnant_workers) => return Ok(redundnant_workers),
@@ -251,15 +250,6 @@ impl WorkersNegotiator {
             max_run_number,
         } = workers_config;
 
-        let runner_strategy_generator = RunnerStrategyGenerator::new(
-            async_client.boxed_clone(),
-            run_id.clone(),
-            queue_results_addr,
-            work_server_addr,
-            local_results_handler,
-            max_run_number,
-        );
-
         let get_init_context: GetInitContext = Arc::new({
             let client = client.boxed_clone();
             let run_id = run_id.clone();
@@ -272,8 +262,10 @@ impl WorkersNegotiator {
             }
         });
 
-        let notify_manifest: Option<NotifyManifest> = if worker_should_generate_manifest {
-            Some(Box::new({
+        let notify_manifest: Option<NotifyManifest> = match assigned {
+            AssignedRun::Fresh {
+                should_generate_manifest: true,
+            } => Some(Box::new({
                 let client = client.boxed_clone();
 
                 move |entity, run_id, manifest_result| {
@@ -303,9 +295,8 @@ impl WorkersNegotiator {
                     let net_protocol::queue::AckManifest {} =
                         net_protocol::read(&mut stream).unwrap();
                 }
-            }))
-        } else {
-            None
+            })),
+            _ => None,
         };
 
         let notify_cancellation: NotifyCancellation = Box::new({
@@ -313,6 +304,16 @@ impl WorkersNegotiator {
             let run_id = run_id.clone();
             move || notify_cancellation(queue_results_addr, &*client, first_runner_entity, run_id)
         });
+
+        let runner_strategy_generator = RunnerStrategyGenerator::new(
+            async_client.boxed_clone(),
+            run_id.clone(),
+            queue_results_addr,
+            work_server_addr,
+            local_results_handler,
+            max_run_number,
+            assigned,
+        );
 
         let pool_config = WorkerPoolConfig {
             size: num_workers,
@@ -392,12 +393,8 @@ async fn wait_for_execution_context(
             MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code } => {
                 Err(NegotiatedWorkers::Redundant { exit_code })
             }
-            MessageFromQueueNegotiator::RunUnknown
-            | MessageFromQueueNegotiator::RunCompleteButExitCodeNotKnown => {
+            MessageFromQueueNegotiator::RunUnknown => {
                 // We are still waiting for this run, sleep on the decay and retry.
-                // Both "unknown run" and "complete, but exit code not known" states are the same
-                // from our perspective - we need to re-poll until the relevant state hits the
-                // queue.
                 //
                 // TODO: timeout if we go too long without finding the run or its execution context.
                 tokio::time::sleep(decay).await;
@@ -529,9 +526,12 @@ pub enum QueueNegotiateError {
 }
 
 /// The test run a worker should ask for work on.
-#[derive(Debug, PartialEq, Eq)]
-pub struct AssignedRun {
-    pub should_generate_manifest: bool,
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub enum AssignedRun {
+    /// This worker is connecting for a fresh run, and should fetch tests online.
+    Fresh { should_generate_manifest: bool },
+    /// This worker is connecting for a retry, and should fetch its manifest from the queue once.
+    Retry,
 }
 
 /// A marker that a test run should work on has already completed by the time the worker started
@@ -540,10 +540,10 @@ pub struct AssignedRunCompeleted {
     pub success: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum AssignedRunStatus {
     RunUnknown,
     Run(AssignedRun),
-    CompleteButExitCodeNotKnown,
     AlreadyDone { exit_code: ExitCode },
 }
 
@@ -706,31 +706,18 @@ impl QueueNegotiator {
 
                 use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
-                    Run(AssignedRun {
-                        should_generate_manifest,
-                    }) => {
-                        tracing::debug!(
-                            ?should_generate_manifest,
-                            ?run_id,
-                            "found run for worker set"
-                        );
+                    Run(assigned) => {
+                        tracing::debug!(?run_id, "found run for worker set");
 
                         MessageFromQueueNegotiator::ExecutionContext(ExecutionContext {
                             work_server_addr: ctx.advertised_queue_work_scheduler_addr,
                             queue_results_addr: ctx.advertised_queue_results_addr,
-                            worker_should_generate_manifest: should_generate_manifest,
+                            assigned,
                         })
                     }
                     AlreadyDone { exit_code } => {
                         tracing::debug!(?run_id, "run already completed");
                         MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code }
-                    }
-                    CompleteButExitCodeNotKnown => {
-                        tracing::debug!(
-                            ?run_id,
-                            "run already completed, but exit code not yet known"
-                        );
-                        MessageFromQueueNegotiator::RunCompleteButExitCodeNotKnown
                     }
                     RunUnknown => {
                         tracing::debug!(?run_id, "run not yet known");
@@ -1025,7 +1012,7 @@ mod test {
         ));
 
         let get_assigned_run = move |_entity, _data: &InvokeWork| {
-            AssignedRunStatus::Run(AssignedRun {
+            AssignedRunStatus::Run(AssignedRun::Fresh {
                 should_generate_manifest: true,
             })
         };
@@ -1105,7 +1092,7 @@ mod test {
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
             move |_, _| {
-                AssignedRunStatus::Run(AssignedRun {
+                AssignedRunStatus::Run(AssignedRun::Fresh {
                     should_generate_manifest: true,
                 })
             },

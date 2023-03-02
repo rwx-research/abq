@@ -1,6 +1,9 @@
-use std::{num::NonZeroUsize, sync::atomic::AtomicUsize};
+use std::{cell::Cell, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
-use abq_utils::{atomic, net_protocol::workers::WorkerTest};
+use abq_utils::{
+    atomic,
+    net_protocol::{entity::Entity, workers::WorkerTest},
+};
 
 /// Concurrently-accessible job queue for a test suite run.
 /// Organized so that concurrent accesses require minimal synchronization, usually
@@ -8,20 +11,44 @@ use abq_utils::{atomic, net_protocol::workers::WorkerTest};
 #[derive(Default, Debug)]
 pub struct JobQueue {
     queue: Vec<WorkerTest>,
+    /// To which worker has each entry in the manifest been assigned to?
+    /// Modified as a run progresses, by popping off [Self::get_work]
+    assigned_entities: Vec<EntityCell>,
     /// The last item popped off the queue.
     ptr: AtomicUsize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EntityCell(Cell<Entity>);
+
+impl EntityCell {
+    fn new(entity: Entity) -> Self {
+        Self(Cell::new(entity))
+    }
+}
+
+/// SAFETY: this wrapper is only used in [JobQueue::assigned_entities], which is only accessed by
+/// [JobQueue::get_work], and its access pattern is guarded by the assignment of an uncontested
+/// region of the queue to a thread. As such, there will never be conflating writes to an EntityCell
+/// (though there may conflating write/reads).
+unsafe impl Sync for EntityCell {}
+
 impl JobQueue {
     pub fn new(work: Vec<WorkerTest>) -> Self {
+        let work_len = work.len();
         Self {
             queue: work,
+            assigned_entities: vec![EntityCell::new(Entity::DEBUG_FAKE); work_len],
             ptr: AtomicUsize::new(0),
         }
     }
 
-    /// Pops up to the next `n` items in the queue.
-    pub fn get_work(&self, n: NonZeroUsize) -> impl ExactSizeIterator<Item = WorkerTest> + '_ {
+    /// Pops up to the next `n` items in the queue and assigns them to the given `entity`.
+    pub fn get_work(
+        &self,
+        entity: Entity,
+        n: NonZeroUsize,
+    ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
         let n = n.get() as usize;
         let queue_len = self.queue.len();
 
@@ -49,11 +76,27 @@ impl JobQueue {
             self.ptr.store(queue_len, atomic::ORDERING);
         }
 
-        self.queue[start_idx..end_idx].iter().cloned()
+        for entity_cell in self.assigned_entities[start_idx..end_idx].iter() {
+            entity_cell.0.set(entity);
+        }
+
+        self.queue[start_idx..end_idx].iter()
     }
 
     pub fn is_at_end(&self) -> bool {
         self.ptr.load(atomic::ORDERING) >= self.queue.len()
+    }
+
+    /// Gets the subset of the manifest assigned to a given worker.
+    pub fn get_partition_for_entity(
+        &self,
+        entity: Entity,
+    ) -> impl Iterator<Item = &WorkerTest> + '_ {
+        self.assigned_entities
+            .iter()
+            .enumerate()
+            .filter(move |(_, cell)| cell.0.get() == entity)
+            .map(|(i, _)| &self.queue[i])
     }
 }
 
@@ -68,10 +111,12 @@ mod test {
     use abq_utils::{
         atomic,
         net_protocol::{
+            entity::Entity,
             queue::TestSpec,
             runners::{ProtocolWitness, TestCase},
             workers::{WorkId, WorkerTest, INIT_RUN_NUMBER},
         },
+        vec_map::VecMap,
     };
 
     use super::JobQueue;
@@ -97,13 +142,16 @@ mod test {
         let queue = Arc::new(JobQueue::new(manifest));
 
         let mut threads = Vec::with_capacity(num_threads);
+        let mut workers = VecMap::with_capacity(num_threads);
 
         for n in 1..=num_threads {
             let queue = queue.clone();
             let num_popped = num_popped.clone();
             let n = NonZeroUsize::try_from(n).unwrap();
+            let entity = Entity::local_client();
+            workers.insert(entity, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(n);
+                let popped = queue.get_work(entity, n);
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -114,6 +162,86 @@ mod test {
 
         for handle in threads {
             handle.join().unwrap();
+        }
+
+        assert_eq!(num_popped.load(atomic::ORDERING), num_tests);
+        assert!(queue.is_at_end());
+
+        // Now, go through the queue's assigned entities and make sure everything looks okay.
+        // There should be no holes, and the runs of assignments should align with how many tests
+        // each worker popped off.
+        let assigned = &queue.assigned_entities;
+        let mut chunks = vec![(assigned.first().unwrap(), 0)];
+        for entity in assigned {
+            let mut last_chunk = chunks.last_mut();
+            let last_chunk = last_chunk.as_mut().unwrap();
+            let entity_batch = workers.get(entity.0.get()).unwrap();
+
+            // Add to the latest run, or if the worker pulled more than once in a row, break
+            // up the chunks into separate runs.
+            if last_chunk.0 == entity && last_chunk.1 < entity_batch.get() {
+                last_chunk.1 += 1;
+            } else {
+                chunks.push((entity, 1));
+            }
+        }
+        let mut chunks_it = chunks.into_iter().peekable();
+        while let Some((entity, run)) = chunks_it.next() {
+            let entity_batch = workers.get(entity.0.get()).unwrap();
+            match chunks_it.peek() {
+                Some(_) => assert_eq!(run, entity_batch.get()),
+                None => assert!(run <= entity_batch.get()),
+            }
+        }
+    }
+
+    #[test]
+    #[n_times(100)]
+    fn fuzz_partitions() {
+        let num_tests = 10_000;
+        let num_threads = 20;
+        let num_popped = Arc::new(AtomicUsize::new(0));
+
+        let protocol = ProtocolWitness::iter_all().next().unwrap();
+        let manifest = std::iter::repeat(WorkerTest::new(
+            TestSpec {
+                work_id: WorkId::new(),
+                test_case: TestCase::new(protocol, "test", Default::default()),
+            },
+            INIT_RUN_NUMBER,
+        ))
+        .take(10_000)
+        .collect();
+
+        let queue = Arc::new(JobQueue::new(manifest));
+
+        let mut threads = Vec::with_capacity(num_threads);
+
+        for n in 1..=num_threads {
+            let queue = queue.clone();
+            let num_popped = num_popped.clone();
+            let n = NonZeroUsize::try_from(n).unwrap();
+            let entity = Entity::local_client();
+            let handle = std::thread::spawn(move || {
+                let mut local_manifest = vec![];
+                loop {
+                    let popped = queue.get_work(entity, n);
+                    num_popped.fetch_add(popped.len(), atomic::ORDERING);
+                    if popped.len() == 0 {
+                        break;
+                    }
+                    local_manifest.extend(popped.cloned());
+                }
+                local_manifest
+            });
+            threads.push((entity, handle));
+        }
+
+        for (entity, handle) in threads {
+            let local_manifest = handle.join().unwrap();
+            let queue_seen_manifest: Vec<_> =
+                queue.get_partition_for_entity(entity).cloned().collect();
+            assert_eq!(local_manifest, queue_seen_manifest);
         }
 
         assert_eq!(num_popped.load(atomic::ORDERING), num_tests);

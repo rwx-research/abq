@@ -2,7 +2,6 @@
 
 use std::{io, net::SocketAddr};
 
-use crate::workers::TestsFetcher;
 use abq_utils::{
     net_async::{ClientStream, ConfiguredClient},
     net_protocol::{
@@ -11,7 +10,6 @@ use abq_utils::{
         workers::{NextWorkBundle, RunId},
     },
 };
-use async_trait::async_trait;
 
 const DEFAULT_MAX_ATTEMPTS_IN_CYCLE: usize = 3;
 
@@ -62,18 +60,15 @@ impl PersistedTestsFetcher {
     }
 }
 
-#[async_trait]
-impl TestsFetcher for PersistedTestsFetcher {
-    async fn get_next_tests(&mut self) -> NextWorkBundle {
+impl PersistedTestsFetcher {
+    pub async fn get_next_tests(&mut self) -> NextWorkBundle {
         let span = tracing::trace_span!("get_next_tests", run_id=?self.run_id, work_server=?self.work_server_addr);
         let _get_next_work = span.enter();
 
         // TODO: propagate errors here upwards rather than panicking
         self.wait_for_next_work_bundle().await.unwrap()
     }
-}
 
-impl PersistedTestsFetcher {
     /// Asks the work server for the next item of work to run.
     ///
     /// If the connection is noted to have been dropped, we re-try at most twice.

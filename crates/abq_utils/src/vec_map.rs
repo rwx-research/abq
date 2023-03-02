@@ -51,6 +51,10 @@ impl<K: Eq, V> VecMap<K, V> {
             .map(|i| self.set.swap_remove(i).1)
     }
 
+    pub fn get(&mut self, key: K) -> Option<&V> {
+        self.set.iter().find(|(k, _)| k == &key).map(|(_, v)| v)
+    }
+
     pub fn contains(&self, key: &K) -> bool {
         self.set.iter().any(|(k, _)| k == key)
     }

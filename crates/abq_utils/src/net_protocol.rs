@@ -161,6 +161,11 @@ pub mod entity {
     }
 
     impl Entity {
+        pub const DEBUG_FAKE: Self = Self {
+            id: [0; 16],
+            tag: Tag::ExternalClient,
+        };
+
         pub fn new(tag: Tag) -> Self {
             Self {
                 id: uuid::Uuid::new_v4().into_bytes(),
@@ -608,7 +613,7 @@ pub mod work_server {
     use super::{
         entity::Entity,
         runners::MetadataMap,
-        workers::{self, RunId},
+        workers::{self, NextWorkBundle, RunId},
     };
 
     #[derive(Serialize, Deserialize)]
@@ -628,6 +633,12 @@ pub mod work_server {
         /// A worker is connecting with the intent to hold a persistent connection
         /// over which it will request next tests to run.
         PersistentWorkerNextTestsConnection(RunId),
+
+        /// An ask to the partition of a manifest assigned to a given entity for the given run.
+        RetryManifestPartition {
+            run_id: RunId,
+            entity: Entity,
+        },
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -657,6 +668,12 @@ pub mod work_server {
     pub enum NextTestResponse {
         /// The set of tests to run next
         Bundle(workers::NextWorkBundle),
+    }
+
+    #[derive(Serialize, Deserialize, Debug)]
+    pub enum RetryManifestResponse {
+        Manifest(NextWorkBundle),
+        RunDoesNotExist,
     }
 }
 

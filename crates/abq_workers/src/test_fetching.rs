@@ -11,12 +11,14 @@ use abq_utils::{
 use async_trait::async_trait;
 use tracing::instrument;
 
-use self::{persistent_test_fetcher::PersistedTestsFetcher, retries::RetryTracker};
-
+mod out_of_process_retry_manifest_fetcher;
 mod persistent_test_fetcher;
 mod retries;
 
+use out_of_process_retry_manifest_fetcher::OutOfProcessRetryManifestFetcher;
+use persistent_test_fetcher::PersistedTestsFetcher;
 pub use retries::ResultsTracker;
+use retries::RetryTracker;
 
 /// The provider of tests to an ABQ runner on a worker node.
 ///
@@ -33,7 +35,7 @@ pub use retries::ResultsTracker;
 /// is the source of new tests.
 ///
 /// NEW_PROCESS_RETRY: takes the place of FRESH if this is a re-run of a previously-completed
-/// execution of a test suite by a worker. Not yet implemented.
+/// execution of a test suite by a worker.
 pub struct Fetcher {
     initial_source: Option<InitialSource>,
     retry_source: RetryTracker,
@@ -42,20 +44,30 @@ pub struct Fetcher {
 
 const DEFAULT_PENDING_RETRY_MANIFEST_WAIT_TIME: Duration = Duration::from_millis(100);
 
+/// How the initial manifest from the queue should be sourced.
+pub enum SourcingStrategy {
+    /// This runner is new to the given test; use the FRESH strategy.
+    Fresh,
+    /// This runner is retrying a given test run; use NEW_PROCESS_RETRY strategy.
+    Retry,
+}
+
 impl Fetcher {
     pub fn new(
+        sourcing_strategy: SourcingStrategy,
         entity: Entity,
         work_server_addr: SocketAddr,
         client: Box<dyn ConfiguredClient>,
         run_id: RunId,
         max_run_number: u32,
     ) -> (Self, ResultsTracker) {
-        let initial_source = InitialSource::Fresh(persistent_test_fetcher::start(
+        let initial_source = InitialSource::from_strategy(
+            sourcing_strategy,
             entity,
             work_server_addr,
             client,
             run_id,
-        ));
+        );
 
         Self::new_help(
             initial_source,
@@ -82,7 +94,32 @@ impl Fetcher {
 /// The initial source of tests; this is either FRESH or NEW_PROCESS_RETRY.
 enum InitialSource {
     Fresh(PersistedTestsFetcher),
-    // TODO: NEW_PROCESS_RETRY
+    Retry(OutOfProcessRetryManifestFetcher),
+}
+
+impl InitialSource {
+    fn from_strategy(
+        strategy: SourcingStrategy,
+        entity: Entity,
+        work_server_addr: SocketAddr,
+        client: Box<dyn ConfiguredClient>,
+        run_id: RunId,
+    ) -> Self {
+        match strategy {
+            SourcingStrategy::Fresh => Self::Fresh(persistent_test_fetcher::start(
+                entity,
+                work_server_addr,
+                client,
+                run_id,
+            )),
+            SourcingStrategy::Retry => Self::Retry(OutOfProcessRetryManifestFetcher::new(
+                entity,
+                work_server_addr,
+                client,
+                run_id,
+            )),
+        }
+    }
 }
 
 impl Fetcher {
@@ -99,9 +136,20 @@ impl Fetcher {
         //      One the retry manifest issues [NextWork::EndOfWork], there are no more tests to be
         //      run.
         loop {
-            match &mut self.initial_source {
-                Some(InitialSource::Fresh(fetcher)) => {
-                    let mut tests = fetcher.get_next_tests().await;
+            let initial_source = std::mem::take(&mut self.initial_source);
+
+            match initial_source {
+                Some(source) => {
+                    let mut tests = match source {
+                        InitialSource::Fresh(mut s) => {
+                            let tests = s.get_next_tests().await;
+                            // Put the source back, we may need it to fetch incremental tests again.
+                            self.initial_source = Some(InitialSource::Fresh(s));
+                            tests
+                        }
+                        InitialSource::Retry(s) => s.get_next_tests().await,
+                    };
+
                     let hydration_status = self
                         .retry_source
                         .hydrate_ordered_manifest_slice(tests.work.clone());
@@ -179,15 +227,44 @@ mod test {
     };
 
     use super::{
-        persistent_test_fetcher::test::{scaffold_server, server_establish, server_send_bundle},
-        Fetcher, InitialSource,
+        out_of_process_retry_manifest_fetcher, persistent_test_fetcher, Fetcher, InitialSource,
     };
 
     #[tokio::test]
-    async fn empty_manifest() {
+    async fn empty_manifest_fresh() {
+        use persistent_test_fetcher::test::{
+            scaffold_server, server_establish, server_send_bundle,
+        };
+
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, _results) = Fetcher::new_help(
             InitialSource::Fresh(queue_fetcher),
+            INIT_RUN_NUMBER,
+            Duration::MAX,
+        );
+
+        let server_task = async move {
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(&mut conn, [NextWork::EndOfWork]).await;
+        };
+
+        let ((), bundle) = tokio::join!(server_task, fetcher.get_next_tests());
+
+        let NextWorkBundle { work } = bundle;
+
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0], NextWork::EndOfWork);
+    }
+
+    #[tokio::test]
+    async fn empty_manifest_retry() {
+        use out_of_process_retry_manifest_fetcher::test::{
+            scaffold_server, server_establish, server_send_bundle,
+        };
+
+        let (server, queue_fetcher) = scaffold_server().await;
+        let (mut fetcher, _results) = Fetcher::new_help(
+            InitialSource::Retry(queue_fetcher),
             INIT_RUN_NUMBER,
             Duration::MAX,
         );
@@ -228,7 +305,11 @@ mod test {
 
     #[tokio::test]
     #[with_protocol_version]
-    async fn fetch_incremental_from_queue() {
+    async fn fetch_incremental_from_queue_fresh() {
+        use persistent_test_fetcher::test::{
+            scaffold_server, server_establish, server_send_bundle,
+        };
+
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, _results) = Fetcher::new_help(
             InitialSource::Fresh(queue_fetcher),
@@ -281,7 +362,55 @@ mod test {
 
     #[tokio::test]
     #[with_protocol_version]
-    async fn fetch_from_queue_then_no_retries() {
+    async fn fetch_retry_manifest_from_queue() {
+        use out_of_process_retry_manifest_fetcher::test::{
+            scaffold_server, server_establish, server_send_bundle,
+        };
+
+        let (server, queue_fetcher) = scaffold_server().await;
+        let (mut fetcher, _results) = Fetcher::new_help(
+            InitialSource::Retry(queue_fetcher),
+            INIT_RUN_NUMBER,
+            Duration::MAX,
+        );
+
+        let server_task = async move {
+            let mut conn = server_establish(&*server).await;
+            server_send_bundle(
+                &mut conn,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                    EndOfWork,
+                ],
+            )
+            .await;
+        };
+
+        let fetch_task = async move {
+            assert_eq!(
+                fetcher.get_next_tests().await.work,
+                [
+                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                    worker_test(spec(proto, 4), INIT_RUN_NUMBER),
+                ],
+            );
+        };
+
+        let ((), ()) = tokio::join!(server_task, fetch_task);
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn fetch_from_queue_then_no_retries_fresh() {
+        use persistent_test_fetcher::test::{
+            scaffold_server, server_establish, server_send_bundle,
+        };
+
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, _results) = Fetcher::new_help(
             InitialSource::Fresh(queue_fetcher),
@@ -319,71 +448,163 @@ mod test {
 
     #[tokio::test]
     #[with_protocol_version]
-    async fn fetch_from_queue_then_multiple_retries() {
+    async fn fetch_from_queue_then_multiple_retries_fresh() {
+        macro_rules! go_test {
+            ($server:expr, $fetcher:expr, $results_tracker:expr) => {{
+                let server_task = async move {
+                    let mut conn = server_establish(&*$server).await;
+                    server_send_bundle(
+                        &mut conn,
+                        [
+                            worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                            worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                            worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                            EndOfWork,
+                        ],
+                    )
+                    .await;
+                };
+
+                let fetch_task = async move {
+                    // Attempt 1, from online
+                    assert_eq!(
+                        $fetcher.get_next_tests().await.work,
+                        [
+                            worker_test(spec(proto, 1), INIT_RUN_NUMBER),
+                            worker_test(spec(proto, 2), INIT_RUN_NUMBER),
+                            worker_test(spec(proto, 3), INIT_RUN_NUMBER),
+                        ],
+                    );
+
+                    $results_tracker.account_results([
+                        &associated_results(wid(1), INIT_RUN_NUMBER, [result(test(1), FAILURE)]),
+                        &associated_results(wid(2), INIT_RUN_NUMBER, [result(test(2), FAILURE)]),
+                        &associated_results(wid(3), INIT_RUN_NUMBER, [result(test(3), SUCCESS)]),
+                    ]);
+
+                    // Attempt 2
+                    assert_eq!(
+                        $fetcher.get_next_tests().await.work,
+                        [
+                            worker_test(with_focus(spec(proto, 1), test(1)), INIT_RUN_NUMBER + 1),
+                            worker_test(with_focus(spec(proto, 2), test(2)), INIT_RUN_NUMBER + 1),
+                        ],
+                    );
+
+                    $results_tracker.account_results([
+                        &associated_results(
+                            wid(1),
+                            INIT_RUN_NUMBER + 1,
+                            [result(test(1), FAILURE)],
+                        ),
+                        &associated_results(
+                            wid(2),
+                            INIT_RUN_NUMBER + 1,
+                            [result(test(2), SUCCESS)],
+                        ),
+                    ]);
+
+                    // Attempt 3
+                    assert_eq!(
+                        $fetcher.get_next_tests().await.work,
+                        [worker_test(
+                            with_focus(spec(proto, 1), test(1)),
+                            INIT_RUN_NUMBER + 2
+                        ),],
+                    );
+
+                    $results_tracker.account_results([&associated_results(
+                        wid(1),
+                        INIT_RUN_NUMBER + 2,
+                        [result(test(1), FAILURE)],
+                    )]);
+
+                    // Done, even though we had failures
+                    assert_eq!($fetcher.get_next_tests().await.work, [EndOfWork]);
+                };
+
+                let ((), ()) = tokio::join!(server_task, fetch_task);
+            }};
+        }
+
+        {
+            use persistent_test_fetcher::test::{
+                scaffold_server, server_establish, server_send_bundle,
+            };
+
+            let (server, queue_fetcher) = scaffold_server(1).await;
+            let (mut fetcher, mut results_tracker) = Fetcher::new_help(
+                InitialSource::Fresh(queue_fetcher),
+                INIT_RUN_NUMBER + 2,
+                Duration::MAX,
+            );
+
+            go_test!(server, fetcher, results_tracker)
+        }
+
+        {
+            use out_of_process_retry_manifest_fetcher::test::{
+                scaffold_server, server_establish, server_send_bundle,
+            };
+
+            let (server, queue_fetcher) = scaffold_server().await;
+            let (mut fetcher, mut results_tracker) = Fetcher::new_help(
+                InitialSource::Retry(queue_fetcher),
+                INIT_RUN_NUMBER + 2,
+                Duration::MAX,
+            );
+
+            go_test!(server, fetcher, results_tracker)
+        }
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn fetch_from_queue_followed_by_end_of_work_waits_for_retries_fresh() {
+        use persistent_test_fetcher::test::{
+            scaffold_server, server_establish, server_send_bundle,
+        };
+
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, mut results_tracker) = Fetcher::new_help(
             InitialSource::Fresh(queue_fetcher),
-            INIT_RUN_NUMBER + 2,
+            INIT_RUN_NUMBER + 1,
             Duration::MAX,
         );
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(
-                &mut conn,
-                [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
-                    EndOfWork,
-                ],
-            )
-            .await;
+            server_send_bundle(&mut conn, [worker_test(spec(proto, 1), INIT_RUN_NUMBER)]).await;
+            server_send_bundle(&mut conn, [EndOfWork]).await;
         };
 
         let fetch_task = async move {
             // Attempt 1, from online
             assert_eq!(
                 fetcher.get_next_tests().await.work,
-                [
-                    worker_test(spec(proto, 1), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 2), INIT_RUN_NUMBER),
-                    worker_test(spec(proto, 3), INIT_RUN_NUMBER),
-                ],
+                [worker_test(spec(proto, 1), INIT_RUN_NUMBER),],
             );
 
-            results_tracker.account_results([
-                &associated_results(wid(1), INIT_RUN_NUMBER, [result(test(1), FAILURE)]),
-                &associated_results(wid(2), INIT_RUN_NUMBER, [result(test(2), FAILURE)]),
-                &associated_results(wid(3), INIT_RUN_NUMBER, [result(test(3), SUCCESS)]),
-            ]);
+            // Attempt 2 will need to fetch from retries of attempt 1.
+
+            results_tracker.account_results([&associated_results(
+                wid(1),
+                INIT_RUN_NUMBER,
+                [result(test(1), FAILURE)],
+            )]);
 
             // Attempt 2
             assert_eq!(
                 fetcher.get_next_tests().await.work,
-                [
-                    worker_test(with_focus(spec(proto, 1), test(1)), INIT_RUN_NUMBER + 1),
-                    worker_test(with_focus(spec(proto, 2), test(2)), INIT_RUN_NUMBER + 1),
-                ],
-            );
-
-            results_tracker.account_results([
-                &associated_results(wid(1), INIT_RUN_NUMBER + 1, [result(test(1), FAILURE)]),
-                &associated_results(wid(2), INIT_RUN_NUMBER + 1, [result(test(2), SUCCESS)]),
-            ]);
-
-            // Attempt 3
-            assert_eq!(
-                fetcher.get_next_tests().await.work,
                 [worker_test(
                     with_focus(spec(proto, 1), test(1)),
-                    INIT_RUN_NUMBER + 2
+                    INIT_RUN_NUMBER + 1
                 ),],
             );
 
             results_tracker.account_results([&associated_results(
                 wid(1),
-                INIT_RUN_NUMBER + 2,
+                INIT_RUN_NUMBER + 1,
                 [result(test(1), FAILURE)],
             )]);
 
@@ -396,18 +617,25 @@ mod test {
 
     #[tokio::test]
     #[with_protocol_version]
-    async fn fetch_from_queue_followed_by_end_of_work_waits_for_retries() {
-        let (server, queue_fetcher) = scaffold_server(1).await;
+    async fn fetch_from_queue_followed_by_end_of_work_waits_for_retries_out_of_process_retry() {
+        use out_of_process_retry_manifest_fetcher::test::{
+            scaffold_server, server_establish, server_send_bundle,
+        };
+
+        let (server, queue_fetcher) = scaffold_server().await;
         let (mut fetcher, mut results_tracker) = Fetcher::new_help(
-            InitialSource::Fresh(queue_fetcher),
+            InitialSource::Retry(queue_fetcher),
             INIT_RUN_NUMBER + 1,
             Duration::MAX,
         );
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(&mut conn, [worker_test(spec(proto, 1), INIT_RUN_NUMBER)]).await;
-            server_send_bundle(&mut conn, [EndOfWork]).await;
+            server_send_bundle(
+                &mut conn,
+                [worker_test(spec(proto, 1), INIT_RUN_NUMBER), EndOfWork],
+            )
+            .await;
         };
 
         let fetch_task = async move {

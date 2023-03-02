@@ -12,6 +12,7 @@ use abq_utils::{
 use futures::FutureExt;
 
 use crate::{
+    negotiate::AssignedRun,
     results_handler::{MultiplexingResultsHandler, QueueResultsSender},
     test_fetching,
     workers::NotifyMaterialTestsAllRun,
@@ -35,6 +36,7 @@ pub struct RunnerStrategyGenerator {
     work_server_addr: SocketAddr,
     local_results_handler: SharedResultsHandler,
     max_run_number: u32,
+    assigned: AssignedRun,
 }
 
 impl RunnerStrategyGenerator {
@@ -45,6 +47,7 @@ impl RunnerStrategyGenerator {
         work_server_addr: SocketAddr,
         local_results_handler: SharedResultsHandler,
         max_run_number: u32,
+        assigned: AssignedRun,
     ) -> Self {
         Self {
             client,
@@ -53,6 +56,7 @@ impl RunnerStrategyGenerator {
             work_server_addr,
             local_results_handler,
             max_run_number,
+            assigned,
         }
     }
 }
@@ -66,9 +70,16 @@ impl StrategyGenerator for RunnerStrategyGenerator {
             work_server_addr,
             local_results_handler,
             max_run_number,
+            assigned,
         } = &self;
 
+        let sourcing_strategy = match assigned {
+            AssignedRun::Fresh { .. } => test_fetching::SourcingStrategy::Fresh,
+            AssignedRun::Retry => test_fetching::SourcingStrategy::Retry,
+        };
+
         let (tests_fetcher, results_retry_tracker) = test_fetching::Fetcher::new(
+            sourcing_strategy,
             runner_entity,
             *work_server_addr,
             client.boxed_clone(),

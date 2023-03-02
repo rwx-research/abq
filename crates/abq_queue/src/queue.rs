@@ -18,7 +18,7 @@ use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request, TestSpec,
 };
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
-use abq_utils::net_protocol::work_server;
+use abq_utils::net_protocol::work_server::{self};
 use abq_utils::net_protocol::workers::{
     ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
 };
@@ -174,17 +174,6 @@ impl Deref for SharedRuns {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum AssignedRunLookup {
-    Some(AssignedRun),
-    /// There is no associated run yet known.
-    NotFound,
-    /// An associated run is known, but it has already completed; a worker should exit immediately.
-    AlreadyDone {
-        exit_code: ExitCode,
-    },
-}
-
 enum InitMetadata {
     Metadata(MetadataMap),
     WaitingForManifest,
@@ -244,7 +233,7 @@ impl AllRuns {
         batch_size_hint: NonZeroUsize,
         last_test_timeout: Duration,
         entity: Entity,
-    ) -> AssignedRunLookup {
+    ) -> AssignedRunStatus {
         {
             if self.runs.read().get(run_id).is_none() {
                 let runs = self.runs.write();
@@ -276,7 +265,7 @@ impl AllRuns {
                     ?run_id,
                     "illegal state - a run must always be populated when looking up for worker"
                 );
-                return AssignedRunLookup::NotFound;
+                return AssignedRunStatus::RunUnknown;
             }
         };
 
@@ -292,22 +281,46 @@ impl AllRuns {
                     "same worker connecting twice for manifest"
                 );
 
-                AssignedRunLookup::Some(AssignedRun {
+                AssignedRunStatus::Run(AssignedRun::Fresh {
                     should_generate_manifest: false,
                 })
             }
             RunState::HasWork { active_workers, .. } => {
                 let mut active_workers = active_workers.lock();
-                let old = active_workers.insert(entity, None);
-                log_assert!(
-                    old.is_none(),
-                    ?entity,
-                    "same worker connecting twice at run head"
-                );
+                let old_active_worker_info = active_workers.insert(entity, None);
 
-                AssignedRunLookup::Some(AssignedRun {
-                    should_generate_manifest: false,
-                })
+                match old_active_worker_info {
+                    None => {
+                        // This is a fresh worker.
+                        AssignedRunStatus::Run(AssignedRun::Fresh {
+                            should_generate_manifest: false,
+                        })
+                    }
+                    Some(old_finished_state) => {
+                        // This is a worker re-connecting out-of-process, presumably for a retry.
+                        //
+                        // Unfortunately, we cannot reliably guard on `old_finished_state`
+                        // indicating that the worker sent a finished-all-results notification
+                        // here. That's because the worker may have spuriously crashed, and failed
+                        // to notify us of its failure.
+                        //
+                        // As such, we don't attempt to distinguish between duplicate workers and
+                        // out-of-process-retrying workers at this time, and instead always provide
+                        // the subset of the manifest the worker was previously assigned to run.
+                        //
+                        // TODO(out-of-process-retries): right now this query happens on the level
+                        // of a worker pool. Ideally, each runner would query for find_or_create_run
+                        // itself, and if this is done we could hand out the manifest right here,
+                        // rather than asking the runner to reconnect to retrieve the manifest.
+                        tracing::info!(
+                            ?old_finished_state,
+                            ?entity,
+                            "worker reconnecting for out-of-process retry manifest"
+                        );
+
+                        AssignedRunStatus::Run(AssignedRun::Retry)
+                    }
+                }
             }
             RunState::InitialManifestDone {
                 new_worker_exit_code,
@@ -320,12 +333,12 @@ impl AllRuns {
                 // code was.
                 //
                 // TODO: support out-of-process retries.
-                AssignedRunLookup::AlreadyDone { exit_code }
+                AssignedRunStatus::AlreadyDone { exit_code }
             }
             RunState::Cancelled { .. } => {
                 log_assert!(run.data.is_none(), "run data exists after cancelled run");
 
-                AssignedRunLookup::AlreadyDone {
+                AssignedRunStatus::AlreadyDone {
                     exit_code: ExitCode::CANCELLED,
                 }
             }
@@ -340,7 +353,7 @@ impl AllRuns {
         run_id: RunId,
         batch_size_hint: NonZeroUsize,
         last_test_timeout: Duration,
-    ) -> AssignedRunLookup {
+    ) -> AssignedRunStatus {
         let mut worker_timings = new_worker_timings();
         worker_timings.insert(worker_entity, time::Instant::now());
 
@@ -360,7 +373,7 @@ impl AllRuns {
         let old_run = runs.insert(run_id, RwLock::new(run));
         log_assert!(old_run.is_none(), "can only be called when run is fresh!");
 
-        AssignedRunLookup::Some(AssignedRun {
+        AssignedRunStatus::Run(AssignedRun::Fresh {
             should_generate_manifest: true,
         })
     }
@@ -441,7 +454,7 @@ impl AllRuns {
         }
     }
 
-    pub fn next_work(&self, run_id: &RunId) -> NextWorkResult {
+    pub fn next_work(&self, entity: Entity, run_id: &RunId) -> NextWorkResult {
         let runs = self.runs.read();
 
         let run = runs.get(run_id).expect("no run recorded").read();
@@ -454,7 +467,7 @@ impl AllRuns {
                 last_test_timeout,
                 ..
             } => {
-                Self::determine_next_work(queue, *batch_size_hint, *last_test_timeout)
+                Self::get_next_work_online(queue, entity, *batch_size_hint, *last_test_timeout)
             }
             RunState::InitialManifestDone { .. } | RunState::Cancelled {..} => {
                 // Let the worker know that we've reached the end of the queue.
@@ -467,8 +480,9 @@ impl AllRuns {
         }
     }
 
-    fn determine_next_work(
+    fn get_next_work_online(
         queue: &JobQueue,
+        entity: Entity,
         batch_size_hint: NonZeroUsize,
         last_test_timeout: Duration,
     ) -> NextWorkResult {
@@ -477,8 +491,14 @@ impl AllRuns {
         let batch_size = batch_size_hint;
 
         // Pop the next batch.
+        // TODO: can we get rid of the clone allocation here?
         let mut bundle = Vec::with_capacity(batch_size.get() as _);
-        bundle.extend(queue.get_work(batch_size).map(NextWork::Work));
+        bundle.extend(
+            queue
+                .get_work(entity, batch_size)
+                .cloned()
+                .map(NextWork::Work),
+        );
 
         let pulled_tests_status;
 
@@ -522,6 +542,42 @@ impl AllRuns {
         NextWorkResult::Present {
             bundle,
             status: pulled_tests_status,
+        }
+    }
+
+    pub fn get_retry_manifest(&self, run_id: &RunId, entity: Entity) -> Option<NextWorkBundle> {
+        let runs = self.runs.read();
+        let run = runs.get(run_id)?.read();
+
+        match &run.state {
+            RunState::WaitingForManifest { .. } => {
+                tracing::error!(
+                    ?run_id,
+                    ?entity,
+                    "illegal state - attempting to fetch retry manifest while waiting for manifest"
+                );
+                None
+            }
+            RunState::HasWork { queue, .. } => {
+                // TODO: can we get rid of the clone allocation here?
+                //
+                // TODO: should we launch discovery of a partition on a blocking async task?
+                // If this ever takes a non-trivial amount of time, consider doing so.
+                let mut manifest: Vec<_> = queue
+                    .get_partition_for_entity(entity)
+                    .cloned()
+                    .map(NextWork::Work)
+                    .collect();
+                manifest.push(NextWork::EndOfWork);
+
+                Some(NextWorkBundle { work: manifest })
+            }
+            RunState::InitialManifestDone { .. } => {
+                todo!("fetch retry manifest after manifest items handed out")
+            }
+            RunState::Cancelled { .. } => {
+                todo!("fetch retry manifest after cancellation")
+            }
         }
     }
 
@@ -988,16 +1044,7 @@ fn start_queue(config: QueueConfig) -> Abq {
                 .unwrap()
             };
 
-            let opt_assigned = {
-                queues.find_or_create_run(run_id, batch_size_hint, *test_results_timeout, entity)
-            };
-            match opt_assigned {
-                AssignedRunLookup::Some(assigned) => AssignedRunStatus::Run(assigned),
-                AssignedRunLookup::NotFound => AssignedRunStatus::RunUnknown,
-                AssignedRunLookup::AlreadyDone { exit_code } => {
-                    AssignedRunStatus::AlreadyDone { exit_code }
-                }
-            }
+            queues.find_or_create_run(run_id, batch_size_hint, *test_results_timeout, entity)
         }
     };
 
@@ -2049,6 +2096,20 @@ impl WorkScheduler {
                         )
                     });
             }
+            RetryManifestPartition { run_id, entity } => {
+                use net_protocol::work_server::RetryManifestResponse;
+
+                let opt_manifest = ctx.queues.get_retry_manifest(&run_id, entity);
+                let response = match opt_manifest {
+                    Some(man) => RetryManifestResponse::Manifest(man),
+                    None => RetryManifestResponse::RunDoesNotExist,
+                };
+
+                net_protocol::async_write(&mut stream, &response)
+                    .await
+                    .located(here!())
+                    .entity(entity)?;
+            }
         }
 
         Ok(())
@@ -2088,7 +2149,7 @@ impl WorkScheduler {
             use net_protocol::work_server::NextTestResponse;
 
             // Pull the next bundle of work.
-            let next_work_result = { queues.next_work(&run_id) };
+            let next_work_result = queues.next_work(entity, &run_id);
 
             match next_work_result {
                 NextWorkResult::Present { bundle, status } => {
@@ -2154,8 +2215,8 @@ mod test {
     use crate::{
         connections::ConnectedWorkers,
         queue::{
-            ActiveRunResponders, AddedManifest, AssignedRunLookup, CancelReason, QueueServer,
-            RunStatus, SharedRuns, WorkScheduler,
+            fake_test_spec, ActiveRunResponders, AddedManifest, CancelReason, NextWorkResult,
+            QueueServer, RunStatus, SharedRuns, WorkScheduler,
         },
         timeout::{RunTimeoutManager, RunTimeoutStrategy},
     };
@@ -2176,13 +2237,13 @@ mod test {
             },
             runners::{NativeRunnerSpecification, TestCase, TestResult},
             work_server,
-            workers::{RunId, WorkId},
+            workers::{NextWork, RunId, WorkId, WorkerTest, INIT_RUN_NUMBER},
         },
         server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;
-    use abq_workers::negotiate::AssignedRun;
+    use abq_workers::negotiate::{AssignedRun, AssignedRunStatus};
     use tokio::sync::{Mutex, RwLock};
     use tracing_test::traced_test;
 
@@ -2702,7 +2763,7 @@ mod test {
             );
             assert_eq!(
                 assigned_lookup,
-                AssignedRunLookup::Some(AssignedRun {
+                AssignedRunStatus::Run(AssignedRun::Fresh {
                     should_generate_manifest: true
                 })
             );
@@ -2720,7 +2781,7 @@ mod test {
             );
             assert_eq!(
                 assigned_lookup,
-                AssignedRunLookup::Some(AssignedRun {
+                AssignedRunStatus::Run(AssignedRun::Fresh {
                     should_generate_manifest: false
                 })
             );
@@ -2746,7 +2807,7 @@ mod test {
             );
             assert_eq!(
                 assigned_lookup,
-                AssignedRunLookup::Some(AssignedRun {
+                AssignedRunStatus::Run(AssignedRun::Fresh {
                     should_generate_manifest: false
                 })
             );
@@ -3079,6 +3140,108 @@ mod test {
         assert!(!worker_results_tasks.has_tasks_for(&run_id));
         assert!(!worker_next_tests_tasks.has_tasks_for(&run_id));
     }
+
+    #[test]
+    #[with_protocol_version]
+    fn pull_retry_manifest_for_active_work() {
+        let queues = SharedRuns::default();
+        let run_id = RunId::unique();
+
+        let test1 = fake_test_spec(proto);
+        let test2 = fake_test_spec(proto);
+        let test3 = fake_test_spec(proto);
+
+        let entity = Entity::local_client();
+
+        let _ = queues.find_or_create_run(
+            &run_id,
+            one_nonzero_usize(),
+            DEFAULT_CLIENT_POLL_TIMEOUT,
+            Entity::local_client(),
+        );
+        let _ = queues.add_manifest(
+            &run_id,
+            vec![test1.clone(), test2.clone(), test3],
+            Default::default(),
+        );
+
+        // Prime the queue, pulling two entries for the entity
+        {
+            let NextWorkResult::Present { bundle, .. } = queues.next_work(entity, &run_id);
+            assert_eq!(
+                bundle.work,
+                vec![NextWork::Work(WorkerTest::new(
+                    test1.clone(),
+                    INIT_RUN_NUMBER
+                ))]
+            );
+        }
+        {
+            let NextWorkResult::Present { bundle, .. } = queues.next_work(entity, &run_id);
+            assert_eq!(
+                bundle.work,
+                vec![NextWork::Work(WorkerTest::new(
+                    test2.clone(),
+                    INIT_RUN_NUMBER
+                ))]
+            );
+        }
+
+        let mut shutdown_tx;
+        let server_thread;
+        let client;
+        let mut conn;
+        {
+            let server = WorkScheduler { queues };
+
+            let server_opts =
+                ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+            let client_opts =
+                ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
+
+            let listener = server_opts.bind("0.0.0.0:0").unwrap();
+            let server_addr = listener.local_addr().unwrap();
+            let (this_shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
+            shutdown_tx = this_shutdown_tx;
+            server_thread = thread::spawn(move || {
+                server
+                    .start_on(
+                        listener,
+                        RunTimeoutManager::new(RunTimeoutStrategy::default()),
+                        shutdown_rx,
+                        ConnectedWorkers::default(),
+                    )
+                    .unwrap();
+            });
+
+            client = client_opts.build().unwrap();
+            conn = client.connect(server_addr).unwrap();
+        }
+
+        let request = work_server::Request {
+            entity,
+            message: work_server::Message::RetryManifestPartition { run_id, entity },
+        };
+        net_protocol::write(&mut conn, &request).unwrap();
+        let response: work_server::RetryManifestResponse = net_protocol::read(&mut conn).unwrap();
+
+        match response {
+            work_server::RetryManifestResponse::Manifest(manifest) => {
+                assert_eq!(
+                    manifest.work,
+                    vec![
+                        NextWork::Work(WorkerTest::new(test1, INIT_RUN_NUMBER)),
+                        NextWork::Work(WorkerTest::new(test2, INIT_RUN_NUMBER)),
+                        NextWork::EndOfWork
+                    ]
+                )
+            }
+            _ => panic!(),
+        }
+
+        shutdown_tx.shutdown_immediately().unwrap();
+        server_thread.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3086,7 +3249,10 @@ mod test_pull_work {
     use std::time::Duration;
 
     use abq_test_utils::one_nonzero_usize;
-    use abq_utils::net_protocol::workers::{NextWork, RunId, WorkerTest};
+    use abq_utils::net_protocol::{
+        entity::Entity,
+        workers::{NextWork, RunId, WorkerTest},
+    };
     use abq_with_protocol_version::with_protocol_version;
 
     use crate::queue::{
@@ -3125,7 +3291,7 @@ mod test_pull_work {
 
         // First pull. There should be additional tests following it.
         {
-            let next_work = queues.next_work(&run_id);
+            let next_work = queues.next_work(Entity::local_client(), &run_id);
 
             assert!(
                 matches!(next_work, NextWorkResult::Present { bundle, status }
@@ -3141,7 +3307,7 @@ mod test_pull_work {
 
         // Second pull. Now we reach the end of all tests and all test run attempts.
         {
-            let next_work = queues.next_work(&run_id);
+            let next_work = queues.next_work(Entity::local_client(), &run_id);
 
             assert!(
                 matches!(next_work, NextWorkResult::Present { bundle, status }
@@ -3160,7 +3326,7 @@ mod test_pull_work {
         // Now, if another worker pulls work it should get nothing other than an end-of-test marker,
         // and be told we're all done.
         {
-            let next_work = queues.next_work(&run_id);
+            let next_work = queues.next_work(Entity::local_client(), &run_id);
 
             assert!(
                 matches!(next_work, NextWorkResult::Present { bundle, status }
