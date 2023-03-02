@@ -1143,6 +1143,10 @@ mod test {
         artifacts_dir().join("abqtest_write_runner_number")
     }
 
+    fn abqtest_write_worker_number_path() -> PathBuf {
+        artifacts_dir().join("abqtest_write_worker_number")
+    }
+
     #[tokio::test]
     #[with_protocol_version]
     async fn test_1_worker_1_echo() {
@@ -1415,6 +1419,45 @@ mod test {
 
         let all_completed = all_completed.lock().unwrap();
         assert_eq!(all_completed.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn sets_abq_native_worker_env_vars() {
+        let (_write_work, get_next_tests) = work_writer();
+        let (_results, results_handler_generator) = results_collector();
+        let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
+
+        let runner_strategy = StaticRunnerStrategy {
+            get_next_tests_generator: &get_next_tests,
+            results_handler_generator: &results_handler_generator,
+            notify_all_tests_run_generator: &notify_all_tests_run_generator,
+        };
+
+        let writefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let writefile_path = writefile.to_path_buf();
+
+        let (mut config, _manifest_collector) = setup_pool(
+            RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+                cmd: abqtest_write_worker_number_path().display().to_string(),
+                args: vec![writefile_path.display().to_string()],
+                extra_env: Default::default(),
+            }),
+            WorkerTag::new(152),
+            RunId::unique(),
+            &runner_strategy,
+            noop_notify_cancellation(),
+        );
+
+        config.size = NonZeroUsize::new(3).unwrap();
+
+        let mut pool = WorkerPool::new(config).await;
+        let _pool_exit = pool.shutdown();
+
+        let worker_ids = std::fs::read_to_string(writefile).unwrap();
+        assert_eq!(worker_ids, "152\n152\n152\n");
+
+        let all_completed = all_completed.lock().unwrap();
+        assert_eq!(all_completed.len(), 3);
     }
 
     #[tokio::test]

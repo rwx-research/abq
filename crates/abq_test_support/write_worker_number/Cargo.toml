@@ -1,0 +1,12 @@
+# NOTE: make sure this package is built before running tests.
+# Until https://github.com/rust-lang/cargo/issues/9096 lands dependers cannot
+# rely explicitly on this package.
+
+[package]
+name = "abqtest_write_worker_number"
+version = "0.1.0"
+edition = "2021"
+description = "Writes to a given file the value of ABQ_WORKER and exits."
+
+[dependencies]
+fs4.workspace = true

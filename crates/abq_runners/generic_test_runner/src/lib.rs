@@ -580,6 +580,9 @@ impl<'a> NativeRunnerHandle<'a> {
     }
 }
 
+/// Each native test runner spawned by a worker has the environment variable `ABQ_WORKER` set to a integer.
+const ABQ_WORKER: &str = "ABQ_WORKER";
+
 pub async fn run_async<SendManifest, GetInitContext>(
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
@@ -600,11 +603,16 @@ where
     let NativeTestRunnerParams {
         cmd,
         args,
-        extra_env: additional_env,
+        extra_env: mut additional_env,
     } = input;
 
     // TODO: get from runner params
     let protocol_version_timeout = Duration::from_secs(60);
+
+    additional_env.insert(
+        ABQ_WORKER.to_owned(),
+        runner_meta.runner.worker().to_string(),
+    );
 
     let native_runner_args = NativeRunnerArgs {
         program: &cmd,

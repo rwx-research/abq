@@ -12,6 +12,7 @@ members = [
   "crates/abq_test_support/run_n_times",
   "crates/abq_test_support/with_protocol_version",
   "crates/abq_test_support/write_runner_number",
+  "crates/abq_test_support/write_worker_number",
   "crates/abq_utils",
   "crates/abq_workers",
   "crates/reporters/dot",
