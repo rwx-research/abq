@@ -672,7 +672,16 @@ pub mod work_server {
     #[derive(Serialize, Deserialize, Debug)]
     pub enum RetryManifestResponse {
         Manifest(NextWorkBundle),
+        /// The manifest has not been fully persisted yet; try again later.
+        NotYetPersisted,
+        /// The run associated with the manifest does not exist.
         RunDoesNotExist,
+        /// The associated run failed during manifest generation; we don't know what tests to
+        /// retry.
+        ManifestNeverReceived,
+        /// The manifest should have been persisted, but something faulted in the queue, and the
+        /// persistence failed.
+        FailedToLoad,
     }
 }
 

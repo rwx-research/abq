@@ -17,6 +17,10 @@ impl<T> WorkerSet<T> {
         Self(Vec::with_capacity(cap))
     }
 
+    pub fn contains_by_tag(&self, entity: &Entity) -> bool {
+        self.iter().any(|(e, _)| e.tag == entity.tag)
+    }
+
     /// Inserts an entity by its tag.
     /// Returns an old entity with the same tag, if any.
     pub fn insert_by_tag(&mut self, entity: Entity, val: T) -> Option<(Entity, T)> {
@@ -49,23 +53,10 @@ impl<T> WorkerSet<T> {
         }
     }
 
-    pub fn remove_by_tag(&mut self, entity: Entity) -> Option<(Entity, T)> {
-        log_assert!(
-            matches!(entity.tag, Tag::Runner(..)),
-            ?entity,
-            "somehow, a non-worker entity is being tracked"
-        );
-        self.0
-            .iter()
-            .position(|(k, _)| k == &entity)
-            .map(|i| self.0.swap_remove(i))
-    }
-
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &(Entity, T)> {
         self.0.iter()
     }

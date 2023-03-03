@@ -30,6 +30,7 @@ num_cpus.workspace = true
 termcolor.workspace = true
 atty.workspace = true
 indicatif.workspace = true
+tempfile.workspace = true
 
 tokio.workspace = true
 futures.workspace = true

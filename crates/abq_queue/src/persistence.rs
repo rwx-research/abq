@@ -1,1 +1,1 @@
-mod manifest;
+pub mod manifest;

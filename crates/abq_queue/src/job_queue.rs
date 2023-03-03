@@ -5,6 +5,8 @@ use abq_utils::{
     net_protocol::{entity::Tag, workers::WorkerTest},
 };
 
+use crate::persistence;
+
 /// Concurrently-accessible job queue for a test suite run.
 /// Organized so that concurrent accesses require minimal synchronization, usually
 /// a single atomic exchange in the happy path.
@@ -98,6 +100,25 @@ impl JobQueue {
             .enumerate()
             .filter(move |(_, cell)| cell.0.get() == entity_tag)
             .map(|(i, _)| &self.queue[i])
+    }
+
+    pub fn into_manifest_view(self) -> persistence::manifest::ManifestView {
+        let Self {
+            queue,
+            assigned_entities,
+            ptr: _,
+        } = self;
+
+        // Try to convince the compiler that we can simply transmute the list of TagCells to Tags,
+        // and we don't actually need another allocation.
+        debug_assert_eq!(std::mem::align_of::<TagCell>(), std::mem::align_of::<Tag>());
+        debug_assert_eq!(std::mem::size_of::<TagCell>(), std::mem::size_of::<Tag>());
+        let assigned_entities = assigned_entities
+            .into_iter()
+            .map(|t| t.0.into_inner())
+            .collect();
+
+        persistence::manifest::ManifestView::new(queue, assigned_entities)
     }
 }
 

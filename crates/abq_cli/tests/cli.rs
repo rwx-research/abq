@@ -12,6 +12,7 @@ use abq_utils::net_protocol::runners::{
     NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
 };
 use abq_with_protocol_version::with_protocol_version;
+use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
@@ -408,19 +409,24 @@ fn assert_sum_of_re<'a>(
 ) {
     let mut total_run = 0;
     for output in outputs {
-        let tests: usize = re
-            .captures(output)
-            .and_then(|m| m.get(1))
-            .and_then(|m| m.as_str().parse().ok())
-            .unwrap_or_else(|| panic!("{output}"));
-        total_run += tests;
+        total_run += get_num_of_re(&re, output);
     }
     assert_eq!(total_run, expected);
 }
 
+fn get_num_of_re(re: &Regex, s: &str) -> usize {
+    re.captures(s)
+        .and_then(|m| m.get(1))
+        .and_then(|m| m.as_str().parse().ok())
+        .unwrap_or_else(|| panic!("{s}"))
+}
+
+fn re_run() -> Regex {
+    regex::Regex::new(r"(\d+) tests, \d+ failures").unwrap()
+}
+
 fn assert_sum_of_run_tests<'a>(outputs: impl IntoIterator<Item = &'a str>, expected: usize) {
-    let re_run = regex::Regex::new(r"(\d+) tests, \d+ failures").unwrap();
-    assert_sum_of_re(outputs, re_run, expected);
+    assert_sum_of_re(outputs, re_run(), expected);
 }
 
 fn assert_sum_of_run_test_failures<'a>(
@@ -1582,4 +1588,151 @@ test_all_network_config_options! {
 
         term_queue(queue_proc);
     }
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn out_of_process_retries_smoke() {
+    let name = "out_of_process_retries_smoke";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let attempts = 4;
+    let num_tests = 64;
+    let num_workers = 6;
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+
+    let mut queue_proc = Abq::new(name)
+        .args(conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]))
+        .spawn();
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start") {
+                break;
+            }
+        }
+    }
+
+    let mut manifest = vec![];
+
+    for t in 1..=num_tests {
+        manifest.push(TestOrGroup::test(Test::new(
+            proto,
+            t.to_string(),
+            [],
+            Default::default(),
+        )));
+    }
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: {
+                let mut run_tests = vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                ];
+
+                for _ in 0..num_tests {
+                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
+                    // faux result.
+                    // Otherwise assume we ran out of tests on our node and exit.
+                    run_tests.push(IfAliveReadAndWriteFake(Status::Success));
+                }
+                run_tests
+            },
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+    let test_args = |worker: usize| {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = simfile_path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker={worker}"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("-n=1"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let mut run_on_each_worker = vec![];
+
+    for attempt in 0..attempts {
+        let workers: Vec<_> = (0..num_workers)
+            .map(|i| {
+                Abq::new(format!("{name}_worker{i}_attempt{attempt}"))
+                    .args(test_args(i))
+                    .spawn()
+            })
+            .collect();
+
+        let mut stdouts = vec![];
+        let mut run_on_each = vec![];
+        for worker in workers {
+            let Output {
+                status,
+                stdout,
+                stderr,
+            } = worker.wait_with_output().unwrap();
+            let stdout = String::from_utf8_lossy(&stdout).to_string();
+            let stderr = String::from_utf8_lossy(&stderr).to_string();
+            assert!(status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+            run_on_each.push(get_num_of_re(&re_run(), &stdout));
+            stdouts.push(stdout);
+        }
+
+        assert_sum_of_run_tests(stdouts.iter().map(|s| s.as_str()), 64);
+
+        if attempt == 0 {
+            run_on_each_worker = run_on_each;
+        } else {
+            assert_eq!(run_on_each, run_on_each_worker);
+        }
+    }
+
+    term_queue(queue_proc);
 }

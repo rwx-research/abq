@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use abq_utils::{
     error::ResultLocation,
-    here, log_assert,
+    here,
     net_protocol::{
-        entity::{self, Entity, Tag, WorkerRunner},
+        entity::Tag,
         workers::{RunId, WorkerTest},
     },
 };
@@ -13,7 +13,8 @@ use tokio::fs;
 
 use super::{ManifestView, PersistentManifest, Result};
 
-/// Persists manifests on a filesystem, encoding/decoding with [bincode].
+/// Persists manifests on a filesystem, encoding/decoding to JSON.
+#[derive(Clone)]
 pub struct FilesystemPersistor {
     root: PathBuf,
 }
@@ -57,15 +58,19 @@ impl PersistentManifest for FilesystemPersistor {
 
         Ok(view.get_partition_for_entity(entity_tag))
     }
+
+    fn boxed_clone(&self) -> Box<dyn PersistentManifest> {
+        Box::new(self.clone())
+    }
 }
 
 #[cfg(test)]
 mod test {
     use std::path::PathBuf;
 
-    use abq_test_utils::{spec, wid};
+    use abq_test_utils::spec;
     use abq_utils::net_protocol::{
-        entity::{Entity, Tag},
+        entity::Tag,
         workers::{RunId, WorkerTest, INIT_RUN_NUMBER},
     };
 

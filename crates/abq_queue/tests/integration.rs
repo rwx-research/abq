@@ -10,7 +10,10 @@ use std::{
 };
 
 use abq_native_runner_simulation::pack_msgs_to_disk;
-use abq_queue::queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT};
+use abq_queue::{
+    persistence::manifest::{self, SharedPersistManifest},
+    queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT},
+};
 use abq_test_utils::artifacts_dir;
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
@@ -44,6 +47,7 @@ use futures::FutureExt;
 use ntest::timeout;
 use parking_lot::Mutex;
 use serial_test::serial;
+use tempfile::TempDir;
 use tracing_test::traced_test;
 use Action::*;
 use Assert::*;
@@ -64,19 +68,26 @@ struct ExternId(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SpawnId(usize);
 
+/// External dependencies that must be preserved while a test is ongoing.
+struct QueueExtDeps {
+    _manifests_path: TempDir,
+}
+
 enum Servers {
-    Unified(QueueConfig),
+    Unified(QueueConfig, QueueExtDeps),
 }
 
 impl Default for Servers {
     fn default() -> Self {
-        Self::from_config(Default::default())
-    }
-}
-
-impl Servers {
-    fn from_config(config: QueueConfig) -> Self {
-        Self::Unified(config)
+        let manifests_path = tempfile::tempdir().unwrap();
+        let persist_manifest = SharedPersistManifest::new(manifest::fs::FilesystemPersistor::new(
+            manifests_path.path(),
+        ));
+        let config = QueueConfig::new(persist_manifest);
+        let deps = QueueExtDeps {
+            _manifests_path: manifests_path,
+        };
+        Self::Unified(config, deps)
     }
 }
 
@@ -173,7 +184,7 @@ type FlatResult<'a> = (WorkId, u32, &'a TestResult);
 
 #[allow(clippy::type_complexity)]
 enum Assert<'a> {
-    TestResults(Run, &'a dyn Fn(&[FlatResult<'_>]) -> bool),
+    TestResults(Run, Box<dyn Fn(&[FlatResult<'_>]) -> bool>),
 
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, Box<dyn Fn(&WorkersExitStatus)>),
@@ -373,8 +384,8 @@ fn action_to_fut(
 }
 
 fn run_test(servers: Servers, steps: Steps) {
-    let mut queue = match servers {
-        Unified(config) => Abq::start(config),
+    let (mut queue, _deps) = match servers {
+        Unified(config, deps) => (Abq::start(config), deps),
     };
 
     let client_opts =
@@ -487,11 +498,14 @@ fn multiple_jobs_complete() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(Run(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results(&mut results);
-                    results == [(1, "echo1"), (1, "echo2")]
-                }),
+                TestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results == [(1, "echo1"), (1, "echo2")]
+                    }),
+                ),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -541,17 +555,23 @@ fn multiple_invokers() {
                 WaitForCompletedRun(Run(1)),
             ],
             [
-                TestResults(Run(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results(&mut results);
-                    results == [(1, "echo1"), (1, "echo2")]
-                }),
+                TestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results == [(1, "echo1"), (1, "echo2")]
+                    }),
+                ),
                 //
-                TestResults(Run(2), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results(&mut results);
-                    results == [(1, "echo3"), (1, "echo4"), (1, "echo5")]
-                }),
+                TestResults(
+                    Run(2),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results == [(1, "echo3"), (1, "echo4"), (1, "echo5")]
+                    }),
+                ),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| (assert_eq!(e, &WorkersExitStatus::SUCCESS))),
@@ -591,11 +611,14 @@ fn batch_two_requests_at_a_time() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(Run(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results(&mut results);
-                    results == [(1, "echo1"), (1, "echo2"), (1, "echo3"), (1, "echo4")]
-                }),
+                TestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results == [(1, "echo1"), (1, "echo2"), (1, "echo3"), (1, "echo4")]
+                    }),
+                ),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -619,7 +642,7 @@ fn empty_manifest_exits_gracefully() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(Run(1), &|results| results.is_empty()),
+                TestResults(Run(1), Box::new(|results| results.is_empty())),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -856,11 +879,14 @@ fn getting_run_after_work_is_complete_returns_nothing() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(Run(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results(&mut results);
-                    results == [(1, "echo1"), (1, "echo2")]
-                }),
+                TestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results == [(1, "echo1"), (1, "echo2")]
+                    }),
+                ),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -1033,19 +1059,22 @@ fn multiple_tests_per_work_id_reported() {
                 WaitForCompletedRun(Run(1)),
             ],
             [
-                TestResults(Run(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results(&mut results);
-                    results
-                        == [
-                            (1, "echo1"),
-                            (1, "echo2"),
-                            (1, "echo3"),
-                            (1, "echo4"),
-                            (1, "echo5"),
-                            (1, "echo6"),
-                        ]
-                }),
+                TestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results
+                            == [
+                                (1, "echo1"),
+                                (1, "echo2"),
+                                (1, "echo3"),
+                                (1, "echo4"),
+                                (1, "echo5"),
+                                (1, "echo6"),
+                            ]
+                    }),
+                ),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -1123,11 +1152,14 @@ fn many_retries_complete() {
                 WaitForCompletedRun(Run(1)),
             ],
             [
-                TestResults(Run(1), &|results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results_owned(&mut results);
-                    results == expected_results
-                }),
+                TestResults(
+                    Run(1),
+                    Box::new(move |results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results_owned(&mut results);
+                        results == expected_results
+                    }),
+                ),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
@@ -1194,13 +1226,14 @@ fn many_retries_many_workers_complete() {
                 // Run should be seen as completed
                 WaitForCompletedRun(Run(1)),
             )),
-            end_workers_asserts
-                .into_iter()
-                .chain(once(TestResults(Run(1), &|results| {
+            end_workers_asserts.into_iter().chain(once(TestResults(
+                Run(1),
+                Box::new(move |results| {
                     let mut results = results.to_vec();
                     let results = sort_results_owned(&mut results);
                     results == expected_results
-                }))),
+                }),
+            ))),
         )
         .test();
 }
@@ -1318,11 +1351,14 @@ fn many_retries_many_workers_complete_native() {
         .act(start_actions)
         .step(
             end_workers_actions,
-            [TestResults(Run(1), &|results| {
-                let mut results = results.to_vec();
-                let results = sort_results_owned(&mut results);
-                results == expected_results
-            })],
+            [TestResults(
+                Run(1),
+                Box::new(move |results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results_owned(&mut results);
+                    results == expected_results
+                }),
+            )],
         )
         .test();
 }
@@ -1397,7 +1433,7 @@ fn cancellation_native() {
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
                 ),
-                TestResults(Run(1), &|results| results.is_empty()),
+                TestResults(Run(1), Box::new(|results| results.is_empty())),
             ],
         )
         // A second pair of workers must also be cancelled.
@@ -1418,4 +1454,145 @@ fn cancellation_native() {
             )],
         )
         .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn retry_out_of_process_worker() {
+    let manifest1 = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1".to_string()),
+            echo_test(proto, "echo2".to_string()),
+        ],
+        Default::default(),
+    ));
+    let runner1 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest1));
+
+    // Second attempt of the runner produces no manifest, and should be fed our retry manifest from
+    // the first pass.
+    let manifest2 = ManifestMessage::new(Manifest::new([], Default::default()));
+    let runner2 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest2));
+
+    TestBuilder::default()
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner1),
+        )])
+        .step(
+            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
+            [
+                TestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results == [(1, "echo1"), (1, "echo2")]
+                    }),
+                ),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+            ],
+        )
+        // Second attempt of the run should run the same tests, produce the same results.
+        .act([StartWorkers(
+            Run(1),
+            Wid(2),
+            WorkersConfigBuilder::new(1, runner2),
+        )])
+        .step(
+            [StopWorkers(Wid(2)), WaitForCompletedRun(Run(1))],
+            [
+                TestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results == [(1, "echo1"), (1, "echo1"), (1, "echo2"), (1, "echo2")]
+                    }),
+                ),
+                WorkerExitStatus(
+                    Wid(2),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+            ],
+        )
+        .test();
+}
+
+#[test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+fn many_retries_of_many_out_of_process_workers() {
+    let num_tests = 64;
+    let num_workers = 6;
+    let num_out_of_process_retries = 4;
+
+    let mut manifest = vec![];
+    let mut expected_results_one_pass = vec![];
+
+    for t in 1..=num_tests {
+        manifest.push(echo_test(proto, format!("echo{t}")));
+        expected_results_one_pass.push((INIT_RUN_NUMBER, format!("echo{t}")));
+    }
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+    let empty_manifest = ManifestMessage::new(Manifest::new(vec![], Default::default()));
+
+    let runner0 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+    let runner_after_0 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(empty_manifest));
+
+    let mut builder = TestBuilder::default();
+    let run = Run(1);
+    for retry in 1..=num_out_of_process_retries {
+        let mut start_actions = vec![];
+        let mut end_workers_actions = vec![];
+        let mut end_workers_asserts = vec![];
+
+        // Push on the workers for this set of out-of-process retries
+        for i in 0..num_workers {
+            let runner = if retry == 1 {
+                runner0.clone()
+            } else {
+                runner_after_0.clone()
+            };
+            let workers_config = WorkersConfigBuilder::new(i as u32, runner);
+
+            let worker_uuid = retry * num_workers + i;
+
+            start_actions.push(StartWorkers(run, Wid(worker_uuid), workers_config));
+
+            end_workers_actions.push(StopWorkers(Wid(worker_uuid)));
+            end_workers_asserts.push(WorkerExitStatus(
+                Wid(worker_uuid),
+                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+            ));
+        }
+        end_workers_actions.push(WaitForCompletedRun(run));
+
+        // The number of expected results is now the results * how many retries we had
+        let mut expected_results: Vec<_> = std::iter::repeat(expected_results_one_pass.clone())
+            .take(retry)
+            .flatten()
+            .collect();
+        expected_results.sort();
+        end_workers_asserts.push(TestResults(
+            run,
+            Box::new(move |results| {
+                let mut results = results.to_vec();
+                let results = sort_results_owned(&mut results);
+                results == expected_results
+            }),
+        ));
+
+        // Chain on the test, then do the next retry iteration.
+        builder = builder
+            .act(start_actions)
+            .step(end_workers_actions, end_workers_asserts);
+    }
+
+    builder.test();
 }

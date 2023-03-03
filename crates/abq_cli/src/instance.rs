@@ -1,3 +1,4 @@
+use abq_queue::persistence::manifest::{self, SharedPersistManifest};
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::Entity;
@@ -10,6 +11,7 @@ use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
 use std::net::{IpAddr, SocketAddr};
 use std::thread;
+use tempfile::TempDir;
 
 use abq_queue::queue::{Abq, QueueConfig};
 
@@ -31,6 +33,12 @@ pub fn start_abq_forever(
     // Public IP defaults to the binding IP.
     let public_ip = public_ip.unwrap_or(bind_ip);
 
+    let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
+
+    let persist_manifest = SharedPersistManifest::new(manifest::fs::FilesystemPersistor::new(
+        manifests_path.path(),
+    ));
+
     let queue_config = QueueConfig {
         public_ip,
         bind_ip,
@@ -38,10 +46,16 @@ pub fn start_abq_forever(
         work_port,
         negotiator_port,
         server_options,
+        persist_manifest,
     };
     let mut abq = Abq::start(queue_config);
 
     tracing::debug!("Queue active at {}", abq.server_addr());
+
+    println!(
+        "Persisting manifests at {}",
+        manifests_path.path().display()
+    );
 
     println!("Run the following to invoke a test run:");
     println!(
@@ -110,7 +124,11 @@ enum AbqLocator {
     Remote {
         queue_negotiator: QueueNegotiatorHandle,
     },
-    Local(Abq),
+    Local(Abq, EphemeralAbqGuards),
+}
+
+struct EphemeralAbqGuards {
+    _manifests_path: TempDir,
 }
 
 #[derive(Debug, Error)]
@@ -137,7 +155,7 @@ impl AbqInstance {
             AbqLocator::Remote {
                 queue_negotiator, ..
             } => *queue_negotiator,
-            AbqLocator::Local(abq) => abq.get_negotiator_handle(),
+            AbqLocator::Local(abq, _) => abq.get_negotiator_handle(),
         }
     }
 
@@ -158,13 +176,22 @@ impl AbqInstance {
             None => ServerAuthStrategy::no_auth(),
         };
 
-        let queue = Abq::start(QueueConfig {
-            server_options: ServerOptions::new(server_auth, server_tls),
-            ..Default::default()
-        });
+        let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
+
+        let persist_manifest = SharedPersistManifest::new(manifest::fs::FilesystemPersistor::new(
+            manifests_path.path(),
+        ));
+
+        let mut config = QueueConfig::new(persist_manifest);
+        config.server_options = ServerOptions::new(server_auth, server_tls);
+
+        let queue = Abq::start(config);
+        let guards = EphemeralAbqGuards {
+            _manifests_path: manifests_path,
+        };
 
         AbqInstance {
-            locator: AbqLocator::Local(queue),
+            locator: AbqLocator::Local(queue, guards),
             client_options: ClientOptions::new(client_auth, client_tls),
         }
     }

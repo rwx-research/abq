@@ -18,7 +18,7 @@ use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request, TestSpec,
 };
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
-use abq_utils::net_protocol::work_server::{self};
+use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
     ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
 };
@@ -42,6 +42,9 @@ use tokio::io::AsyncWriteExt;
 use tracing::instrument;
 
 use crate::job_queue::JobQueue;
+use crate::persistence::manifest::{
+    self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
+};
 use crate::prelude::*;
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
@@ -80,13 +83,28 @@ enum RunState {
         /// The exit code for the test run that should be yielded by a new worker connecting.
         new_worker_exit_code: ExitCode,
 
-        /// Workers that are still actively executing tests.
-        active_workers: Mutex<WorkerSet<()>>,
+        /// Top-level test suite metadata workers should initialize with.
+        /// Must be persisted for out-of-process retries.
+        init_metadata: MetadataMap,
+
+        /// Workers that have been seen for this run, and whether they are still active.
+        /// Any seen worker is elligible for out-of-process retries.
+        seen_workers: RwLock<WorkerSet<bool>>,
+
+        /// A marker of whether the manifest associated with this run has been persisted.
+        manifest_persistence: ManifestPersistence,
     },
     Cancelled {
         #[allow(unused)] // yet
         reason: CancelReason,
     },
+}
+
+#[derive(Debug)]
+enum ManifestPersistence {
+    Persisted(ManifestPersistedCell),
+    ManifestNeverReceived,
+    EmptyManifest,
 }
 
 struct RunData {
@@ -167,7 +185,7 @@ enum InitMetadata {
 }
 
 /// What is the state of the queue of tests for a run after some bundle of tests have been pulled?
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum PulledTestsStatus {
     /// There are additional tests remaining.
     MoreTestsRemaining,
@@ -190,9 +208,10 @@ impl PulledTestsStatus {
 }
 
 /// Result of trying to pull a batch of tests for a worker.
-struct NextWorkResult {
+struct NextWorkResult<'a> {
     bundle: NextWorkBundle,
     status: PulledTestsStatus,
+    opt_persistent_manifest_plan: Option<PersistManifestPlan<'a>>,
 }
 
 #[derive(Debug)]
@@ -204,6 +223,14 @@ enum AddedManifest {
         worker_connection_times: WorkerTimings,
     },
     RunCancelled,
+}
+
+enum RetryManifestState {
+    Manifest(NextWorkBundle),
+    RunNotFound,
+    ManifestNeverReceived,
+    NotYetPersisted,
+    FetchFromPersistence,
 }
 
 impl AllRuns {
@@ -319,16 +346,22 @@ impl AllRuns {
             }
             RunState::InitialManifestDone {
                 new_worker_exit_code,
+                seen_workers,
                 ..
             } => {
-                let exit_code = *new_worker_exit_code;
                 log_assert!(run.data.is_none(), "run data exists after completed run");
 
-                // The worker should exit successfully locally, regardless of what the overall
-                // code was.
-                //
-                // TODO: support out-of-process retries.
-                AssignedRunStatus::AlreadyDone { exit_code }
+                if seen_workers.read().contains_by_tag(&entity) {
+                    // This worker was already involved in this run; assume it's connecting for an
+                    // out-of-process retry.
+                    AssignedRunStatus::Run(AssignedRun::Retry)
+                } else {
+                    let exit_code = *new_worker_exit_code;
+                    // Fresh workers shouldn't get any new work.
+                    // The worker should exit successfully locally, regardless of what the overall
+                    // code was.
+                    AssignedRunStatus::AlreadyDone { exit_code }
+                }
             }
             RunState::Cancelled { .. } => {
                 log_assert!(run.data.is_none(), "run data exists after cancelled run");
@@ -429,24 +462,37 @@ impl AllRuns {
         }
     }
 
-    pub fn init_metadata(&self, run_id: RunId) -> InitMetadata {
+    pub fn init_metadata(&self, run_id: &RunId, entity: Entity) -> InitMetadata {
         let runs = self.runs.read();
 
-        let run = runs.get(&run_id).expect("no run recorded").read();
+        let run = runs.get(run_id).expect("no run recorded").read();
 
         match &run.state {
             RunState::WaitingForManifest { .. } => InitMetadata::WaitingForManifest,
             RunState::HasWork { init_metadata, .. } => {
                 InitMetadata::Metadata(init_metadata.clone())
             }
-            RunState::InitialManifestDone { .. } => {
-                InitMetadata::RunAlreadyCompleted { cancelled: false }
+            RunState::InitialManifestDone {
+                init_metadata,
+                seen_workers,
+                ..
+            } => {
+                if seen_workers.read().contains_by_tag(&entity) {
+                    // This worker was already involved in this run; assume it's connecting for an
+                    // out-of-process retry.
+                    InitMetadata::Metadata(init_metadata.clone())
+                } else {
+                    // Fresh workers shouldn't get any new work.
+                    // The worker should exit successfully locally, regardless of what the overall
+                    // code was.
+                    InitMetadata::RunAlreadyCompleted { cancelled: false }
+                }
             }
             RunState::Cancelled { .. } => InitMetadata::RunAlreadyCompleted { cancelled: true },
         }
     }
 
-    pub fn next_work(&self, entity: Entity, run_id: &RunId) -> NextWorkResult {
+    pub fn next_work<'a>(&self, entity: Entity, run_id: &'a RunId) -> NextWorkResult<'a> {
         let runs = self.runs.read();
 
         let run = runs.get(run_id).expect("no run recorded").read();
@@ -460,32 +506,40 @@ impl AllRuns {
                 ..
             } => {
                 active_workers.lock().insert_by_tag_if_missing(entity, None);
-                let result = Self::get_next_work_online(queue, entity, *batch_size_hint);
-                match result.status {
+                let (bundle, status) = Self::get_next_work_online(queue, entity, *batch_size_hint);
+                match status {
                     PulledTestsStatus::MoreTestsRemaining => {
-                        result
+                        NextWorkResult {
+                            bundle, status, opt_persistent_manifest_plan: None
+                        }
                     }
                     PulledTestsStatus::PulledLastTest { .. } | PulledTestsStatus::QueueWasEmpty => {
                         drop(run);
                         drop(runs);
                         tracing::debug!(?entity, ?run_id, "saw end of manifest for entity");
-                        self.try_mark_reached_end_of_manifest(run_id, ExitCode::SUCCESS);
-                        result
+
+                        let opt_persistent_manifest_plan = self.try_mark_reached_end_of_manifest(run_id, ExitCode::SUCCESS);
+
+                        NextWorkResult{
+                            bundle, status, opt_persistent_manifest_plan
+                        }
                     }
                 }
             }
-            RunState::InitialManifestDone {  active_workers, .. } => {
+            RunState::InitialManifestDone {  seen_workers, .. } => {
                 // Let the worker know that we've reached the end of the queue.
-                active_workers.lock().insert_by_tag_if_missing(entity, ());
+                seen_workers.write().insert_by_tag_if_missing(entity, true);
                 NextWorkResult{
                     bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
-                    status: PulledTestsStatus::QueueWasEmpty
+                    status: PulledTestsStatus::QueueWasEmpty,
+                    opt_persistent_manifest_plan: None,
                 }
             }
             RunState::Cancelled {..} => {
                 NextWorkResult{
                     bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
-                    status: PulledTestsStatus::QueueWasEmpty
+                    status: PulledTestsStatus::QueueWasEmpty,
+                    opt_persistent_manifest_plan: None,
                 }
             }
             RunState::WaitingForManifest {..} => unreachable!("Invalid state - work can only be requested after initialization metadata, at which point the manifest is known.")
@@ -496,7 +550,7 @@ impl AllRuns {
         queue: &JobQueue,
         entity: Entity,
         batch_size_hint: NonZeroUsize,
-    ) -> NextWorkResult {
+    ) -> (NextWorkBundle, PulledTestsStatus) {
         // NB: in the future, the batch size is likely to be determined intelligently, i.e.
         // from off-line timing data. But for now, we use the hint the client provided.
         let batch_size = batch_size_hint;
@@ -550,15 +604,15 @@ impl AllRuns {
 
         let bundle = NextWorkBundle { work: bundle };
 
-        NextWorkResult {
-            bundle,
-            status: pulled_tests_status,
-        }
+        (bundle, pulled_tests_status)
     }
 
-    pub fn get_retry_manifest(&self, run_id: &RunId, entity: Entity) -> Option<NextWorkBundle> {
+    pub fn get_retry_manifest(&self, run_id: &RunId, entity: Entity) -> RetryManifestState {
         let runs = self.runs.read();
-        let run = runs.get(run_id)?.read();
+        let run = match runs.get(run_id) {
+            Some(run) => run.read(),
+            None => return RetryManifestState::RunNotFound,
+        };
 
         match &run.state {
             RunState::WaitingForManifest { .. } => {
@@ -567,7 +621,7 @@ impl AllRuns {
                     ?entity,
                     "illegal state - attempting to fetch retry manifest while waiting for manifest"
                 );
-                None
+                RetryManifestState::RunNotFound
             }
             RunState::HasWork { queue, .. } => {
                 // TODO: can we get rid of the clone allocation here?
@@ -581,11 +635,28 @@ impl AllRuns {
                     .collect();
                 manifest.push(NextWork::EndOfWork);
 
-                Some(NextWorkBundle { work: manifest })
+                RetryManifestState::Manifest(NextWorkBundle { work: manifest })
             }
-            RunState::InitialManifestDone { .. } => {
-                todo!("fetch retry manifest after manifest items handed out")
-            }
+            RunState::InitialManifestDone {
+                manifest_persistence,
+                ..
+            } => match manifest_persistence {
+                ManifestPersistence::Persisted(cell) => {
+                    if cell.is_persisted() {
+                        RetryManifestState::FetchFromPersistence
+                    } else {
+                        RetryManifestState::NotYetPersisted
+                    }
+                }
+                ManifestPersistence::ManifestNeverReceived => {
+                    RetryManifestState::ManifestNeverReceived
+                }
+                ManifestPersistence::EmptyManifest => {
+                    RetryManifestState::Manifest(NextWorkBundle {
+                        work: vec![NextWork::EndOfWork],
+                    })
+                }
+            },
             RunState::Cancelled { .. } => {
                 todo!("fetch retry manifest after cancellation")
             }
@@ -625,9 +696,9 @@ impl AllRuns {
                     "worker was not seen as active before completion notification"
                 );
             }
-            RunState::InitialManifestDone { active_workers, .. } => {
-                let mut active_workers = active_workers.lock();
-                let was_present = active_workers.remove_by_tag(entity);
+            RunState::InitialManifestDone { seen_workers, .. } => {
+                let mut seen_workers = seen_workers.write();
+                let was_present = seen_workers.insert_by_tag(entity, false);
                 log_assert!(
                     was_present.is_some(),
                     ?entity,
@@ -640,27 +711,40 @@ impl AllRuns {
         }
     }
 
-    fn try_mark_reached_end_of_manifest(&self, run_id: &RunId, new_worker_exit_code: ExitCode) {
+    fn try_mark_reached_end_of_manifest<'a>(
+        &self,
+        run_id: &'a RunId,
+        new_worker_exit_code: ExitCode,
+    ) -> Option<PersistManifestPlan<'a>> {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
 
-        let active_worker_timings = match &mut run.state {
+        let active_worker_timings;
+        let queue;
+        let init_metadata;
+        match &mut run.state {
             RunState::HasWork {
-                queue,
+                queue: this_queue,
                 active_workers: this_active_workers,
+                init_metadata: this_init_metadata,
                 ..
             } => {
-                log_assert!(queue.is_at_end(), "Invalid state - queue is not complete!");
-                Mutex::into_inner(std::mem::take(this_active_workers))
+                log_assert!(
+                    this_queue.is_at_end(),
+                    "Invalid state - queue is not complete!"
+                );
+                active_worker_timings = Mutex::into_inner(std::mem::take(this_active_workers));
+                queue = std::mem::take(this_queue);
+                init_metadata = std::mem::take(this_init_metadata);
             }
             RunState::Cancelled { .. } => {
                 // Cancellation always takes priority over completeness.
-                return Default::default();
+                return None;
             }
             RunState::InitialManifestDone { .. } => {
                 // We already got marked as completed; bail out.
-                return Default::default();
+                return None;
             }
             RunState::WaitingForManifest { .. } => {
                 unreachable!("Invalid state");
@@ -669,17 +753,23 @@ impl AllRuns {
 
         tracing::info!(?run_id, "marking end of manifest");
 
-        let mut still_active_workers = WorkerSet::default();
+        let mut seen_workers = WorkerSet::default();
 
         for (worker, opt_completed) in active_worker_timings {
-            if opt_completed.is_none() {
-                still_active_workers.insert_by_tag(worker, ());
-            }
+            // The worker is still active if we don't have a completion time for it.
+            let is_active = opt_completed.is_none();
+            seen_workers.insert_by_tag(worker, is_active);
         }
+
+        // Build the plan to persist the manifest.
+        let view = queue.into_manifest_view();
+        let (manifest_persisted, plan) = manifest::build_persistence_plan(run_id, view);
 
         run.state = RunState::InitialManifestDone {
             new_worker_exit_code,
-            active_workers: Mutex::new(still_active_workers),
+            init_metadata,
+            seen_workers: RwLock::new(seen_workers),
+            manifest_persistence: ManifestPersistence::Persisted(manifest_persisted),
         };
 
         // Drop the run data, since we no longer need it.
@@ -688,9 +778,11 @@ impl AllRuns {
 
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
+
+        Some(plan)
     }
 
-    pub fn mark_failed_to_start(&self, run_id: RunId) {
+    pub fn mark_failed_to_receive_manifest(&self, run_id: RunId) {
         let runs = self.runs.read();
 
         let mut run = runs.get(&run_id).expect("no run recorded").write();
@@ -710,7 +802,9 @@ impl AllRuns {
 
         run.state = RunState::InitialManifestDone {
             new_worker_exit_code: ExitCode::FAILURE,
-            active_workers: Default::default(),
+            init_metadata: Default::default(),
+            seen_workers: Default::default(),
+            manifest_persistence: ManifestPersistence::ManifestNeverReceived,
         };
 
         // Drop the run data, since we no longer need it.
@@ -743,7 +837,9 @@ impl AllRuns {
         // Trivially successful
         run.state = RunState::InitialManifestDone {
             new_worker_exit_code: ExitCode::SUCCESS,
-            active_workers: Default::default(),
+            init_metadata: Default::default(),
+            seen_workers: Default::default(),
+            manifest_persistence: ManifestPersistence::EmptyManifest,
         };
 
         // Drop the run data, since we no longer need it.
@@ -783,10 +879,13 @@ impl AllRuns {
             RunState::WaitingForManifest { .. } | RunState::HasWork { .. } => {
                 Some(RunStatus::Active)
             }
-            RunState::InitialManifestDone { active_workers, .. } => {
-                let active_workers = active_workers.lock();
+            RunState::InitialManifestDone { seen_workers, .. } => {
+                let seen_workers = seen_workers.read();
                 Some(RunStatus::InitialManifestDone {
-                    num_active_workers: active_workers.len(),
+                    num_active_workers: seen_workers
+                        .iter()
+                        .map(|(_, active)| *active as usize)
+                        .sum(),
                 })
             }
             RunState::Cancelled { .. } => Some(RunStatus::Cancelled),
@@ -809,9 +908,13 @@ impl AllRuns {
                 .filter(|p| p.1.is_none())
                 .map(|p| p.0)
                 .collect(),
-            RunState::InitialManifestDone { active_workers, .. } => {
-                active_workers.lock().iter().copied().map(|p| p.0).collect()
-            }
+            RunState::InitialManifestDone { seen_workers, .. } => seen_workers
+                .read()
+                .iter()
+                .filter(|p| p.1)
+                .copied()
+                .map(|p| p.0)
+                .collect(),
             RunState::Cancelled { .. } => Default::default(),
         }
     }
@@ -951,12 +1054,14 @@ pub struct QueueConfig {
     pub negotiator_port: u16,
     /// How the queue should construct its servers.
     pub server_options: ServerOptions,
+    /// How manifests should be persisted.
+    pub persist_manifest: SharedPersistManifest,
 }
 
-impl Default for QueueConfig {
+impl QueueConfig {
     /// Creates a [`QueueConfig`] that always binds and advertises on INADDR_ANY, with arbitrary
     /// ports for its servers.
-    fn default() -> Self {
+    pub fn new(persist_manifest: SharedPersistManifest) -> Self {
         Self {
             public_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -967,6 +1072,7 @@ impl Default for QueueConfig {
                 ServerAuthStrategy::no_auth(),
                 ServerTlsStrategy::no_tls(),
             ),
+            persist_manifest,
         }
     }
 }
@@ -982,6 +1088,7 @@ fn start_queue(config: QueueConfig) -> Abq {
         work_port,
         negotiator_port,
         server_options,
+        persist_manifest,
     } = config;
 
     let mut shutdown_manager = ShutdownManager::default();
@@ -1011,6 +1118,7 @@ fn start_queue(config: QueueConfig) -> Abq {
     let work_scheduler_handle = thread::spawn({
         let scheduler = WorkScheduler {
             queues: queues.clone(),
+            persist_manifest,
         };
         move || scheduler.start_on(new_work_server, work_scheduler_shutdown_rx)
     });
@@ -1535,7 +1643,7 @@ impl QueueServer {
         if is_empty_manifest {
             queues.mark_empty_manifest_complete(run_id);
         } else {
-            queues.mark_failed_to_start(run_id);
+            queues.mark_failed_to_receive_manifest(run_id);
         }
 
         Ok(())
@@ -1609,6 +1717,7 @@ fn log_deprecations(entity: Entity, run_id: RunId, deprecations: meta::Deprecati
 /// This does not schedule work in any interesting way today, but it may in the future.
 struct WorkScheduler {
     queues: SharedRuns,
+    persist_manifest: SharedPersistManifest,
 }
 
 /// An error that happens in the construction or execution of the work-scheduling server.
@@ -1630,6 +1739,7 @@ pub enum WorkSchedulerError {
 struct SchedulerCtx {
     queues: SharedRuns,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
+    persist_manifest: SharedPersistManifest,
 }
 
 impl WorkScheduler {
@@ -1645,10 +1755,11 @@ impl WorkScheduler {
         let server_result: Result<(), WorkSchedulerError> = rt.block_on(async {
             let listener = listener.into_async()?;
 
-            let Self { queues } = self;
+            let Self { queues, persist_manifest } = self;
             let ctx = SchedulerCtx {
                 queues,
                 handshake_ctx: Arc::new(listener.handshake_ctx()),
+                persist_manifest,
             };
 
             loop {
@@ -1715,7 +1826,7 @@ impl WorkScheduler {
                 }
             }
             InitContext { run_id } => {
-                let init_metadata = { ctx.queues.init_metadata(run_id.clone()) };
+                let init_metadata = ctx.queues.init_metadata(&run_id, entity);
 
                 use net_protocol::work_server::{InitContext, InitContextResponse};
                 let response = match init_metadata {
@@ -1735,16 +1846,27 @@ impl WorkScheduler {
             }
             PersistentWorkerNextTestsConnection(run_id) => {
                 tokio::spawn(Self::start_persistent_next_tests_requests_task(
-                    ctx.queues, run_id, stream, entity,
+                    ctx.queues,
+                    ctx.persist_manifest,
+                    run_id,
+                    stream,
+                    entity,
                 ));
             }
             RetryManifestPartition { run_id, entity } => {
                 use net_protocol::work_server::RetryManifestResponse;
 
                 let opt_manifest = ctx.queues.get_retry_manifest(&run_id, entity);
+
+                use RetryManifestState::*;
                 let response = match opt_manifest {
-                    Some(man) => RetryManifestResponse::Manifest(man),
-                    None => RetryManifestResponse::RunDoesNotExist,
+                    Manifest(man) => RetryManifestResponse::Manifest(man),
+                    FetchFromPersistence => {
+                        fetch_persisted_manifest(&ctx.persist_manifest, &run_id, entity).await
+                    }
+                    RunNotFound => RetryManifestResponse::RunDoesNotExist,
+                    ManifestNeverReceived => RetryManifestResponse::ManifestNeverReceived,
+                    NotYetPersisted => RetryManifestResponse::NotYetPersisted,
                 };
 
                 net_protocol::async_write(&mut stream, &response)
@@ -1759,6 +1881,7 @@ impl WorkScheduler {
 
     async fn start_persistent_next_tests_requests_task(
         queues: SharedRuns,
+        persist_manifest: SharedPersistManifest,
         run_id: RunId,
         mut conn: Box<dyn net_async::ServerStream>,
         entity: Entity,
@@ -1786,7 +1909,11 @@ impl WorkScheduler {
             // Pull the next bundle of work.
             let next_work_result = queues.next_work(entity, &run_id);
 
-            let NextWorkResult { bundle, status } = next_work_result;
+            let NextWorkResult {
+                bundle,
+                status,
+                opt_persistent_manifest_plan,
+            } = next_work_result;
 
             let response = NextTestResponse::Bundle(bundle);
 
@@ -1794,10 +1921,73 @@ impl WorkScheduler {
                 .await
                 .located(here!())?;
 
+            if let Some(persist_manifest_plan) = opt_persistent_manifest_plan {
+                // Our last task will be to execute manifest persistence.
+                run_manifest_persistence_task(
+                    &persist_manifest,
+                    &run_id,
+                    persist_manifest_plan,
+                    entity,
+                )
+                .await;
+
+                log_assert!(
+                    status.reached_end_of_tests(),
+                    ?run_id,
+                    ?status,
+                    "got a manifest plan, but did not reach end of tests"
+                );
+                return Ok(());
+            }
+
             if status.reached_end_of_tests() {
                 // Exit, since the worker should not ask us for tests again.
                 return Ok(());
             }
+        }
+    }
+}
+
+async fn run_manifest_persistence_task(
+    persist_manifest: &SharedPersistManifest,
+    run_id: &RunId,
+    persist_manifest_plan: PersistManifestPlan<'_>,
+    entity: Entity,
+) {
+    let task = manifest::make_persistence_task(persist_manifest.borrowed(), persist_manifest_plan);
+
+    let span = tracing::info_span!("running manifest persistence task", ?run_id, ?entity);
+    let _enter = span.enter();
+    if let Err(error) = task.await.entity(entity) {
+        log_entityful_error!(error, "failed to execute manifest persistence job: {}");
+    }
+}
+
+#[instrument(level = "trace", skip(persist_manifest))]
+async fn fetch_persisted_manifest(
+    persist_manifest: &SharedPersistManifest,
+    run_id: &RunId,
+    entity: Entity,
+) -> work_server::RetryManifestResponse {
+    let manifest_result = persist_manifest
+        .get_partition_for_entity(run_id, entity.tag)
+        .await;
+
+    match manifest_result.entity(entity) {
+        Ok(manifest) => {
+            let manifest = manifest
+                .into_iter()
+                .map(NextWork::Work)
+                .chain(std::iter::once(NextWork::EndOfWork))
+                .collect();
+            RetryManifestResponse::Manifest(NextWorkBundle { work: manifest })
+        }
+        Err(error) => {
+            log_entityful_error!(
+                error,
+                "manifest marked as persisted, but its loading failed: {}"
+            );
+            RetryManifestResponse::FailedToLoad
         }
     }
 }
@@ -1825,9 +2015,12 @@ mod test {
         time::Instant,
     };
 
-    use crate::queue::{
-        fake_test_spec, ActiveRunResponders, AddedManifest, CancelReason, NextWorkResult,
-        QueueServer, RunStatus, SharedRuns, WorkScheduler,
+    use crate::{
+        persistence::manifest::in_memory::InMemoryPersistor,
+        queue::{
+            ActiveRunResponders, AddedManifest, CancelReason, QueueServer, RunStatus, SharedRuns,
+            WorkScheduler,
+        },
     };
     use abq_run_n_times::n_times;
     use abq_test_utils::{accept_handshake, assert_scoped_log, one_nonzero_usize};
@@ -1846,7 +2039,7 @@ mod test {
             },
             runners::{NativeRunnerSpecification, TestCase, TestResult},
             work_server,
-            workers::{NextWork, RunId, WorkId, WorkerTest, INIT_RUN_NUMBER},
+            workers::{RunId, WorkId},
         },
         server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -1946,6 +2139,7 @@ mod test {
 
         let work_scheduler = WorkScheduler {
             queues: Default::default(),
+            persist_manifest: InMemoryPersistor::shared(),
         };
         let work_server_handle = thread::spawn(|| {
             work_scheduler.start_on(server, server_shutdown_rx).unwrap();
@@ -1976,6 +2170,7 @@ mod test {
 
         let server = WorkScheduler {
             queues: Default::default(),
+            persist_manifest: InMemoryPersistor::shared(),
         };
 
         let listener = server_opts.bind("0.0.0.0:0").unwrap();
@@ -2085,6 +2280,7 @@ mod test {
     fn connecting_to_work_server_with_auth_okay() {
         let server = WorkScheduler {
             queues: Default::default(),
+            persist_manifest: InMemoryPersistor::shared(),
         };
 
         let (server_auth, client_auth, _) = build_random_strategies();
@@ -2119,6 +2315,7 @@ mod test {
     fn connecting_to_work_server_with_no_auth_fails() {
         let server = WorkScheduler {
             queues: Default::default(),
+            persist_manifest: InMemoryPersistor::shared(),
         };
 
         let (server_auth, _, _) = build_random_strategies();
@@ -2593,6 +2790,129 @@ mod test {
         ));
         assert!(!active_runs.read().await.contains_key(&run_id));
     }
+}
+
+#[cfg(test)]
+mod test_pull_work {
+    use abq_test_utils::one_nonzero_usize;
+    use abq_utils::net_protocol::{
+        entity::Entity,
+        workers::{NextWork, RunId, WorkerTest},
+    };
+    use abq_with_protocol_version::with_protocol_version;
+
+    use crate::queue::{
+        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunData, RunState, RunStatus,
+        SharedRuns,
+    };
+
+    #[test]
+    #[with_protocol_version]
+    fn pull_last_tests_for_final_test_run_attempt_shows_tests_complete() {
+        // Set up the queue so only one test is pulled, and there are a total of two attempts.
+        let queue = JobQueue::new(vec![
+            WorkerTest {
+                spec: fake_test_spec(proto),
+                run_number: 1,
+            },
+            WorkerTest {
+                spec: fake_test_spec(proto),
+                run_number: 2,
+            },
+        ]);
+
+        let batch_size_hint = one_nonzero_usize();
+
+        let has_work = RunState::HasWork {
+            queue,
+            init_metadata: Default::default(),
+            batch_size_hint,
+            active_workers: Default::default(),
+        };
+
+        let run_id = RunId::unique();
+        let queues = SharedRuns::default();
+        queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
+
+        // First pull. There should be additional tests following it.
+        {
+            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
+
+            assert!(matches!(next_work, NextWorkResult { bundle, status, .. }
+                if bundle.work.len() == 1 && matches!(status, PulledTestsStatus::MoreTestsRemaining)
+            ));
+
+            assert!(matches!(
+                queues.get_run_status(&run_id),
+                Some(RunStatus::Active)
+            ));
+        }
+
+        // Second pull. Now we reach the end of all tests and all test run attempts.
+        {
+            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
+
+            assert!(matches!(next_work, NextWorkResult { bundle, status, .. }
+                if bundle.work.len() == 2 // 1 - test, 1 - end of work
+                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
+                && matches!(status, PulledTestsStatus::PulledLastTest { .. })
+            ));
+
+            assert!(matches!(
+                queues.get_run_status(&run_id),
+                Some(RunStatus::InitialManifestDone { .. })
+            ));
+        }
+
+        // Now, if another worker pulls work it should get nothing other than an end-of-test marker,
+        // and be told we're all done.
+        {
+            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
+
+            assert!(matches!(next_work, NextWorkResult { bundle, status, .. }
+                if bundle.work.len() == 1
+                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
+                && matches!(status, PulledTestsStatus::QueueWasEmpty)
+            ));
+
+            assert!(matches!(
+                queues.get_run_status(&run_id),
+                Some(RunStatus::InitialManifestDone { .. })
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod retry_manifest {
+    use std::{
+        net::SocketAddr,
+        thread::{self},
+        time::Duration,
+    };
+
+    use crate::{
+        job_queue::JobQueue,
+        persistence::manifest::{in_memory::InMemoryPersistor, SharedPersistManifest},
+        queue::{fake_test_spec, NextWorkResult, RunData, RunState, SharedRuns, WorkScheduler},
+    };
+    use abq_test_utils::{one_nonzero_usize, spec, worker_test};
+    use abq_utils::{
+        auth::{ClientAuthStrategy, ServerAuthStrategy},
+        net_async,
+        net_opt::{ClientOptions, ServerOptions},
+        net_protocol::{
+            self,
+            entity::Entity,
+            work_server,
+            workers::{NextWork, RunId, WorkerTest, INIT_RUN_NUMBER},
+        },
+        server_shutdown::ShutdownManager,
+        tls::{ClientTlsStrategy, ServerTlsStrategy},
+    };
+    use abq_with_protocol_version::with_protocol_version;
+    use abq_workers::negotiate::{AssignedRun, AssignedRunStatus};
+    use ntest::timeout;
 
     #[test]
     #[with_protocol_version]
@@ -2638,9 +2958,169 @@ mod test {
         assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
     }
 
-    #[test]
+    struct WorkSchedulerBuilder(WorkScheduler);
+    impl WorkSchedulerBuilder {
+        fn new(queues: SharedRuns) -> Self {
+            Self(WorkScheduler {
+                queues,
+                persist_manifest: InMemoryPersistor::shared(),
+            })
+        }
+        fn with_persist_manifest(mut self, persist: SharedPersistManifest) -> Self {
+            self.0.persist_manifest = persist;
+            self
+        }
+    }
+
+    struct WorkSchedulerState {
+        shutdown_tx: ShutdownManager,
+        server_thread: thread::JoinHandle<()>,
+        server_addr: SocketAddr,
+        conn: Box<dyn net_async::ClientStream>,
+        client: Box<dyn net_async::ConfiguredClient>,
+    }
+
+    async fn build_work_scheduler(builder: WorkSchedulerBuilder) -> WorkSchedulerState {
+        let server = builder.0;
+
+        let server_opts =
+            ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+        let client_opts =
+            ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
+
+        let listener = server_opts.bind("0.0.0.0:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
+        let server_thread = thread::spawn(move || {
+            server.start_on(listener, shutdown_rx).unwrap();
+        });
+
+        let client = client_opts.build_async().unwrap();
+        let conn = client.connect(server_addr).await.unwrap();
+
+        WorkSchedulerState {
+            shutdown_tx,
+            server_thread,
+            server_addr,
+            conn,
+            client,
+        }
+    }
+
+    #[tokio::test]
     #[with_protocol_version]
-    fn pull_retry_manifest_for_active_work() {
+    #[timeout(1000)]
+    async fn pulling_end_of_manifest_eventually_persists_manifest() {
+        let spec1 = spec(1);
+        let spec2 = spec(2);
+
+        let manifest = vec![
+            WorkerTest::new(spec1.clone(), 1),
+            WorkerTest::new(spec2.clone(), 1),
+        ];
+
+        let run_id = RunId::unique();
+
+        let queues = {
+            let queue = JobQueue::new(manifest);
+
+            let batch_size_hint = 2.try_into().unwrap();
+
+            let has_work = RunState::HasWork {
+                queue,
+                init_metadata: Default::default(),
+                batch_size_hint,
+                active_workers: Default::default(),
+            };
+
+            let queues = SharedRuns::default();
+            queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
+            queues
+        };
+
+        let persist_manifest = InMemoryPersistor::shared();
+
+        let WorkSchedulerState {
+            mut shutdown_tx,
+            server_thread,
+            server_addr,
+            mut conn,
+            client,
+        } = build_work_scheduler(
+            WorkSchedulerBuilder::new(queues.clone())
+                .with_persist_manifest(persist_manifest.clone()),
+        )
+        .await;
+
+        let entity = Entity::runner(1, 1);
+
+        // Open a persistent work connection, ask for a bundle of tests.
+        let request = work_server::Request {
+            entity,
+            message: work_server::Message::PersistentWorkerNextTestsConnection(run_id.clone()),
+        };
+        net_protocol::async_write(&mut conn, &request)
+            .await
+            .unwrap();
+        net_protocol::async_write(&mut conn, &work_server::NextTestRequest {})
+            .await
+            .unwrap();
+
+        let work_server::NextTestResponse::Bundle(bundle) =
+            net_protocol::async_read(&mut conn).await.unwrap();
+
+        assert_eq!(
+            bundle.work,
+            vec![
+                worker_test(spec1.clone(), 1),
+                worker_test(spec2.clone(), 1),
+                NextWork::EndOfWork
+            ]
+        );
+
+        // In time, we should see that the manifest was persisted.
+        loop {
+            let mut conn = client.connect(server_addr).await.unwrap();
+            let request = work_server::Request {
+                entity: Entity::runner(1, 1),
+                message: work_server::Message::RetryManifestPartition {
+                    run_id: run_id.clone(),
+                    entity: Entity::runner(1, 1),
+                },
+            };
+            net_protocol::async_write(&mut conn, &request)
+                .await
+                .unwrap();
+            let response = net_protocol::async_read(&mut conn).await.unwrap();
+
+            use work_server::RetryManifestResponse::*;
+            match response {
+                Manifest(man) => {
+                    assert_eq!(
+                        man.work,
+                        vec![
+                            worker_test(spec1, 1),
+                            worker_test(spec2, 1),
+                            NextWork::EndOfWork
+                        ]
+                    );
+                    break;
+                }
+                NotYetPersisted => {
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                    continue;
+                }
+                response => unreachable!("{response:?}"),
+            }
+        }
+
+        shutdown_tx.shutdown_immediately().unwrap();
+        server_thread.join().unwrap();
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn pull_retry_manifest_for_active_work() {
         let queues = SharedRuns::default();
         let run_id = RunId::unique();
 
@@ -2679,36 +3159,22 @@ mod test {
             );
         }
 
-        let mut shutdown_tx;
-        let server_thread;
-        let client;
-        let mut conn;
-        {
-            let server = WorkScheduler { queues };
-
-            let server_opts =
-                ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
-            let client_opts =
-                ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
-
-            let listener = server_opts.bind("0.0.0.0:0").unwrap();
-            let server_addr = listener.local_addr().unwrap();
-            let (this_shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
-            shutdown_tx = this_shutdown_tx;
-            server_thread = thread::spawn(move || {
-                server.start_on(listener, shutdown_rx).unwrap();
-            });
-
-            client = client_opts.build().unwrap();
-            conn = client.connect(server_addr).unwrap();
-        }
+        let WorkSchedulerState {
+            mut shutdown_tx,
+            server_thread,
+            mut conn,
+            ..
+        } = build_work_scheduler(WorkSchedulerBuilder::new(queues)).await;
 
         let request = work_server::Request {
             entity,
             message: work_server::Message::RetryManifestPartition { run_id, entity },
         };
-        net_protocol::write(&mut conn, &request).unwrap();
-        let response: work_server::RetryManifestResponse = net_protocol::read(&mut conn).unwrap();
+        net_protocol::async_write(&mut conn, &request)
+            .await
+            .unwrap();
+        let response: work_server::RetryManifestResponse =
+            net_protocol::async_read(&mut conn).await.unwrap();
 
         match response {
             work_server::RetryManifestResponse::Manifest(manifest) => {
@@ -2726,97 +3192,5 @@ mod test {
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_thread.join().unwrap();
-    }
-}
-
-#[cfg(test)]
-mod test_pull_work {
-
-    use abq_test_utils::one_nonzero_usize;
-    use abq_utils::net_protocol::{
-        entity::Entity,
-        workers::{NextWork, RunId, WorkerTest},
-    };
-    use abq_with_protocol_version::with_protocol_version;
-
-    use crate::queue::{
-        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunData, RunState, RunStatus,
-        SharedRuns,
-    };
-
-    #[test]
-    #[with_protocol_version]
-    fn pull_last_tests_for_final_test_run_attempt_shows_tests_complete() {
-        // Set up the queue so only one test is pulled, and there are a total of two attempts.
-        let queue = JobQueue::new(vec![
-            WorkerTest {
-                spec: fake_test_spec(proto),
-                run_number: 1,
-            },
-            WorkerTest {
-                spec: fake_test_spec(proto),
-                run_number: 2,
-            },
-        ]);
-
-        let batch_size_hint = one_nonzero_usize();
-
-        let has_work = RunState::HasWork {
-            queue,
-            init_metadata: Default::default(),
-            batch_size_hint,
-            active_workers: Default::default(),
-        };
-
-        let run_id = RunId::unique();
-        let queues = SharedRuns::default();
-        queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
-
-        // First pull. There should be additional tests following it.
-        {
-            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
-
-            assert!(matches!(next_work, NextWorkResult { bundle, status }
-                if bundle.work.len() == 1 && matches!(status, PulledTestsStatus::MoreTestsRemaining)
-            ));
-
-            assert!(matches!(
-                queues.get_run_status(&run_id),
-                Some(RunStatus::Active)
-            ));
-        }
-
-        // Second pull. Now we reach the end of all tests and all test run attempts.
-        {
-            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
-
-            assert!(matches!(next_work, NextWorkResult { bundle, status }
-                if bundle.work.len() == 2 // 1 - test, 1 - end of work
-                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
-                && matches!(status, PulledTestsStatus::PulledLastTest { .. })
-            ));
-
-            assert!(matches!(
-                queues.get_run_status(&run_id),
-                Some(RunStatus::InitialManifestDone { .. })
-            ));
-        }
-
-        // Now, if another worker pulls work it should get nothing other than an end-of-test marker,
-        // and be told we're all done.
-        {
-            let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
-
-            assert!(matches!(next_work, NextWorkResult { bundle, status }
-                if bundle.work.len() == 1
-                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
-                && matches!(status, PulledTestsStatus::QueueWasEmpty)
-            ));
-
-            assert!(matches!(
-                queues.get_run_status(&run_id),
-                Some(RunStatus::InitialManifestDone { .. })
-            ));
-        }
     }
 }

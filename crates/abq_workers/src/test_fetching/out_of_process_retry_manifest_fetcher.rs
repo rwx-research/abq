@@ -15,6 +15,11 @@ use abq_utils::{
 const CONNECTION_ATTEMPTS: usize = 5;
 const CONNECTION_BACKOFF: Duration = Duration::from_secs(3);
 
+const TRY_FETCH_MANIFEST_ATTEMPTS: usize = 20;
+const TRY_FETCH_MANIFEST_BACKOFF: Duration = Duration::from_secs(3);
+const TRY_FETCH_MANIFEST_SECONDS: usize =
+    TRY_FETCH_MANIFEST_BACKOFF.as_secs() as usize * TRY_FETCH_MANIFEST_ATTEMPTS;
+
 pub struct OutOfProcessRetryManifestFetcher {
     entity: Entity,
     work_server_addr: SocketAddr,
@@ -47,32 +52,54 @@ impl OutOfProcessRetryManifestFetcher {
             run_id,
         } = self;
 
-        let mut conn = async_retry_n(CONNECTION_ATTEMPTS, CONNECTION_BACKOFF, |attempt| {
-            if attempt > 1 {
-                tracing::info!(
-                    "reattempting connection to work server for retry manifest {}",
-                    attempt
-                );
-            }
-            client.connect(work_server_addr)
-        })
-        .await
-        .expect("work server not available");
-
-        use net_protocol::work_server::{Message, Request, RetryManifestResponse};
-
-        let request = Request {
-            entity,
-            message: Message::RetryManifestPartition { run_id, entity },
-        };
-        net_protocol::async_write(&mut conn, &request)
+        let try_fetch_manifest = |_attempt| async {
+            let mut conn = async_retry_n(CONNECTION_ATTEMPTS, CONNECTION_BACKOFF, |attempt| {
+                if attempt > 1 {
+                    tracing::info!(
+                        "reattempting connection to work server for retry manifest {}",
+                        attempt
+                    );
+                }
+                client.connect(work_server_addr)
+            })
             .await
-            .unwrap();
+            .expect("work server not available");
 
-        match net_protocol::async_read(&mut conn).await.unwrap() {
-            RetryManifestResponse::Manifest (manifest) => manifest,
-            RetryManifestResponse::RunDoesNotExist => unreachable!("attempted to request a retry manifest for a test run that does not exist on the target queue"),
-        }
+            use net_protocol::work_server::{Message, Request, RetryManifestResponse::*};
+
+            let request = Request {
+                entity,
+                message: Message::RetryManifestPartition {
+                    run_id: run_id.clone(),
+                    entity,
+                },
+            };
+            net_protocol::async_write(&mut conn, &request)
+                .await
+                .unwrap();
+
+            match net_protocol::async_read(&mut conn).await.unwrap() {
+                Manifest(manifest) => Ok(manifest),
+                NotYetPersisted => Err(()),
+                RunDoesNotExist => unreachable!("attempted to request a retry manifest for a test run that does not exist on the target queue"),
+                // TODO make all of these errors
+                ManifestNeverReceived => unreachable!("manifest never received for the given run"),
+                FailedToLoad => unreachable!("manifest failed to be loaded by the queue"),
+            }
+        };
+
+        async_retry_n(
+            TRY_FETCH_MANIFEST_ATTEMPTS,
+            TRY_FETCH_MANIFEST_BACKOFF,
+            try_fetch_manifest,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "failed to fetch manifest after {} seconds",
+                TRY_FETCH_MANIFEST_SECONDS
+            )
+        })
     }
 }
 
