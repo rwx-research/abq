@@ -223,7 +223,8 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
     run_id_result.ok().map(RunId)
 }
 
-fn abq_main() -> anyhow::Result<ExitCode> {
+#[tokio::main(flavor = "multi_thread")]
+async fn abq_main() -> anyhow::Result<ExitCode> {
     use clap::{error::ErrorKind, CommandFactory};
 
     let _tracing_guards = setup_tracing()?;
@@ -274,6 +275,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 negotiator_port,
                 ServerOptions::new(server_auth, server_tls),
             )
+            .await
         }
         Command::Test {
             worker,
@@ -325,7 +327,8 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 client_auth,
                 resolved_tls,
                 deprecations,
-            )?;
+            )
+            .await?;
             let results_timeout = Duration::from_secs(inactivity_timeout_seconds);
 
             let num_runners = match num {
@@ -355,6 +358,7 @@ fn abq_main() -> anyhow::Result<ExitCode> {
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
             )
+            .await
         }
         Command::Health {
             queue,
@@ -515,7 +519,7 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
     })
 }
 
-fn find_or_create_abq(
+async fn find_or_create_abq(
     entity: Entity,
     run_id: RunId,
     queue_addr_or_opt_tls: Result<SocketAddr, Option<Vec<u8>>>,
@@ -550,12 +554,10 @@ fn find_or_create_abq(
                 ),
             };
 
-            Ok(AbqInstance::new_ephemeral(
-                opt_user_token,
-                client_auth,
-                server_tls,
-                client_tls,
-            ))
+            Ok(
+                AbqInstance::new_ephemeral(opt_user_token, client_auth, server_tls, client_tls)
+                    .await,
+            )
         }
     }
 }

@@ -2,7 +2,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use abq_reporting::{CompletedSummary, Reporter};
+use abq_reporting::CompletedSummary;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
 use abq_utils::net_protocol::queue::InvokeWork;
@@ -27,7 +27,7 @@ use self::reporting::{build_reporters, ReportingTaskHandle};
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
-pub fn start_workers_standalone(
+pub async fn start_workers_standalone(
     run_id: RunId,
     tag: WorkerTag,
     num_workers: NonZeroUsize,
@@ -41,44 +41,9 @@ pub fn start_workers_standalone(
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
 ) -> ! {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-
     let test_suite_name = "suite"; // TODO: determine this correctly
     let reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name);
 
-    rt.block_on(start_standalone_help(
-        run_id,
-        tag,
-        num_workers,
-        max_run_number,
-        runner_kind,
-        working_dir,
-        reporters,
-        stdout_preferences,
-        batch_size,
-        test_results_timeout,
-        queue_negotiator,
-        client_opts,
-    ))
-}
-
-async fn start_standalone_help(
-    run_id: RunId,
-    tag: WorkerTag,
-    num_workers: NonZeroUsize,
-    max_run_number: u32,
-    runner_kind: RunnerKind,
-    working_dir: PathBuf,
-    reporters: Vec<Box<dyn Reporter>>,
-    stdout_preferences: StdoutPreferences,
-    batch_size: NonZeroU64,
-    test_results_timeout: Duration,
-    queue_negotiator: QueueNegotiatorHandle,
-    client_opts: ClientOptions,
-) -> ! {
     let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
 
     let context = WorkerContext::AlwaysWorkIn { working_dir };
@@ -92,6 +57,7 @@ async fn start_standalone_help(
         local_results_handler: Box::new(reporting_proxy),
         worker_context: context,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
+        protocol_version_timeout: abq_workers::DEFAULT_PROTOCOL_VERSION_TIMEOUT,
         results_batch_size_hint: batch_size.get(),
         max_run_number,
     };
@@ -107,7 +73,7 @@ async fn start_standalone_help(
         test_results_timeout,
     };
 
-    let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool_on_executor(
+    let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(
         workers_config,
         queue_negotiator,
         client_opts,
@@ -127,7 +93,7 @@ async fn start_standalone_help(
                 do_shutdown(worker_pool, reporting_handle, stdout_preferences).await;
             }
             _ = term_signals.next() => {
-                do_cancellation_shutdown(worker_pool);
+                do_cancellation_shutdown(worker_pool).await;
             }
         }
     }
@@ -143,7 +109,7 @@ async fn do_shutdown(
         native_runner_info,
         manifest_generation_output,
         final_captured_outputs,
-    } = worker_pool.shutdown();
+    } = worker_pool.shutdown().await;
 
     tracing::debug!("Workers shutdown");
 
@@ -184,13 +150,15 @@ async fn do_shutdown(
     std::process::exit(exit_code.get());
 }
 
-fn do_cancellation_shutdown(worker_pool: NegotiatedWorkers) -> ! {
+async fn do_cancellation_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
+    worker_pool.cancel().await;
+
     let WorkersExit {
         status: _,
         native_runner_info: _,
         manifest_generation_output: _,
         final_captured_outputs,
-    } = worker_pool.cancel();
+    } = worker_pool.shutdown().await;
 
     tracing::debug!("Workers cancelled");
 

@@ -6,16 +6,13 @@ use abq_utils::{
     error::ResultLocation,
     here, net_async,
     net_protocol::{self, entity::Entity, queue::AssociatedTestResults, workers::RunId},
-    results_handler::{NotifyResults, ResultsHandler, SharedResultsHandler},
+    results_handler::{NotifyResults, SharedResultsHandler},
     retry::async_retry_n,
 };
 use async_trait::async_trait;
 use tracing::instrument;
 
 use crate::test_fetching;
-
-/// A way to get a new [NotifyResults] value for a unique test run.
-pub type ResultsHandlerGenerator<'a> = &'a (dyn Fn(Entity) -> ResultsHandler + Send + Sync);
 
 /// A results handler that dispatches results to the remote queue, and also any local handlers.
 pub(crate) struct MultiplexingResultsHandler {

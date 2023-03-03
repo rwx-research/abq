@@ -18,7 +18,7 @@ use abq_test_utils::artifacts_dir;
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
     exit::ExitCode,
-    net::{ClientStream, ConfiguredClient},
+    net_async::{ClientStream, ConfiguredClient},
     net_opt::ClientOptions,
     net_protocol::{
         self,
@@ -42,8 +42,9 @@ use abq_with_protocol_version::with_protocol_version;
 use abq_workers::{
     negotiate::{NegotiatedWorkers, WorkersConfig, WorkersNegotiator},
     workers::{WorkerContext, WorkersExit, WorkersExitStatus},
+    DEFAULT_PROTOCOL_VERSION_TIMEOUT,
 };
-use futures::FutureExt;
+use futures::{future::BoxFuture, FutureExt};
 use ntest::timeout;
 use parking_lot::Mutex;
 use serial_test::serial;
@@ -123,6 +124,7 @@ impl WorkersConfigBuilder {
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
             results_batch_size_hint: 1,
+            protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
         };
         Self {
             config,
@@ -165,7 +167,8 @@ fn native_runner_simulation_bin() -> String {
         .to_string()
 }
 
-type GetConn<'a> = &'a dyn Fn() -> Box<dyn ClientStream>;
+type GetConn<'a> = Box<dyn Fn() -> BoxFuture<'static, Box<dyn ClientStream>> + Sync + Send>;
+type UseConn = Box<dyn Fn(GetConn, RunId) -> BoxFuture<'static, ()> + Sync + Send>;
 
 enum Action {
     // TODO: consolidate start/stop workers by making worker pools async by default
@@ -173,11 +176,10 @@ enum Action {
     StopWorkers(Wid),
     CancelWorkers(Wid),
 
-    #[allow(unused)] // for now
     WaitForCompletedRun(Run),
 
     /// Make a connection to the work server, the callback will test a request.
-    WSRunRequest(Run, Box<dyn Fn(GetConn, RunId) + Send + Sync>),
+    WSRunRequest(Run, UseConn),
 }
 
 type FlatResult<'a> = (WorkId, u32, &'a TestResult);
@@ -215,8 +217,8 @@ impl<'a> TestBuilder<'a> {
         self
     }
 
-    fn test(self) {
-        run_test(self.servers, self.steps)
+    async fn test(self) {
+        run_test(self.servers, self.steps).await
     }
 }
 
@@ -289,7 +291,7 @@ fn action_to_fut(
             };
 
             async move {
-                let worker_pool = WorkersNegotiator::negotiate_and_start_pool_on_executor(
+                let worker_pool = WorkersNegotiator::negotiate_and_start_pool(
                     config,
                     negotiator,
                     client_opts.clone(),
@@ -313,23 +315,28 @@ fn action_to_fut(
 
             worker_pool.wait().await;
 
-            let workers_result =
-                match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.shutdown())) {
-                    Ok(exit) => WorkersExitKind::Exit(exit),
-                    Err(_) => WorkersExitKind::Panic,
-                };
+            let workers_result = match panic::AssertUnwindSafe(worker_pool.shutdown())
+                .catch_unwind()
+                .await
+            {
+                Ok(exit) => WorkersExitKind::Exit(exit),
+                Err(_) => WorkersExitKind::Panic,
+            };
             worker_exit_kinds.lock().insert(n, workers_result);
         }
         .boxed(),
 
         CancelWorkers(worker_id) => async move {
-            let worker_pool = workers.lock().await.remove(&worker_id).unwrap();
+            let mut worker_pool = workers.lock().await.remove(&worker_id).unwrap();
 
-            let workers_result =
-                match panic::catch_unwind(panic::AssertUnwindSafe(|| worker_pool.cancel())) {
-                    Ok(exit) => WorkersExitKind::Exit(exit),
-                    Err(_) => WorkersExitKind::Panic,
-                };
+            worker_pool.cancel().await;
+            let workers_result = match panic::AssertUnwindSafe(worker_pool.shutdown())
+                .catch_unwind()
+                .await
+            {
+                Ok(exit) => WorkersExitKind::Exit(exit),
+                Err(_) => WorkersExitKind::Panic,
+            };
             worker_exit_kinds.lock().insert(worker_id, workers_result);
         }
         .boxed(),
@@ -375,110 +382,107 @@ fn action_to_fut(
             let run_id = get_run_id!(n);
             let work_scheduler_addr = queue.work_server_addr();
             async move {
-                let get_conn = &|| client.connect(work_scheduler_addr).unwrap();
-                callback(get_conn, run_id);
+                let get_conn: GetConn = Box::new(move || {
+                    let client = client.boxed_clone();
+                    async move { client.connect(work_scheduler_addr).await.unwrap() }.boxed()
+                });
+                callback(get_conn, run_id).await;
             }
             .boxed()
         }
     }
 }
 
-fn run_test(servers: Servers, steps: Steps) {
+async fn run_test(servers: Servers, steps: Steps<'_>) {
     let (mut queue, _deps) = match servers {
-        Unified(config, deps) => (Abq::start(config), deps),
+        Unified(config, deps) => (Abq::start(config).await, deps),
     };
 
     let client_opts =
         ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
-    let client = client_opts.clone().build().unwrap();
+    let client = client_opts.clone().build_async().unwrap();
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        let mut run_ids: HashMap<Run, RunId> = Default::default();
-        let mut run_results: HashMap<Run, SharedAssociatedTestResults> = Default::default();
+    let mut run_ids: HashMap<Run, RunId> = Default::default();
+    let mut run_results: HashMap<Run, SharedAssociatedTestResults> = Default::default();
 
-        let workers = Workers::default();
-        let workers_redundant = WorkersRedundant::default();
-        let worker_exit_kinds = WorkersExitKinds::default();
+    let workers = Workers::default();
+    let workers_redundant = WorkersRedundant::default();
+    let worker_exit_kinds = WorkersExitKinds::default();
 
-        for (action_set, asserts) in steps {
-            let mut futs = vec![];
-            for action in action_set {
-                let fut = action_to_fut(
-                    &queue,
-                    &mut run_ids,
-                    &mut run_results,
-                    client.boxed_clone(),
-                    client_opts.clone(),
-                    workers.clone(),
-                    workers_redundant.clone(),
-                    worker_exit_kinds.clone(),
-                    action,
-                );
+    for (action_set, asserts) in steps {
+        let mut futs = vec![];
+        for action in action_set {
+            let fut = action_to_fut(
+                &queue,
+                &mut run_ids,
+                &mut run_results,
+                client.boxed_clone(),
+                client_opts.clone(),
+                workers.clone(),
+                workers_redundant.clone(),
+                worker_exit_kinds.clone(),
+                action,
+            );
 
-                futs.push(fut);
-            }
+            futs.push(fut);
+        }
 
-            // Wait for all steps to complete, then we start the round asserts.
-            futures::future::join_all(futs).await;
+        // Wait for all steps to complete, then we start the round asserts.
+        futures::future::join_all(futs).await;
 
-            for check in asserts {
-                match check {
-                    TestResults(n, check) => {
-                        let results = run_results.get(&n).expect("run results not found");
-                        let results = results.lock();
+        for check in asserts {
+            match check {
+                TestResults(n, check) => {
+                    let results = run_results.get(&n).expect("run results not found");
+                    let results = results.lock();
 
-                        let flattened_results: Vec<_> = results
-                            .iter()
-                            .flat_map(
-                                |AssociatedTestResults {
-                                     work_id,
-                                     run_number,
-                                     results,
-                                     ..
-                                 }| {
-                                    results.iter().map(|result| (*work_id, *run_number, result))
-                                },
-                            )
-                            .collect();
+                    let flattened_results: Vec<_> = results
+                        .iter()
+                        .flat_map(
+                            |AssociatedTestResults {
+                                 work_id,
+                                 run_number,
+                                 results,
+                                 ..
+                             }| {
+                                results.iter().map(|result| (*work_id, *run_number, result))
+                            },
+                        )
+                        .collect();
 
-                        assert!(check(&flattened_results));
+                    assert!(check(&flattened_results));
+                }
+
+                WorkersAreRedundant(n) => {
+                    assert!(workers_redundant.lock().get(&n).unwrap());
+                }
+
+                WorkerExitStatus(n, workers_exit) => {
+                    let results = worker_exit_kinds.lock();
+                    let real_result = results.get(&n).expect("workers result not found");
+                    match real_result {
+                        WorkersExitKind::Exit(exit) => workers_exit(&exit.status),
+                        WorkersExitKind::Panic => panic!("expected exit result, not panic"),
                     }
+                }
 
-                    WorkersAreRedundant(n) => {
-                        assert!(workers_redundant.lock().get(&n).unwrap());
-                    }
-
-                    WorkerExitStatus(n, workers_exit) => {
-                        let results = worker_exit_kinds.lock();
-                        let real_result = results.get(&n).expect("workers result not found");
-                        match real_result {
-                            WorkersExitKind::Exit(exit) => workers_exit(&exit.status),
-                            WorkersExitKind::Panic => panic!("expected exit result, not panic"),
-                        }
-                    }
-
-                    WorkerResultStatus(n, workers_result) => {
-                        let results = worker_exit_kinds.lock();
-                        let real_result = results.get(&n).expect("workers result not found");
-                        workers_result(real_result)
-                    }
+                WorkerResultStatus(n, workers_result) => {
+                    let results = worker_exit_kinds.lock();
+                    let real_result = results.get(&n).expect("workers result not found");
+                    workers_result(real_result)
                 }
             }
         }
-    });
+    }
 
-    queue.shutdown().unwrap();
+    queue.shutdown().await.unwrap();
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
 #[traced_test]
-fn multiple_jobs_complete() {
+async fn multiple_jobs_complete() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
             echo_test(proto, "echo1".to_string()),
@@ -512,13 +516,14 @@ fn multiple_jobs_complete() {
                 ),
             ],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
-fn multiple_invokers() {
+async fn multiple_invokers() {
     let runner1 = {
         let manifest = ManifestMessage::new(Manifest::new(
             [
@@ -582,14 +587,15 @@ fn multiple_invokers() {
                 ),
             ],
         )
-        .test();
+        .test()
+        .await;
 }
 
 // TODO write some tests that smoke over # of workers and batch sizes
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
-fn batch_two_requests_at_a_time() {
+async fn batch_two_requests_at_a_time() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
             echo_test(proto, "echo1".to_string()),
@@ -625,12 +631,13 @@ fn batch_two_requests_at_a_time() {
                 ),
             ],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
-fn empty_manifest_exits_gracefully() {
+async fn empty_manifest_exits_gracefully() {
     let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, empty_manifest_msg());
 
     TestBuilder::default()
@@ -649,13 +656,14 @@ fn empty_manifest_exits_gracefully() {
                 ),
             ],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[traced_test]
 #[with_protocol_version]
-fn get_init_context_from_work_server_waiting_for_first_worker() {
+async fn get_init_context_from_work_server_waiting_for_first_worker() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
             echo_test(proto, "echo1".to_string()),
@@ -679,31 +687,37 @@ fn get_init_context_from_work_server_waiting_for_first_worker() {
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
-                use net_protocol::work_server::{Message, Request};
+                async move {
+                    use net_protocol::work_server::{Message, Request};
 
-                let mut conn = get_conn();
+                    let mut conn = get_conn().await;
 
-                // Ask the server for the next test; we should be told a manifest is still TBD.
-                net_protocol::write(
-                    &mut conn,
-                    Request {
-                        entity: Entity::local_client(),
-                        message: Message::InitContext { run_id },
-                    },
-                )
-                .unwrap();
+                    // Ask the server for the next test; we should be told a manifest is still TBD.
+                    net_protocol::async_write(
+                        &mut conn,
+                        &Request {
+                            entity: Entity::local_client(),
+                            message: Message::InitContext { run_id },
+                        },
+                    )
+                    .await
+                    .unwrap();
 
-                let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
+                    let response: InitContextResponse =
+                        net_protocol::async_read(&mut conn).await.unwrap();
 
-                assert!(matches!(response, InitContextResponse::WaitingForManifest));
+                    assert!(matches!(response, InitContextResponse::WaitingForManifest));
+                }
+                .boxed()
             }),
         )])
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
-fn get_init_context_from_work_server_waiting_for_manifest() {
+async fn get_init_context_from_work_server_waiting_for_manifest() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
         Default::default(),
@@ -720,32 +734,38 @@ fn get_init_context_from_work_server_waiting_for_manifest() {
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
-                use net_protocol::work_server::{Message, Request};
+                async move {
+                    use net_protocol::work_server::{Message, Request};
 
-                let mut conn = get_conn();
+                    let mut conn = get_conn().await;
 
-                // Ask the server for the next test; we should be told a manifest is still TBD.
-                net_protocol::write(
-                    &mut conn,
-                    Request {
-                        entity: Entity::local_client(),
-                        message: Message::InitContext { run_id },
-                    },
-                )
-                .unwrap();
+                    // Ask the server for the next test; we should be told a manifest is still TBD.
+                    net_protocol::async_write(
+                        &mut conn,
+                        &Request {
+                            entity: Entity::local_client(),
+                            message: Message::InitContext { run_id },
+                        },
+                    )
+                    .await
+                    .unwrap();
 
-                let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
+                    let response: InitContextResponse =
+                        net_protocol::async_read(&mut conn).await.unwrap();
 
-                assert!(matches!(response, InitContextResponse::WaitingForManifest));
+                    assert!(matches!(response, InitContextResponse::WaitingForManifest));
+                }
+                .boxed()
             }),
         )])
         .act([StopWorkers(Wid(1))])
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
-fn get_init_context_from_work_server_active() {
+async fn get_init_context_from_work_server_active() {
     let expected_init_meta = {
         let mut meta = MetadataMap::default();
         meta.insert("hello".to_string(), "world".into());
@@ -771,43 +791,49 @@ fn get_init_context_from_work_server_active() {
         .act([WSRunRequest(
             Run(1),
             Box::new(move |get_conn, run_id| {
-                use net_protocol::work_server::{Message, Request};
+                let expected_init_meta = expected_init_meta.clone();
+                async move {
+                    use net_protocol::work_server::{Message, Request};
 
-                // Ask the server for the work context, it should align with the init_meta we gave
-                // to begin with.
-                loop {
-                    let mut conn = get_conn();
+                    // Ask the server for the work context, it should align with the init_meta we gave
+                    // to begin with.
+                    loop {
+                        let mut conn = get_conn().await;
 
-                    net_protocol::write(
-                        &mut conn,
-                        Request {
-                            entity: Entity::local_client(),
-                            message: Message::InitContext {
-                                run_id: run_id.clone(),
+                        net_protocol::async_write(
+                            &mut conn,
+                            &Request {
+                                entity: Entity::local_client(),
+                                message: Message::InitContext {
+                                    run_id: run_id.clone(),
+                                },
                             },
-                        },
-                    )
-                    .unwrap();
+                        )
+                        .await
+                        .unwrap();
 
-                    match net_protocol::read(&mut conn).unwrap() {
-                        InitContextResponse::WaitingForManifest => continue,
-                        InitContextResponse::InitContext(InitContext { init_meta }) => {
-                            assert_eq!(init_meta, expected_init_meta);
-                            return;
+                        match net_protocol::async_read(&mut conn).await.unwrap() {
+                            InitContextResponse::WaitingForManifest => continue,
+                            InitContextResponse::InitContext(InitContext { init_meta }) => {
+                                assert_eq!(init_meta, expected_init_meta);
+                                return;
+                            }
+                            InitContextResponse::RunAlreadyCompleted { .. } => unreachable!(),
                         }
-                        InitContextResponse::RunAlreadyCompleted { .. } => unreachable!(),
                     }
                 }
+                .boxed()
             }),
         )])
         .act([StopWorkers(Wid(1))])
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[traced_test]
-fn get_init_context_after_run_already_completed() {
+async fn get_init_context_after_run_already_completed() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
         Default::default(),
@@ -831,34 +857,40 @@ fn get_init_context_after_run_already_completed() {
         .act([WSRunRequest(
             Run(1),
             Box::new(|get_conn, run_id| {
-                use net_protocol::work_server::{Message, Request};
+                async move {
+                    use net_protocol::work_server::{Message, Request};
 
-                let mut conn = get_conn();
+                    let mut conn = get_conn().await;
 
-                // Ask the server for the work context, we should be told the run is already done.
-                net_protocol::write(
-                    &mut conn,
-                    Request {
-                        entity: Entity::local_client(),
-                        message: Message::InitContext { run_id },
-                    },
-                )
-                .unwrap();
+                    // Ask the server for the work context, we should be told the run is already done.
+                    net_protocol::async_write(
+                        &mut conn,
+                        &Request {
+                            entity: Entity::local_client(),
+                            message: Message::InitContext { run_id },
+                        },
+                    )
+                    .await
+                    .unwrap();
 
-                let response: InitContextResponse = net_protocol::read(&mut conn).unwrap();
+                    let response: InitContextResponse =
+                        net_protocol::async_read(&mut conn).await.unwrap();
 
-                assert!(matches!(
-                    response,
-                    InitContextResponse::RunAlreadyCompleted { cancelled: false }
-                ));
+                    assert!(matches!(
+                        response,
+                        InitContextResponse::RunAlreadyCompleted { cancelled: false }
+                    ));
+                }
+                .boxed()
             }),
         )])
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
-fn getting_run_after_work_is_complete_returns_nothing() {
+async fn getting_run_after_work_is_complete_returns_nothing() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
             echo_test(proto, "echo1".to_string()),
@@ -914,12 +946,13 @@ fn getting_run_after_work_is_complete_returns_nothing() {
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
             )],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
-fn test_cancellation_drops_remaining_work() {
+async fn test_cancellation_drops_remaining_work() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
         Default::default(),
@@ -933,7 +966,7 @@ fn test_cancellation_drops_remaining_work() {
         .act([StartWorkers(
             Run(1),
             Wid(1),
-            WorkersConfigBuilder::new(1, runner.clone()),
+            WorkersConfigBuilder::new(1, runner.clone()).with_num_workers(one_nonzero_usize()),
         )])
         .step(
             [
@@ -962,11 +995,12 @@ fn test_cancellation_drops_remaining_work() {
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
             )],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
-fn failure_to_run_worker_command_exits_gracefully() {
+#[tokio::test]
+async fn failure_to_run_worker_command_exits_gracefully() {
     let runner = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
         cmd: "__zzz_not_a_command__".to_string(),
         args: Default::default(),
@@ -990,11 +1024,12 @@ fn failure_to_run_worker_command_exits_gracefully() {
                 Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
             )],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
-fn native_runner_fails_due_to_manifest_failure() {
+#[tokio::test]
+async fn native_runner_fails_due_to_manifest_failure() {
     let manifest = ManifestMessage::new_failure(OutOfBandError {
         message: "1 != 2".to_owned(),
         backtrace: Some(vec!["cmp.x".to_string(), "add.x".to_string()]),
@@ -1026,13 +1061,14 @@ fn native_runner_fails_due_to_manifest_failure() {
                 Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
             )],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
-fn multiple_tests_per_work_id_reported() {
+async fn multiple_tests_per_work_id_reported() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
             echo_test(proto, "echo1,echo2,echo3".to_string()),
@@ -1081,13 +1117,14 @@ fn multiple_tests_per_work_id_reported() {
                 ),
             ],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[timeout(1500)] // 1.5 second
-fn runner_panic_stops_worker() {
+async fn runner_panic_stops_worker() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
         Default::default(),
@@ -1107,14 +1144,15 @@ fn runner_panic_stops_worker() {
                 assert!(matches!(e, WorkersExitKind::Panic))
             })],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)]
-fn many_retries_complete() {
+async fn many_retries_complete() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
             echo_test(proto, "echo1".to_string()),
@@ -1166,14 +1204,15 @@ fn many_retries_complete() {
                 ),
             ],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)]
-fn many_retries_many_workers_complete() {
+async fn many_retries_many_workers_complete() {
     let attempts = 4;
     let num_tests = 64;
     let num_workers = 6;
@@ -1235,14 +1274,15 @@ fn many_retries_many_workers_complete() {
                 }),
             ))),
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[serial]
 #[timeout(3000)]
-fn many_retries_many_workers_complete_native() {
+async fn many_retries_many_workers_complete_native() {
     let attempts = 4;
     let num_tests = 64;
     let num_workers = 6;
@@ -1360,14 +1400,15 @@ fn many_retries_many_workers_complete_native() {
                 }),
             )],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[serial]
 #[timeout(2000)] // 2 seconds
-fn cancellation_native() {
+async fn cancellation_native() {
     use abq_native_runner_simulation::{legal_spawned_message, pack, Msg::*};
 
     let manifest = ManifestMessage::new(Manifest::new(
@@ -1453,13 +1494,14 @@ fn cancellation_native() {
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
             )],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
-fn retry_out_of_process_worker() {
+async fn retry_out_of_process_worker() {
     let manifest1 = ManifestMessage::new(Manifest::new(
         [
             echo_test(proto, "echo1".to_string()),
@@ -1520,13 +1562,14 @@ fn retry_out_of_process_worker() {
                 ),
             ],
         )
-        .test();
+        .test()
+        .await;
 }
 
-#[test]
+#[tokio::test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
-fn many_retries_of_many_out_of_process_workers() {
+async fn many_retries_of_many_out_of_process_workers() {
     let num_tests = 64;
     let num_workers = 6;
     let num_out_of_process_retries = 4;
@@ -1594,5 +1637,5 @@ fn many_retries_of_many_out_of_process_workers() {
             .step(end_workers_actions, end_workers_asserts);
     }
 
-    builder.test();
+    builder.test().await;
 }

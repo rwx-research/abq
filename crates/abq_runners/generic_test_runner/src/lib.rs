@@ -36,7 +36,7 @@ use abq_utils::net_protocol::workers::{
 };
 use abq_utils::{atomic, net_protocol};
 use futures::future::BoxFuture;
-use futures::{Future, FutureExt};
+use futures::FutureExt;
 use indoc::indoc;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -100,7 +100,6 @@ pub struct NativeRunnerInfo {
 pub async fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
-    native_runner_died: impl Future<Output = ()>,
 ) -> Result<(NativeRunnerInfo, RunnerConnection), GenericRunnerErrorKind> {
     let start = Instant::now();
     let (
@@ -113,10 +112,6 @@ pub async fn open_native_runner_connection(
         _ = tokio::time::sleep(timeout) => {
             tracing::error!(?timeout, elapsed=?start.elapsed(), "timeout");
             return Err(ProtocolVersionError::Timeout.into());
-        }
-
-        _  = native_runner_died => {
-            return Err(ProtocolVersionError::WorkerQuit.into());
         }
 
         opt_conn = listener.accept() => {
@@ -268,11 +263,28 @@ pub trait TestsFetcher {
 
 pub type GetNextTests = Box<dyn TestsFetcher + Send>;
 
+#[async_trait]
+pub trait ManifestSender {
+    async fn send_manifest(self: Box<Self>, manifest_result: ManifestResult);
+}
+
+pub type SendManifest = Box<dyn ManifestSender + Send + Sync>;
+
+pub type InitContextResult = Result<InitContext, RunAlreadyCompleted>;
+
+#[async_trait]
+pub trait InitContextFetcher {
+    async fn get_init_context(self: Box<Self>) -> io::Result<InitContextResult>;
+}
+
+pub type GetInitContext = Box<dyn InitContextFetcher + Send>;
+
 pub type Outcome = Result<TestRunnerExit, GenericRunnerError>;
 
-pub fn run_sync<SendManifest, GetInitContext>(
+pub fn run_sync(
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
+    protocol_version_timeout: Duration,
     working_dir: PathBuf,
     shutdown_immediately: OneshotRx,
     results_batch_size: u64,
@@ -282,12 +294,7 @@ pub fn run_sync<SendManifest, GetInitContext>(
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     debug_native_runner: bool,
-) -> Result<TestRunnerExit, GenericRunnerError>
-where
-    // TODO: make both of these async!
-    SendManifest: FnMut(ManifestResult),
-    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
-{
+) -> Result<TestRunnerExit, GenericRunnerError> {
     let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build());
@@ -295,6 +302,7 @@ where
     rt.block_on(run_async(
         runner_meta,
         input,
+        protocol_version_timeout,
         working_dir,
         shutdown_immediately,
         results_batch_size,
@@ -447,13 +455,9 @@ impl<'a> NativeRunnerHandle<'a> {
             CapturePipes::new(child_stdout, child_stderr)
         };
 
-        let native_runner_died = async {
-            let _ = child.wait().await;
-        };
-
         // First, get and validate the protocol version message.
         let opt_open_connection_err =
-            open_native_runner_connection(listener, protocol_version_timeout, native_runner_died)
+            open_native_runner_connection(listener, protocol_version_timeout)
                 .await
                 .located(here!());
 
@@ -583,9 +587,12 @@ impl<'a> NativeRunnerHandle<'a> {
 /// Each native test runner spawned by a worker has the environment variable `ABQ_WORKER` set to a integer.
 const ABQ_WORKER: &str = "ABQ_WORKER";
 
-pub async fn run_async<SendManifest, GetInitContext>(
+pub const DEFAULT_PROTOCOL_VERSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub async fn run_async(
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
+    protocol_version_timeout: Duration,
     working_dir: PathBuf,
     shutdown_immediately: OneshotRx,
     results_batch_size: u64,
@@ -595,19 +602,12 @@ pub async fn run_async<SendManifest, GetInitContext>(
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     _debug_native_runner: bool,
-) -> Result<TestRunnerExit, GenericRunnerError>
-where
-    SendManifest: FnMut(ManifestResult),
-    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
-{
+) -> Result<TestRunnerExit, GenericRunnerError> {
     let NativeTestRunnerParams {
         cmd,
         args,
         extra_env: mut additional_env,
     } = input;
-
-    // TODO: get from runner params
-    let protocol_version_timeout = Duration::from_secs(60);
 
     additional_env.insert(
         ABQ_WORKER.to_owned(),
@@ -660,7 +660,7 @@ where
     }
 }
 
-async fn run_help<SendManifest, GetInitContext>(
+async fn run_help(
     send_manifest: Option<SendManifest>,
     opt_native_runner_handle: Result<NativeRunnerHandle<'_>, GenericRunnerError>,
     get_init_context: GetInitContext,
@@ -670,18 +670,14 @@ async fn run_help<SendManifest, GetInitContext>(
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     runner_meta: RunnerMeta,
     // TODO this is already on the handle
-) -> Result<TestRunnerExit, GenericRunnerError>
-where
-    SendManifest: FnMut(ManifestResult),
-    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
-{
+) -> Result<TestRunnerExit, GenericRunnerError> {
     // If we need to retrieve the manifest, do that first.
     // If the native runner is erroring and we are generating the manigest,
     // the error will be attached to the generated manifest; otherwise, bail out.
     let mut native_runner_handle;
     let mut manifest_generation_output = None;
 
-    if let Some(mut send_manifest) = send_manifest {
+    if let Some(send_manifest) = send_manifest {
         let manifest_or_error = match opt_native_runner_handle {
             Ok(mut handle) => {
                 // Package the native runner handle into the result, so that we can initialize it
@@ -696,13 +692,17 @@ where
             Ok(((manifest, captured_output), handle)) => {
                 native_runner_handle = handle;
                 manifest_generation_output = Some(captured_output);
-                send_manifest(ManifestResult::Manifest(manifest));
+                send_manifest
+                    .send_manifest(ManifestResult::Manifest(manifest))
+                    .await;
             }
             Err(err) => {
-                send_manifest(ManifestResult::TestRunnerError {
-                    error: err.error.to_string(),
-                    output: err.output.clone(),
-                });
+                send_manifest
+                    .send_manifest(ManifestResult::TestRunnerError {
+                        error: err.error.to_string(),
+                        output: err.output.clone(),
+                    })
+                    .await;
                 return Err(err);
             }
         }
@@ -770,7 +770,7 @@ async fn try_send_result_to_channel(
     Ok(())
 }
 
-async fn execute_all_tests<'a, GetInitContext>(
+async fn execute_all_tests<'a>(
     native_runner_handle: &mut NativeRunnerHandle<'a>,
     get_init_context: GetInitContext,
     results_batch_size: u64,
@@ -778,10 +778,7 @@ async fn execute_all_tests<'a, GetInitContext>(
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     runner_meta: RunnerMeta,
-) -> Result<ExitCode, LocatedError>
-where
-    GetInitContext: Fn() -> io::Result<Result<InitContext, RunAlreadyCompleted>>,
-{
+) -> Result<ExitCode, LocatedError> {
     let NativeRunnerInfo {
         protocol: _,
         specification: runner_spec,
@@ -798,7 +795,7 @@ where
     // context-fetching in parallel.
     let init_context: InitContext;
     {
-        match get_init_context().located(here!())? {
+        match get_init_context.get_init_context().await.located(here!())? {
             Ok(the_init_context) => {
                 init_context = the_init_context;
                 native_runner_handle
@@ -1276,7 +1273,7 @@ pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
     working_dir: PathBuf,
 ) -> Result<(ReportedManifest, Vec<Vec<TestResult>>), GenericRunnerError> {
-    let mut manifest_message = None;
+    let manifest_message = Arc::new(Mutex::new(None));
 
     // Currently, an atomic mutex is used here because `send_manifest`, `get_next_test`, and the
     // main thread all need access to manifest's memory location. We can get away with unsafe code
@@ -1284,35 +1281,62 @@ pub fn execute_wrapped_runner(
     // and moreover, `send_manifest` will never be called again. But to avoid bugs, we don't do
     // that for now.
     let flat_manifest = Arc::new(Mutex::new(None));
-    let mut opt_error_cell = None;
+    let opt_error_cell = Arc::new(Mutex::new(None));
 
     let test_results = Arc::new(Mutex::new(vec![]));
 
-    let send_manifest = {
-        let flat_manifest = Arc::clone(&flat_manifest);
-        let manifest_message = &mut manifest_message;
-        let opt_error_cell = &mut opt_error_cell;
-        move |manifest_result: ManifestResult| match manifest_result {
-            ManifestResult::Manifest(real_manifest) => {
-                let mut flat_manifest = flat_manifest.lock();
+    #[allow(clippy::type_complexity)]
+    struct SendManifest {
+        flat_manifest: Arc<Mutex<Option<(Vec<TestSpec>, MetadataMap)>>>,
+        manifest_message: Arc<Mutex<Option<ReportedManifest>>>,
+        opt_error_cell: Arc<Mutex<Option<String>>>,
+    }
 
-                if manifest_message.is_some() || flat_manifest.is_some() {
-                    panic!("Manifest has already been defined, but is being sent again");
+    #[async_trait]
+    impl ManifestSender for SendManifest {
+        async fn send_manifest(self: Box<Self>, manifest: ManifestResult) {
+            let Self {
+                flat_manifest,
+                manifest_message,
+                opt_error_cell,
+            } = *self;
+            match manifest {
+                ManifestResult::Manifest(real_manifest) => {
+                    let mut flat_manifest = flat_manifest.lock();
+                    let mut manifest_message = manifest_message.lock();
+
+                    if manifest_message.is_some() || flat_manifest.is_some() {
+                        panic!("Manifest has already been defined, but is being sent again");
+                    }
+
+                    *manifest_message = Some(real_manifest.clone());
+                    *flat_manifest = Some(real_manifest.manifest.flatten());
                 }
-
-                *manifest_message = Some(real_manifest.clone());
-                *flat_manifest = Some(real_manifest.manifest.flatten());
-            }
-            ManifestResult::TestRunnerError { error, output: _ } => {
-                *opt_error_cell = Some(error);
+                ManifestResult::TestRunnerError { error, output: _ } => {
+                    *opt_error_cell.lock() = Some(error);
+                }
             }
         }
+    }
+
+    let send_manifest = SendManifest {
+        flat_manifest: flat_manifest.clone(),
+        manifest_message: manifest_message.clone(),
+        opt_error_cell: opt_error_cell.clone(),
     };
-    let get_init_context = || {
-        Ok(Ok(InitContext {
-            init_meta: Default::default(),
-        }))
-    };
+
+    struct GetInitContext;
+
+    #[async_trait]
+    impl InitContextFetcher for GetInitContext {
+        async fn get_init_context(self: Box<Self>) -> io::Result<InitContextResult> {
+            Ok(Ok(InitContext {
+                init_meta: Default::default(),
+            }))
+        }
+    }
+
+    let get_init_context = GetInitContext;
 
     struct Fetcher {
         #[allow(clippy::type_complexity)]
@@ -1367,18 +1391,19 @@ pub fn execute_wrapped_runner(
     let _opt_exit_error = run_sync(
         RunnerMeta::fake(),
         native_runner_params,
+        DEFAULT_PROTOCOL_VERSION_TIMEOUT,
         working_dir,
         shutdown_rx,
         5,
-        Some(send_manifest),
-        get_init_context,
+        Some(Box::new(send_manifest)),
+        Box::new(get_init_context),
         get_next_test,
         results_handler,
         Box::new(|| async {}.boxed()),
         false,
     );
 
-    if let Some(error) = opt_error_cell {
+    if let Some(error) = Arc::try_unwrap(opt_error_cell).unwrap().into_inner() {
         return Err(GenericRunnerError {
             error: io::Error::new(io::ErrorKind::InvalidInput, error).located(here!()),
             output: CapturedOutput::empty(),
@@ -1392,7 +1417,10 @@ pub fn execute_wrapped_runner(
         .collect();
 
     Ok((
-        manifest_message.expect("manifest never received!"),
+        Arc::try_unwrap(manifest_message)
+            .unwrap()
+            .into_inner()
+            .expect("manifest never received!"),
         test_results,
     ))
 }
@@ -1447,11 +1475,7 @@ mod test_validate_protocol_version_message {
                 .unwrap();
         };
 
-        let parent = open_native_runner_connection(
-            &mut listener,
-            Duration::from_secs(1),
-            sleep(Duration::MAX),
-        );
+        let parent = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         let (_, result) = futures::join!(child, parent);
 
@@ -1485,11 +1509,7 @@ mod test_validate_protocol_version_message {
                 .unwrap();
         };
 
-        let parent = open_native_runner_connection(
-            &mut listener,
-            Duration::from_secs(1),
-            sleep(Duration::MAX),
-        );
+        let parent = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         let (_, result) = futures::join!(child, parent);
 
@@ -1514,11 +1534,7 @@ mod test_validate_protocol_version_message {
                 .unwrap();
         };
 
-        let parent = open_native_runner_connection(
-            &mut listener,
-            Duration::from_secs(1),
-            sleep(Duration::MAX),
-        );
+        let parent = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         let (_, result) = futures::join!(child, parent);
 
@@ -1536,11 +1552,7 @@ mod test_validate_protocol_version_message {
             drop(stream);
         };
 
-        let parent = open_native_runner_connection(
-            &mut listener,
-            Duration::from_secs(1),
-            sleep(Duration::MAX),
-        );
+        let parent = open_native_runner_connection(&mut listener, Duration::from_secs(1));
 
         let (_, result) = futures::join!(child, parent);
 
@@ -1565,7 +1577,7 @@ mod test_validate_protocol_version_message {
                 .unwrap();
         };
 
-        let parent = open_native_runner_connection(&mut listener, timeout, sleep(Duration::MAX));
+        let parent = open_native_runner_connection(&mut listener, timeout);
 
         let (_, result) = futures::join!(child, parent);
 
@@ -1576,42 +1588,18 @@ mod test_validate_protocol_version_message {
             GenericRunnerErrorKind::ProtocolVersion(ProtocolVersionError::Timeout)
         ));
     }
-
-    #[tokio::test]
-    #[with_protocol_version]
-    async fn protocol_version_message_tunnel_connection_dies() {
-        let mut listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
-        let socket_addr = listener.local_addr().unwrap();
-
-        let timeout = Duration::from_millis(100);
-        let child = async {
-            sleep(Duration::from_millis(100)).await;
-            let mut stream = TcpStream::connect(socket_addr).await.unwrap();
-            let spawned_message = legal_spawned_message(proto);
-            net_protocol::async_write_local(&mut stream, &spawned_message)
-                .await
-                .unwrap();
-        };
-
-        let parent = open_native_runner_connection(&mut listener, timeout, sleep(Duration::ZERO));
-
-        let (_, result) = futures::join!(child, parent);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            GenericRunnerErrorKind::ProtocolVersion(ProtocolVersionError::WorkerQuit)
-        ));
-    }
 }
 
-#[cfg(test)]
-struct ImmediateTests {
+pub struct ImmediateTests {
     tests: Vec<NextWorkBundle>,
 }
 
-#[cfg(test)]
+impl ImmediateTests {
+    pub fn new(tests: Vec<NextWorkBundle>) -> Self {
+        Self { tests }
+    }
+}
+
 #[async_trait]
 impl TestsFetcher for ImmediateTests {
     async fn get_next_tests(&mut self) -> NextWorkBundle {
@@ -1638,10 +1626,47 @@ fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
     (all_test_run, Box::new(notify_all_tests_run))
 }
 
+pub struct StaticManifestCollector {
+    manifest: Arc<Mutex<Option<ManifestResult>>>,
+}
+
+impl StaticManifestCollector {
+    pub fn new(manifest: Arc<Mutex<Option<ManifestResult>>>) -> Self {
+        Self { manifest }
+    }
+}
+
+#[async_trait]
+impl ManifestSender for StaticManifestCollector {
+    async fn send_manifest(self: Box<Self>, result: ManifestResult) {
+        *self.manifest.lock() = Some(result);
+    }
+}
+
+pub struct StaticGetInitContext {
+    context: InitContextResult,
+}
+
+impl StaticGetInitContext {
+    pub fn new(context: InitContextResult) -> Self {
+        Self { context }
+    }
+}
+
+#[async_trait]
+impl InitContextFetcher for StaticGetInitContext {
+    async fn get_init_context(self: Box<Self>) -> io::Result<InitContextResult> {
+        Ok(self.context)
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
-    use crate::{execute_wrapped_runner, notify_all_tests_run, run_sync, ImmediateTests};
+    use crate::{
+        execute_wrapped_runner, notify_all_tests_run, run_sync, ImmediateTests,
+        StaticGetInitContext, StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+    };
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
@@ -1685,14 +1710,16 @@ mod test_abq_jest {
             extra_env: Default::default(),
         };
 
-        let mut manifest = None;
+        let manifest = Arc::new(Mutex::new(None));
         let test_results = Arc::new(Mutex::new(vec![]));
 
-        let send_manifest = |real_manifest| manifest = Some(real_manifest);
-        let get_init_context = || {
-            Ok(Ok(InitContext {
+        let send_manifest = StaticManifestCollector {
+            manifest: manifest.clone(),
+        };
+        let get_init_context = StaticGetInitContext {
+            context: Ok(InitContext {
                 init_meta: Default::default(),
-            }))
+            }),
         };
         let get_next_test = Box::new(ImmediateTests {
             tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
@@ -1705,11 +1732,12 @@ mod test_abq_jest {
         run_sync(
             RunnerMeta::fake(),
             input,
+            DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             npm_jest_project_path(),
             shutdown_rx,
             5,
-            Some(send_manifest),
-            get_init_context,
+            Some(Box::new(send_manifest)),
+            Box::new(get_init_context),
             get_next_test,
             results_handler,
             notify_all_tests_run,
@@ -1723,7 +1751,7 @@ mod test_abq_jest {
             mut manifest,
             native_runner_protocol,
             native_runner_specification,
-        } = match manifest.unwrap() {
+        } = match Arc::try_unwrap(manifest).unwrap().into_inner().unwrap() {
             ManifestResult::Manifest(man) => man,
             ManifestResult::TestRunnerError { .. } => unreachable!(),
         };
@@ -1847,7 +1875,9 @@ mod test_abq_jest {
             extra_env: Default::default(),
         };
 
-        let get_init_context = || Ok(Err(RunAlreadyCompleted { cancelled: false }));
+        let get_init_context = StaticGetInitContext {
+            context: Err(RunAlreadyCompleted { cancelled: false }),
+        };
         let get_next_test = ImmediateTests {
             tests: vec![NextWorkBundle::new(vec![NextWork::Work(WorkerTest {
                 spec: TestSpec {
@@ -1863,14 +1893,15 @@ mod test_abq_jest {
 
         let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
-        let runner_result = run_sync::<fn(ManifestResult), _>(
+        let runner_result = run_sync(
             RunnerMeta::fake(),
             input,
+            DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             npm_jest_project_path(),
             shutdown_rx,
             5,
             None,
-            get_init_context,
+            Box::new(get_init_context),
             Box::new(get_next_test),
             results_handler,
             notify_all_tests_run,
@@ -1888,7 +1919,12 @@ mod test_abq_jest {
 
 #[cfg(test)]
 mod test_invalid_command {
-    use crate::{notify_all_tests_run, run_sync, GenericRunnerError, ImmediateTests};
+    use std::sync::Arc;
+
+    use crate::{
+        notify_all_tests_run, run_sync, GenericRunnerError, ImmediateTests, StaticGetInitContext,
+        StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+    };
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
@@ -1896,6 +1932,7 @@ mod test_invalid_command {
     };
     use abq_utils::results_handler::NoopResultsHandler;
     use abq_utils::{atomic, oneshot_notify};
+    use parking_lot::Mutex;
 
     #[test]
     fn invalid_command_yields_error() {
@@ -1905,13 +1942,15 @@ mod test_invalid_command {
             extra_env: Default::default(),
         };
 
-        let mut manifest_result = None;
+        let manifest_result = Arc::new(Mutex::new(None));
 
-        let send_manifest = |result| manifest_result = Some(result);
-        let get_init_context = || {
-            Ok(Ok(InitContext {
+        let send_manifest = StaticManifestCollector {
+            manifest: manifest_result.clone(),
+        };
+        let get_init_context = StaticGetInitContext {
+            context: Ok(InitContext {
                 init_meta: Default::default(),
-            }))
+            }),
         };
         let get_next_test = ImmediateTests {
             tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
@@ -1925,18 +1964,22 @@ mod test_invalid_command {
         let runner_result = run_sync(
             RunnerMeta::fake(),
             input,
+            DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             std::env::current_dir().unwrap(),
             shutdown_rx,
             5,
-            Some(send_manifest),
-            get_init_context,
+            Some(Box::new(send_manifest)),
+            Box::new(get_init_context),
             Box::new(get_next_test),
             results_handler,
             notify_all_tests_run,
             false,
         );
 
-        let manifest_result = manifest_result.unwrap();
+        let manifest_result = Arc::try_unwrap(manifest_result)
+            .unwrap()
+            .into_inner()
+            .unwrap();
 
         assert!(matches!(
             manifest_result,

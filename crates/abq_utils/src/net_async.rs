@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::auth::Role;
 
 #[async_trait]
-pub trait ServerListener {
+pub trait ServerListener: Sync + Send {
     fn local_addr(&self) -> io::Result<SocketAddr>;
 
     /// Accept a stream, without performing any additional validation.

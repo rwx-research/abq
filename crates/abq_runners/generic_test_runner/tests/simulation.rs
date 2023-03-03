@@ -3,7 +3,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use abq_generic_test_runner::{GenericRunnerError, GetNextTests, TestsFetcher};
+use abq_generic_test_runner::{
+    GenericRunnerError, GetNextTests, ImmediateTests, SendManifest, StaticGetInitContext,
+    StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+};
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
 use abq_utils::exit::ExitCode;
@@ -24,7 +27,6 @@ use abq_utils::results_handler::{SharedAssociatedTestResults, StaticResultsHandl
 use abq_utils::{atomic, oneshot_notify};
 
 use abq_with_protocol_version::with_protocol_version;
-use async_trait::async_trait;
 use futures::FutureExt;
 use parking_lot::Mutex;
 use tempfile::{NamedTempFile, TempPath};
@@ -50,8 +52,6 @@ fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessag
     RawNativeRunnerSpawnedMessage::new(proto, protocol_version, runner_specification)
 }
 
-const NO_GENERATE_MANIFEST: Option<fn(ManifestResult)> = None;
-
 struct RunnerState {
     _simfile: TempPath,
     shutdown: OneshotTx,
@@ -59,7 +59,7 @@ struct RunnerState {
     all_tests_run: Arc<AtomicBool>,
 }
 
-fn get_simulated_runner<SendManifest: FnMut(ManifestResult)>(
+fn get_simulated_runner(
     simulation: impl IntoIterator<Item = Msg>,
     with_manifest: Option<SendManifest>,
     get_next_test: GetNextTests,
@@ -81,11 +81,9 @@ fn get_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     let all_results: SharedAssociatedTestResults = Default::default();
     let all_tests_run = Arc::new(AtomicBool::new(false));
 
-    let get_init_context = || {
-        Ok(Ok(InitContext {
-            init_meta: Default::default(),
-        }))
-    };
+    let get_init_context = StaticGetInitContext::new(Ok(InitContext {
+        init_meta: Default::default(),
+    }));
     let results_handler = Box::new(StaticResultsHandler::new(all_results.clone()));
 
     let notify_all_tests_run = {
@@ -103,11 +101,12 @@ fn get_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     let runner_task = abq_generic_test_runner::run_async(
         RunnerMeta::fake(),
         input,
+        DEFAULT_PROTOCOL_VERSION_TIMEOUT,
         std::env::current_dir().unwrap(),
         shutdown_rx,
         5,
         with_manifest,
-        get_init_context,
+        Box::new(get_init_context),
         get_next_test,
         results_handler,
         Box::new(notify_all_tests_run),
@@ -124,7 +123,7 @@ fn get_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     (runner_task, state)
 }
 
-fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
+fn run_simulated_runner(
     simulation: impl IntoIterator<Item = Msg>,
     with_manifest: Option<SendManifest>,
     get_next_test: GetNextTests,
@@ -162,7 +161,7 @@ fn run_simulated_runner<SendManifest: FnMut(ManifestResult)>(
     )
 }
 
-fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
+fn run_simulated_runner_to_error(
     simulation: impl IntoIterator<Item = Msg>,
     with_manifest: Option<SendManifest>,
     get_next_test: GetNextTests,
@@ -178,11 +177,9 @@ fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
         extra_env: Default::default(),
     };
 
-    let get_init_context = || {
-        Ok(Ok(InitContext {
-            init_meta: Default::default(),
-        }))
-    };
+    let get_init_context = StaticGetInitContext::new(Ok(InitContext {
+        init_meta: Default::default(),
+    }));
     let all_results: Arc<Mutex<Vec<AssociatedTestResults>>> = Default::default();
 
     let results_handler = Box::new(StaticResultsHandler::new(all_results.clone()));
@@ -203,11 +200,12 @@ fn run_simulated_runner_to_error<SendManifest: FnMut(ManifestResult)>(
     let err = abq_generic_test_runner::run_sync(
         RunnerMeta::fake(),
         input,
+        DEFAULT_PROTOCOL_VERSION_TIMEOUT,
         std::env::current_dir().unwrap(),
         shutdown_rx,
         5,
         with_manifest,
-        get_init_context,
+        Box::new(get_init_context),
         get_next_test,
         results_handler,
         Box::new(notify_all_tests_run),
@@ -232,17 +230,6 @@ macro_rules! check_bytes {
     ($out:expr, $expected:expr) => {
         assert_eq!($out, $expected, "{}", debug_bytes($out));
     };
-}
-
-struct ImmediateTests {
-    tests: Vec<NextWorkBundle>,
-}
-
-#[async_trait]
-impl TestsFetcher for ImmediateTests {
-    async fn get_next_tests(&mut self) -> NextWorkBundle {
-        self.tests.remove(0)
-    }
 }
 
 #[test]
@@ -302,12 +289,10 @@ fn capture_output_before_and_during_tests() {
             NextWork::EndOfWork,
         ])
     }
-    let get_next_tests = ImmediateTests {
-        tests: vec![work_bundle(proto)],
-    };
+    let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 
     let (mut results, _man_output, final_captures, notified_all_run) =
-        run_simulated_runner(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
+        run_simulated_runner(simulation, None, Box::new(get_next_tests));
 
     assert!(notified_all_run);
 
@@ -415,18 +400,14 @@ fn big_manifest() {
     ];
 
     let manifest: Arc<Mutex<Option<ManifestResult>>> = Default::default();
-    let with_manifest = Box::new({
-        let manifest = manifest.clone();
-        move |manifest_result| {
-            *manifest.lock() = Some(manifest_result);
-        }
-    });
-    let get_next_tests = ImmediateTests {
-        tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
-    };
+    let with_manifest = StaticManifestCollector::new(manifest.clone());
+    let get_next_tests = ImmediateTests::new(vec![NextWorkBundle::new(vec![NextWork::EndOfWork])]);
 
-    let (results, _man_output, _, notified_all_ran) =
-        run_simulated_runner(simulation, Some(with_manifest), Box::new(get_next_tests));
+    let (results, _man_output, _, notified_all_ran) = run_simulated_runner(
+        simulation,
+        Some(Box::new(with_manifest)),
+        Box::new(get_next_tests),
+    );
 
     assert!(notified_all_ran);
 
@@ -489,18 +470,14 @@ fn capture_output_during_manifest_gen() {
     ];
 
     let manifest: Arc<Mutex<Option<ManifestResult>>> = Default::default();
-    let with_manifest = Box::new({
-        let manifest = manifest.clone();
-        move |manifest_result| {
-            *manifest.lock() = Some(manifest_result);
-        }
-    });
-    let get_next_tests = ImmediateTests {
-        tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
-    };
+    let with_manifest = StaticManifestCollector::new(manifest.clone());
+    let get_next_tests = ImmediateTests::new(vec![NextWorkBundle::new(vec![NextWork::EndOfWork])]);
 
-    let (results, man_output, _, notified_all_ran) =
-        run_simulated_runner(simulation, Some(with_manifest), Box::new(get_next_tests));
+    let (results, man_output, _, notified_all_ran) = run_simulated_runner(
+        simulation,
+        Some(Box::new(with_manifest)),
+        Box::new(get_next_tests),
+    );
 
     assert!(notified_all_ran);
 
@@ -553,9 +530,7 @@ fn native_runner_respawn_for_higher_run_numbers() {
             NextWork::EndOfWork,
         ])
     }
-    let get_next_tests = ImmediateTests {
-        tests: vec![work_bundle(proto)],
-    };
+    let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 
     let simulation = [
         Connect,
@@ -576,8 +551,7 @@ fn native_runner_respawn_for_higher_run_numbers() {
         Exit(0),
     ];
 
-    let (mut results, _, _, _) =
-        run_simulated_runner(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
+    let (mut results, _, _, _) = run_simulated_runner(simulation, None, Box::new(get_next_tests));
 
     assert_eq!(results.len(), 3);
     results.sort_by_key(|r| r.work_id);
@@ -632,12 +606,10 @@ fn native_runner_fails_while_executing_tests() {
             NextWork::EndOfWork,
         ])
     }
-    let get_next_tests = ImmediateTests {
-        tests: vec![work_bundle(proto)],
-    };
+    let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 
     let (error, mut results, _notified_all_run) =
-        run_simulated_runner_to_error(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
+        run_simulated_runner_to_error(simulation, None, Box::new(get_next_tests));
 
     let GenericRunnerError { error: _, output } = error;
 
@@ -726,12 +698,9 @@ async fn cancellation_of_native_runner_succeeds() {
             NextWork::EndOfWork,
         ])
     }
-    let get_next_tests = ImmediateTests {
-        tests: vec![work_bundle(proto)],
-    };
+    let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 
-    let (run_tests_task, state) =
-        get_simulated_runner(simulation, NO_GENERATE_MANIFEST, Box::new(get_next_tests));
+    let (run_tests_task, state) = get_simulated_runner(simulation, None, Box::new(get_next_tests));
 
     let runner_handle = tokio::spawn(run_tests_task);
     state.shutdown.notify().unwrap();

@@ -80,14 +80,14 @@ pub struct CompletedSignaler {
 }
 
 impl CompletedSignaler {
-    pub fn completed(self) {
-        let _ = self.tx_completed.blocking_send(());
+    pub async fn completed(self) {
+        let _ = self.tx_completed.send(()).await;
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::{thread, time::Duration};
+    use std::time::Duration;
 
     use abq_run_n_times::n_times;
 
@@ -102,16 +102,16 @@ mod test {
 
         assert_eq!(live_count.read(), count);
 
-        let handle = thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             for _ in 1..count {
-                signal.clone().completed();
+                signal.clone().completed().await;
             }
-            signal.completed();
+            signal.completed().await;
         });
 
         live_count.wait().await;
         assert_eq!(live_count.read(), 0);
-        handle.join().unwrap();
+        handle.await.unwrap();
     }
 
     #[tokio::test]
@@ -123,16 +123,16 @@ mod test {
 
         assert_eq!(live_count.read(), count);
 
-        let handle = thread::spawn({
+        let handle = tokio::spawn({
             let signal = signal.clone();
-            move || {
+            async move {
                 for _ in 1..count {
-                    signal.clone().completed();
+                    signal.clone().completed().await;
                 }
             }
         });
 
-        handle.join().unwrap();
+        handle.await.unwrap();
         tokio::select! {
             _ = live_count.wait() => panic!("{}", live_count.read()),
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
@@ -150,15 +150,15 @@ mod test {
 
         assert_eq!(live_count.read(), count);
 
-        let handle = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
             for _ in 1..count {
-                signal.clone().completed();
+                signal.clone().completed().await;
             }
-            signal.completed();
+            signal.completed().await;
         });
 
-        handle.join().unwrap();
+        handle.await.unwrap();
         loop {
             tokio::select! {
                 _ = live_count.wait() => break,

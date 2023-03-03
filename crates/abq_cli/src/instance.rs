@@ -16,13 +16,13 @@ use tempfile::TempDir;
 use abq_queue::queue::{Abq, QueueConfig};
 
 use thiserror::Error;
-use tokio::{runtime::Builder, select};
+use tokio::select;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 type ClientAuthStrategy = abq_utils::auth::ClientAuthStrategy<abq_utils::auth::User>;
 
 /// Starts an [Abq] instance in the current process forever.
-pub fn start_abq_forever(
+pub async fn start_abq_forever(
     public_ip: Option<IpAddr>,
     bind_ip: IpAddr,
     server_port: u16,
@@ -48,7 +48,7 @@ pub fn start_abq_forever(
         server_options,
         persist_manifest,
     };
-    let mut abq = Abq::start(queue_config);
+    let mut abq = Abq::start(queue_config).await;
 
     tracing::debug!("Queue active at {}", abq.server_addr());
 
@@ -81,36 +81,33 @@ pub fn start_abq_forever(
     });
 
     // Make sure the queue retires on one term signal, and dies on two term signals.
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    rt.block_on(async {
-        let mut received_shutdown = false;
+    let mut received_shutdown = false;
 
-        loop {
-            select! {
-                _ = stop_queue_rx.recv() => {
-                    if received_shutdown {
-                        assert!(abq.is_retired());
-                        tracing::debug!("second shutdown signal; killing queue");
-                        // If we already received a shutdown signal, immediately
-                        // exit and kill the queue.
-                        return;
-                    }
-                    // Otherwise, move the queue into retirement and wake only
-                    // to check if it's fully been drained.
-                    received_shutdown = true;
-                    abq.retire();
-                    tracing::debug!("first shutdown signal; retiring queue");
+    loop {
+        select! {
+            _ = stop_queue_rx.recv() => {
+                if received_shutdown {
+                    assert!(abq.is_retired());
+                    tracing::debug!("second shutdown signal; killing queue");
+                    // If we already received a shutdown signal, immediately
+                    // exit and kill the queue.
+                    break;
                 }
+                // Otherwise, move the queue into retirement and wake only
+                // to check if it's fully been drained.
+                received_shutdown = true;
+                abq.retire();
+                tracing::debug!("first shutdown signal; retiring queue");
             }
         }
-    });
+    }
 
     tracing::debug!("shutting down queue");
     term_signals_handle.close();
     listen_for_signals_thread.join().unwrap();
 
     tracing::debug!("shut down queue");
-    abq.shutdown().unwrap();
+    abq.shutdown().await.unwrap();
 
     std::process::exit(0);
 }
@@ -159,7 +156,7 @@ impl AbqInstance {
         }
     }
 
-    pub fn new_ephemeral(
+    pub async fn new_ephemeral(
         opt_user_token: Option<UserToken>,
         client_auth: ClientAuthStrategy,
         server_tls: ServerTlsStrategy,
@@ -185,7 +182,7 @@ impl AbqInstance {
         let mut config = QueueConfig::new(persist_manifest);
         config.server_options = ServerOptions::new(server_auth, server_tls);
 
-        let queue = Abq::start(config);
+        let queue = Abq::start(config).await;
         let guards = EphemeralAbqGuards {
             _manifests_path: manifests_path,
         };

@@ -87,12 +87,8 @@ fn main() -> anyhow::Result<()> {
             rt.block_on(async {
                 let mut server = tokio::net::TcpListener::bind(server_addr).await?;
 
-                let (_runner_info, mut runner_conn) = open_native_runner_connection(
-                    &mut server,
-                    Duration::from_secs(10),
-                    tokio::time::sleep(Duration::MAX),
-                )
-                .await?;
+                let (_runner_info, mut runner_conn) =
+                    open_native_runner_connection(&mut server, Duration::from_secs(10)).await?;
                 let manifest = wait_for_manifest(&mut runner_conn).await?;
 
                 serde_json::to_writer(std::io::stdout(), &manifest)?;

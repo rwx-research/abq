@@ -2,9 +2,8 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::panic;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
-use std::{sync::mpsc, thread};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind};
 use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
@@ -21,11 +20,13 @@ use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
     ManifestResult, NativeTestRunnerParams, ReportedManifest, TestLikeRunner, WorkerTest,
 };
-use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, RunId, RunnerKind};
+use abq_utils::net_protocol::workers::{NextWork, RunId, RunnerKind};
 use abq_utils::oneshot_notify::{self, OneshotRx, OneshotTx};
 use abq_utils::results_handler::ResultsHandler;
+use async_trait::async_trait;
+use futures::FutureExt;
 
-use crate::liveness::LiveCount;
+use crate::liveness::{CompletedSignaler, LiveCount};
 use crate::runner_strategy::RunnerStrategy;
 use crate::{runner_strategy, test_like_runner};
 
@@ -35,18 +36,13 @@ pub use abq_generic_test_runner::GetNextTests;
 pub use abq_generic_test_runner::NotifyMaterialTestsAllRun;
 pub use abq_generic_test_runner::TestsFetcher;
 
-pub type GetNextTestsGenerator<'a> = &'a (dyn Fn(Entity) -> GetNextTests + Send + Sync);
+pub type NotifyManifest = abq_generic_test_runner::SendManifest;
+pub type GetInitContext = abq_generic_test_runner::GetInitContext;
 
-pub type GetInitContext =
-    Arc<dyn Fn(Entity) -> io::Result<InitContextResult> + Send + Sync + 'static>;
-pub type NotifyManifest = Box<dyn Fn(Entity, &RunId, ManifestResult) + Send + Sync + 'static>;
-
-pub type NotifyCancellation = Box<dyn FnOnce() + Send + Sync + 'static>;
-
-pub type NotifyMaterialTestsAllRunGenerator<'a> =
-    &'a (dyn Fn() -> NotifyMaterialTestsAllRun + Send + Sync);
-
-type MarkWorkerComplete = Box<dyn FnOnce() + Send + Sync + 'static>;
+#[async_trait]
+pub trait NotifyCancellation: Send {
+    async fn cancel(self: Box<Self>);
+}
 
 #[derive(Clone, Debug)]
 pub enum WorkerContext {
@@ -74,15 +70,12 @@ pub struct WorkerPoolConfig<'a> {
     pub runner_kind: RunnerKind,
     /// The work run we're working for.
     pub run_id: RunId,
-    /// When [`Some`], one worker must be chosen to generate and return the manifest the following
-    /// way.
-    pub notify_manifest: Option<NotifyManifest>,
-    /// How should workers initialize their native test runners?
-    pub get_init_context: GetInitContext,
+    /// Whether a runner on this pool should generate the manifest.
+    pub some_runner_should_generate_manifest: bool,
     /// How runners should communicate.
     pub runner_strategy_generator: &'a dyn runner_strategy::StrategyGenerator,
     /// How should the workers notify cancellation.
-    pub notify_cancellation: NotifyCancellation,
+    pub notify_cancellation: Box<dyn NotifyCancellation>,
     /// How many results should be sent back at a time?
     pub results_batch_size_hint: u64,
     /// Context under which workers should operate.
@@ -90,6 +83,8 @@ pub struct WorkerPoolConfig<'a> {
 
     /// Whether to allow passthrough of stdout/stderr from the native runner process.
     pub debug_native_runner: bool,
+    /// The maximum amount of time to wait for the protocol version message.
+    pub protocol_version_timeout: Duration,
 }
 
 /// Manages a pool of threads and processes upon which work is run and reported back.
@@ -109,7 +104,7 @@ pub struct WorkerPool {
     runners_shutdown: Option<Vec<OneshotTx>>,
     live_count: LiveCount,
 
-    notify_cancellation: Option<NotifyCancellation>,
+    notify_cancellation: Option<Box<dyn NotifyCancellation>>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -135,6 +130,18 @@ pub struct WorkersExit {
     pub final_captured_outputs: Vec<(RunnerMeta, CapturedOutput)>,
 }
 
+struct SignalRunnerCompletion {
+    runner_id: usize,
+    signal_completed: CompletedSignaler,
+}
+
+impl SignalRunnerCompletion {
+    async fn completed(self) {
+        self.signal_completed.completed().await;
+        tracing::debug!("runner {} done", self.runner_id);
+    }
+}
+
 impl WorkerPool {
     pub async fn new(config: WorkerPoolConfig<'_>) -> Self {
         let WorkerPoolConfig {
@@ -143,13 +150,13 @@ impl WorkerPool {
             tag: workers_tag,
             runner_kind,
             run_id,
-            get_init_context,
+            some_runner_should_generate_manifest,
             results_batch_size_hint: results_batch_size,
             runner_strategy_generator,
-            notify_manifest,
             notify_cancellation,
             worker_context,
             debug_native_runner,
+            protocol_version_timeout,
         } = config;
 
         let num_workers = size.get();
@@ -160,84 +167,35 @@ impl WorkerPool {
 
         let mut runners_shutdown = Vec::with_capacity(num_workers);
 
-        let mark_worker_complete = || {
-            let signal_completed = signal_completed.clone();
-            Box::new(move || {
-                signal_completed.completed();
-                tracing::debug!("worker done");
-            })
-        };
-
         let is_singleton_runner = num_workers == 1;
 
-        {
-            // Provision the first worker independently, so that if we need to generate a manifest,
-            // only it gets the manifest notifier.
-            // TODO: consider hiding this behind a macro for code duplication purposes
+        for runner_id in 1..=num_workers {
             let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
             runners_shutdown.push(shutdown_tx);
 
-            let get_init_context = Arc::clone(&get_init_context);
-            let mark_worker_complete = mark_worker_complete();
-
-            let entity = first_runner_entity;
-            let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(1));
-            let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
-
-            let RunnerStrategy {
-                get_next_tests,
-                results_handler,
-                notify_all_tests_run,
-            } = runner_strategy_generator.generate(entity);
-
-            debug_assert_eq!(entity.tag, entity::Tag::Runner(runner));
-
-            let worker_env = RunnerEnv {
-                entity,
-                runner_meta,
-                shutdown_immediately: shutdown_rx,
-                run_id: run_id.clone(),
-                get_init_context,
-                tests_fetcher: get_next_tests,
-                results_batch_size,
-                results_handler,
-                context: worker_context.clone(),
-                notify_manifest,
-                notify_all_tests_run,
-                debug_native_runner,
+            let mark_runner_complete = SignalRunnerCompletion {
+                runner_id,
+                signal_completed: signal_completed.clone(),
             };
 
-            let runner_kind = {
-                let mut runner = runner_kind.clone();
-                runner.set_runner_id(1);
-                runner
+            let entity = if runner_id == 1 {
+                first_runner_entity
+            } else {
+                Entity::runner(workers_tag, runner_id as u32)
             };
-
-            runners.push((
-                runner_meta,
-                ThreadWorker::new(runner_kind, worker_env, mark_worker_complete),
-            ));
-        }
-
-        // Provision the rest of the workers.
-        for runner_id in 1..num_workers {
-            let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
-            runners_shutdown.push(shutdown_tx);
-
-            let get_init_context = Arc::clone(&get_init_context);
-            let mark_worker_complete = mark_worker_complete();
-
-            let runner_id = runner_id + 1;
-            let entity = Entity::runner(workers_tag, runner_id as u32);
             let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(runner_id as u32));
             let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
-            debug_assert!(!is_singleton_runner);
+
+            // Have the first runner generate the manifest, if applicable.
+            let should_generate_manifest = some_runner_should_generate_manifest && runner_id == 1;
 
             let RunnerStrategy {
+                notify_manifest,
+                get_init_context,
                 get_next_tests,
                 results_handler,
                 notify_all_tests_run,
-            } = runner_strategy_generator.generate(entity);
+            } = runner_strategy_generator.generate(entity, should_generate_manifest);
 
             let worker_env = RunnerEnv {
                 entity,
@@ -250,8 +208,9 @@ impl WorkerPool {
                 results_handler,
                 notify_all_tests_run,
                 context: worker_context.clone(),
-                notify_manifest: None,
+                notify_manifest,
                 debug_native_runner,
+                protocol_version_timeout,
             };
 
             let runner_kind = {
@@ -262,7 +221,7 @@ impl WorkerPool {
 
             runners.push((
                 runner_meta,
-                ThreadWorker::new(runner_kind, worker_env, mark_worker_complete),
+                ThreadWorker::new(runner_kind, worker_env, mark_runner_complete),
             ));
         }
 
@@ -285,16 +244,14 @@ impl WorkerPool {
         self.live_count.read() > 0
     }
 
-    pub fn cancel(mut self) -> WorkersExit {
+    pub async fn cancel(&mut self) {
         let notify_cancellation = std::mem::take(&mut self.notify_cancellation)
             .expect("illegal state - cannot cancel more than once");
-        notify_cancellation();
-
-        self.shutdown()
+        notify_cancellation.cancel().await;
     }
 
     /// Shuts down the worker pool, returning the pool [exit status][WorkersExit].
-    pub fn shutdown(&mut self) -> WorkersExit {
+    pub async fn shutdown(&mut self) -> WorkersExit {
         debug_assert!(self.active);
 
         self.active = false;
@@ -317,7 +274,7 @@ impl WorkerPool {
                 .handle
                 .take()
                 .expect("worker thread already stolen")
-                .join()
+                .await
                 .expect("runner thread panicked rather than erroring");
 
             let final_captured_output = match opt_err {
@@ -390,7 +347,7 @@ impl Drop for WorkerPool {
 }
 
 struct ThreadWorker {
-    handle: Option<thread::JoinHandle<Result<TestRunnerExit, GenericRunnerError>>>,
+    handle: Option<tokio::task::JoinHandle<Result<TestRunnerExit, GenericRunnerError>>>,
 }
 
 enum AttemptError {
@@ -412,6 +369,7 @@ struct RunnerEnv {
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     context: WorkerContext,
+    protocol_version_timeout: Duration,
     debug_native_runner: bool,
 }
 
@@ -419,20 +377,23 @@ impl ThreadWorker {
     pub fn new(
         runner_kind: RunnerKind,
         worker_env: RunnerEnv,
-        mark_worker_complete: MarkWorkerComplete,
+        mark_runner_complete: SignalRunnerCompletion,
     ) -> Self {
-        let handle = thread::spawn(move || {
-            let result_wrapper =
-                panic::catch_unwind(panic::AssertUnwindSafe(|| match runner_kind {
-                    RunnerKind::GenericNativeTestRunner(params) => {
-                        start_generic_test_runner(worker_env, params)
-                    }
-                    RunnerKind::TestLikeRunner(runner, manifest) => {
-                        start_test_like_runner(worker_env, runner, *manifest)
-                    }
-                }));
+        let handle = tokio::spawn(async move {
+            let result_wrapper = match runner_kind {
+                RunnerKind::GenericNativeTestRunner(params) => {
+                    panic::AssertUnwindSafe(start_generic_test_runner(worker_env, params))
+                        .catch_unwind()
+                        .await
+                }
+                RunnerKind::TestLikeRunner(runner, manifest) => {
+                    panic::AssertUnwindSafe(start_test_like_runner(worker_env, runner, *manifest))
+                        .catch_unwind()
+                        .await
+                }
+            };
 
-            mark_worker_complete();
+            mark_runner_complete.completed().await;
 
             result_wrapper.unwrap()
         });
@@ -443,7 +404,7 @@ impl ThreadWorker {
     }
 }
 
-fn start_generic_test_runner(
+async fn start_generic_test_runner(
     env: RunnerEnv,
     native_runner_params: NativeTestRunnerParams,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
@@ -459,6 +420,7 @@ fn start_generic_test_runner(
         results_batch_size,
         context,
         shutdown_immediately,
+        protocol_version_timeout,
         debug_native_runner,
     } = env;
 
@@ -471,13 +433,6 @@ fn start_generic_test_runner(
         run_id, entity
     );
 
-    let notify_manifest = notify_manifest.map(|notify_manifest| {
-        let run_id = run_id.clone();
-        move |manifest_result| notify_manifest(entity, &run_id, manifest_result)
-    });
-
-    let get_init_context = move || get_init_context(entity);
-
     let get_next_tests_bundle: abq_generic_test_runner::GetNextTests = tests_fetcher;
 
     let working_dir = match context {
@@ -486,9 +441,10 @@ fn start_generic_test_runner(
     };
 
     // Running in its own thread.
-    abq_generic_test_runner::run_sync(
+    abq_generic_test_runner::run_async(
         runner_meta,
         native_runner_params,
+        protocol_version_timeout,
         working_dir,
         shutdown_immediately,
         results_batch_size,
@@ -499,6 +455,7 @@ fn start_generic_test_runner(
         notify_all_tests_run,
         debug_native_runner,
     )
+    .await
 }
 
 fn build_test_like_runner_manifest_result(
@@ -527,24 +484,21 @@ fn build_test_like_runner_manifest_result(
     })
 }
 
-fn start_test_like_runner(
+async fn start_test_like_runner(
     env: RunnerEnv,
     runner: TestLikeRunner,
     manifest: ManifestMessage,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     let RunnerEnv {
-        entity,
         runner_meta,
-        mut shutdown_immediately,
-        mut tests_fetcher,
+        shutdown_immediately,
+        tests_fetcher,
         get_init_context,
-        run_id,
-        results_batch_size: _,
-        mut results_handler,
+        results_handler,
         notify_all_tests_run,
         context,
         notify_manifest,
-        debug_native_runner: _,
+        ..
     } = env;
 
     match runner {
@@ -572,17 +526,17 @@ fn start_test_like_runner(
         let manifest_result = build_test_like_runner_manifest_result(manifest);
         match manifest_result {
             Ok(manifest) => {
-                notify_manifest(entity, &run_id, ManifestResult::Manifest(manifest));
+                notify_manifest
+                    .send_manifest(ManifestResult::Manifest(manifest))
+                    .await;
             }
             Err(oob) => {
-                notify_manifest(
-                    entity,
-                    &run_id,
-                    ManifestResult::TestRunnerError {
+                notify_manifest
+                    .send_manifest(ManifestResult::TestRunnerError {
                         error: oob.to_string(),
                         output: CapturedOutput::empty(),
-                    },
-                );
+                    })
+                    .await;
                 return Err(GenericRunnerError::no_captures(
                     GenericRunnerErrorKind::NativeRunner(oob.into()).located(here!()),
                 ));
@@ -590,7 +544,8 @@ fn start_test_like_runner(
         };
     }
 
-    let init_context = match get_init_context(entity) {
+    let init_context_result = get_init_context.get_init_context().await;
+    let init_context = match init_context_result {
         Ok(context_result) => match context_result {
             Ok(ctx) => ctx,
             Err(RunAlreadyCompleted { cancelled }) => {
@@ -619,34 +574,45 @@ fn start_test_like_runner(
         }
     };
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    tokio::select! {
+        exit_early = test_like_runner_exec_loop(tests_fetcher, runner.clone(), context, init_context, runner_meta, results_handler) => {
+            if let Some(value) = exit_early
+            {
+                return value;
+            }
+        }
+        _ = shutdown_immediately => {
+            if matches!(runner, TestLikeRunner::NeverReturnOnTest(..)) {
+                return Err(GenericRunnerError::no_captures(
+                    io::Error::new(io::ErrorKind::Unsupported, "will not return test")
+                        .located(here!()),
+                ));
+            }
+        }
+    }
 
+    notify_all_tests_run().await;
+
+    Ok(TestRunnerExit {
+        exit_code: ExitCode::SUCCESS,
+        manifest_generation_output: None,
+        final_captured_output: CapturedOutput::empty(),
+        native_runner_info: None,
+    })
+}
+
+async fn test_like_runner_exec_loop(
+    mut tests_fetcher: GetNextTests,
+    runner: TestLikeRunner,
+    context: WorkerContext,
+    init_context: InitContext,
+    runner_meta: RunnerMeta,
+    mut results_handler: ResultsHandler,
+) -> Option<Result<TestRunnerExit, GenericRunnerError>> {
     'tests_done: loop {
-        // First, check if we have been asked to shutdown.
-        // TODO: wrap the whole test-like runner loop as async
-        let bundle = match shutdown_immediately.try_recv() {
-            Ok(()) => {
-                if matches!(&runner, TestLikeRunner::NeverReturnOnTest(..)) {
-                    return Err(GenericRunnerError::no_captures(
-                        io::Error::new(io::ErrorKind::Unsupported, "will not return test")
-                            .located(here!()),
-                    ));
-                }
-                break;
-            }
-            Err(mpsc::TryRecvError::Disconnected) => panic!("Pool died before worker did"),
-            Err(mpsc::TryRecvError::Empty) => {
-                // No message from the parent. Wait for the next test_id to come in.
-                let NextWorkBundle { work: bundle, .. } =
-                    rt.block_on(tests_fetcher.get_next_tests());
-                bundle
-            }
-        };
+        let bundle = tests_fetcher.get_next_tests().await;
 
-        for next_work in bundle {
+        for next_work in bundle.work {
             match next_work {
                 NextWork::EndOfWork => {
                     // Shut down the worker
@@ -658,10 +624,10 @@ fn start_test_like_runner(
                 }) => {
                     if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == test_case.id() )
                     {
-                        return Err(GenericRunnerError::no_captures(
+                        return Some(Err(GenericRunnerError::no_captures(
                             io::Error::new(io::ErrorKind::Unsupported, "will not return test")
                                 .located(here!()),
-                        ));
+                        )));
                     }
 
                     // Try the test_id once + how ever many retries were requested.
@@ -716,7 +682,7 @@ fn start_test_like_runner(
                             after_all_tests: None,
                         };
 
-                        rt.block_on(results_handler.send_results(vec![associated_result]));
+                        results_handler.send_results(vec![associated_result]).await;
                         break 'attempts;
                     }
                 }
@@ -724,14 +690,7 @@ fn start_test_like_runner(
         }
     }
 
-    rt.block_on(notify_all_tests_run());
-
-    Ok(TestRunnerExit {
-        exit_code: ExitCode::SUCCESS,
-        manifest_generation_output: None,
-        final_captured_output: CapturedOutput::empty(),
-        native_runner_info: None,
-    })
+    None
 }
 
 #[inline(always)]
@@ -832,13 +791,15 @@ fn attempt_test_id_for_test_like_runner(
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, VecDeque};
-    use std::io;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use abq_generic_test_runner::{
+        StaticGetInitContext, StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+    };
     use abq_test_utils::artifacts_dir;
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
     use abq_utils::exit::ExitCode;
@@ -848,6 +809,7 @@ mod test {
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Test, TestCase, TestOrGroup, TestResult,
     };
+
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
         ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
@@ -860,16 +822,15 @@ mod test {
     use abq_with_protocol_version::with_protocol_version;
     use async_trait::async_trait;
     use futures::FutureExt;
+    use parking_lot::Mutex;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
     use super::{
-        GetNextTests, GetNextTestsGenerator, InitContextResult, NotifyCancellation, NotifyManifest,
-        NotifyMaterialTestsAllRun, NotifyMaterialTestsAllRunGenerator, TestsFetcher, WorkerContext,
-        WorkerPool,
+        GetNextTests, InitContextResult, NotifyCancellation, NotifyManifest,
+        NotifyMaterialTestsAllRun, TestsFetcher, WorkerContext, WorkerPool,
     };
     use crate::negotiate::QueueNegotiator;
-    use crate::results_handler::ResultsHandlerGenerator;
     use crate::runner_strategy::{self, RunnerStrategy};
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
     use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkId};
@@ -885,8 +846,10 @@ mod test {
     impl TestsFetcher for Fetcher {
         async fn get_next_tests(&mut self) -> NextWorkBundle {
             loop {
-                if let Some(work) = self.reader.lock().unwrap().pop_front() {
-                    return NextWorkBundle::new(vec![work]);
+                let head = { self.reader.lock().pop_front() };
+                match head {
+                    Some(work) => return NextWorkBundle::new(vec![work]),
+                    None => tokio::time::sleep(Duration::from_micros(10)).await,
                 }
             }
         }
@@ -896,7 +859,7 @@ mod test {
         let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
         let reader = Arc::clone(&writer);
         let write_work = move |work| {
-            writer.lock().unwrap().push_back(work);
+            writer.lock().push_back(work);
         };
 
         let get_next_tests = move |_| {
@@ -905,16 +868,6 @@ mod test {
             get_next_tests
         };
         (write_work, get_next_tests)
-    }
-
-    fn manifest_collector() -> (ManifestCollector, NotifyManifest) {
-        let man: ManifestCollector = Arc::new(Mutex::new(None));
-        let man2 = Arc::clone(&man);
-        let results_handler: NotifyManifest = Box::new(move |_, _, man| {
-            let old_manifest = man2.lock().unwrap().replace(man);
-            debug_assert!(old_manifest.is_none(), "Overwriting a manifest! This is either a bug in your test, or the worker pool implementation.");
-        });
-        (man, results_handler)
     }
 
     struct StaticResultsCollector {
@@ -928,7 +881,7 @@ mod test {
                 work_id, results, ..
             } in results
             {
-                let old_result = self.results.lock().unwrap().insert(work_id, results);
+                let old_result = self.results.lock().insert(work_id, results);
                 debug_assert!(old_result.is_none(), "Overwriting a result! This is either a bug in your test, or the worker pool implementation.");
             }
         }
@@ -956,7 +909,7 @@ mod test {
             let all = all.clone();
             move || {
                 let atomic = Arc::new(AtomicBool::new(false));
-                all.lock().unwrap().push(atomic.clone());
+                all.lock().push(atomic.clone());
 
                 let notifier = move || {
                     async move {
@@ -971,21 +924,43 @@ mod test {
         (all, generator)
     }
 
-    fn empty_init_context(_entity: Entity) -> io::Result<InitContextResult> {
-        Ok(Ok(InitContext {
+    fn empty_init_context() -> InitContextResult {
+        Ok(InitContext {
             init_meta: Default::default(),
-        }))
+        })
     }
 
+    type GetNextTestsGenerator<'a> = &'a (dyn Fn(Entity) -> GetNextTests + Send + Sync);
+    type NotifyMaterialTestsAllRunGenerator<'a> =
+        &'a (dyn Fn() -> NotifyMaterialTestsAllRun + Send + Sync);
+    type ResultsHandlerGenerator<'a> = &'a (dyn Fn(Entity) -> ResultsHandler + Send + Sync);
+
     struct StaticRunnerStrategy<'a> {
+        manifest_collector: ManifestCollector,
         get_next_tests_generator: GetNextTestsGenerator<'a>,
         results_handler_generator: ResultsHandlerGenerator<'a>,
         notify_all_tests_run_generator: NotifyMaterialTestsAllRunGenerator<'a>,
     }
 
     impl<'a> runner_strategy::StrategyGenerator for StaticRunnerStrategy<'a> {
-        fn generate(&self, runner_entity: Entity) -> RunnerStrategy {
+        fn generate(
+            &self,
+            runner_entity: Entity,
+            should_generate_manifest: bool,
+        ) -> RunnerStrategy {
+            let notify_manifest: Option<NotifyManifest> = if should_generate_manifest {
+                Some(Box::new(StaticManifestCollector::new(
+                    self.manifest_collector.clone(),
+                )))
+            } else {
+                None
+            };
+
+            let get_init_context = StaticGetInitContext::new(empty_init_context());
+
             RunnerStrategy {
+                notify_manifest,
+                get_init_context: Box::new(get_init_context),
                 get_next_tests: (self.get_next_tests_generator)(runner_entity),
                 results_handler: (self.results_handler_generator)(runner_entity),
                 notify_all_tests_run: (self.notify_all_tests_run_generator)(),
@@ -998,26 +973,22 @@ mod test {
         worker_pool_tag: WorkerTag,
         run_id: RunId,
         runner_strategy_generator: &'a StaticRunnerStrategy<'a>,
-        notify_cancellation: NotifyCancellation,
-    ) -> (WorkerPoolConfig<'a>, ManifestCollector) {
-        let (manifest_collector, notify_manifest) = manifest_collector();
-
-        let config = WorkerPoolConfig {
+        notify_cancellation: Box<dyn NotifyCancellation>,
+    ) -> WorkerPoolConfig<'a> {
+        WorkerPoolConfig {
             size: NonZeroUsize::new(1).unwrap(),
+            some_runner_should_generate_manifest: true,
             tag: worker_pool_tag,
             first_runner_entity: Entity::first_runner(worker_pool_tag),
-            get_init_context: Arc::new(empty_init_context),
             results_batch_size_hint: 5,
             runner_kind,
             runner_strategy_generator,
             run_id,
-            notify_manifest: Some(notify_manifest),
             notify_cancellation,
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
-        };
-
-        (config, manifest_collector)
+            protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        }
     }
 
     fn local_work(test: TestCase, work_id: WorkId) -> NextWork {
@@ -1034,35 +1005,44 @@ mod test {
         TestOrGroup::test(Test::new(protocol, echo_msg, [], Default::default()))
     }
 
-    fn await_manifest_tests(manifest: ManifestCollector) -> Vec<TestSpec> {
+    async fn await_manifest_tests(manifest: ManifestCollector) -> Vec<TestSpec> {
         loop {
-            match manifest.lock().unwrap().take() {
+            let man = { manifest.lock().take() };
+            match man {
                 Some(ManifestResult::Manifest(manifest)) => return manifest.manifest.flatten().0,
                 Some(ManifestResult::TestRunnerError { .. }) => unreachable!(),
-                None => continue,
+                None => {
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                    continue;
+                }
             }
         }
     }
 
-    fn await_results<F>(results: ResultsCollector, predicate: F)
+    async fn await_results<F>(results: ResultsCollector, predicate: F)
     where
         F: Fn(&ResultsCollector) -> bool,
     {
         let duration = Instant::now();
 
         while !predicate(&results) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
             if duration.elapsed() >= Duration::from_secs(5) {
                 panic!(
                     "Failed to match the predicate within 5 seconds. Current results: {:?}",
                     results
                 );
             }
-            // spin
         }
     }
 
-    fn noop_notify_cancellation() -> NotifyCancellation {
-        Box::new(|| {})
+    fn noop_notify_cancellation() -> Box<dyn NotifyCancellation> {
+        struct Noop {}
+        #[async_trait]
+        impl NotifyCancellation for Noop {
+            async fn cancel(self: Box<Self>) {}
+        }
+        Box::new(Noop {})
     }
 
     async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
@@ -1079,14 +1059,16 @@ mod test {
             echo_test(protocol, echo_string)
         });
         let manifest = ManifestMessage::new(Manifest::new(tests, Default::default()));
+        let manifest_collector = ManifestCollector::default();
 
         let runner_strategy = StaticRunnerStrategy {
+            manifest_collector: manifest_collector.clone(),
             get_next_tests_generator: &get_next_tests,
             results_handler_generator: &results_handler_generator,
             notify_all_tests_run_generator: &notify_all_tests_run_generator,
         };
 
-        let (default_config, manifest_collector) = setup_pool(
+        let default_config = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
             WorkerTag::new(0),
             run_id,
@@ -1102,7 +1084,7 @@ mod test {
         let mut pool = WorkerPool::new(config).await;
 
         // Write the work
-        let tests = await_manifest_tests(manifest_collector);
+        let tests = await_manifest_tests(manifest_collector).await;
 
         for (i, test) in tests.into_iter().enumerate() {
             write_work(local_work(test.test_case, WorkId([i as _; 16])))
@@ -1116,7 +1098,6 @@ mod test {
         await_results(results, |results| {
             let results: HashMap<_, _> = results
                 .lock()
-                .unwrap()
                 .clone()
                 .into_iter()
                 .map(|(k, rs)| {
@@ -1126,15 +1107,17 @@ mod test {
                 .collect();
 
             results == expected_results
-        });
+        })
+        .await;
 
-        let exit = pool.shutdown();
+        pool.wait().await;
+        let exit = pool.shutdown().await;
         assert!(matches!(
             exit.status,
             WorkersExitStatus::Completed(ExitCode::SUCCESS)
         ));
 
-        let all_completed = all_completed.lock().unwrap();
+        let all_completed = all_completed.lock();
         assert_eq!(all_completed.len(), num_workers);
         assert!(all_completed.iter().all(|b| b.load(atomic::ORDERING)));
     }
@@ -1310,18 +1293,19 @@ mod test {
         pool.shutdown();
     }
 
-    #[test]
+    #[tokio::test]
     #[traced_test]
-    fn bad_message_doesnt_take_down_queue_negotiator_server() {
+    async fn bad_message_doesnt_take_down_queue_negotiator_server() {
         let listener =
             ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
-                .bind("0.0.0.0:0")
+                .bind_async("0.0.0.0:0")
+                .await
                 .unwrap();
         let listener_addr = listener.local_addr().unwrap();
 
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
 
-        let mut negotiator = QueueNegotiator::new(
+        let mut negotiator = QueueNegotiator::start(
             listener_addr.ip(),
             listener,
             shutdown_rx,
@@ -1329,7 +1313,7 @@ mod test {
             "0.0.0.0:0".parse().unwrap(),
             |_, _| panic!("should not ask for assigned run in this test"),
         )
-        .unwrap();
+        .await;
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
             .build()
@@ -1338,7 +1322,7 @@ mod test {
         net_protocol::write(&mut conn, "bad message").unwrap();
 
         shutdown_tx.shutdown_immediately().unwrap();
-        negotiator.join();
+        negotiator.join().await;
 
         logs_with_scope_contain("", "error handling connection");
     }
@@ -1348,14 +1332,16 @@ mod test {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
+        let manifest_collector = ManifestCollector::default();
 
         let runner_strategy = StaticRunnerStrategy {
+            manifest_collector: manifest_collector.clone(),
             get_next_tests_generator: &get_next_tests,
             results_handler_generator: &results_handler_generator,
             notify_all_tests_run_generator: &notify_all_tests_run_generator,
         };
 
-        let (default_config, _manifest_collector) = setup_pool(
+        let default_config = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
                 // This command should cause the worker to error, since it can't even be executed
                 cmd: "__zzz_not_a_command__".into(),
@@ -1371,11 +1357,11 @@ mod test {
         let mut pool = WorkerPool::new(default_config).await;
 
         pool.wait().await;
-        let pool_exit = pool.shutdown();
+        let pool_exit = pool.shutdown().await;
 
         assert!(matches!(pool_exit.status, WorkersExitStatus::Error { .. }));
 
-        let all_completed = all_completed.lock().unwrap();
+        let all_completed = all_completed.lock();
         assert_eq!(all_completed.len(), 1);
         assert!(!all_completed[0].load(atomic::ORDERING));
     }
@@ -1385,8 +1371,10 @@ mod test {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
+        let manifest_collector = ManifestCollector::default();
 
         let runner_strategy = StaticRunnerStrategy {
+            manifest_collector: manifest_collector.clone(),
             get_next_tests_generator: &get_next_tests,
             results_handler_generator: &results_handler_generator,
             notify_all_tests_run_generator: &notify_all_tests_run_generator,
@@ -1395,7 +1383,7 @@ mod test {
         let writefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let writefile_path = writefile.to_path_buf();
 
-        let (mut config, _manifest_collector) = setup_pool(
+        let mut config = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
                 cmd: abqtest_write_runner_number_path().display().to_string(),
                 args: vec![writefile_path.display().to_string()],
@@ -1408,8 +1396,10 @@ mod test {
         );
 
         config.size = NonZeroUsize::new(5).unwrap();
+        config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;
+        pool.wait().await;
         let _pool_exit = pool.shutdown();
 
         let worker_ids = std::fs::read_to_string(writefile).unwrap();
@@ -1417,7 +1407,7 @@ mod test {
         worker_ids.sort();
         assert_eq!(worker_ids, &["1", "2", "3", "4", "5"]);
 
-        let all_completed = all_completed.lock().unwrap();
+        let all_completed = all_completed.lock();
         assert_eq!(all_completed.len(), 5);
     }
 
@@ -1426,8 +1416,10 @@ mod test {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
+        let manifest_collector = ManifestCollector::default();
 
         let runner_strategy = StaticRunnerStrategy {
+            manifest_collector: manifest_collector.clone(),
             get_next_tests_generator: &get_next_tests,
             results_handler_generator: &results_handler_generator,
             notify_all_tests_run_generator: &notify_all_tests_run_generator,
@@ -1436,7 +1428,7 @@ mod test {
         let writefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
         let writefile_path = writefile.to_path_buf();
 
-        let (mut config, _manifest_collector) = setup_pool(
+        let mut config = setup_pool(
             RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
                 cmd: abqtest_write_worker_number_path().display().to_string(),
                 args: vec![writefile_path.display().to_string()],
@@ -1449,14 +1441,16 @@ mod test {
         );
 
         config.size = NonZeroUsize::new(3).unwrap();
+        config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;
+        pool.wait().await;
         let _pool_exit = pool.shutdown();
 
         let worker_ids = std::fs::read_to_string(writefile).unwrap();
         assert_eq!(worker_ids, "152\n152\n152\n");
 
-        let all_completed = all_completed.lock().unwrap();
+        let all_completed = all_completed.lock();
         assert_eq!(all_completed.len(), 3);
     }
 
@@ -1466,8 +1460,10 @@ mod test {
         let (_write_work, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
+        let manifest_collector = ManifestCollector::default();
 
         let runner_strategy = StaticRunnerStrategy {
+            manifest_collector: manifest_collector.clone(),
             get_next_tests_generator: &get_next_tests,
             results_handler_generator: &results_handler_generator,
             notify_all_tests_run_generator: &notify_all_tests_run_generator,
@@ -1477,7 +1473,7 @@ mod test {
             [echo_test(proto, "test1".to_string())],
             Default::default(),
         ));
-        let (mut config, _manifest_collector) = setup_pool(
+        let mut config = setup_pool(
             RunnerKind::TestLikeRunner(TestLikeRunner::ExitWith(27), Box::new(manifest)),
             WorkerTag::new(0),
             RunId::unique(),
@@ -1486,9 +1482,11 @@ mod test {
         );
 
         config.size = NonZeroUsize::new(1).unwrap();
+        config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;
-        let pool_exit = pool.shutdown();
+        pool.wait().await;
+        let pool_exit = pool.shutdown().await;
 
         assert!(
             matches!(
@@ -1498,7 +1496,7 @@ mod test {
             "{pool_exit:?}"
         );
 
-        let all_completed = all_completed.lock().unwrap();
+        let all_completed = all_completed.lock();
         assert_eq!(all_completed.len(), 1);
     }
 }

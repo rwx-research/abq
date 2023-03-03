@@ -1,5 +1,6 @@
 //! Module negotiate helps worker pools attach to queues.
 
+use async_trait::async_trait;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -7,18 +8,18 @@ use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     sync::Arc,
-    thread,
     time::Duration,
 };
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use tracing::{error, instrument};
 
 use crate::{
     negotiate,
     runner_strategy::RunnerStrategyGenerator,
     workers::{
-        GetInitContext, InitContextResult, NotifyCancellation, NotifyManifest, WorkerContext,
-        WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus,
+        NotifyCancellation, WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
+        WorkersExitStatus,
     },
 };
 use abq_utils::{
@@ -32,11 +33,11 @@ use abq_utils::{
         entity::{Entity, WorkerTag},
         meta::DeprecationRecord,
         publicize_addr,
-        queue::{InvokeWork, NegotiatorInfo, RunAlreadyCompleted},
+        queue::{InvokeWork, NegotiatorInfo},
         workers::{RunId, RunnerKind},
     },
     results_handler::SharedResultsHandler,
-    retry::retry_n,
+    retry::async_retry_n,
     server_shutdown::ShutdownReceiver,
 };
 
@@ -109,6 +110,7 @@ pub struct WorkersConfig {
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
     pub debug_native_runner: bool,
+    pub protocol_version_timeout: Duration,
     /// Hint for how many test results should be sent back in a batch.
     pub results_batch_size_hint: u64,
     /// Max number of test suite run attempts
@@ -136,7 +138,7 @@ pub enum NegotiatedWorkers {
 }
 
 impl NegotiatedWorkers {
-    pub fn shutdown(&mut self) -> WorkersExit {
+    pub async fn shutdown(&mut self) -> WorkersExit {
         match self {
             &mut NegotiatedWorkers::Redundant { exit_code } => WorkersExit {
                 status: WorkersExitStatus::Completed(exit_code),
@@ -144,19 +146,14 @@ impl NegotiatedWorkers {
                 final_captured_outputs: Default::default(),
                 native_runner_info: None,
             },
-            NegotiatedWorkers::Pool(pool) => pool.shutdown(),
+            NegotiatedWorkers::Pool(pool) => pool.shutdown().await,
         }
     }
 
-    pub fn cancel(self) -> WorkersExit {
+    pub async fn cancel(&mut self) {
         match self {
-            NegotiatedWorkers::Redundant { exit_code } => WorkersExit {
-                status: WorkersExitStatus::Completed(exit_code),
-                manifest_generation_output: None,
-                final_captured_outputs: Default::default(),
-                native_runner_info: None,
-            },
-            NegotiatedWorkers::Pool(pool) => pool.cancel(),
+            NegotiatedWorkers::Redundant { .. } => {}
+            NegotiatedWorkers::Pool(pool) => pool.cancel().await,
         }
     }
 
@@ -177,41 +174,16 @@ impl NegotiatedWorkers {
 }
 
 impl WorkersNegotiator {
-    /// Runs the workers-side of the negotiation, returning the configured worker pool once
-    /// negotiation is complete.
     #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, client_options), fields(
         num_workers = workers_config.num_workers
     ))]
-    pub fn negotiate_and_start_pool(
-        workers_config: WorkersConfig,
-        queue_negotiator_handle: QueueNegotiatorHandle,
-        client_options: ClientOptions<User>,
-        invoke_data: InvokeWork,
-    ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(Self::negotiate_and_start_pool_on_executor(
-            workers_config,
-            queue_negotiator_handle,
-            client_options,
-            invoke_data,
-        ))
-    }
-
-    #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, client_options), fields(
-        num_workers = workers_config.num_workers
-    ))]
-    pub async fn negotiate_and_start_pool_on_executor(
+    pub async fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
         queue_negotiator_handle: QueueNegotiatorHandle,
         client_options: ClientOptions<User>,
         invoke_data: InvokeWork,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
         let first_runner_entity = Entity::runner(workers_config.tag, 1);
-        let client = client_options.clone().build()?;
         let async_client = client_options.build_async()?;
 
         let run_id = invoke_data.run_id.clone();
@@ -248,62 +220,23 @@ impl WorkersNegotiator {
             debug_native_runner,
             results_batch_size_hint,
             max_run_number,
+            protocol_version_timeout,
         } = workers_config;
 
-        let get_init_context: GetInitContext = Arc::new({
-            let client = client.boxed_clone();
-            let run_id = run_id.clone();
-
-            move |entity| {
-                let span = tracing::trace_span!("get_init_context", run_id=?run_id, new_work_server=?work_server_addr);
-                let _get_next_work = span.enter();
-
-                wait_for_init_context(entity, &*client, work_server_addr, run_id.clone())
-            }
+        // TODO each runner should get a different one of these.
+        let notify_cancellation = Box::new(CancelRunNotifier {
+            client: async_client.boxed_clone(),
+            entity: first_runner_entity,
+            run_id: run_id.clone(),
+            queue_addr: queue_results_addr,
         });
 
-        let notify_manifest: Option<NotifyManifest> = match assigned {
+        let some_runner_should_generate_manifest = match assigned {
             AssignedRun::Fresh {
-                should_generate_manifest: true,
-            } => Some(Box::new({
-                let client = client.boxed_clone();
-
-                move |entity, run_id, manifest_result| {
-                    let span = tracing::trace_span!("notify_manifest", ?entity, run_id=?run_id, queue_server=?queue_results_addr);
-                    let _notify_manifest = span.enter();
-
-                    let message = net_protocol::queue::Request {
-                        entity,
-                        message: net_protocol::queue::Message::ManifestResult(
-                            run_id.clone(),
-                            manifest_result,
-                        ),
-                    };
-
-                    let mut stream = retry_n(5, Duration::from_secs(3), |attempt| {
-                        if attempt > 1 {
-                            tracing::info!(
-                                "reattempting connection to queue for manifest {}",
-                                attempt
-                            );
-                        }
-                        client.connect(queue_results_addr)
-                    })
-                    .expect("results server not available");
-
-                    net_protocol::write(&mut stream, &message).unwrap();
-                    let net_protocol::queue::AckManifest {} =
-                        net_protocol::read(&mut stream).unwrap();
-                }
-            })),
-            _ => None,
+                should_generate_manifest,
+            } => should_generate_manifest,
+            AssignedRun::Retry => false,
         };
-
-        let notify_cancellation: NotifyCancellation = Box::new({
-            let client = client.boxed_clone();
-            let run_id = run_id.clone();
-            move || notify_cancellation(queue_results_addr, &*client, first_runner_entity, run_id)
-        });
 
         let runner_strategy_generator = RunnerStrategyGenerator::new(
             async_client.boxed_clone(),
@@ -317,17 +250,17 @@ impl WorkersNegotiator {
 
         let pool_config = WorkerPoolConfig {
             size: num_workers,
+            some_runner_should_generate_manifest,
             tag,
             first_runner_entity,
             runner_kind,
-            get_init_context,
             runner_strategy_generator: &runner_strategy_generator,
             results_batch_size_hint,
             worker_context,
             run_id,
-            notify_manifest,
             notify_cancellation,
             debug_native_runner,
+            protocol_version_timeout,
         };
 
         tracing::debug!("Starting worker pool");
@@ -338,30 +271,46 @@ impl WorkersNegotiator {
     }
 }
 
-fn notify_cancellation(
-    queue_addr: SocketAddr,
-    client: &dyn net::ConfiguredClient,
+struct CancelRunNotifier {
+    client: Box<dyn net_async::ConfiguredClient>,
     entity: Entity,
     run_id: RunId,
-) {
-    let mut stream = retry_n(5, Duration::from_secs(3), |attempt| {
-        if attempt > 1 {
-            tracing::info!(
-                "reattempting connection to queue for cancellation {}",
-                attempt
-            );
-        }
-        client.connect(queue_addr)
-    })
-    .expect("queue server not available");
+    queue_addr: SocketAddr,
+}
 
-    let message = net_protocol::queue::Request {
-        entity,
-        message: net_protocol::queue::Message::CancelRun(run_id),
-    };
+#[async_trait]
+impl NotifyCancellation for CancelRunNotifier {
+    async fn cancel(self: Box<Self>) {
+        let Self {
+            client,
+            entity,
+            run_id,
+            queue_addr,
+        } = *self;
 
-    net_protocol::write(&mut stream, &message).unwrap();
-    let net_protocol::queue::AckTestCancellation {} = net_protocol::read(&mut stream).unwrap();
+        let mut stream = async_retry_n(5, Duration::from_secs(3), |attempt| {
+            if attempt > 1 {
+                tracing::info!(
+                    "reattempting connection to queue for cancellation {}",
+                    attempt
+                );
+            }
+            client.connect(queue_addr)
+        })
+        .await
+        .expect("queue server not available");
+
+        let message = net_protocol::queue::Request {
+            entity,
+            message: net_protocol::queue::Message::CancelRun(run_id),
+        };
+
+        net_protocol::async_write(&mut stream, &message)
+            .await
+            .unwrap();
+        let net_protocol::queue::AckTestCancellation {} =
+            net_protocol::async_read(&mut stream).await.unwrap();
+    }
 }
 
 /// Waits to receive worker execution context from a queue negotiator.
@@ -411,58 +360,15 @@ async fn wait_for_execution_context(
     }
 }
 
-/// Asks the work server for native runner initialization context.
-/// Blocks on the result, repeatedly pinging the server until work is available.
-fn wait_for_init_context(
-    entity: Entity,
-    client: &dyn net::ConfiguredClient,
-    work_server_addr: SocketAddr,
-    run_id: RunId,
-) -> io::Result<InitContextResult> {
-    use net_protocol::work_server::{InitContextResponse, Message, Request};
-
-    // The work server may be waiting for the manifest, which the initialization context is blocked on;
-    // to avoid pinging the server too often, let's decay on the frequency of our requests.
-    let mut decay = Duration::from_millis(10);
-    let max_decay = Duration::from_secs(3);
-    loop {
-        let mut stream = client.connect(work_server_addr)?;
-
-        let next_test_request = Request {
-            entity,
-            message: Message::InitContext {
-                run_id: run_id.clone(),
-            },
-        };
-
-        net_protocol::write(&mut stream, next_test_request)?;
-        match net_protocol::read(&mut stream)? {
-            InitContextResponse::WaitingForManifest => {
-                thread::sleep(decay);
-                decay *= 2;
-                if decay >= max_decay {
-                    tracing::info!("hit max decay limit for requesting initialization context");
-                    decay = max_decay;
-                }
-                continue;
-            }
-            InitContextResponse::InitContext(init_context) => return Ok(Ok(init_context)),
-            InitContextResponse::RunAlreadyCompleted { cancelled } => {
-                return Ok(Err(RunAlreadyCompleted { cancelled }))
-            }
-        }
-    }
-}
-
 /// The queue side of the negotiation.
 pub struct QueueNegotiator {
     addr: SocketAddr,
-    listener_handle: Option<thread::JoinHandle<Result<(), QueueNegotiatorServerError>>>,
+    listener_handle: Option<JoinHandle<Result<(), QueueNegotiatorServerError>>>,
 }
 
 /// Address of a queue negotiator.
 #[derive(Clone, Copy)]
-pub struct QueueNegotiatorHandle(SocketAddr);
+pub struct QueueNegotiatorHandle(pub SocketAddr);
 
 #[derive(Debug, Error)]
 pub enum QueueNegotiatorHandleError {
@@ -588,82 +494,75 @@ where
 }
 
 impl QueueNegotiator {
-    /// Starts a queue negotiator on a new thread.
+    /// Starts a queue negotiator on an async executor.
     ///
     /// * `get_assigned_run` - should fetch the status of an assigned run and yield immediately.
-    pub fn new<GetAssignedRun>(
+    pub async fn start<GetAssignedRun>(
         public_ip: IpAddr,
-        listener: Box<dyn net::ServerListener>,
+        listener: Box<dyn net_async::ServerListener>,
         mut shutdown_rx: ShutdownReceiver,
         queue_work_scheduler_addr: SocketAddr,
         queue_results_addr: SocketAddr,
         get_assigned_run: GetAssignedRun,
-    ) -> Result<Self, QueueNegotiatorServerError>
+    ) -> Self
     where
         GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
     {
-        let addr = listener.local_addr()?;
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let advertised_queue_work_scheduler_addr =
+                publicize_addr(queue_work_scheduler_addr, public_ip);
+            let advertised_queue_results_addr = publicize_addr(queue_results_addr, public_ip);
 
-        let advertised_queue_work_scheduler_addr =
-            publicize_addr(queue_work_scheduler_addr, public_ip);
-        let advertised_queue_results_addr = publicize_addr(queue_results_addr, public_ip);
+            tracing::debug!("Starting negotiator on {}", addr);
 
-        tracing::debug!("Starting negotiator on {}", addr);
+            // Initialize the listener in the async context.
+            let handshake_ctx = listener.handshake_ctx();
 
-        let listener_handle = thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let ctx = QueueNegotiatorCtx {
+                get_assigned_run: Arc::new(get_assigned_run),
+                advertised_queue_work_scheduler_addr,
+                advertised_queue_results_addr,
+                handshake_ctx: Arc::new(handshake_ctx),
+            };
 
-            let server_result: Result<(), QueueNegotiatorServerError> = rt.block_on(async {
-                // Initialize the listener in the async context.
-                let listener = listener.into_async()?;
-                let handshake_ctx = listener.handshake_ctx();
-
-                let ctx = QueueNegotiatorCtx {
-                    get_assigned_run: Arc::new(get_assigned_run),
-                    advertised_queue_work_scheduler_addr,
-                    advertised_queue_results_addr,
-                    handshake_ctx: Arc::new(handshake_ctx),
+            loop {
+                let (client, _) = tokio::select! {
+                    conn = listener.accept() => {
+                        match conn {
+                            Ok(conn) => conn,
+                            Err(e) => {
+                                tracing::error!("error accepting connection to negotiator: {:?}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.recv_shutdown_immediately() => {
+                        break;
+                    }
                 };
 
-                loop {
-                    let (client, _) = tokio::select! {
-                        conn = listener.accept() => {
-                            match conn {
-                                Ok(conn) => conn,
-                                Err(e) => {
-                                    tracing::error!("error accepting connection to negotiator: {:?}", e);
-                                    continue;
-                                }
-                            }
+                tokio::spawn({
+                    let ctx = ctx.clone();
+                    async move {
+                        let result = Self::handle_conn(ctx, client).await;
+                        if let Err(error) = result {
+                            log_entityful_error!(
+                                error,
+                                "error handling connection to negotiator: {:?}"
+                            );
                         }
-                        _ = shutdown_rx.recv_shutdown_immediately() => {
-                            break;
-                        }
-                    };
+                    }
+                });
+            }
 
-                    tokio::spawn({
-                        let ctx = ctx.clone();
-                        async move {
-                            let result = Self::handle_conn(ctx, client).await;
-                            if let Err(error) = result {
-                                log_entityful_error!(error, "error handling connection to negotiator: {:?}");
-                            }
-                        }
-                    });
-                }
-
-                Ok(())
-            });
-
-            server_result
+            Ok(())
         });
 
-        Ok(Self {
+        Self {
             addr,
-            listener_handle: Some(listener_handle),
-        })
+            listener_handle: Some(handle),
+        }
     }
 
     async fn handle_conn<GetAssignedRun>(
@@ -738,22 +637,8 @@ impl QueueNegotiator {
         QueueNegotiatorHandle(self.addr)
     }
 
-    pub fn join(&mut self) {
-        self.listener_handle
-            .take()
-            .unwrap()
-            .join()
-            .unwrap()
-            .unwrap();
-    }
-}
-
-impl Drop for QueueNegotiator {
-    fn drop(&mut self) {
-        if self.listener_handle.is_some() {
-            // `shutdown` was not called manually before this drop
-            self.join();
-        }
+    pub async fn join(&mut self) {
+        self.listener_handle.take().unwrap().await.unwrap().unwrap();
     }
 }
 
@@ -761,13 +646,13 @@ impl Drop for QueueNegotiator {
 mod test {
     use std::net::SocketAddr;
     use std::num::NonZeroUsize;
-    use std::sync::{mpsc, Arc, Mutex};
-    use std::thread::{self, JoinHandle};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExitStatus};
+    use abq_generic_test_runner::DEFAULT_PROTOCOL_VERSION_TIMEOUT;
     use abq_test_utils::one_nonzero;
     use abq_utils::auth::{
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
@@ -790,8 +675,11 @@ mod test {
     use abq_utils::results_handler::NoopResultsHandler;
     use abq_utils::server_shutdown::ShutdownManager;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
-    use abq_utils::{net, net_protocol};
+    use abq_utils::{net_async, net_protocol};
     use abq_with_protocol_version::with_protocol_version;
+    use parking_lot::Mutex;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
     use tracing_test::internal::logs_with_scope_contain;
     use tracing_test::traced_test;
 
@@ -809,17 +697,19 @@ mod test {
     type QueueNextWork = (SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
     type QueueResults = (Messages, SocketAddr, mpsc::Sender<()>, JoinHandle<()>);
 
-    fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
+    async fn mock_queue_next_work_server(manifest_collector: ManifestCollector) -> QueueNextWork {
         let server = ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
-            .bind("0.0.0.0:0")
+            .bind_async("0.0.0.0:0")
+            .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(2);
 
-        let handle = thread::spawn(move || {
+        let handle = tokio::spawn(async move {
             let mut work_to_write = loop {
-                match manifest_collector.lock().unwrap().take() {
+                let manifest_result = { manifest_collector.lock().take() };
+                match manifest_result {
                     Some(man) => {
                         let work: Vec<_> = man
                             .manifest
@@ -839,54 +729,55 @@ mod test {
                             .collect();
                         break work;
                     }
-                    None => continue,
+                    None => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
                 }
             };
 
             work_to_write.reverse();
-            server.set_nonblocking(true).unwrap();
             let mut recv_init_context = false;
             loop {
-                match server.accept() {
-                    Ok((mut worker, _)) => {
+                tokio::select! {
+                    conn = server.accept() => {
+                        let (conn, _) = conn.unwrap();
+                        let mut worker = server.handshake_ctx().handshake(conn).await.unwrap();
+
                         if !recv_init_context {
                             recv_init_context = true;
-                            net_protocol::write(
+                            net_protocol::async_write(
                                 &mut worker,
-                                InitContextResponse::InitContext(InitContext {
+                                &InitContextResponse::InitContext(InitContext {
                                     init_meta: Default::default(),
                                 }),
                             )
+                            .await
                             .unwrap();
                         } else {
                             let _connect_msg: work_server::Request =
-                                net_protocol::read(&mut worker).unwrap();
+                                net_protocol::async_read(&mut worker).await.unwrap();
                             let mut all_done = false;
                             while !all_done {
                                 let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
                                 all_done = matches!(work, NextWork::EndOfWork);
                                 let work_bundle = NextWorkBundle::new(vec![work]);
 
-                                let NextTestRequest {} = match net_protocol::read(&mut worker) {
-                                    Ok(r) => r,
-                                    _ => break, // worker disconnected
-                                };
+                                let NextTestRequest {} =
+                                    match net_protocol::async_read(&mut worker).await {
+                                        Ok(r) => r,
+                                        _ => break, // worker disconnected
+                                    };
                                 let response = NextTestResponse::Bundle(work_bundle);
-                                net_protocol::write(&mut worker, response).unwrap();
+                                net_protocol::async_write(&mut worker, &response)
+                                    .await
+                                    .unwrap();
                             }
                         }
                     }
-
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        match shutdown_rx.try_recv() {
-                            Ok(()) => return,
-                            Err(_) => {
-                                thread::sleep(Duration::from_millis(10));
-                                continue;
-                            }
-                        }
+                    _ = shutdown_rx.recv() => {
+                        return
                     }
-                    _ => unreachable!(),
                 }
             }
         });
@@ -894,87 +785,107 @@ mod test {
         (server_addr, shutdown_tx, handle)
     }
 
-    fn mock_queue_results_server(manifest_collector: ManifestCollector) -> QueueResults {
+    async fn mock_queue_results_server(manifest_collector: ManifestCollector) -> QueueResults {
         let msgs = Arc::new(Mutex::new(Vec::new()));
         let msgs2 = Arc::clone(&msgs);
 
         let server = ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
-            .bind("0.0.0.0:0")
+            .bind_async("0.0.0.0:0")
+            .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        server.set_nonblocking(true).unwrap();
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel(2);
 
-        let handle = thread::spawn(move || loop {
-            let mut client = match server.accept() {
-                Ok((client, _)) => client,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    match shutdown_rx.try_recv() {
-                        Ok(()) => return,
-                        Err(_) => {
-                            thread::sleep(Duration::from_millis(10));
-                            continue;
+        let handle = tokio::spawn(async move {
+            loop {
+                let (conn, _) = tokio::select! {
+                    conn = server.accept() => {
+                        conn.unwrap()
+                    }
+                    _ = shutdown_rx.recv() => {
+                        return;
+                    }
+                };
+
+                let mut client = server.handshake_ctx().handshake(conn).await.unwrap();
+
+                let request: net_protocol::queue::Request =
+                    net_protocol::async_read(&mut client).await.unwrap();
+                match request.message {
+                    net_protocol::queue::Message::WorkerResult(_, results) => {
+                        net_protocol::async_write(
+                            &mut client,
+                            &net_protocol::queue::AckTestResults {},
+                        )
+                        .await
+                        .unwrap();
+                        for tr in results {
+                            msgs2.lock().extend(tr.results);
                         }
                     }
-                }
-                Err(_) => unreachable!(),
-            };
-
-            let request: net_protocol::queue::Request = net_protocol::read(&mut client).unwrap();
-            match request.message {
-                net_protocol::queue::Message::WorkerResult(_, results) => {
-                    net_protocol::write(&mut client, net_protocol::queue::AckTestResults {})
+                    net_protocol::queue::Message::ManifestResult(_, manifest_result) => {
+                        let manifest = match manifest_result {
+                            ManifestResult::Manifest(man) => man,
+                            _ => unreachable!(),
+                        };
+                        let old_manifest = manifest_collector.lock().replace(manifest);
+                        debug_assert!(
+                            old_manifest.is_none(),
+                            "replacing existing manifest! This is a bug in our tests."
+                        );
+                        net_protocol::async_write(
+                            &mut client,
+                            &net_protocol::queue::AckManifest {},
+                        )
+                        .await
                         .unwrap();
-                    for tr in results {
-                        msgs2.lock().unwrap().extend(tr.results);
                     }
-                }
-                net_protocol::queue::Message::ManifestResult(_, manifest_result) => {
-                    let manifest = match manifest_result {
-                        ManifestResult::Manifest(man) => man,
-                        _ => unreachable!(),
-                    };
-                    let old_manifest = manifest_collector.lock().unwrap().replace(manifest);
-                    debug_assert!(
-                        old_manifest.is_none(),
-                        "replacing existing manifest! This is a bug in our tests."
-                    );
-                    net_protocol::write(&mut client, net_protocol::queue::AckManifest {}).unwrap();
-                }
-                net_protocol::queue::Message::RunStatus(_) => {
-                    net_protocol::write(
-                        &mut client,
-                        net_protocol::queue::RunStatus::InitialManifestDone {
-                            num_active_workers: 0,
-                        },
-                    )
-                    .unwrap();
-                }
-                net_protocol::queue::Message::WorkerRanAllTests(_) => {
-                    net_protocol::write(&mut client, net_protocol::queue::AckWorkerRanAllTests {})
+                    net_protocol::queue::Message::RunStatus(_) => {
+                        net_protocol::async_write(
+                            &mut client,
+                            &net_protocol::queue::RunStatus::InitialManifestDone {
+                                num_active_workers: 0,
+                            },
+                        )
+                        .await
                         .unwrap();
+                    }
+                    net_protocol::queue::Message::WorkerRanAllTests(_) => {
+                        net_protocol::async_write(
+                            &mut client,
+                            &net_protocol::queue::AckWorkerRanAllTests {},
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
         });
 
         (msgs, server_addr, shutdown_tx, handle)
     }
 
-    fn close_queue_servers(
+    async fn close_queue_servers(
         shutdown_next_work_server: mpsc::Sender<()>,
         next_work_handle: JoinHandle<()>,
         shutdown_results_server: mpsc::Sender<()>,
         results_handle: JoinHandle<()>,
     ) {
-        shutdown_next_work_server.send(()).unwrap();
-        next_work_handle.join().unwrap();
-        shutdown_results_server.send(()).unwrap();
-        results_handle.join().unwrap();
+        let (r1, r2, r3, r4) = tokio::join!(
+            shutdown_next_work_server.send(()),
+            next_work_handle,
+            shutdown_results_server.send(()),
+            results_handle
+        );
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+        r4.unwrap();
     }
 
-    fn await_messages<F>(msgs: Messages, timeout: Duration, predicate: F)
+    async fn await_messages<F>(msgs: Messages, timeout: Duration, predicate: F)
     where
         F: Fn(&Messages) -> bool,
     {
@@ -987,7 +898,7 @@ mod test {
                     msgs
                 );
             }
-            thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -995,14 +906,14 @@ mod test {
         TestOrGroup::test(Test::new(protocol, echo_msg, [], Default::default()))
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn queue_and_workers_lifecycle() {
+    async fn queue_and_workers_lifecycle() {
         let manifest_collector = ManifestCollector::default();
         let (next_work_addr, shutdown_next_work_server, next_work_handle) =
-            mock_queue_next_work_server(Arc::clone(&manifest_collector));
+            mock_queue_next_work_server(Arc::clone(&manifest_collector)).await;
         let (msgs, results_addr, shutdown_results_server, results_handle) =
-            mock_queue_results_server(manifest_collector);
+            mock_queue_results_server(manifest_collector).await;
 
         let run_id = RunId::unique();
 
@@ -1018,17 +929,20 @@ mod test {
         };
 
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
-        let mut queue_negotiator = QueueNegotiator::new(
-            "0.0.0.0".parse().unwrap(),
+        let listener =
             ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
-                .bind("0.0.0.0:0")
-                .unwrap(),
+                .bind_async("0.0.0.0:0")
+                .await
+                .unwrap();
+        let mut queue_negotiator = QueueNegotiator::start(
+            "0.0.0.0".parse().unwrap(),
+            listener,
             shutdown_rx,
             next_work_addr,
             results_addr,
             get_assigned_run,
         )
-        .unwrap();
+        .await;
         let workers_config = WorkersConfig {
             tag: WorkerTag::new(0),
             num_workers: NonZeroUsize::new(1).unwrap(),
@@ -1038,6 +952,7 @@ mod test {
             debug_native_runner: false,
             results_batch_size_hint: 1,
             max_run_number: INIT_RUN_NUMBER,
+            protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
         };
 
         let invoke_data = InvokeWork {
@@ -1052,39 +967,45 @@ mod test {
             ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls()),
             invoke_data,
         )
+        .await
         .unwrap();
 
         await_messages(msgs, Duration::from_secs(1), |msgs| {
-            let msgs = msgs.lock().unwrap();
+            let msgs = msgs.lock();
             if msgs.len() != 1 {
                 return false;
             }
 
             let result = msgs.last().unwrap();
             result.status == Status::Success && result.output.as_ref().unwrap() == "hello"
-        });
+        })
+        .await;
 
-        let workers_exit = workers.shutdown();
+        workers.wait().await;
+        let workers_exit = workers.shutdown().await;
         assert!(matches!(
             workers_exit.status,
             WorkersExitStatus::Completed(ExitCode::SUCCESS)
         ));
 
         shutdown_tx.shutdown_immediately().unwrap();
-        queue_negotiator.join();
+        queue_negotiator.join().await;
 
         close_queue_servers(
             shutdown_next_work_server,
             next_work_handle,
             shutdown_results_server,
             results_handle,
-        );
+        )
+        .await;
     }
 
-    fn test_negotiator(server: Box<dyn net::ServerListener>) -> (QueueNegotiator, ShutdownManager) {
+    async fn test_negotiator(
+        server: Box<dyn net_async::ServerListener>,
+    ) -> (QueueNegotiator, ShutdownManager) {
         let (shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
 
-        let negotiator = QueueNegotiator::new(
+        let negotiator = QueueNegotiator::start(
             "0.0.0.0".parse().unwrap(),
             server,
             shutdown_rx,
@@ -1097,97 +1018,106 @@ mod test {
                 })
             },
         )
-        .unwrap();
+        .await;
 
         (negotiator, shutdown_tx)
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn queue_negotiator_healthcheck() {
+    async fn queue_negotiator_healthcheck() {
         let server = ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls())
-            .bind("0.0.0.0:0")
+            .bind_async("0.0.0.0:0")
+            .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server).await;
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
-            .build()
+            .build_async()
             .unwrap();
-        let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(
+        let mut conn = client.connect(server_addr).await.unwrap();
+        net_protocol::async_write(
             &mut conn,
-            super::Request {
+            &super::Request {
                 entity: Entity::local_client(),
                 message: MessageToQueueNegotiator::HealthCheck,
             },
         )
+        .await
         .unwrap();
-        let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
+        let health_msg: net_protocol::health::Health =
+            net_protocol::async_read(&mut conn).await.unwrap();
 
         assert_eq!(health_msg, net_protocol::health::healthy());
 
         shutdown_tx.shutdown_immediately().unwrap();
-        queue_negotiator.join();
+        queue_negotiator.join().await;
     }
 
-    #[test]
+    #[tokio::test]
     #[traced_test]
     #[with_protocol_version]
-    fn queue_negotiator_with_auth_okay() {
+    async fn queue_negotiator_with_auth_okay() {
         let (server_auth, client_auth, _) = build_random_strategies();
 
         let server = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls())
-            .bind("0.0.0.0:0")
+            .bind_async("0.0.0.0:0")
+            .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server).await;
 
         let client = ClientOptions::new(client_auth, ClientTlsStrategy::no_tls())
-            .build()
+            .build_async()
             .unwrap();
-        let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(
+        let mut conn = client.connect(server_addr).await.unwrap();
+        net_protocol::async_write(
             &mut conn,
-            super::Request {
+            &super::Request {
                 entity: Entity::local_client(),
                 message: MessageToQueueNegotiator::HealthCheck,
             },
         )
+        .await
         .unwrap();
-        let health_msg: net_protocol::health::Health = net_protocol::read(&mut conn).unwrap();
+        let health_msg: net_protocol::health::Health =
+            net_protocol::async_read(&mut conn).await.unwrap();
 
         assert_eq!(health_msg, net_protocol::health::healthy());
 
         shutdown_tx.shutdown_immediately().unwrap();
-        queue_negotiator.join();
+        queue_negotiator.join().await;
 
         logs_with_scope_contain("", "error handling connection");
     }
 
-    #[test]
+    #[tokio::test]
     #[traced_test]
     #[with_protocol_version]
-    fn queue_negotiator_connect_with_no_auth_fails() {
+    async fn queue_negotiator_connect_with_no_auth_fails() {
         let (server_auth, _, _) = build_random_strategies();
 
         let server = ServerOptions::new(server_auth, ServerTlsStrategy::no_tls())
-            .bind("0.0.0.0:0")
+            .bind_async("0.0.0.0:0")
+            .await
             .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server);
+        let (mut queue_negotiator, mut shutdown_tx) = test_negotiator(server).await;
 
         let client = ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls())
-            .build()
+            .build_async()
             .unwrap();
-        let mut conn = client.connect(server_addr).unwrap();
-        net_protocol::write(&mut conn, MessageToQueueNegotiator::HealthCheck).unwrap();
+        let mut conn = client.connect(server_addr).await.unwrap();
+        net_protocol::async_write(&mut conn, &MessageToQueueNegotiator::HealthCheck)
+            .await
+            .unwrap();
 
         shutdown_tx.shutdown_immediately().unwrap();
-        queue_negotiator.join();
+        queue_negotiator.join().await;
 
         logs_with_scope_contain("", "error handling connection");
     }
