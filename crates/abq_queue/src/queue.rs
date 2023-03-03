@@ -1175,17 +1175,6 @@ fn start_queue(config: QueueConfig) -> Abq {
     }
 }
 
-/// TODO get rid of this, right now it's around only guard when handling cancellation
-type ActiveRunRespondersInner = HashMap<RunId, tokio::sync::Mutex<()>>;
-
-/// Shared responders.
-type ActiveRunResponders = Arc<
-    tokio::sync::RwLock<
-        //
-        ActiveRunRespondersInner,
-    >,
->;
-
 /// Central server listening for new test run runs and results.
 struct QueueServer {
     queues: SharedRuns,
@@ -1210,9 +1199,6 @@ pub enum QueueServerError {
 #[derive(Clone)]
 struct QueueServerCtx {
     queues: SharedRuns,
-    /// When all results for a particular run are communicated, we want to make sure that the
-    /// responder thread is closed and that the entry here is dropped.
-    active_runs: ActiveRunResponders,
     public_negotiator_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
@@ -1250,7 +1236,6 @@ impl QueueServer {
 
             let ctx = QueueServerCtx {
                 queues,
-                active_runs: Default::default(),
                 public_negotiator_addr,
                 handshake_ctx: Arc::new(server_listener.handshake_ctx()),
             };
@@ -1340,18 +1325,11 @@ impl QueueServer {
                 let _shutdown = stream.shutdown().await;
                 drop(stream);
 
-                Self::handle_run_cancellation(ctx.queues, ctx.active_runs, entity, run_id).await
+                Self::handle_run_cancellation(ctx.queues, entity, run_id).await
             }
             Message::ManifestResult(run_id, manifest_result) => {
-                Self::handle_manifest_result(
-                    ctx.queues,
-                    ctx.active_runs,
-                    entity,
-                    run_id,
-                    manifest_result,
-                    stream,
-                )
-                .await
+                Self::handle_manifest_result(ctx.queues, entity, run_id, manifest_result, stream)
+                    .await
             }
             Message::WorkerResult(run_id, results) => {
                 // Recording and sending the test result back to the abq test client may
@@ -1453,25 +1431,13 @@ impl QueueServer {
     }
 
     /// A worker requests cancellation of a test run.
-    #[instrument(level = "trace", skip(queues, active_runs))]
+    #[instrument(level = "trace", skip(queues))]
     async fn handle_run_cancellation(
         queues: SharedRuns,
-        active_runs: ActiveRunResponders,
         entity: Entity,
         run_id: RunId,
     ) -> OpaqueResult<()> {
         tracing::info!(?run_id, ?entity, "worker cancelled a test run");
-
-        // IFTTT: handle_manifest_*, handle_worker_results
-        //
-        // Take an exclusive lock over active_runs for the duration of the update so there is no
-        // interference with updating other state.
-        let mut active_runs = active_runs.write().await;
-
-        {
-            // Drop the active state.
-            active_runs.remove(&run_id);
-        }
 
         {
             // Mark the cancellation in the queue first, so that new queries from workers will be
@@ -1482,10 +1448,9 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues, active_runs, manifest_result, stream))]
+    #[instrument(level = "trace", skip(queues, manifest_result, stream))]
     async fn handle_manifest_result(
         queues: SharedRuns,
-        active_runs: ActiveRunResponders,
         entity: Entity,
         run_id: RunId,
         manifest_result: ManifestResult,
@@ -1510,7 +1475,6 @@ impl QueueServer {
                 if !flat_manifest.is_empty() {
                     Self::handle_manifest_success(
                         queues,
-                        active_runs,
                         entity,
                         run_id,
                         flat_manifest,
@@ -1522,7 +1486,6 @@ impl QueueServer {
                 } else {
                     Self::handle_manifest_empty_or_failure(
                         queues,
-                        active_runs,
                         entity,
                         run_id,
                         Ok(native_runner_info),
@@ -1534,7 +1497,6 @@ impl QueueServer {
             ManifestResult::TestRunnerError { error, output } => {
                 Self::handle_manifest_empty_or_failure(
                     queues,
-                    active_runs,
                     entity,
                     run_id,
                     Err((error, output)),
@@ -1548,7 +1510,6 @@ impl QueueServer {
     #[instrument(level = "trace", skip(queues, flat_manifest))]
     async fn handle_manifest_success(
         queues: SharedRuns,
-        active_runs: ActiveRunResponders,
         entity: Entity,
         run_id: RunId,
         flat_manifest: Vec<TestSpec>,
@@ -1564,20 +1525,6 @@ impl QueueServer {
             .await
             .located(here!())?;
 
-        // IFTTT: handle_run_cancellation
-        //
-        // Take an exclusive lock on the active run responder so that no one
-        // (including cancellation) can steal it away before the manifest is registered,
-        // and the initialization data is communicated.
-        //
-        // This avoids blocking start of workers for the test run, but will force
-        // consumption of the test-start information before any test results.
-        let active_runs = active_runs.read().await;
-        let _opt_responder = match active_runs.get(&run_id) {
-            None => None,
-            Some(responder) => Some(responder.lock().await),
-        };
-
         let added_manifest = queues.add_manifest(&run_id, flat_manifest.clone(), init_metadata);
 
         match added_manifest {
@@ -1592,7 +1539,6 @@ impl QueueServer {
             }
             AddedManifest::RunCancelled => {
                 // If the run was already cancelled, there is nothing for us to do.
-                assert!(!active_runs.contains_key(&run_id));
                 tracing::info!(?run_id, ?entity, "received manifest for cancelled run");
             }
         }
@@ -1603,7 +1549,6 @@ impl QueueServer {
     #[instrument(level = "trace", skip(queues))]
     async fn handle_manifest_empty_or_failure(
         queues: SharedRuns,
-        active_runs: ActiveRunResponders,
         entity: Entity,
         run_id: RunId,
         manifest_result: Result<
@@ -1638,8 +1583,6 @@ impl QueueServer {
         }
 
         // Remove the active run state.
-        active_runs.write().await.remove(&run_id);
-
         if is_empty_manifest {
             queues.mark_empty_manifest_complete(run_id);
         } else {
@@ -2007,20 +1950,11 @@ fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        collections::HashMap,
-        io,
-        sync::Arc,
-        thread::{self},
-        time::Instant,
-    };
+    use std::{io, thread, time::Instant};
 
     use crate::{
         persistence::manifest::in_memory::InMemoryPersistor,
-        queue::{
-            ActiveRunResponders, AddedManifest, CancelReason, QueueServer, RunStatus, SharedRuns,
-            WorkScheduler,
-        },
+        queue::{AddedManifest, CancelReason, QueueServer, RunStatus, SharedRuns, WorkScheduler},
     };
     use abq_run_n_times::n_times;
     use abq_test_utils::{accept_handshake, assert_scoped_log, one_nonzero_usize};
@@ -2046,7 +1980,6 @@ mod test {
     };
     use abq_with_protocol_version::with_protocol_version;
     use abq_workers::negotiate::{AssignedRun, AssignedRunStatus};
-    use tokio::sync::{Mutex, RwLock};
     use tracing_test::traced_test;
 
     fn build_random_strategies() -> (
@@ -2587,22 +2520,13 @@ mod test {
             let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
             queues
         };
-        let active_runs: ActiveRunResponders = {
-            let mut map = HashMap::default();
-            map.insert(run_id.clone(), Mutex::new(()));
-            Arc::new(RwLock::new(map))
-        };
 
         let entity = Entity::runner(0, 1);
 
         // Cancel the run, make sure we exit smoothly
         {
-            let cancellation_fut = QueueServer::handle_run_cancellation(
-                queues.clone(),
-                Arc::clone(&active_runs),
-                entity,
-                run_id.clone(),
-            );
+            let cancellation_fut =
+                QueueServer::handle_run_cancellation(queues.clone(), entity, run_id.clone());
 
             let cancellation_end = cancellation_fut.await;
             assert!(cancellation_end.is_ok());
@@ -2619,7 +2543,6 @@ mod test {
 
             let handle_manifest_fut = QueueServer::handle_manifest_success(
                 queues.clone(),
-                active_runs.clone(),
                 entity,
                 run_id.clone(),
                 vec![TestSpec {
@@ -2647,7 +2570,6 @@ mod test {
             queues.get_run_status(&run_id).unwrap(),
             RunStatus::Cancelled {}
         ));
-        assert!(!active_runs.read().await.contains_key(&run_id));
     }
 
     #[tokio::test]
@@ -2671,22 +2593,13 @@ mod test {
             let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
             queues
         };
-        let active_runs: ActiveRunResponders = {
-            let mut map = HashMap::default();
-            map.insert(run_id.clone(), Mutex::new(()));
-            Arc::new(RwLock::new(map))
-        };
 
         let entity = Entity::runner(0, 1);
 
         // Cancel the run, make sure we exit smoothly
         let do_cancellation_fut = async {
-            let cancellation_fut = QueueServer::handle_run_cancellation(
-                queues.clone(),
-                Arc::clone(&active_runs),
-                entity,
-                run_id.clone(),
-            );
+            let cancellation_fut =
+                QueueServer::handle_run_cancellation(queues.clone(), entity, run_id.clone());
 
             let cancellation_end = cancellation_fut.await;
             assert!(cancellation_end.is_ok());
@@ -2702,13 +2615,11 @@ mod test {
             let (mut client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
 
             let queues = queues.clone();
-            let active_runs = active_runs.clone();
             let run_id = run_id.clone();
 
             async move {
                 let handle_manifest_fut = QueueServer::handle_manifest_success(
                     queues,
-                    active_runs,
                     entity,
                     run_id,
                     vec![TestSpec {
@@ -2741,7 +2652,6 @@ mod test {
             queues.get_run_status(&run_id).unwrap(),
             RunStatus::Cancelled {}
         ));
-        assert!(!active_runs.read().await.contains_key(&run_id));
     }
 
     #[tokio::test]
@@ -2756,11 +2666,6 @@ mod test {
             assert!(matches!(added, AddedManifest::Added { .. }));
             queues
         };
-        let active_runs: ActiveRunResponders = {
-            let mut map = HashMap::default();
-            map.insert(run_id.clone(), Mutex::new(()));
-            Arc::new(RwLock::new(map))
-        };
 
         let entity = Entity::runner(0, 1);
 
@@ -2771,12 +2676,8 @@ mod test {
             run_id.clone(),
             vec![result],
         );
-        let cancellation_fut = QueueServer::handle_run_cancellation(
-            queues.clone(),
-            Arc::clone(&active_runs),
-            entity,
-            run_id.clone(),
-        );
+        let cancellation_fut =
+            QueueServer::handle_run_cancellation(queues.clone(), entity, run_id.clone());
 
         let (send_last_result_end, cancellation_end) =
             futures::join!(send_last_result_fut, cancellation_fut);
@@ -2788,7 +2689,6 @@ mod test {
             queues.get_run_status(&run_id).unwrap(),
             RunStatus::Cancelled {}
         ));
-        assert!(!active_runs.read().await.contains_key(&run_id));
     }
 }
 
