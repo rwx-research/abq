@@ -6,12 +6,18 @@ use std::{
 };
 
 use abq_utils::{
+    auth::{
+        build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
+        UserToken,
+    },
     net_async,
+    net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
         queue::TestSpec,
         runners::{ProtocolWitness, TestCase, TestId},
         workers::{NextWork, WorkId, WorkerTest},
     },
+    tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
 
 pub const WORKSPACE: &str = env!("ABQ_WORKSPACE_DIR");
@@ -101,4 +107,46 @@ pub fn spec(id: usize) -> TestSpec {
 
 pub fn worker_test(spec: TestSpec, run_number: u32) -> NextWork {
     NextWork::Work(WorkerTest::new(spec, run_number))
+}
+
+pub fn build_random_strategies() -> (
+    ServerAuthStrategy,
+    ClientAuthStrategy<User>,
+    ClientAuthStrategy<Admin>,
+) {
+    build_strategies(UserToken::new_random(), AdminToken::new_random())
+}
+
+pub fn build_primitive_opts() -> (ServerOptions, ClientOptions<User>) {
+    let server_opts =
+        ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
+    let client_opts =
+        ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
+    (server_opts, client_opts)
+}
+
+pub async fn build_fake_connection() -> (
+    Box<dyn net_async::ServerListener>,
+    Box<dyn net_async::ServerStream>,
+    Box<dyn net_async::ClientStream>,
+) {
+    let (server_opts, client_opts) = build_primitive_opts();
+    let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
+    let fake_server_addr = fake_server.local_addr().unwrap();
+
+    let client = client_opts.build_async().unwrap();
+
+    let (client_res, server_res) = tokio::join!(
+        client.connect(fake_server_addr),
+        accept_handshake(&*fake_server)
+    );
+    let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
+    (fake_server, server_conn, client_conn)
+}
+
+#[macro_export]
+macro_rules! s {
+    ($s:expr) => {
+        $s.to_string()
+    };
 }

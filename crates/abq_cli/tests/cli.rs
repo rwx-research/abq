@@ -3,7 +3,7 @@
 #![allow(clippy::useless_format)]
 
 use abq_native_runner_simulation::{pack, pack_msgs, pack_msgs_to_disk, Msg::*};
-use abq_test_utils::{artifacts_dir, sanitize_output, WORKSPACE};
+use abq_test_utils::{artifacts_dir, s, sanitize_output, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, Status, Test, TestOrGroup,
@@ -191,12 +191,6 @@ fn port_active(port: u16) -> bool {
 
 const TEST_USER_AUTH_TOKEN: &str = "abqs_ckoUjQN4ufq1MiUeaNllztfyqjCtuz";
 const TEST_ADMIN_AUTH_TOKEN: &str = "abqadmin_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF";
-
-macro_rules! s {
-    ($s:expr) => {
-        $s.to_string()
-    };
-}
 
 /// Configuration options for how clients and servers in an abq run communicate.
 /// Namely: whether they use an authentication header or not, and eventually, whether they use TLS

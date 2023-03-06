@@ -445,7 +445,7 @@ pub mod queue {
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
-        entity::Entity,
+        entity::{Entity, Tag},
         meta::DeprecationRecord,
         runners::{
             AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestCase, TestResult,
@@ -601,13 +601,28 @@ pub mod queue {
         /// Notification from a worker to the queue that it finished running all scheduled tests
         /// for a suite run.
         WorkerRanAllTests(RunId),
+        /// A request to stream test results.
+        TestResults(RunId),
         /// Query the queue for the state of a run at a particular moment in time.
         RunStatus(RunId),
     }
 
+    #[derive(Serialize, Deserialize, Debug)]
+    pub enum TestResultsResponse {
+        /// The test results are available.
+        Results(OpaqueLazyAssociatedTestResults),
+        /// Some test results are still being persisted, the request for test results should
+        /// re-query in the future.
+        Pending,
+        /// Test results are not yet available because of the following outstanding runners.
+        OutstandingRunners(Vec<Tag>),
+        /// The test results are unavailable for the given reason.
+        Error(String),
+    }
+
     /// A lazy-loaded representation of [AssociatedTestResults].
     /// The implementor should store the results as JSON lines of JSON-encoded [AssociatedTestResults].
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Debug)]
     pub struct OpaqueLazyAssociatedTestResults(Vec<Box<serde_json::value::RawValue>>);
 
     impl OpaqueLazyAssociatedTestResults {

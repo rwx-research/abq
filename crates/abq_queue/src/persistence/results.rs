@@ -74,15 +74,20 @@ impl ResultsPersistedCell {
         }))
     }
 
-    pub async fn persist(
-        &self,
-        persistence: &SharedPersistResults,
+    /// Creates a persistence job, recording the pending set of results to persist.
+    #[inline]
+    pub fn build_persist_plan<'a>(
+        &'a self,
+        persistence: &'a SharedPersistResults,
         results: Vec<AssociatedTestResults>,
-    ) -> ArcResult<()> {
+    ) -> PersistencePlan<'a> {
         self.0.processing.fetch_add(1, atomic::ORDERING);
-        let result = persistence.0.dump(&self.0.run_id, results).await;
-        self.0.processing.fetch_sub(1, atomic::ORDERING);
-        result
+
+        PersistencePlan {
+            persist_results: &*persistence.0,
+            cell: &self.0,
+            results,
+        }
     }
 
     /// Attempts to retrieve a set of test results.
@@ -95,6 +100,23 @@ impl ResultsPersistedCell {
             return None;
         }
         Some(persistence.0.get_results(&self.0.run_id).await)
+    }
+}
+
+pub struct PersistencePlan<'a> {
+    persist_results: &'a dyn PersistResults,
+    cell: &'a CellInner,
+    results: Vec<AssociatedTestResults>,
+}
+
+impl<'a> PersistencePlan<'a> {
+    pub async fn execute(self) -> ArcResult<()> {
+        let result = self
+            .persist_results
+            .dump(&self.cell.run_id, self.results)
+            .await;
+        self.cell.processing.fetch_sub(1, atomic::ORDERING);
+        result
     }
 }
 
@@ -151,7 +173,8 @@ mod test {
             AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
         ];
 
-        cell.persist(&persistence, results1.clone()).await.unwrap();
+        let plan = cell.build_persist_plan(&persistence, results1.clone());
+        plan.execute().await.unwrap();
 
         // Due to our listed constraints, retrieval may finish before persistence of results2 does.
         // That's okay. But the retrieved must definitely include at least results1.
@@ -165,10 +188,12 @@ mod test {
                 }
             }
         };
-        let (persist2_result, retrieve_result) =
-            tokio::join!(cell.persist(&persistence, results2.clone()), retrieve_task,);
+        let persist_task = async {
+            let plan = cell.build_persist_plan(&persistence, results2.clone());
+            plan.execute().await.unwrap();
+        };
+        let ((), retrieve_result) = tokio::join!(persist_task, retrieve_task);
 
-        persist2_result.unwrap();
         let retrieved = retrieve_result.unwrap();
         let results = retrieved.decode().unwrap();
 

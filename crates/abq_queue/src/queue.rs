@@ -11,9 +11,10 @@ use abq_utils::auth::ServerAuthStrategy;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
-use abq_utils::net_protocol::entity::Entity;
+use abq_utils::net_protocol::entity::{Entity, Tag};
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request, TestSpec,
+    AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo,
+    OpaqueLazyAssociatedTestResults, Request, TestResultsResponse, TestSpec,
 };
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
@@ -239,6 +240,7 @@ enum AddedManifest {
     RunCancelled,
 }
 
+#[derive(Debug)]
 enum RetryManifestState {
     Manifest(NextWorkBundle),
     RunNotFound,
@@ -259,6 +261,27 @@ enum WriteResultsError {
     EmptyManifest,
     #[error("attempting to write results for cancelled run")]
     RunCancelled,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+enum ReadResultsError {
+    #[error("results cannot be read for an unregistered run")]
+    RunNotFound,
+    #[error("results cannot be read before manifest is received")]
+    WaitingForManifest,
+    #[error("results cannot be read because a manifest failed to be generated")]
+    ManifestNeverReceived,
+    #[error("results cannot be read because the run was cancelled before any results were stored")]
+    RunCancelled,
+}
+
+#[derive(Debug)]
+enum ReadResultsState {
+    /// Results are ready to be retrieved, no active workers are currently seen.
+    ReadFromCell(ResultsPersistedCell),
+    /// The given workers are still active.
+    OutstandingRunners(Vec<Tag>),
+    EmptyManifest,
 }
 
 impl AllRuns {
@@ -666,6 +689,65 @@ impl AllRuns {
         }
     }
 
+    pub fn get_read_results_cell(
+        &self,
+        run_id: &RunId,
+    ) -> Result<ReadResultsState, ReadResultsError> {
+        use ReadResultsError::*;
+
+        let runs = self.runs.read();
+        let run = match runs.get(run_id) {
+            Some(run) => run.read(),
+            None => return Err(RunNotFound),
+        };
+
+        match &run.state {
+            RunState::WaitingForManifest { .. } => Err(WaitingForManifest),
+            RunState::HasWork { active_workers, .. } => {
+                // While we still have work in the initial manifest, we have outstanding tests to
+                // persist; don't permit reading right now.
+                let active_workers = active_workers.lock();
+
+                let active_runners = active_workers
+                    .iter()
+                    .filter(|(_, done_time)| done_time.is_none())
+                    .map(|(e, _)| e.tag)
+                    .collect();
+                Ok(ReadResultsState::OutstandingRunners(active_runners))
+            }
+            RunState::InitialManifestDone {
+                results_persistence,
+                seen_workers,
+                ..
+            } => {
+                match results_persistence {
+                    ResultsPersistence::Persisted(cell) => {
+                        // Query the state of the active workers.
+                        // If we don't have any pending, the results can be fetched (subject to the
+                        // linearizability consistency model; see [crate::persistence::results]).
+                        let workers = seen_workers.read();
+                        let mut active_workers = workers
+                            .iter()
+                            .filter(|(_, is_active)| *is_active)
+                            .map(|(e, _)| e.tag)
+                            .peekable();
+
+                        if active_workers.peek().is_none() {
+                            Ok(ReadResultsState::ReadFromCell(cell.clone()))
+                        } else {
+                            Ok(ReadResultsState::OutstandingRunners(
+                                active_workers.collect(),
+                            ))
+                        }
+                    }
+                    ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
+                    ResultsPersistence::EmptyManifest => Ok(ReadResultsState::EmptyManifest),
+                }
+            }
+            RunState::Cancelled { .. } => Err(RunCancelled),
+        }
+    }
+
     pub fn get_retry_manifest(&self, run_id: &RunId, entity: Entity) -> RetryManifestState {
         let runs = self.runs.read();
         let run = match runs.get(run_id) {
@@ -682,7 +764,11 @@ impl AllRuns {
                 );
                 RetryManifestState::RunNotFound
             }
-            RunState::HasWork { queue, .. } => {
+            RunState::HasWork {
+                queue,
+                active_workers,
+                ..
+            } => {
                 // TODO: can we get rid of the clone allocation here?
                 //
                 // TODO: should we launch discovery of a partition on a blocking async task?
@@ -694,14 +780,20 @@ impl AllRuns {
                     .collect();
                 manifest.push(NextWork::EndOfWork);
 
+                // Mark the worker as active again, regardless of its existing state.
+                active_workers.lock().insert_by_tag(entity, None);
+
                 RetryManifestState::Manifest(NextWorkBundle { work: manifest })
             }
             RunState::InitialManifestDone {
                 manifest_persistence,
+                seen_workers,
                 ..
             } => match manifest_persistence {
                 ManifestPersistence::Persisted(cell) => {
                     if cell.is_persisted() {
+                        // Mark the worker as active again, regardless of its existing state.
+                        seen_workers.write().insert_by_tag(entity, true);
                         RetryManifestState::FetchFromPersistence
                     } else {
                         RetryManifestState::NotYetPersisted
@@ -1404,30 +1496,13 @@ impl QueueServer {
                     .await
             }
             Message::WorkerResult(run_id, results) => {
-                // Recording and sending the test result back to the abq test client may
-                // be expensive, with multiple IO transactions. There is no reason to block the
-                // client connection on that; recall that the worker side of the connection will
-                // move on to the next test as soon as it sends a test result back.
-                //
-                // So, we have no use for the connection as soon as we've parsed the test results out.
-                // The worker will have been waiting for us to notify them once the parsing is
-                // complete (XREF https://github.com/rwx-research/abq/issues/281), so notify them
-                // now and close out our side of the connection.
-                net_protocol::async_write(&mut stream, &net_protocol::queue::AckTestResults {})
-                    .await
-                    .located(here!())
-                    .entity(entity)?;
-                // Worker connection might exit without FIN ACK - allow disconnect here.
-                let _shutdown = stream.shutdown().await;
-                drop(stream);
-
-                // Record the test results and notify the test client out-of-band.
                 Self::handle_worker_results(
                     ctx.queues,
                     ctx.persist_results,
-                    entity,
                     run_id,
+                    entity,
                     results,
+                    stream,
                 )
                 .await
             }
@@ -1449,6 +1524,17 @@ impl QueueServer {
                     run_id,
                     entity,
                     notification_time,
+                )
+                .await
+            }
+
+            Message::TestResults(run_id) => {
+                Self::handle_test_results_request(
+                    ctx.queues,
+                    ctx.persist_results,
+                    run_id,
+                    entity,
+                    stream,
                 )
                 .await
             }
@@ -1675,17 +1761,103 @@ impl QueueServer {
     async fn handle_worker_results(
         queues: SharedRuns,
         persist_results: SharedPersistResults,
-        entity: Entity,
         run_id: RunId,
+        entity: Entity,
         results: Vec<AssociatedTestResults>,
+        mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         tracing::debug!(?entity, ?run_id, "got result");
 
-        let cell = queues.get_write_results_cell(&run_id).located(here!())?;
-        let result = cell.persist(&persist_results, results).await;
+        // Build a plan for persistence of the result, then immediately chuck the test result ACK
+        // over the wire before executing the plan.
+        //
+        // We must build the plan beforehand to properly account the number of persistence tasks
+        // in progress; otherwise, we face a race where
+        //   - a worker sends test results
+        //   - we enqueue their processing, not accounting the pending task beforehand
+        //   - ACK the worker and the worker exits
+        //   - a test-fetching request is sent is is processes before the results persistence task
+        //     begins execution, so the fact that there is a pending persistence is not seen.
+        //
+        // To avoid this, do a (relatively) cheap fetch and update of the number of persistence
+        // tasks, then send the ACK, since we don't want to block the workers on the actual
+        // persistence.
+        let cell_result = queues.get_write_results_cell(&run_id).located(here!());
+        let plan_result = match cell_result.as_ref() {
+            Ok(cell) => Ok(cell.build_persist_plan(&persist_results, results)),
+            Err(e) => Err(e),
+        };
 
-        // result is an Arc, so we must lower it to a non-arc at this point.
-        result.map_err(|e| e.error.to_string().located(e.location))
+        let opt_ack_error =
+            net_protocol::async_write(&mut stream, &net_protocol::queue::AckTestResults {})
+                .await
+                .located(here!());
+        // Worker connection might exit without FIN ACK - allow disconnect here.
+        let _shutdown = stream.shutdown().await;
+        drop(stream);
+
+        match plan_result {
+            Ok(plan) => {
+                let result = plan.execute().await.map_err(dearc_located);
+                result.or(opt_ack_error)
+            }
+            Err(_) => Err(cell_result.unwrap_err()),
+        }
+    }
+
+    #[instrument(level = "trace", skip(queues, persist_results))]
+    async fn handle_test_results_request(
+        queues: SharedRuns,
+        persist_results: SharedPersistResults,
+        run_id: RunId,
+        entity: Entity,
+        mut stream: Box<dyn net_async::ServerStream>,
+    ) -> OpaqueResult<()> {
+        let response;
+        let result;
+
+        match queues.get_read_results_cell(&run_id).located(here!()) {
+            Ok(state) => match state {
+                ReadResultsState::ReadFromCell(cell) => {
+                    // Happy path: actually attempt the retrieval. Let's see what comes up.
+                    match cell.retrieve(&persist_results).await {
+                        Some(Ok(results)) => {
+                            response = TestResultsResponse::Results(results);
+                            result = Ok(());
+                        }
+                        None => {
+                            response = TestResultsResponse::Pending;
+                            result = Ok(());
+                        }
+                        Some(Err(e)) => {
+                            response = TestResultsResponse::Error(e.to_string());
+                            result = Err(e.error.to_string().located(here!()));
+                        }
+                    };
+                }
+                ReadResultsState::OutstandingRunners(tags) => {
+                    response = TestResultsResponse::OutstandingRunners(tags);
+                    result = Ok(());
+                }
+                ReadResultsState::EmptyManifest => {
+                    // Since this is an empty manifest, there must be no results; inject the empty
+                    // list.
+                    response = TestResultsResponse::Results(
+                        OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![]),
+                    );
+                    result = Ok(());
+                }
+            },
+            Err(e) => {
+                response = TestResultsResponse::Error(e.error.to_string());
+                result = Err(e);
+            }
+        };
+
+        net_protocol::async_write(&mut stream, &response)
+            .await
+            .located(here!())?;
+        result
     }
 
     #[instrument(level = "trace", skip(queues))]
@@ -1723,6 +1895,12 @@ impl QueueServer {
 
         Ok(())
     }
+}
+
+/// Unwrap the Arc from a [LocatedError]. Needed sometimes when the return type expects a
+/// non-counted error; since a [LocatedError] is opaque, this simply converts it to a string.
+fn dearc_located(e: Arc<LocatedError>) -> LocatedError {
+    e.error.to_string().located(e.location)
 }
 
 fn log_deprecations(entity: Entity, run_id: RunId, deprecations: meta::DeprecationRecord) {
@@ -2022,12 +2200,12 @@ mod test {
         queue::{AddedManifest, CancelReason, QueueServer, RunStatus, SharedRuns, WorkScheduler},
     };
     use abq_run_n_times::n_times;
-    use abq_test_utils::{accept_handshake, assert_scoped_log, one_nonzero_usize};
+    use abq_test_utils::{
+        accept_handshake, assert_scoped_log, build_fake_connection, build_random_strategies,
+        one_nonzero_usize,
+    };
     use abq_utils::{
-        auth::{
-            build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
-            UserToken,
-        },
+        auth::{build_strategies, AdminToken, ClientAuthStrategy, ServerAuthStrategy, UserToken},
         exit::ExitCode,
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
@@ -2046,14 +2224,6 @@ mod test {
     use abq_with_protocol_version::with_protocol_version;
     use abq_workers::negotiate::{AssignedRun, AssignedRunStatus};
     use tracing_test::traced_test;
-
-    fn build_random_strategies() -> (
-        ServerAuthStrategy,
-        ClientAuthStrategy<User>,
-        ClientAuthStrategy<Admin>,
-    ) {
-        build_strategies(UserToken::new_random(), AdminToken::new_random())
-    }
 
     #[tokio::test]
     #[traced_test]
@@ -2747,13 +2917,16 @@ mod test {
 
         let entity = Entity::runner(0, 1);
 
+        let (_listener, server_conn, _client_conn) = build_fake_connection().await;
+
         let result = AssociatedTestResults::fake(WorkId::new(), vec![TestResult::fake()]);
         let send_last_result_fut = QueueServer::handle_worker_results(
             queues.clone(),
             persistence::results::InMemoryPersistor::new_shared(),
-            entity,
             run_id.clone(),
+            entity,
             vec![result],
+            server_conn,
         );
         let cancellation_fut =
             QueueServer::handle_run_cancellation(queues.clone(), entity, run_id.clone());
@@ -3180,12 +3353,15 @@ mod retry_manifest {
 
 #[cfg(test)]
 mod persist_results {
-    use abq_test_utils::{one_nonzero_usize, wid};
+    use std::time::Instant;
+
+    use abq_test_utils::{build_fake_connection, one_nonzero_usize, wid};
     use abq_utils::{
         exit::ExitCode,
         net_protocol::{
-            entity::Entity,
-            queue::{AssociatedTestResults, CancelReason},
+            self,
+            entity::{Entity, Tag},
+            queue::{AssociatedTestResults, CancelReason, TestResultsResponse},
             runners::TestResult,
             workers::RunId,
         },
@@ -3195,9 +3371,14 @@ mod persist_results {
     use crate::{
         job_queue::JobQueue,
         persistence::{self, results::ResultsPersistedCell},
+        queue::ReadResultsState,
+        worker_tracking::WorkerSet,
     };
 
-    use super::{ManifestPersistence, QueueServer, ResultsPersistence, RunState, SharedRuns};
+    use super::{
+        ManifestPersistence, QueueServer, ReadResultsError, ResultsPersistence, RetryManifestState,
+        RunData, RunState, SharedRuns,
+    };
 
     #[tokio::test]
     #[timeout(1000)]
@@ -3223,12 +3404,15 @@ mod persist_results {
             vec![TestResult::fake()],
         )];
 
+        let (_listener, server_conn, _client_conn) = build_fake_connection().await;
+
         QueueServer::handle_worker_results(
             queues.clone(),
             results_persistence.clone(),
-            Entity::runner(0, 1),
             run_id.clone(),
+            Entity::runner(0, 1),
             results.clone(),
+            server_conn,
         )
         .await
         .unwrap();
@@ -3263,12 +3447,15 @@ mod persist_results {
             vec![TestResult::fake()],
         )];
 
+        let (_listener, server_conn, _client_conn) = build_fake_connection().await;
+
         QueueServer::handle_worker_results(
             queues.clone(),
             results_persistence.clone(),
-            Entity::runner(0, 1),
             run_id.clone(),
+            Entity::runner(0, 1),
             results.clone(),
+            server_conn,
         )
         .await
         .unwrap();
@@ -3299,12 +3486,15 @@ mod persist_results {
             vec![TestResult::fake()],
         )];
 
+        let (_listener, server_conn, _client_conn) = build_fake_connection().await;
+
         let result = QueueServer::handle_worker_results(
             queues.clone(),
             results_persistence.clone(),
-            Entity::runner(0, 1),
             run_id.clone(),
+            Entity::runner(0, 1),
             results.clone(),
+            server_conn,
         )
         .await;
 
@@ -3316,5 +3506,277 @@ mod persist_results {
             opt_retrieved.unwrap().is_err(),
             "cancelled run before any results has results associated"
         );
+    }
+
+    macro_rules! get_read_results_cell {
+        ($test:ident, $state:expr, $($expect_match:tt)+) => {
+            #[test]
+            fn $test() {
+                let run_id = RunId::unique();
+                let queues = SharedRuns::default();
+                let data = None;
+                queues.set_state(run_id.clone(), $state, data);
+                let result = queues.get_read_results_cell(&run_id);
+                assert!(matches!(&result, $($expect_match)*), "{result:?}");
+            }
+        };
+    }
+
+    get_read_results_cell! {
+        get_read_results_cell_when_waiting_for_manifest,
+        RunState::WaitingForManifest { worker_connection_times: Default::default() },
+        Err(ReadResultsError::WaitingForManifest)
+    }
+
+    get_read_results_cell! {
+        get_read_results_cell_when_has_work,
+        {
+            let mut active_workers = WorkerSet::with_capacity(1);
+            active_workers.insert_by_tag(Entity::runner(1, 1), None);
+            active_workers.insert_by_tag(Entity::runner(2, 1), Some(Instant::now()));
+            RunState::HasWork {
+                queue: Default::default(),
+                init_metadata: Default::default(),
+                batch_size_hint: one_nonzero_usize(),
+                active_workers: parking_lot::Mutex::new(active_workers),
+                results_persistence: ResultsPersistedCell::new(RunId::unique()),
+            }
+        },
+        Ok(ReadResultsState::OutstandingRunners(r)) if r == &[Tag::runner(1, 1)]
+    }
+
+    get_read_results_cell! {
+        get_read_results_cell_when_done_no_pending_workers,
+        {
+            let mut active_workers = WorkerSet::with_capacity(1);
+            active_workers.insert_by_tag(Entity::runner(1, 1), false);
+            active_workers.insert_by_tag(Entity::runner(2, 1), false);
+            RunState::InitialManifestDone {
+                new_worker_exit_code: ExitCode::SUCCESS,
+                init_metadata: Default::default(),
+                seen_workers: parking_lot::RwLock::new(active_workers),
+                results_persistence: ResultsPersistence::Persisted(ResultsPersistedCell::new(RunId::unique())),
+                manifest_persistence: ManifestPersistence::EmptyManifest,
+            }
+        },
+        Ok(ReadResultsState::ReadFromCell(..))
+    }
+
+    get_read_results_cell! {
+        get_read_results_cell_when_done_with_pending_workers,
+        {
+            let mut active_workers = WorkerSet::with_capacity(1);
+            active_workers.insert_by_tag(Entity::runner(1, 1), false);
+            active_workers.insert_by_tag(Entity::runner(2, 1), true);
+            RunState::InitialManifestDone {
+                new_worker_exit_code: ExitCode::SUCCESS,
+                init_metadata: Default::default(),
+                seen_workers: parking_lot::RwLock::new(active_workers),
+                results_persistence: ResultsPersistence::Persisted(ResultsPersistedCell::new(RunId::unique())),
+                manifest_persistence: ManifestPersistence::EmptyManifest,
+            }
+        },
+        Ok(ReadResultsState::OutstandingRunners(r)) if r == &[Tag::runner(2, 1)]
+    }
+
+    get_read_results_cell! {
+        get_read_results_cell_when_done_with_empty_manifest,
+        {
+            RunState::InitialManifestDone {
+                new_worker_exit_code: ExitCode::SUCCESS,
+                init_metadata: Default::default(),
+                seen_workers: Default::default(),
+                results_persistence: ResultsPersistence::EmptyManifest,
+                manifest_persistence: ManifestPersistence::EmptyManifest,
+            }
+        },
+        Ok(ReadResultsState::EmptyManifest)
+    }
+
+    get_read_results_cell! {
+        get_read_results_cell_when_done_with_manifest_never_received,
+        {
+            RunState::InitialManifestDone {
+                new_worker_exit_code: ExitCode::SUCCESS,
+                init_metadata: Default::default(),
+                seen_workers: Default::default(),
+                results_persistence: ResultsPersistence::ManifestNeverReceived,
+                manifest_persistence: ManifestPersistence::EmptyManifest,
+            }
+        },
+        Err(ReadResultsError::ManifestNeverReceived)
+    }
+
+    get_read_results_cell! {
+        get_read_results_cell_when_cancelled,
+        {
+            RunState::Cancelled {
+                reason: CancelReason::User
+            }
+        },
+        Err(ReadResultsError::RunCancelled)
+    }
+
+    #[tokio::test]
+    #[timeout(1000)]
+    async fn fetching_results_after_results_provided_and_persisted_multiple() {
+        let run_id = RunId::unique();
+        let results_persistence = persistence::results::InMemoryPersistor::new_shared();
+        let manifest_persistence = persistence::manifest::InMemoryPersistor::shared();
+        let results_cell = ResultsPersistedCell::new(run_id.clone());
+        let queues = {
+            let queues = SharedRuns::default();
+            let batch_size_hint = one_nonzero_usize();
+            // Pretend that worker 1, runner 1 has already finished.
+            let mut active_workers = WorkerSet::with_capacity(1);
+            active_workers.insert_by_tag(Entity::runner(1, 1), Some(Instant::now()));
+            let has_work = RunState::HasWork {
+                queue: JobQueue::default(),
+                batch_size_hint,
+                init_metadata: Default::default(),
+                active_workers: Default::default(),
+                results_persistence: results_cell.clone(),
+            };
+            queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
+            queues
+        };
+
+        let results1 = vec![AssociatedTestResults::fake(
+            wid(1),
+            vec![TestResult::fake()],
+        )];
+
+        let results2 = vec![AssociatedTestResults::fake(
+            wid(2),
+            vec![TestResult::fake()],
+        )];
+
+        for results in [results1.clone(), results2.clone()] {
+            let (_listener, server_conn, _client_conn) = build_fake_connection().await;
+            QueueServer::handle_worker_results(
+                queues.clone(),
+                results_persistence.clone(),
+                run_id.clone(),
+                Entity::runner(0, 1),
+                results,
+                server_conn,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Move into a completed state
+        let persistence_plan = queues
+            .try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS)
+            .unwrap();
+        persistence::manifest::make_persistence_task(
+            manifest_persistence.borrowed(),
+            persistence_plan,
+        )
+        .await
+        .unwrap();
+
+        // Setup simulation of fetching results.
+        let get_test_results_response = {
+            let run_id = run_id.clone();
+            let queues = queues.clone();
+            let results_persistence = results_persistence.clone();
+            move || {
+                let run_id = run_id.clone();
+                let queues = queues.clone();
+                let results_persistence = results_persistence.clone();
+                async move {
+                    let (_listener, server_conn, mut client_conn) = build_fake_connection().await;
+
+                    let fetch_results_fut = async move {
+                        QueueServer::handle_test_results_request(
+                            queues,
+                            results_persistence,
+                            run_id,
+                            Entity::local_client(),
+                            server_conn,
+                        )
+                        .await
+                        .unwrap()
+                    };
+
+                    let read_results_fut = async move {
+                        net_protocol::async_read::<_, TestResultsResponse>(&mut client_conn)
+                            .await
+                            .unwrap()
+                    };
+
+                    let ((), response) = tokio::join!(fetch_results_fut, read_results_fut);
+
+                    response
+                }
+            }
+        };
+
+        use TestResultsResponse::*;
+
+        // Fetch the state of the results after the initial manifest has been completed.
+        {
+            let expected_results = vec![results1.clone(), results2.clone()];
+            let response = get_test_results_response().await;
+            match response {
+                Results(results) => {
+                    let results = results.decode().unwrap();
+                    assert_eq!(results, expected_results);
+                }
+                response => unreachable!("{response:?}"),
+            }
+        }
+
+        // Suppose that worker 1, runner 1 re-attaches for retry. We shouldn't be allowed to fetch
+        // results.
+        {
+            let retry_manifest = queues.get_retry_manifest(&run_id, Entity::runner(1, 1));
+            assert!(
+                matches!(retry_manifest, RetryManifestState::FetchFromPersistence),
+                "{retry_manifest:?}"
+            );
+            let response = get_test_results_response().await;
+            match response {
+                OutstandingRunners(tags) => {
+                    assert_eq!(tags, vec![Tag::runner(1, 1)]);
+                }
+                response => unreachable!("{response:?}"),
+            }
+        }
+
+        // Simulate the runner returning a third set of results and then completing.
+        // After the worker completes, we should be able to fetch the results again.
+        {
+            let results3 = vec![AssociatedTestResults::fake(
+                wid(3),
+                vec![TestResult::fake()],
+            )];
+
+            let (_listener, server_conn, _client_conn) = build_fake_connection().await;
+
+            QueueServer::handle_worker_results(
+                queues.clone(),
+                results_persistence.clone(),
+                run_id.clone(),
+                Entity::runner(1, 1),
+                results3.clone(),
+                server_conn,
+            )
+            .await
+            .unwrap();
+
+            queues.mark_worker_complete(&run_id, Entity::runner(1, 1), Instant::now());
+
+            let expected_results = vec![results1, results2, results3];
+            let response = get_test_results_response().await;
+            match response {
+                Results(results) => {
+                    let results = results.decode().unwrap();
+                    assert_eq!(results, expected_results);
+                }
+                response => unreachable!("{response:?}"),
+            }
+        }
     }
 }

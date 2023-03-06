@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     future::Future,
-    iter::once,
     num::{NonZeroU64, NonZeroUsize},
     panic,
     pin::Pin,
@@ -14,7 +13,7 @@ use abq_queue::{
     persistence,
     queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT},
 };
-use abq_test_utils::artifacts_dir;
+use abq_test_utils::{artifacts_dir, s};
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
     exit::ExitCode,
@@ -23,7 +22,10 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::{Entity, RunnerMeta, WorkerTag},
-        queue::{self, AssociatedTestResults, InvokeWork},
+        queue::{
+            self, AssociatedTestResults, InvokeWork, OpaqueLazyAssociatedTestResults,
+            TestResultsResponse,
+        },
         runners::{
             InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
             ProtocolWitness, RawTestResultMessage, Status, Test, TestOrGroup, TestResult,
@@ -166,6 +168,28 @@ fn sort_results_owned(results: &mut [FlatResult<'_>]) -> Vec<(u32, String)> {
         .collect()
 }
 
+fn flatten_queue_results(results: OpaqueLazyAssociatedTestResults) -> Vec<(u32, String)> {
+    let mut results: Vec<(u32, String)> = results
+        .decode()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .flat_map(
+            |AssociatedTestResults {
+                 run_number,
+                 results,
+                 ..
+             }| {
+                results
+                    .into_iter()
+                    .map(move |r| (run_number, r.output.as_ref().unwrap().clone()))
+            },
+        )
+        .collect();
+    results.sort_unstable();
+    results
+}
+
 fn native_runner_simulation_bin() -> String {
     artifacts_dir()
         .join("abqtest_native_runner_simulation")
@@ -183,6 +207,7 @@ enum Action {
     CancelWorkers(Wid),
 
     WaitForCompletedRun(Run),
+    WaitForNoPendingResults(Run),
 
     /// Make a connection to the work server, the callback will test a request.
     WSRunRequest(Run, UseConn),
@@ -192,7 +217,10 @@ type FlatResult<'a> = (WorkId, u32, &'a TestResult);
 
 #[allow(clippy::type_complexity)]
 enum Assert<'a> {
-    TestResults(Run, Box<dyn Fn(&[FlatResult<'_>]) -> bool>),
+    /// Fetch the test results observed by the workers of a run.
+    WorkerTestResults(Run, Box<dyn Fn(&[FlatResult<'_>]) -> bool>),
+    /// Fetch the test results status observed by the queue.
+    QueueTestResults(Run, Box<dyn Fn(TestResultsResponse)>),
 
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, Box<dyn Fn(&WorkersExitStatus)>),
@@ -384,6 +412,39 @@ fn action_to_fut(
             .boxed()
         }
 
+        WaitForNoPendingResults(n) => {
+            let run_id = get_run_id!(n);
+            let queue_addr = queue.server_addr();
+            let client = client_opts.build_async().unwrap();
+            async move {
+                loop {
+                    let mut conn = client.connect(queue_addr).await.unwrap();
+                    net_protocol::async_write(
+                        &mut conn,
+                        &queue::Request {
+                            entity: Entity::local_client(),
+                            message: queue::Message::TestResults(run_id.clone()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                    use queue::TestResultsResponse::*;
+                    match net_protocol::async_read(&mut conn).await.unwrap() {
+                        Results(..) => {
+                            dbg!("ready");
+                            break;
+                        }
+                        _ => {
+                            tokio::time::sleep(Duration::from_micros(100)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+            .boxed()
+        }
+
         WSRunRequest(n, callback) => {
             let run_id = get_run_id!(n);
             let work_scheduler_addr = queue.work_server_addr();
@@ -438,7 +499,7 @@ async fn run_test(servers: Servers, steps: Steps<'_>) {
 
         for check in asserts {
             match check {
-                TestResults(n, check) => {
+                WorkerTestResults(n, check) => {
                     let results = run_results.get(&n).expect("run results not found");
                     let results = results.lock();
 
@@ -457,6 +518,22 @@ async fn run_test(servers: Servers, steps: Steps<'_>) {
                         .collect();
 
                     assert!(check(&flattened_results));
+                }
+
+                QueueTestResults(n, check) => {
+                    let run_id = run_ids.get(&n).unwrap().clone();
+                    let mut conn = client.connect(queue.server_addr()).await.unwrap();
+                    net_protocol::async_write(
+                        &mut conn,
+                        &net_protocol::queue::Request {
+                            entity: Entity::local_client(),
+                            message: net_protocol::queue::Message::TestResults(run_id),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let response = net_protocol::async_read(&mut conn).await.unwrap();
+                    check(response)
                 }
 
                 WorkersAreRedundant(n) => {
@@ -508,7 +585,7 @@ async fn multiple_jobs_complete() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(
+                WorkerTestResults(
                     Run(1),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -519,6 +596,18 @@ async fn multiple_jobs_complete() {
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                vec![(1, s!("echo1")), (1, s!("echo2"))]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -566,7 +655,7 @@ async fn multiple_invokers() {
                 WaitForCompletedRun(Run(1)),
             ],
             [
-                TestResults(
+                WorkerTestResults(
                     Run(1),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -575,7 +664,7 @@ async fn multiple_invokers() {
                     }),
                 ),
                 //
-                TestResults(
+                WorkerTestResults(
                     Run(2),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -590,6 +679,31 @@ async fn multiple_invokers() {
                 WorkerExitStatus(
                     Wid(2),
                     Box::new(|e| (assert_eq!(e, &WorkersExitStatus::SUCCESS))),
+                ),
+                //
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                vec![(1, s!("echo1")), (1, s!("echo2"))]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+                QueueTestResults(
+                    Run(2),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                vec![(1, s!("echo3")), (1, s!("echo4")), (1, s!("echo5"))]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -623,7 +737,7 @@ async fn batch_two_requests_at_a_time() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(
+                WorkerTestResults(
                     Run(1),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -634,6 +748,23 @@ async fn batch_two_requests_at_a_time() {
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                [
+                                    (1, s!("echo1")),
+                                    (1, s!("echo2")),
+                                    (1, s!("echo3")),
+                                    (1, s!("echo4"))
+                                ]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -655,10 +786,19 @@ async fn empty_manifest_exits_gracefully() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(Run(1), Box::new(|results| results.is_empty())),
+                WorkerTestResults(Run(1), Box::new(|results| results.is_empty())),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(flatten_queue_results(r), []);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -917,7 +1057,7 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
         .step(
             [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(
+                WorkerTestResults(
                     Run(1),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -928,6 +1068,18 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                [(1, s!("echo1")), (1, s!("echo2"))]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -947,10 +1099,25 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                 // Run should still be seen as completed
                 WaitForCompletedRun(Run(1)),
             ],
-            [WorkerExitStatus(
-                Wid(2),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
-            )],
+            [
+                WorkerExitStatus(
+                    Wid(2),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                // Observed test results should not change.
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                [(1, s!("echo1")), (1, s!("echo2"))]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
         )
         .test()
         .await;
@@ -980,10 +1147,22 @@ async fn test_cancellation_drops_remaining_work() {
                 // Run should now be seen as completed
                 WaitForCompletedRun(Run(1)),
             ],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
-            )],
+            [
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+                ),
+                // Queue should see a cancelled run as it relates to the test results.
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Error(s) => {
+                            assert!(s.contains("cancelled"));
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
         )
         .act([StartWorkers(
             Run(1),
@@ -996,10 +1175,21 @@ async fn test_cancellation_drops_remaining_work() {
                 // Run should still be seen as completed
                 WaitForCompletedRun(Run(1)),
             ],
-            [WorkerExitStatus(
-                Wid(2),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
-            )],
+            [
+                WorkerExitStatus(
+                    Wid(2),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Error(s) => {
+                            assert!(s.contains("cancelled"));
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
         )
         .test()
         .await;
@@ -1025,10 +1215,23 @@ async fn failure_to_run_worker_command_exits_gracefully() {
                 // Run should be seen as completed
                 WaitForCompletedRun(Run(1)),
             ],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
-            )],
+            [
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
+                ),
+                // Queue should say that no results could be provided because manifest couldn't be
+                // generated.
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Error(s) => {
+                            assert!(s.contains("manifest failed to be generated"), "{s:?}");
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
         )
         .test()
         .await;
@@ -1062,10 +1265,23 @@ async fn native_runner_fails_due_to_manifest_failure() {
                 // Run should be seen as completed
                 WaitForCompletedRun(Run(1)),
             ],
-            [WorkerExitStatus(
-                Wid(1),
-                Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
-            )],
+            [
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert!(matches!(e, WorkersExitStatus::Error { .. }))),
+                ),
+                // Queue should say that no results could be provided because manifest couldn't be
+                // generated.
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Error(s) => {
+                            assert!(s.contains("manifest failed to be generated"), "{s:?}");
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
         )
         .test()
         .await;
@@ -1101,7 +1317,7 @@ async fn multiple_tests_per_work_id_reported() {
                 WaitForCompletedRun(Run(1)),
             ],
             [
-                TestResults(
+                WorkerTestResults(
                     Run(1),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -1120,6 +1336,25 @@ async fn multiple_tests_per_work_id_reported() {
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                vec![
+                                    (1, s!("echo1")),
+                                    (1, s!("echo2")),
+                                    (1, s!("echo3")),
+                                    (1, s!("echo4")),
+                                    (1, s!("echo5")),
+                                    (1, s!("echo6")),
+                                ]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -1186,6 +1421,8 @@ async fn many_retries_complete() {
             }
         }
     }
+    let expected_worker_results = expected_results.clone();
+    let expected_queue_results = expected_results;
 
     TestBuilder::default()
         .act([StartWorkers(Run(1), Wid(1), workers_config)])
@@ -1196,17 +1433,26 @@ async fn many_retries_complete() {
                 WaitForCompletedRun(Run(1)),
             ],
             [
-                TestResults(
+                WorkerTestResults(
                     Run(1),
                     Box::new(move |results| {
                         let mut results = results.to_vec();
                         let results = sort_results_owned(&mut results);
-                        results == expected_results
+                        results == expected_worker_results
                     }),
                 ),
                 WorkerExitStatus(
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(flatten_queue_results(r), expected_queue_results);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -1241,6 +1487,8 @@ async fn many_retries_many_workers_complete() {
     }
 
     expected_results.sort();
+    let expected_workers_results = expected_results.clone();
+    let expected_queue_results = expected_results;
 
     let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
 
@@ -1263,23 +1511,33 @@ async fn many_retries_many_workers_complete() {
             Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
         ));
     }
+    end_workers_actions.extend([
+        // Run should be seen as completed
+        WaitForCompletedRun(Run(1)),
+        // Wait for all results to be flushed
+        WaitForNoPendingResults(Run(1)),
+    ]);
+    end_workers_asserts.push(WorkerTestResults(
+        Run(1),
+        Box::new(move |results| {
+            let mut results = results.to_vec();
+            let results = sort_results_owned(&mut results);
+            results == expected_workers_results
+        }),
+    ));
+    end_workers_asserts.push(QueueTestResults(
+        Run(1),
+        Box::new(move |resp| match resp {
+            TestResultsResponse::Results(r) => {
+                assert_eq!(flatten_queue_results(r), expected_queue_results);
+            }
+            _ => unreachable!("{resp:?}"),
+        }),
+    ));
 
     TestBuilder::default()
         .act(start_actions)
-        .step(
-            end_workers_actions.into_iter().chain(once(
-                // Run should be seen as completed
-                WaitForCompletedRun(Run(1)),
-            )),
-            end_workers_asserts.into_iter().chain(once(TestResults(
-                Run(1),
-                Box::new(move |results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results_owned(&mut results);
-                    results == expected_results
-                }),
-            ))),
-        )
+        .step(end_workers_actions, end_workers_asserts)
         .test()
         .await;
 }
@@ -1312,6 +1570,8 @@ async fn many_retries_many_workers_complete_native() {
     }
 
     expected_results.sort();
+    let expected_workers_results = expected_results.clone();
+    let expected_queue_results = expected_results;
 
     use abq_native_runner_simulation::{legal_spawned_message, pack, pack_msgs, Msg::*};
 
@@ -1390,21 +1650,36 @@ async fn many_retries_many_workers_complete_native() {
         end_workers_actions.push(StopWorkers(Wid(i)));
     }
 
-    // Run should be seen as completed
-    end_workers_actions.push(WaitForCompletedRun(Run(1)));
+    end_workers_actions.extend([
+        // Run should be seen as completed
+        WaitForCompletedRun(Run(1)),
+        // Wait for all results to be flushed
+        WaitForNoPendingResults(Run(1)),
+    ]);
 
     TestBuilder::default()
         .act(start_actions)
         .step(
             end_workers_actions,
-            [TestResults(
-                Run(1),
-                Box::new(move |results| {
-                    let mut results = results.to_vec();
-                    let results = sort_results_owned(&mut results);
-                    results == expected_results
-                }),
-            )],
+            [
+                WorkerTestResults(
+                    Run(1),
+                    Box::new(move |results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results_owned(&mut results);
+                        results == expected_workers_results
+                    }),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(flatten_queue_results(r), expected_queue_results);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
         )
         .test()
         .await;
@@ -1480,7 +1755,7 @@ async fn cancellation_native() {
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
                 ),
-                TestResults(Run(1), Box::new(|results| results.is_empty())),
+                WorkerTestResults(Run(1), Box::new(|results| results.is_empty())),
             ],
         )
         // A second pair of workers must also be cancelled.
@@ -1529,9 +1804,13 @@ async fn retry_out_of_process_worker() {
             WorkersConfigBuilder::new(1, runner1),
         )])
         .step(
-            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(
+                StopWorkers(Wid(1)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
+            [
+                WorkerTestResults(
                     Run(1),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -1543,6 +1822,18 @@ async fn retry_out_of_process_worker() {
                     Wid(1),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
                 ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                [(1, s!("echo1")), (1, s!("echo2"))]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
             ],
         )
         // Second attempt of the run should run the same tests, produce the same results.
@@ -1552,9 +1843,13 @@ async fn retry_out_of_process_worker() {
             WorkersConfigBuilder::new(1, runner2),
         )])
         .step(
-            [StopWorkers(Wid(2)), WaitForCompletedRun(Run(1))],
             [
-                TestResults(
+                StopWorkers(Wid(2)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
+            [
+                WorkerTestResults(
                     Run(1),
                     Box::new(|results| {
                         let mut results = results.to_vec();
@@ -1565,6 +1860,23 @@ async fn retry_out_of_process_worker() {
                 WorkerExitStatus(
                     Wid(2),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            assert_eq!(
+                                flatten_queue_results(r),
+                                [
+                                    (1, s!("echo1")),
+                                    (1, s!("echo1")),
+                                    (1, s!("echo2")),
+                                    (1, s!("echo2"))
+                                ]
+                            );
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
                 ),
             ],
         )
@@ -1598,8 +1910,14 @@ async fn many_retries_of_many_out_of_process_workers() {
     let run = Run(1);
     for retry in 1..=num_out_of_process_retries {
         let mut start_actions = vec![];
+        // Steps that the workers should take
         let mut end_workers_actions = vec![];
         let mut end_workers_asserts = vec![];
+        // Steps that we should check regarding the state of the queue, after the workers are
+        // complete. Needs to be run separately, because all worker tasks will be run concurrently
+        // with the queue checks otherwise!
+        let mut end_run_actions = vec![];
+        let mut end_run_asserts = vec![];
 
         // Push on the workers for this set of out-of-process retries
         for i in 0..num_workers {
@@ -1620,7 +1938,7 @@ async fn many_retries_of_many_out_of_process_workers() {
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
             ));
         }
-        end_workers_actions.push(WaitForCompletedRun(run));
+        end_run_actions.extend([WaitForCompletedRun(run), WaitForNoPendingResults(run)]);
 
         // The number of expected results is now the results * how many retries we had
         let mut expected_results: Vec<_> = std::iter::repeat(expected_results_one_pass.clone())
@@ -1628,19 +1946,35 @@ async fn many_retries_of_many_out_of_process_workers() {
             .flatten()
             .collect();
         expected_results.sort();
-        end_workers_asserts.push(TestResults(
-            run,
-            Box::new(move |results| {
-                let mut results = results.to_vec();
-                let results = sort_results_owned(&mut results);
-                results == expected_results
-            }),
-        ));
+
+        let expected_workers_results = expected_results.clone();
+        let expected_queue_results = expected_results;
+
+        end_run_asserts.extend([
+            WorkerTestResults(
+                run,
+                Box::new(move |results| {
+                    let mut results = results.to_vec();
+                    let results = sort_results_owned(&mut results);
+                    results == expected_workers_results
+                }),
+            ),
+            QueueTestResults(
+                run,
+                Box::new(move |resp| match resp {
+                    TestResultsResponse::Results(r) => {
+                        assert_eq!(flatten_queue_results(r), expected_queue_results);
+                    }
+                    _ => unreachable!("{resp:?}"),
+                }),
+            ),
+        ]);
 
         // Chain on the test, then do the next retry iteration.
         builder = builder
             .act(start_actions)
-            .step(end_workers_actions, end_workers_asserts);
+            .step(end_workers_actions, end_workers_asserts)
+            .step(end_run_actions, end_run_asserts);
     }
 
     builder.test().await;
