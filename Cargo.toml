@@ -25,12 +25,12 @@ members = [
 [workspace.dependencies]
 serde = "1.0.152"
 serde_derive = "1.0.152"
-serde_json = "1.0.93"
+serde_json = "1.0.94"
 
 rustls = "0.20.8"
 rustls-pemfile = "1.0.2"
 
-tokio = { version = "1.25.0", features = [
+tokio = { version = "1.26.0", features = [
   "fs",
   "io-util",
   "io-std",
@@ -56,27 +56,27 @@ tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "json"] }
 tracing-appender = "0.2.2"
 
-thiserror = "1.0.38"
+thiserror = "1.0.39"
 anyhow = "1.0.69"
-indoc = "2.0.0"
+indoc = "2.0.1"
 
-clap = { version = "4.1.6", features = ["derive", "env"] }
+clap = { version = "4.1.8", features = ["derive", "env"] }
 atty = "0.2.14"
 num_cpus = "1.15.0"
 termcolor = "1.2.0"
 indicatif = "0.17.3"
 
-async-trait = "0.1.64"
+async-trait = "0.1.66"
 static_assertions = "1.1.0"
 derive_more = "0.99.17"
 
 # --- Development ---
 
 insta = { version = "1.28.0", features = ["json"] }
-paste = "1.0.11"
+paste = "1.0.12"
 
 fs4 = "0.6.3"
-tempfile = "3.3.0"
+tempfile = "3.4.0"
 tracing-test = { version = "0.2.4", features = ["no-env-filter"] }
 
 ntest = "0.9.0"
