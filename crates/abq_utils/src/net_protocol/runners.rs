@@ -381,7 +381,7 @@ impl ManifestMessage {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub enum TestRuntime {
     Milliseconds(f64), // v0.1
     Nanoseconds(u64),  // v0.2
@@ -537,7 +537,7 @@ impl std::fmt::Display for OutOfBandError {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TestResultSpec {
     pub status: Status,
     pub id: TestId,
@@ -648,7 +648,7 @@ enum PrivNativeTestResult {
 static_assertions::assert_eq_size!(RawNativeTestResult, [u8; 8]);
 
 /// Test result reported to ABQ, normalizing from a native runner.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TestResult {
     /// The runner this test result originated from
     pub source: RunnerMeta,
@@ -812,7 +812,7 @@ impl InitSuccessMessage {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct CapturedOutput {
     pub stderr: Vec<u8>,
     pub stdout: Vec<u8>,

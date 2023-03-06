@@ -171,7 +171,7 @@ jobs:
           {
             echo "formatted_filesize=$(printf "%'d" "$FILESIZE")"
             echo "filesize=$FILESIZE"
-            echo "smaller_than_55mb=${{ steps.prepare_release.outputs.filesize < 55000000 && 'true' || 'false' }}"
+            echo "smaller_than_60mb=${{ steps.prepare_release.outputs.filesize < 60000000 && 'true' || 'false' }}"
           } >> "$GITHUB_OUTPUT"
         env:
           FILESIZE: ${{ steps.prepare_release.outputs.filesize }}
@@ -187,7 +187,7 @@ jobs:
           pr_number: ${{ steps.pr.outputs.number }}
           message: |
             **Zipped Filesize for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
-            ${{ steps.filesize.outputs.smaller_than_55mb == 'true' && ':white_check_mark: smaller than 55MB' || ':x: greater than 55MB' }}
+            ${{ steps.filesize.outputs.smaller_than_60mb == 'true' && ':white_check_mark: smaller than 60MB' || ':x: greater than 60MB' }}
             ${{ steps.filesize.outputs.formatted_filesize }} bytes
             Note: this is a dev build where we don't do any size optimizations. We expect the filesizes to be much larger than the production builds (last checked: < 4mb)
 

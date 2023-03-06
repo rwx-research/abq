@@ -27,8 +27,6 @@ impl FilesystemPersistor {
     fn get_path(&self, run_id: &RunId) -> PathBuf {
         let run_id = &run_id.0;
 
-        // TODO: I (Ayaz) would like to not have to use json here, but currently the metadata map is
-        // stored as an opauq JSON blob.
         self.root.join(format!("{run_id}.manifest.json"))
     }
 }

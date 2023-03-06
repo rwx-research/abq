@@ -486,7 +486,7 @@ pub mod queue {
     }
 
     /// A set of test results associated with an individual unit of work.
-    #[derive(Serialize, Deserialize, Debug, Clone)]
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
     pub struct AssociatedTestResults {
         /// The run number this test result comes from.
         pub work_id: WorkId,
@@ -603,6 +603,43 @@ pub mod queue {
         WorkerRanAllTests(RunId),
         /// Query the queue for the state of a run at a particular moment in time.
         RunStatus(RunId),
+    }
+
+    /// A lazy-loaded representation of [AssociatedTestResults].
+    /// The implementor should store the results as JSON lines of JSON-encoded [AssociatedTestResults].
+    #[derive(Serialize, Deserialize)]
+    pub struct OpaqueLazyAssociatedTestResults(Vec<Box<serde_json::value::RawValue>>);
+
+    impl OpaqueLazyAssociatedTestResults {
+        pub fn from_raw_json_lines(opaque_lines: Vec<Box<serde_json::value::RawValue>>) -> Self {
+            Self(opaque_lines)
+        }
+
+        pub fn decode(&self) -> serde_json::Result<Vec<Vec<AssociatedTestResults>>> {
+            let mut results = Vec::with_capacity(self.0.len());
+            for results_list in self.0.iter() {
+                results.push(serde_json::from_str(results_list.get())?);
+            }
+            Ok(results)
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use super::OpaqueLazyAssociatedTestResults;
+
+        #[test]
+        fn opaque_lazy_results_does_not_realloc_value() {
+            let opaque = OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                serde_json::value::to_raw_value(r#"hello"#).unwrap(),
+            ]);
+
+            let encoded = serde_json::to_string(&opaque).unwrap();
+            assert_eq!(encoded, r#"["hello"]"#);
+            let decoded: OpaqueLazyAssociatedTestResults = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.0.len(), 1);
+            assert_eq!(decoded.0[0].get(), r#""hello""#);
+        }
     }
 }
 
