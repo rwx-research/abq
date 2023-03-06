@@ -11,7 +11,7 @@ use abq_utils::{
 use async_trait::async_trait;
 use tokio::fs;
 
-use super::{ManifestView, PersistentManifest, Result};
+use super::{ManifestView, PersistentManifest, Result, SharedPersistManifest};
 
 /// Persists manifests on a filesystem, encoding/decoding to JSON.
 #[derive(Clone)]
@@ -22,6 +22,10 @@ pub struct FilesystemPersistor {
 impl FilesystemPersistor {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
+    }
+
+    pub fn new_shared(root: impl Into<PathBuf>) -> SharedPersistManifest {
+        SharedPersistManifest(Box::new(Self { root: root.into() }))
     }
 
     fn get_path(&self, run_id: &RunId) -> PathBuf {

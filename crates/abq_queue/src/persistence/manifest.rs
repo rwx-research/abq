@@ -1,7 +1,10 @@
 //! Persistence of manifests across test runs.
 
-pub mod fs;
-pub mod in_memory;
+mod fs;
+mod in_memory;
+
+pub use fs::FilesystemPersistor;
+pub use in_memory::InMemoryPersistor;
 
 use std::sync::{atomic::AtomicBool, Arc};
 
@@ -70,10 +73,6 @@ impl Clone for SharedPersistManifest {
 }
 
 impl SharedPersistManifest {
-    pub fn new(p: impl PersistentManifest + 'static) -> Self {
-        Self(Box::new(p))
-    }
-
     pub fn borrowed(&self) -> &dyn PersistentManifest {
         &*self.0
     }

@@ -11,7 +11,7 @@ use std::{
 
 use abq_native_runner_simulation::pack_msgs_to_disk;
 use abq_queue::{
-    persistence::manifest::{self, SharedPersistManifest},
+    persistence,
     queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT},
 };
 use abq_test_utils::artifacts_dir;
@@ -72,6 +72,7 @@ struct SpawnId(usize);
 /// External dependencies that must be preserved while a test is ongoing.
 struct QueueExtDeps {
     _manifests_path: TempDir,
+    _results_path: TempDir,
 }
 
 enum Servers {
@@ -81,12 +82,17 @@ enum Servers {
 impl Default for Servers {
     fn default() -> Self {
         let manifests_path = tempfile::tempdir().unwrap();
-        let persist_manifest = SharedPersistManifest::new(manifest::fs::FilesystemPersistor::new(
-            manifests_path.path(),
-        ));
-        let config = QueueConfig::new(persist_manifest);
+        let persist_manifest =
+            persistence::manifest::FilesystemPersistor::new_shared(manifests_path.path());
+
+        let results_path = tempfile::tempdir().unwrap();
+        let persist_results =
+            persistence::results::FilesystemPersistor::new_shared(results_path.path(), 10);
+
+        let config = QueueConfig::new(persist_manifest, persist_results);
         let deps = QueueExtDeps {
             _manifests_path: manifests_path,
+            _results_path: results_path,
         };
         Self::Unified(config, deps)
     }

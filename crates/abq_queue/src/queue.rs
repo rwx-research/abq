@@ -45,6 +45,7 @@ use crate::job_queue::JobQueue;
 use crate::persistence::manifest::{
     self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
 };
+use crate::persistence::results::{ResultsPersistedCell, SharedPersistResults};
 use crate::prelude::*;
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
@@ -76,6 +77,9 @@ enum RunState {
         /// tests.
         /// Some(time) if they have already completed, None if they are still active.
         active_workers: Mutex<WorkerSet<Option<Instant>>>,
+
+        /// A tracker of what results have been persisted.
+        results_persistence: ResultsPersistedCell,
     },
     /// All items in the manifest have been handed out.
     /// Workers may still be executing locally, for example in-band retries.
@@ -93,6 +97,9 @@ enum RunState {
 
         /// A marker of whether the manifest associated with this run has been persisted.
         manifest_persistence: ManifestPersistence,
+
+        /// A tracker of what results have been persisted.
+        results_persistence: ResultsPersistence,
     },
     Cancelled {
         #[allow(unused)] // yet
@@ -103,6 +110,13 @@ enum RunState {
 #[derive(Debug)]
 enum ManifestPersistence {
     Persisted(ManifestPersistedCell),
+    ManifestNeverReceived,
+    EmptyManifest,
+}
+
+#[derive(Debug)]
+enum ResultsPersistence {
+    Persisted(ResultsPersistedCell),
     ManifestNeverReceived,
     EmptyManifest,
 }
@@ -231,6 +245,20 @@ enum RetryManifestState {
     ManifestNeverReceived,
     NotYetPersisted,
     FetchFromPersistence,
+}
+
+#[derive(Debug, Error)]
+enum WriteResultsError {
+    #[error("attempting to write results for unregistered run")]
+    RunNotFound,
+    #[error("attempting to write results before manifest received")]
+    WaitingForManifest,
+    #[error("attempting to write results when manifest failed to be generated")]
+    ManifestNeverReceived,
+    #[error("attempting to write results for empty manifest run")]
+    EmptyManifest,
+    #[error("attempting to write results for cancelled run")]
+    RunCancelled,
 }
 
 impl AllRuns {
@@ -455,6 +483,7 @@ impl AllRuns {
             batch_size_hint: run_data.batch_size_hint,
             init_metadata,
             active_workers: Mutex::new(active_workers),
+            results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
 
         AddedManifest::Added {
@@ -607,6 +636,36 @@ impl AllRuns {
         (bundle, pulled_tests_status)
     }
 
+    pub fn get_write_results_cell(
+        &self,
+        run_id: &RunId,
+    ) -> Result<ResultsPersistedCell, WriteResultsError> {
+        use WriteResultsError::*;
+
+        let runs = self.runs.read();
+        let run = match runs.get(run_id) {
+            Some(run) => run.read(),
+            None => return Err(RunNotFound),
+        };
+
+        match &run.state {
+            RunState::WaitingForManifest { .. } => Err(WaitingForManifest),
+            RunState::HasWork {
+                results_persistence,
+                ..
+            } => Ok(results_persistence.clone()),
+            RunState::InitialManifestDone {
+                results_persistence,
+                ..
+            } => match results_persistence {
+                ResultsPersistence::Persisted(cell) => Ok(cell.clone()),
+                ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
+                ResultsPersistence::EmptyManifest => Err(EmptyManifest),
+            },
+            RunState::Cancelled { .. } => Err(RunCancelled),
+        }
+    }
+
     pub fn get_retry_manifest(&self, run_id: &RunId, entity: Entity) -> RetryManifestState {
         let runs = self.runs.read();
         let run = match runs.get(run_id) {
@@ -723,11 +782,13 @@ impl AllRuns {
         let active_worker_timings;
         let queue;
         let init_metadata;
+        let results_persistence;
         match &mut run.state {
             RunState::HasWork {
                 queue: this_queue,
                 active_workers: this_active_workers,
                 init_metadata: this_init_metadata,
+                results_persistence: this_results_persistence,
                 ..
             } => {
                 log_assert!(
@@ -737,6 +798,7 @@ impl AllRuns {
                 active_worker_timings = Mutex::into_inner(std::mem::take(this_active_workers));
                 queue = std::mem::take(this_queue);
                 init_metadata = std::mem::take(this_init_metadata);
+                results_persistence = this_results_persistence.clone();
             }
             RunState::Cancelled { .. } => {
                 // Cancellation always takes priority over completeness.
@@ -770,6 +832,7 @@ impl AllRuns {
             init_metadata,
             seen_workers: RwLock::new(seen_workers),
             manifest_persistence: ManifestPersistence::Persisted(manifest_persisted),
+            results_persistence: ResultsPersistence::Persisted(results_persistence),
         };
 
         // Drop the run data, since we no longer need it.
@@ -805,6 +868,7 @@ impl AllRuns {
             init_metadata: Default::default(),
             seen_workers: Default::default(),
             manifest_persistence: ManifestPersistence::ManifestNeverReceived,
+            results_persistence: ResultsPersistence::ManifestNeverReceived,
         };
 
         // Drop the run data, since we no longer need it.
@@ -840,6 +904,7 @@ impl AllRuns {
             init_metadata: Default::default(),
             seen_workers: Default::default(),
             manifest_persistence: ManifestPersistence::EmptyManifest,
+            results_persistence: ResultsPersistence::EmptyManifest,
         };
 
         // Drop the run data, since we no longer need it.
@@ -1056,12 +1121,17 @@ pub struct QueueConfig {
     pub server_options: ServerOptions,
     /// How manifests should be persisted.
     pub persist_manifest: SharedPersistManifest,
+    /// How results should be persisted.
+    pub persist_results: SharedPersistResults,
 }
 
 impl QueueConfig {
     /// Creates a [`QueueConfig`] that always binds and advertises on INADDR_ANY, with arbitrary
     /// ports for its servers.
-    pub fn new(persist_manifest: SharedPersistManifest) -> Self {
+    pub fn new(
+        persist_manifest: SharedPersistManifest,
+        persist_results: SharedPersistResults,
+    ) -> Self {
         Self {
             public_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             bind_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -1073,6 +1143,7 @@ impl QueueConfig {
                 ServerTlsStrategy::no_tls(),
             ),
             persist_manifest,
+            persist_results,
         }
     }
 }
@@ -1089,6 +1160,7 @@ async fn start_queue(config: QueueConfig) -> Abq {
         negotiator_port,
         server_options,
         persist_manifest,
+        persist_results,
     } = config;
 
     let mut shutdown_manager = ShutdownManager::default();
@@ -1113,7 +1185,7 @@ async fn start_queue(config: QueueConfig) -> Abq {
     let server_shutdown_rx = shutdown_manager.add_receiver();
     let server_handle = tokio::spawn({
         let queues = queues.clone();
-        let queue_server = QueueServer::new(queues, public_negotiator_addr);
+        let queue_server = QueueServer::new(queues, public_negotiator_addr, persist_results);
         queue_server.start(server_listener, server_shutdown_rx)
     });
 
@@ -1188,6 +1260,7 @@ async fn start_queue(config: QueueConfig) -> Abq {
 /// Central server listening for new test run runs and results.
 struct QueueServer {
     queues: SharedRuns,
+    persist_results: SharedPersistResults,
     public_negotiator_addr: SocketAddr,
 }
 
@@ -1210,13 +1283,19 @@ pub enum QueueServerError {
 struct QueueServerCtx {
     queues: SharedRuns,
     public_negotiator_addr: SocketAddr,
+    persist_results: SharedPersistResults,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
 impl QueueServer {
-    fn new(queues: SharedRuns, public_negotiator_addr: SocketAddr) -> Self {
+    fn new(
+        queues: SharedRuns,
+        public_negotiator_addr: SocketAddr,
+        persist_results: SharedPersistResults,
+    ) -> Self {
         Self {
             queues,
+            persist_results,
             public_negotiator_addr,
         }
     }
@@ -1228,12 +1307,14 @@ impl QueueServer {
     ) -> Result<(), QueueServerError> {
         let Self {
             queues,
+            persist_results,
             public_negotiator_addr,
         } = self;
 
         let ctx = QueueServerCtx {
             queues,
             public_negotiator_addr,
+            persist_results,
             handshake_ctx: Arc::new(server_listener.handshake_ctx()),
         };
 
@@ -1341,7 +1422,14 @@ impl QueueServer {
                 drop(stream);
 
                 // Record the test results and notify the test client out-of-band.
-                Self::handle_worker_results(ctx.queues, entity, run_id, results).await
+                Self::handle_worker_results(
+                    ctx.queues,
+                    ctx.persist_results,
+                    entity,
+                    run_id,
+                    results,
+                )
+                .await
             }
 
             Message::WorkerRanAllTests(run_id) => {
@@ -1583,25 +1671,21 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(_queues))]
+    #[instrument(level = "trace", skip(queues, persist_results))]
     async fn handle_worker_results(
-        _queues: SharedRuns,
+        queues: SharedRuns,
+        persist_results: SharedPersistResults,
         entity: Entity,
         run_id: RunId,
         results: Vec<AssociatedTestResults>,
     ) -> OpaqueResult<()> {
-        // IFTTT: handle_fired_timeout
+        tracing::debug!(?entity, ?run_id, "got result");
 
-        tracing::debug!("got result");
+        let cell = queues.get_write_results_cell(&run_id).located(here!())?;
+        let result = cell.persist(&persist_results, results).await;
 
-        let _num_results = results.len();
-
-        {
-            // TODO do something with the results, eventually!
-            let _ = results;
-        }
-
-        Ok(())
+        // result is an Arc, so we must lower it to a non-arc at this point.
+        result.map_err(|e| e.error.to_string().located(e.location))
     }
 
     #[instrument(level = "trace", skip(queues))]
@@ -1934,7 +2018,7 @@ mod test {
     use std::{io, time::Instant};
 
     use crate::{
-        persistence::manifest::in_memory::InMemoryPersistor,
+        persistence::{self, manifest::InMemoryPersistor},
         queue::{AddedManifest, CancelReason, QueueServer, RunStatus, SharedRuns, WorkScheduler},
     };
     use abq_run_n_times::n_times;
@@ -1974,7 +2058,11 @@ mod test {
     #[tokio::test]
     #[traced_test]
     async fn bad_message_doesnt_take_down_server() {
-        let server = QueueServer::new(Default::default(), "0.0.0.0:0".parse().unwrap());
+        let server = QueueServer::new(
+            Default::default(),
+            "0.0.0.0:0".parse().unwrap(),
+            persistence::results::InMemoryPersistor::new_shared(),
+        );
 
         let server_opts =
             ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
@@ -2015,6 +2103,7 @@ mod test {
         let queue_server = QueueServer {
             queues: Default::default(),
             public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
+            persist_results: persistence::results::InMemoryPersistor::new_shared(),
         };
         let queue_handle = tokio::spawn(queue_server.start(server, server_shutdown_rx));
 
@@ -2110,7 +2199,11 @@ mod test {
     #[traced_test]
     async fn connecting_to_queue_server_with_auth_okay() {
         let negotiator_addr = "0.0.0.0:0".parse().unwrap();
-        let server = QueueServer::new(Default::default(), negotiator_addr);
+        let server = QueueServer::new(
+            Default::default(),
+            negotiator_addr,
+            persistence::results::InMemoryPersistor::new_shared(),
+        );
 
         let (server_auth, client_auth, _) =
             build_strategies(UserToken::new_random(), AdminToken::new_random());
@@ -2152,7 +2245,11 @@ mod test {
     #[traced_test]
     async fn connecting_to_queue_server_with_no_auth_fails() {
         let negotiator_addr = "0.0.0.0:0".parse().unwrap();
-        let server = QueueServer::new(Default::default(), negotiator_addr);
+        let server = QueueServer::new(
+            Default::default(),
+            negotiator_addr,
+            persistence::results::InMemoryPersistor::new_shared(),
+        );
 
         let (server_auth, _, _) = build_random_strategies();
 
@@ -2653,6 +2750,7 @@ mod test {
         let result = AssociatedTestResults::fake(WorkId::new(), vec![TestResult::fake()]);
         let send_last_result_fut = QueueServer::handle_worker_results(
             queues.clone(),
+            persistence::results::InMemoryPersistor::new_shared(),
             entity,
             run_id.clone(),
             vec![result],
@@ -2682,9 +2780,12 @@ mod test_pull_work {
     };
     use abq_with_protocol_version::with_protocol_version;
 
-    use crate::queue::{
-        fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunData, RunState, RunStatus,
-        SharedRuns,
+    use crate::{
+        persistence::results::ResultsPersistedCell,
+        queue::{
+            fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunData, RunState,
+            RunStatus, SharedRuns,
+        },
     };
 
     #[test]
@@ -2703,15 +2804,16 @@ mod test_pull_work {
         ]);
 
         let batch_size_hint = one_nonzero_usize();
+        let run_id = RunId::unique();
 
         let has_work = RunState::HasWork {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
             active_workers: Default::default(),
+            results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
 
-        let run_id = RunId::unique();
         let queues = SharedRuns::default();
         queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
 
@@ -2770,7 +2872,10 @@ mod retry_manifest {
 
     use crate::{
         job_queue::JobQueue,
-        persistence::manifest::{in_memory::InMemoryPersistor, SharedPersistManifest},
+        persistence::{
+            manifest::{InMemoryPersistor, SharedPersistManifest},
+            results::ResultsPersistedCell,
+        },
         queue::{fake_test_spec, NextWorkResult, RunData, RunState, SharedRuns, WorkScheduler},
     };
     use abq_test_utils::{one_nonzero_usize, spec, worker_test};
@@ -2908,6 +3013,7 @@ mod retry_manifest {
                 init_metadata: Default::default(),
                 batch_size_hint,
                 active_workers: Default::default(),
+                results_persistence: ResultsPersistedCell::new(run_id.clone()),
             };
 
             let queues = SharedRuns::default();
@@ -3069,5 +3175,146 @@ mod retry_manifest {
 
         shutdown_tx.shutdown_immediately().unwrap();
         server_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod persist_results {
+    use abq_test_utils::{one_nonzero_usize, wid};
+    use abq_utils::{
+        exit::ExitCode,
+        net_protocol::{
+            entity::Entity,
+            queue::{AssociatedTestResults, CancelReason},
+            runners::TestResult,
+            workers::RunId,
+        },
+    };
+    use ntest::timeout;
+
+    use crate::{
+        job_queue::JobQueue,
+        persistence::{self, results::ResultsPersistedCell},
+    };
+
+    use super::{ManifestPersistence, QueueServer, ResultsPersistence, RunState, SharedRuns};
+
+    #[tokio::test]
+    #[timeout(1000)]
+    async fn sending_results_when_active_eventually_persists_results() {
+        let run_id = RunId::unique();
+        let results_persistence = persistence::results::InMemoryPersistor::new_shared();
+        let results_cell = ResultsPersistedCell::new(run_id.clone());
+        let queues = {
+            let queues = SharedRuns::default();
+            let done = RunState::HasWork {
+                queue: JobQueue::default(),
+                init_metadata: Default::default(),
+                active_workers: Default::default(),
+                results_persistence: results_cell.clone(),
+                batch_size_hint: one_nonzero_usize(),
+            };
+            queues.set_state(run_id.clone(), done, None);
+            queues
+        };
+
+        let results = vec![AssociatedTestResults::fake(
+            wid(1),
+            vec![TestResult::fake()],
+        )];
+
+        QueueServer::handle_worker_results(
+            queues.clone(),
+            results_persistence.clone(),
+            Entity::runner(0, 1),
+            run_id.clone(),
+            results.clone(),
+        )
+        .await
+        .unwrap();
+
+        let opt_retrieved = results_cell.retrieve(&results_persistence).await;
+        assert!(opt_retrieved.is_some(), "outstanding pending results");
+        let actual_results = opt_retrieved.unwrap().unwrap().decode().unwrap();
+        assert_eq!(actual_results, vec![results]);
+    }
+
+    #[tokio::test]
+    #[timeout(1000)]
+    async fn sending_results_when_initial_manifest_done_eventually_persists_results() {
+        let run_id = RunId::unique();
+        let results_persistence = persistence::results::InMemoryPersistor::new_shared();
+        let results_cell = ResultsPersistedCell::new(run_id.clone());
+        let queues = {
+            let queues = SharedRuns::default();
+            let has_work = RunState::InitialManifestDone {
+                new_worker_exit_code: ExitCode::SUCCESS,
+                init_metadata: Default::default(),
+                seen_workers: Default::default(),
+                manifest_persistence: ManifestPersistence::EmptyManifest,
+                results_persistence: ResultsPersistence::Persisted(results_cell.clone()),
+            };
+            queues.set_state(run_id.clone(), has_work, None);
+            queues
+        };
+
+        let results = vec![AssociatedTestResults::fake(
+            wid(1),
+            vec![TestResult::fake()],
+        )];
+
+        QueueServer::handle_worker_results(
+            queues.clone(),
+            results_persistence.clone(),
+            Entity::runner(0, 1),
+            run_id.clone(),
+            results.clone(),
+        )
+        .await
+        .unwrap();
+
+        let opt_retrieved = results_cell.retrieve(&results_persistence).await;
+        assert!(opt_retrieved.is_some(), "outstanding pending results");
+        let actual_results = opt_retrieved.unwrap().unwrap().decode().unwrap();
+        assert_eq!(actual_results, vec![results]);
+    }
+
+    #[tokio::test]
+    #[timeout(1000)]
+    async fn sending_results_when_cancelled_is_error_and_does_nothing() {
+        let run_id = RunId::unique();
+        let results_persistence = persistence::results::InMemoryPersistor::new_shared();
+        let results_cell = ResultsPersistedCell::new(run_id.clone());
+        let queues = {
+            let queues = SharedRuns::default();
+            let done = RunState::Cancelled {
+                reason: CancelReason::User,
+            };
+            queues.set_state(run_id.clone(), done, None);
+            queues
+        };
+
+        let results = vec![AssociatedTestResults::fake(
+            wid(1),
+            vec![TestResult::fake()],
+        )];
+
+        let result = QueueServer::handle_worker_results(
+            queues.clone(),
+            results_persistence.clone(),
+            Entity::runner(0, 1),
+            run_id.clone(),
+            results.clone(),
+        )
+        .await;
+
+        assert!(result.is_err());
+
+        let opt_retrieved = results_cell.retrieve(&results_persistence).await;
+        assert!(opt_retrieved.is_some(), "outstanding pending results");
+        assert!(
+            opt_retrieved.unwrap().is_err(),
+            "cancelled run before any results has results associated"
+        );
     }
 }

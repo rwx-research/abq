@@ -1,4 +1,5 @@
-use abq_queue::persistence::manifest::{self, SharedPersistManifest};
+use abq_queue::persistence;
+use abq_queue::queue::{Abq, QueueConfig};
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::Entity;
@@ -13,13 +14,15 @@ use std::net::{IpAddr, SocketAddr};
 use std::thread;
 use tempfile::TempDir;
 
-use abq_queue::queue::{Abq, QueueConfig};
-
 use thiserror::Error;
 use tokio::select;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 type ClientAuthStrategy = abq_utils::auth::ClientAuthStrategy<abq_utils::auth::User>;
+
+/// Max number of file descriptors to keep open in the results-persistence LRU cache at any given
+/// time.
+const RESULTS_PERSISTENCE_LRU_CAPACITY: usize = 25;
 
 /// Starts an [Abq] instance in the current process forever.
 pub async fn start_abq_forever(
@@ -34,10 +37,14 @@ pub async fn start_abq_forever(
     let public_ip = public_ip.unwrap_or(bind_ip);
 
     let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
+    let persist_manifest =
+        persistence::manifest::FilesystemPersistor::new_shared(manifests_path.path());
 
-    let persist_manifest = SharedPersistManifest::new(manifest::fs::FilesystemPersistor::new(
-        manifests_path.path(),
-    ));
+    let results_path = tempfile::tempdir().expect("unable to create a temporary file");
+    let persist_results = persistence::results::FilesystemPersistor::new_shared(
+        results_path.path(),
+        RESULTS_PERSISTENCE_LRU_CAPACITY,
+    );
 
     let queue_config = QueueConfig {
         public_ip,
@@ -47,6 +54,7 @@ pub async fn start_abq_forever(
         negotiator_port,
         server_options,
         persist_manifest,
+        persist_results,
     };
     let mut abq = Abq::start(queue_config).await;
 
@@ -56,6 +64,7 @@ pub async fn start_abq_forever(
         "Persisting manifests at {}",
         manifests_path.path().display()
     );
+    println!("Persisting results at {}", results_path.path().display());
 
     println!("Run the following to invoke a test run:");
     println!(
@@ -126,6 +135,7 @@ enum AbqLocator {
 
 struct EphemeralAbqGuards {
     _manifests_path: TempDir,
+    _results_path: TempDir,
 }
 
 #[derive(Debug, Error)]
@@ -174,17 +184,20 @@ impl AbqInstance {
         };
 
         let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
+        let persist_manifest =
+            persistence::manifest::FilesystemPersistor::new_shared(manifests_path.path());
 
-        let persist_manifest = SharedPersistManifest::new(manifest::fs::FilesystemPersistor::new(
-            manifests_path.path(),
-        ));
+        let results_path = tempfile::tempdir().expect("unable to create a temporary file");
+        let persist_results =
+            persistence::results::FilesystemPersistor::new_shared(results_path.path(), 10);
 
-        let mut config = QueueConfig::new(persist_manifest);
+        let mut config = QueueConfig::new(persist_manifest, persist_results);
         config.server_options = ServerOptions::new(server_auth, server_tls);
 
         let queue = Abq::start(config).await;
         let guards = EphemeralAbqGuards {
             _manifests_path: manifests_path,
+            _results_path: results_path,
         };
 
         AbqInstance {

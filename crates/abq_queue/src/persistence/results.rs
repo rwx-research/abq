@@ -1,15 +1,16 @@
 //! Persistence of test results for test runs.
 
-#![allow(unused)] // for now
-
 mod fs;
+mod in_memory;
+
+pub use fs::FilesystemPersistor;
+pub use in_memory::InMemoryPersistor;
 
 use std::sync::{atomic::AtomicU64, Arc};
 
 use abq_utils::{
     atomic,
-    error::{LocatedError, ResultLocation},
-    here,
+    error::LocatedError,
     net_protocol::{
         queue::{AssociatedTestResults, OpaqueLazyAssociatedTestResults},
         workers::RunId,
@@ -17,7 +18,6 @@ use abq_utils::{
 };
 use async_trait::async_trait;
 
-type Result<T> = std::result::Result<T, LocatedError>;
 type ArcResult<T> = std::result::Result<T, Arc<LocatedError>>;
 
 #[async_trait]

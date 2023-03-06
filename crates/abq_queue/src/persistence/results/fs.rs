@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use abq_utils::{
-    error::{ErrorLocation, ResultLocation},
+    error::ResultLocation,
     here,
     net_protocol::{
         queue::{AssociatedTestResults, OpaqueLazyAssociatedTestResults},
@@ -11,7 +11,7 @@ use abq_utils::{
 use async_trait::async_trait;
 use tokio::{
     fs::{self, File},
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::Mutex,
 };
 
