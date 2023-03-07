@@ -135,7 +135,7 @@ pub mod test {
             async_read, async_write,
             entity::Entity,
             work_server::{NextTestRequest, NextTestResponse},
-            workers::{NextWork, NextWorkBundle, RunId},
+            workers::{Eow, NextWorkBundle, RunId, WorkerTest},
         },
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
@@ -167,13 +167,15 @@ pub mod test {
 
     pub async fn server_send_bundle(
         conn: &mut Box<dyn ServerStream>,
-        bundle: impl IntoIterator<Item = NextWork>,
+        bundle: impl IntoIterator<Item = WorkerTest>,
+        eow: Eow,
     ) {
         let NextTestRequest {} = async_read(conn).await.unwrap();
         async_write(
             conn,
             &NextTestResponse::Bundle(NextWorkBundle {
                 work: bundle.into_iter().collect(),
+                eow,
             }),
         )
         .await
@@ -198,7 +200,7 @@ pub mod test {
 
             // The third time, let it through
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(&mut conn, []).await;
+            server_send_bundle(&mut conn, [], Eow(true)).await;
         };
 
         let client_task = async move {

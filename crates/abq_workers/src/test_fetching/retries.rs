@@ -5,7 +5,7 @@ use abq_utils::{
     net_protocol::{
         queue::{AssociatedTestResults, TestSpec},
         runners::TestId,
-        workers::{NextWork, WorkId, WorkerTest, INIT_RUN_NUMBER},
+        workers::{Eow, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
     },
 };
 use parking_lot::Mutex;
@@ -145,20 +145,17 @@ impl RetryManifestTracker {
 
     fn hydrate_ordered_manifest_slice(
         &mut self,
-        slice: impl IntoIterator<Item = NextWork>,
+        slice: impl IntoIterator<Item = WorkerTest>,
+        eow: Eow,
     ) -> HydrationStatus {
         let mut status = HydrationStatus::StillHydrating;
-        for item in slice {
-            match item {
-                NextWork::Work(WorkerTest { spec, run_number }) => {
-                    debug_assert_eq!(self.current_run_number, run_number);
-                    self.hydrate_ordered_manifest_item(spec);
-                }
-                NextWork::EndOfWork => {
-                    debug_assert_eq!(status, HydrationStatus::StillHydrating);
-                    status = self.assembled_state.note_end_of_manifest();
-                }
-            }
+        for WorkerTest { spec, run_number } in slice {
+            debug_assert_eq!(self.current_run_number, run_number);
+            self.hydrate_ordered_manifest_item(spec);
+        }
+        if eow.0 {
+            debug_assert_eq!(status, HydrationStatus::StillHydrating);
+            status = self.assembled_state.note_end_of_manifest();
         }
         status
     }
@@ -233,11 +230,12 @@ impl RetryManifestTracker {
         }
     }
 
-    fn try_assemble_retry_manifest(&mut self) -> Option<Vec<NextWork>> {
+    fn try_assemble_retry_manifest(&mut self) -> Option<NextWorkBundle> {
         debug_assert!(self.current_run_number <= self.max_run_number);
 
         if self.current_run_number == self.max_run_number {
-            return Some(vec![NextWork::EndOfWork]);
+            // EOW since we've exhausted all attempts.
+            return Some(NextWorkBundle::new([], Eow(true)));
         }
 
         match &mut self.assembled_state {
@@ -253,28 +251,24 @@ impl RetryManifestTracker {
                 let next_run_number = self.current_run_number + 1;
 
                 let failing_subset: Vec<_> = failing_subset(&self.entries, self.current_run_number)
-                    .map(|spec| {
-                        NextWork::Work(WorkerTest {
-                            spec,
-                            run_number: next_run_number,
-                        })
+                    .map(|spec| WorkerTest {
+                        spec,
+                        run_number: next_run_number,
                     })
                     .collect();
 
                 match failing_subset.last() {
-                    Some(NextWork::Work(test)) => {
+                    Some(test) => {
                         *last_work_name = test.spec.work_id;
                         *processed_last_work_result = false;
                         self.current_run_number = next_run_number;
-                        Some(failing_subset)
+
+                        // Not yet end of work since we have more attempts.
+                        Some(NextWorkBundle::new(failing_subset, Eow(false)))
                     }
                     None => {
-                        // No more retries
-                        Some(vec![NextWork::EndOfWork])
-                    }
-
-                    Some(NextWork::EndOfWork) => {
-                        unreachable!("failing_subset consists only of material work at this point")
+                        // No more retries; this is EOW.
+                        Some(NextWorkBundle::new([], Eow(true)))
                     }
                 }
             }
@@ -312,9 +306,10 @@ impl RetryTracker {
     /// a bug.
     pub fn hydrate_ordered_manifest_slice(
         &mut self,
-        slice: impl IntoIterator<Item = NextWork>,
+        slice: impl IntoIterator<Item = WorkerTest>,
+        eow: Eow,
     ) -> HydrationStatus {
-        self.0.lock().hydrate_ordered_manifest_slice(slice)
+        self.0.lock().hydrate_ordered_manifest_slice(slice, eow)
     }
 
     /// Assemble a subset of the manifest consisting only of entries that failed for the current
@@ -326,7 +321,7 @@ impl RetryTracker {
     /// case the assembly must yield until the last result is known.
     ///
     /// If all attempts have been exhausted, a list of [NextWork::EndOfWork] markers is returned.
-    pub fn try_assemble_retry_manifest(&mut self) -> Option<Vec<NextWork>> {
+    pub fn try_assemble_retry_manifest(&mut self) -> Option<NextWorkBundle> {
         self.0.lock().try_assemble_retry_manifest()
     }
 }
@@ -361,7 +356,7 @@ pub mod test {
     use abq_utils::net_protocol::{
         queue::{AssociatedTestResults, TestSpec},
         runners::{CapturedOutput, Status, TestCase, TestId, TestResult},
-        workers::{NextWork, WorkId, WorkerTest, INIT_RUN_NUMBER},
+        workers::{Eow, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
     };
     use abq_with_protocol_version::with_protocol_version;
     use rand::distributions::{Alphanumeric, DistString};
@@ -558,7 +553,7 @@ pub mod test {
     }
 
     pub fn with_focus(test_spec: impl Into<TestSpec>, focus: impl Into<TestId>) -> TestSpec {
-        let mut test_spec = test_spec.into();
+        let mut test_spec: TestSpec = test_spec.into();
         test_spec.test_case.add_test_focus(focus.into());
         test_spec
     }
@@ -582,7 +577,7 @@ pub mod test {
     fn hydrate_empty_manifest() {
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::EndOfWork]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice([], Eow(true));
         assert_eq!(hydrated, HydrationStatus::EmptyManifest);
     }
 
@@ -608,11 +603,14 @@ pub mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([
-            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
-        ]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice(
+            [
+                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER),
+            ],
+            Eow(false),
+        );
         assert_eq!(hydrated, HydrationStatus::StillHydrating);
 
         tracker.account_results([
@@ -646,12 +644,14 @@ pub mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([
-            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
-            NextWork::EndOfWork,
-        ]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice(
+            [
+                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER),
+            ],
+            Eow(true),
+        );
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
@@ -684,12 +684,14 @@ pub mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([
-            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
-            NextWork::EndOfWork,
-        ]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice(
+            [
+                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER),
+            ],
+            Eow(true),
+        );
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
@@ -701,30 +703,22 @@ pub mod test {
         let manifest = tracker.try_assemble_retry_manifest();
         assert!(manifest.is_some());
 
-        let manifest = manifest.unwrap();
-        assert_eq!(manifest.len(), 3);
+        let NextWorkBundle { work, eow } = manifest.unwrap();
+        assert_eq!(work.len(), 3);
 
         assert_eq!(
-            manifest[0],
-            NextWork::Work(WorkerTest::new(
-                with_focus(spec1.clone(), "test1"),
-                INIT_RUN_NUMBER + 1
-            ))
+            work[0],
+            WorkerTest::new(with_focus(spec1.clone(), "test1"), INIT_RUN_NUMBER + 1)
         );
         assert_eq!(
-            manifest[1],
-            NextWork::Work(WorkerTest::new(
-                with_focus(spec2.clone(), "test2"),
-                INIT_RUN_NUMBER + 1
-            ))
+            work[1],
+            WorkerTest::new(with_focus(spec2.clone(), "test2"), INIT_RUN_NUMBER + 1)
         );
         assert_eq!(
-            manifest[2],
-            NextWork::Work(WorkerTest::new(
-                with_focus(spec3.clone(), "test3"),
-                INIT_RUN_NUMBER + 1
-            ))
+            work[2],
+            WorkerTest::new(with_focus(spec3.clone(), "test3"), INIT_RUN_NUMBER + 1)
         );
+        assert!(!eow);
 
         assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER + 1);
 
@@ -755,12 +749,14 @@ pub mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([
-            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER)),
-            NextWork::EndOfWork,
-        ]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice(
+            [
+                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec3.clone(), INIT_RUN_NUMBER),
+            ],
+            Eow(true),
+        );
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
@@ -772,16 +768,14 @@ pub mod test {
         let manifest = tracker.try_assemble_retry_manifest();
         assert!(manifest.is_some());
 
-        let manifest = manifest.unwrap();
-        assert_eq!(manifest.len(), 1);
+        let NextWorkBundle { work, eow } = manifest.unwrap();
+        assert_eq!(work.len(), 1);
 
         assert_eq!(
-            manifest[0],
-            NextWork::Work(WorkerTest::new(
-                with_focus(spec1.clone(), "test1"),
-                INIT_RUN_NUMBER + 1
-            ))
+            work[0],
+            WorkerTest::new(with_focus(spec1.clone(), "test1"), INIT_RUN_NUMBER + 1)
         );
+        assert!(!eow);
 
         assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER + 1);
 
@@ -807,11 +801,13 @@ pub mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([
-            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
-            NextWork::EndOfWork,
-        ]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice(
+            [
+                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
+            ],
+            Eow(true),
+        );
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
@@ -822,10 +818,9 @@ pub mod test {
         let manifest = tracker.try_assemble_retry_manifest();
         assert!(manifest.is_some());
 
-        let manifest = manifest.unwrap();
-        assert_eq!(manifest.len(), 1);
-
-        assert_eq!(manifest[0], NextWork::EndOfWork);
+        let NextWorkBundle { work, eow } = manifest.unwrap();
+        assert!(work.is_empty());
+        assert!(eow);
     }
 
     #[test]
@@ -845,11 +840,13 @@ pub mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([
-            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
-            NextWork::Work(WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)),
-            NextWork::EndOfWork,
-        ]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice(
+            [
+                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
+                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
+            ],
+            Eow(true),
+        );
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
@@ -860,16 +857,14 @@ pub mod test {
         let manifest = tracker.try_assemble_retry_manifest();
         assert!(manifest.is_some());
 
-        let manifest = manifest.unwrap();
-        assert_eq!(manifest.len(), 1);
+        let NextWorkBundle { work, eow } = manifest.unwrap();
+        assert_eq!(work.len(), 1);
 
         assert_eq!(
-            manifest[0],
-            NextWork::Work(WorkerTest::new(
-                with_focus(spec1.clone(), "test1"),
-                INIT_RUN_NUMBER + 1
-            ))
+            work[0],
+            WorkerTest::new(with_focus(spec1.clone(), "test1"), INIT_RUN_NUMBER + 1)
         );
+        assert!(!eow);
 
         assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER + 1);
 
@@ -898,10 +893,10 @@ pub mod test {
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
 
-        let hydrated = tracker.hydrate_ordered_manifest_slice([
-            NextWork::Work(WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)),
-            NextWork::EndOfWork,
-        ]);
+        let hydrated = tracker.hydrate_ordered_manifest_slice(
+            [WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)],
+            Eow(true),
+        );
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         // First retry
@@ -915,16 +910,14 @@ pub mod test {
             let manifest = tracker.try_assemble_retry_manifest();
             assert!(manifest.is_some());
 
-            let manifest = manifest.unwrap();
-            assert_eq!(manifest.len(), 1);
+            let NextWorkBundle { work, eow } = manifest.unwrap();
+            assert_eq!(work.len(), 1);
 
             assert_eq!(
-                manifest[0],
-                NextWork::Work(WorkerTest::new(
-                    with_focus(spec1.clone(), "test1"),
-                    INIT_RUN_NUMBER + 1
-                ))
+                work[0],
+                WorkerTest::new(with_focus(spec1.clone(), "test1"), INIT_RUN_NUMBER + 1)
             );
+            assert!(!eow);
 
             assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER + 1);
             assert!(
@@ -944,16 +937,14 @@ pub mod test {
             let manifest = tracker.try_assemble_retry_manifest();
             assert!(manifest.is_some());
 
-            let manifest = manifest.unwrap();
-            assert_eq!(manifest.len(), 1);
+            let NextWorkBundle { work, eow } = manifest.unwrap();
+            assert_eq!(work.len(), 1);
 
             assert_eq!(
-                manifest[0],
-                NextWork::Work(WorkerTest::new(
-                    with_focus(spec1.clone(), "test1"),
-                    INIT_RUN_NUMBER + 2
-                ))
+                work[0],
+                WorkerTest::new(with_focus(spec1.clone(), "test1"), INIT_RUN_NUMBER + 2)
             );
+            assert!(!eow);
 
             assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER + 2);
         }
@@ -972,10 +963,9 @@ pub mod test {
                 let manifest = tracker.try_assemble_retry_manifest();
                 assert!(manifest.is_some());
 
-                let manifest = manifest.unwrap();
-                assert_eq!(manifest.len(), 1);
-
-                assert_eq!(manifest[0], NextWork::EndOfWork);
+                let NextWorkBundle { work, eow } = manifest.unwrap();
+                assert!(work.is_empty());
+                assert!(eow);
 
                 assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER + 2);
             }
@@ -991,10 +981,9 @@ pub mod test {
             let manifest = tracker.try_assemble_retry_manifest();
             assert!(manifest.is_some());
 
-            let manifest = manifest.unwrap();
-            assert_eq!(manifest.len(), 1);
-
-            assert_eq!(manifest[0], NextWork::EndOfWork);
+            let NextWorkBundle { work, eow } = manifest.unwrap();
+            assert!(work.is_empty());
+            assert!(eow);
 
             assert_eq!(tracker.current_run_number, INIT_RUN_NUMBER);
         }
@@ -1019,9 +1008,10 @@ pub mod test {
 
         // Hydrate with first test
         {
-            let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::Work(
-                WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER),
-            )]);
+            let hydrated = tracker.hydrate_ordered_manifest_slice(
+                [WorkerTest::new(spec1.clone(), INIT_RUN_NUMBER)],
+                Eow(false),
+            );
             assert_eq!(hydrated, HydrationStatus::StillHydrating);
             assert_eq!(
                 tracker.assembled_state,
@@ -1050,9 +1040,10 @@ pub mod test {
 
         // Hydrate with second test
         {
-            let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::Work(
-                WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER),
-            )]);
+            let hydrated = tracker.hydrate_ordered_manifest_slice(
+                [WorkerTest::new(spec2.clone(), INIT_RUN_NUMBER)],
+                Eow(false),
+            );
             assert_eq!(hydrated, HydrationStatus::StillHydrating);
             assert_eq!(
                 tracker.assembled_state,
@@ -1081,7 +1072,7 @@ pub mod test {
 
         // Hydrate end-of-work
         {
-            let hydrated = tracker.hydrate_ordered_manifest_slice([NextWork::EndOfWork]);
+            let hydrated = tracker.hydrate_ordered_manifest_slice([], Eow(true));
             assert_eq!(hydrated, HydrationStatus::EndOfManifest);
             assert_eq!(
                 tracker.assembled_state,

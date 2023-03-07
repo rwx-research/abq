@@ -113,7 +113,7 @@ pub mod test {
             async_read, async_write,
             entity::Entity,
             work_server::{Message, Request, RetryManifestResponse},
-            workers::{NextWork, NextWorkBundle, RunId},
+            workers::{Eow, NextWorkBundle, RunId, WorkerTest},
         },
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
@@ -142,7 +142,8 @@ pub mod test {
 
     pub async fn server_send_bundle(
         conn: &mut Box<dyn ServerStream>,
-        bundle: impl IntoIterator<Item = NextWork>,
+        bundle: impl IntoIterator<Item = WorkerTest>,
+        eow: Eow,
     ) {
         let request: Request = async_read(conn).await.unwrap();
         assert!(matches!(
@@ -153,6 +154,7 @@ pub mod test {
             conn,
             &RetryManifestResponse::Manifest(NextWorkBundle {
                 work: bundle.into_iter().collect(),
+                eow,
             }),
         )
         .await
@@ -170,12 +172,13 @@ pub mod test {
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(&mut conn, [NextWork::EndOfWork]).await;
+            server_send_bundle(&mut conn, [], Eow(true)).await;
         };
 
         let client_task = async move {
             let bundle = fetcher.get_next_tests().await;
-            assert_eq!(bundle.work, vec![NextWork::EndOfWork]);
+            assert!(bundle.work.is_empty());
+            assert!(bundle.eow.0);
         };
 
         let ((), ()) = tokio::join!(server_task, client_task);

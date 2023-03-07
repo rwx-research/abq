@@ -1,6 +1,6 @@
 //! Utilities for buffering and acting on messages (from the queue), refilling messages on-demand.
 
-use abq_utils::log_assert;
+use abq_utils::{log_assert, net_protocol::workers::Eow};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
@@ -72,14 +72,12 @@ pub(crate) fn channel<T>(
     (producer, consumer)
 }
 
-pub(crate) struct Completed(pub bool);
-
 #[async_trait]
 pub(crate) trait FetchMessages {
     type T;
     type Iter: ExactSizeIterator<Item = Self::T>;
 
-    async fn fetch(&mut self) -> (Self::Iter, Completed);
+    async fn fetch(&mut self) -> (Self::Iter, Eow);
 }
 
 impl<T> BatchedProducer<T> {
@@ -220,7 +218,7 @@ mod test {
     use abq_utils::atomic;
     use async_trait::async_trait;
 
-    use super::{channel, Completed, FetchMessages, RecvMsg, RefillStrategy};
+    use super::{channel, Eow, FetchMessages, RecvMsg, RefillStrategy};
 
     async fn run_channels<F, E, C, CFut>(
         capacity: usize,
@@ -263,10 +261,10 @@ mod test {
             type T = u8;
             type Iter = std::array::IntoIter<u8, 1>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+            async fn fetch(&mut self) -> (Self::Iter, Eow) {
                 self.count += 1;
                 let loaded = self.count;
-                ([loaded].into_iter(), Completed(loaded == 5))
+                ([loaded].into_iter(), Eow(loaded == 5))
             }
         }
 
@@ -313,12 +311,12 @@ mod test {
             type T = u8;
             type Iter = std::vec::IntoIter<Self::T>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+            async fn fetch(&mut self) -> (Self::Iter, Eow) {
                 self.count += 1;
                 match self.count {
-                    1 => (vec![1, 2, 3].into_iter(), Completed(false)),
-                    2 => (vec![4, 5, 6].into_iter(), Completed(false)),
-                    3 => (vec![7, 8].into_iter(), Completed(true)),
+                    1 => (vec![1, 2, 3].into_iter(), Eow(false)),
+                    2 => (vec![4, 5, 6].into_iter(), Eow(false)),
+                    3 => (vec![7, 8].into_iter(), Eow(true)),
                     _ => unreachable!(),
                 }
             }
@@ -375,11 +373,11 @@ mod test {
             type T = u8;
             type Iter = std::vec::IntoIter<Self::T>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+            async fn fetch(&mut self) -> (Self::Iter, Eow) {
                 self.count += 1;
                 match self.count {
-                    1 => (vec![1, 2, 3, 4].into_iter(), Completed(false)),
-                    2 => (vec![5, 6, 7, 8].into_iter(), Completed(false)),
+                    1 => (vec![1, 2, 3, 4].into_iter(), Eow(false)),
+                    2 => (vec![5, 6, 7, 8].into_iter(), Eow(false)),
                     _ => unreachable!(),
                 }
             }
@@ -410,11 +408,11 @@ mod test {
             type T = u8;
             type Iter = std::vec::IntoIter<Self::T>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Completed) {
+            async fn fetch(&mut self) -> (Self::Iter, Eow) {
                 self.count += 1;
                 match self.count {
-                    1 => (vec![1].into_iter(), Completed(false)),
-                    2 => (vec![2].into_iter(), Completed(false)),
+                    1 => (vec![1].into_iter(), Eow(false)),
+                    2 => (vec![2].into_iter(), Eow(false)),
                     _ => unreachable!(),
                 }
             }

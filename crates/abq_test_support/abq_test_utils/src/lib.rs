@@ -15,7 +15,7 @@ use abq_utils::{
     net_protocol::{
         queue::TestSpec,
         runners::{ProtocolWitness, TestCase, TestId},
-        workers::{NextWork, WorkId, WorkerTest},
+        workers::WorkId,
     },
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
@@ -103,10 +103,6 @@ pub fn spec(id: usize) -> TestSpec {
         test_case: TestCase::new(ProtocolWitness::TEST, test(id), Default::default()),
         work_id: wid(id),
     }
-}
-
-pub fn worker_test(spec: TestSpec, run_number: u32) -> NextWork {
-    NextWork::Work(WorkerTest::new(spec, run_number))
 }
 
 pub fn build_random_strategies() -> (

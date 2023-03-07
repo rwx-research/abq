@@ -20,12 +20,12 @@ use abq_utils::net_protocol::results::{self};
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
-    ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
+    Eow, ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
 };
 use abq_utils::net_protocol::{
     self,
     queue::{InvokeWork, Message, RunStatus},
-    workers::{NextWork, RunId},
+    workers::RunId,
 };
 use abq_utils::net_protocol::{meta, publicize_addr};
 use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
@@ -614,14 +614,14 @@ impl AllRuns {
                 // Let the worker know that we've reached the end of the queue.
                 seen_workers.write().insert_by_tag_if_missing(entity, true);
                 NextWorkResult{
-                    bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
+                    bundle: NextWorkBundle::new([], Eow(true)),
                     status: PulledTestsStatus::QueueWasEmpty,
                     opt_persistent_manifest_plan: None,
                 }
             }
             RunState::Cancelled {..} => {
                 NextWorkResult{
-                    bundle: NextWorkBundle::new(vec![NextWork::EndOfWork]),
+                    bundle: NextWorkBundle::new([], Eow(true)),
                     status: PulledTestsStatus::QueueWasEmpty,
                     opt_persistent_manifest_plan: None,
                 }
@@ -642,12 +642,7 @@ impl AllRuns {
         // Pop the next batch.
         // TODO: can we get rid of the clone allocation here?
         let mut bundle = Vec::with_capacity(batch_size.get() as _);
-        bundle.extend(
-            queue
-                .get_work(entity.tag, batch_size)
-                .cloned()
-                .map(NextWork::Work),
-        );
+        bundle.extend(queue.get_work(entity.tag, batch_size).cloned());
 
         let pulled_tests_status;
 
@@ -664,13 +659,8 @@ impl AllRuns {
             //     tests compose it. In this case, we must tell the requester to yield
             //     until those results arrive.
             match bundle.last() {
-                Some(NextWork::Work(_)) => {
+                Some(_) => {
                     pulled_tests_status = PulledTestsStatus::PulledLastTest;
-                }
-                Some(NextWork::EndOfWork) => {
-                    // To avoid additional allocation and moves when we pop the queue, we built
-                    // `bundle` as NextWork above, but it only consists of `NextWork::Work` variants.
-                    unreachable!("illegal state - EndOfWork variant must not exist at this point.")
                 }
                 None => {
                     pulled_tests_status = PulledTestsStatus::QueueWasEmpty;
@@ -681,12 +671,10 @@ impl AllRuns {
             pulled_tests_status = PulledTestsStatus::MoreTestsRemaining;
         };
 
-        if pulled_tests_status.reached_end_of_tests() {
-            // Let the worker know this is the end, so they don't ask again.
-            bundle.push(NextWork::EndOfWork);
-        }
+        // Let the worker know this is the end, so they don't ask again.
+        let eow = Eow(pulled_tests_status.reached_end_of_tests());
 
-        let bundle = NextWorkBundle { work: bundle };
+        let bundle = NextWorkBundle { work: bundle, eow };
 
         (bundle, pulled_tests_status)
     }
@@ -803,17 +791,19 @@ impl AllRuns {
                 //
                 // TODO: should we launch discovery of a partition on a blocking async task?
                 // If this ever takes a non-trivial amount of time, consider doing so.
-                let mut manifest: Vec<_> = queue
+                let manifest: Vec<_> = queue
                     .get_partition_for_entity(entity.tag)
                     .cloned()
-                    .map(NextWork::Work)
                     .collect();
-                manifest.push(NextWork::EndOfWork);
+                let eow = Eow(true);
 
                 // Mark the worker as active again, regardless of its existing state.
                 active_workers.lock().insert_by_tag(entity, None);
 
-                RetryManifestState::Manifest(NextWorkBundle { work: manifest })
+                RetryManifestState::Manifest(NextWorkBundle {
+                    work: manifest,
+                    eow,
+                })
             }
             RunState::InitialManifestDone {
                 manifest_persistence,
@@ -833,8 +823,10 @@ impl AllRuns {
                     RetryManifestState::ManifestNeverReceived
                 }
                 ManifestPersistence::EmptyManifest => {
+                    // Ship the empty manifest over.
                     RetryManifestState::Manifest(NextWorkBundle {
-                        work: vec![NextWork::EndOfWork],
+                        work: vec![],
+                        eow: Eow(true),
                     })
                 }
             },
@@ -2246,14 +2238,10 @@ async fn fetch_persisted_manifest(
         .await;
 
     match manifest_result.entity(entity) {
-        Ok(manifest) => {
-            let manifest = manifest
-                .into_iter()
-                .map(NextWork::Work)
-                .chain(std::iter::once(NextWork::EndOfWork))
-                .collect();
-            RetryManifestResponse::Manifest(NextWorkBundle { work: manifest })
-        }
+        Ok(manifest) => RetryManifestResponse::Manifest(NextWorkBundle {
+            work: manifest,
+            eow: Eow(true),
+        }),
         Err(error) => {
             log_entityful_error!(
                 error,
@@ -3037,7 +3025,7 @@ mod test_pull_work {
     use abq_test_utils::one_nonzero_usize;
     use abq_utils::net_protocol::{
         entity::Entity,
-        workers::{NextWork, RunId, WorkerTest},
+        workers::{RunId, WorkerTest},
     };
     use abq_with_protocol_version::with_protocol_version;
 
@@ -3097,8 +3085,8 @@ mod test_pull_work {
             let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
             assert!(matches!(next_work, NextWorkResult { bundle, status, .. }
-                if bundle.work.len() == 2 // 1 - test, 1 - end of work
-                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
+                if bundle.work.len() == 1
+                && bundle.eow.0
                 && matches!(status, PulledTestsStatus::PulledLastTest { .. })
             ));
 
@@ -3114,8 +3102,8 @@ mod test_pull_work {
             let next_work = queues.next_work(Entity::runner(0, 1), &run_id);
 
             assert!(matches!(next_work, NextWorkResult { bundle, status, .. }
-                if bundle.work.len() == 1
-                && matches!(bundle.work.last(), Some(NextWork::EndOfWork))
+                if bundle.work.is_empty()
+                && bundle.eow.0
                 && matches!(status, PulledTestsStatus::QueueWasEmpty)
             ));
 
@@ -3139,7 +3127,7 @@ mod retry_manifest {
         },
         queue::{fake_test_spec, NextWorkResult, RunData, RunState, SharedRuns, WorkScheduler},
     };
-    use abq_test_utils::{one_nonzero_usize, spec, worker_test};
+    use abq_test_utils::{one_nonzero_usize, spec};
     use abq_utils::{
         auth::{ClientAuthStrategy, ServerAuthStrategy},
         net_async,
@@ -3148,7 +3136,7 @@ mod retry_manifest {
             self,
             entity::Entity,
             work_server,
-            workers::{NextWork, RunId, WorkerTest, INIT_RUN_NUMBER},
+            workers::{NextWorkBundle, RunId, WorkerTest, INIT_RUN_NUMBER},
         },
         server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -3189,10 +3177,7 @@ mod retry_manifest {
             let NextWorkResult { bundle, .. } = queues.next_work(worker0, &run_id);
             assert_eq!(
                 bundle.work,
-                vec![NextWork::Work(WorkerTest::new(
-                    test1.clone(),
-                    INIT_RUN_NUMBER
-                ))]
+                vec![WorkerTest::new(test1.clone(), INIT_RUN_NUMBER)]
             );
         }
 
@@ -3313,14 +3298,16 @@ mod retry_manifest {
         let work_server::NextTestResponse::Bundle(bundle) =
             net_protocol::async_read(&mut conn).await.unwrap();
 
+        let NextWorkBundle { work, eow } = bundle;
+
         assert_eq!(
-            bundle.work,
+            work,
             vec![
-                worker_test(spec1.clone(), 1),
-                worker_test(spec2.clone(), 1),
-                NextWork::EndOfWork
+                WorkerTest::new(spec1.clone(), 1),
+                WorkerTest::new(spec2.clone(), 1),
             ]
         );
+        assert!(eow);
 
         // In time, we should see that the manifest was persisted.
         loop {
@@ -3339,15 +3326,12 @@ mod retry_manifest {
 
             use work_server::RetryManifestResponse::*;
             match response {
-                Manifest(man) => {
+                Manifest(NextWorkBundle { work, eow }) => {
                     assert_eq!(
-                        man.work,
-                        vec![
-                            worker_test(spec1, 1),
-                            worker_test(spec2, 1),
-                            NextWork::EndOfWork
-                        ]
+                        work,
+                        vec![WorkerTest::new(spec1, 1), WorkerTest::new(spec2, 1),]
                     );
+                    assert!(eow);
                     break;
                 }
                 NotYetPersisted => {
@@ -3384,23 +3368,15 @@ mod retry_manifest {
         // Prime the queue, pulling two entries for the entity
         {
             let NextWorkResult { bundle, .. } = queues.next_work(entity, &run_id);
-            assert_eq!(
-                bundle.work,
-                vec![NextWork::Work(WorkerTest::new(
-                    test1.clone(),
-                    INIT_RUN_NUMBER
-                ))]
-            );
+            let NextWorkBundle { work, eow } = bundle;
+            assert_eq!(work, vec![WorkerTest::new(test1.clone(), INIT_RUN_NUMBER)]);
+            assert!(!eow);
         }
         {
             let NextWorkResult { bundle, .. } = queues.next_work(entity, &run_id);
-            assert_eq!(
-                bundle.work,
-                vec![NextWork::Work(WorkerTest::new(
-                    test2.clone(),
-                    INIT_RUN_NUMBER
-                ))]
-            );
+            let NextWorkBundle { work, eow } = bundle;
+            assert_eq!(work, vec![WorkerTest::new(test2.clone(), INIT_RUN_NUMBER)]);
+            assert!(!eow);
         }
 
         let WorkSchedulerState {
@@ -3421,15 +3397,15 @@ mod retry_manifest {
             net_protocol::async_read(&mut conn).await.unwrap();
 
         match response {
-            work_server::RetryManifestResponse::Manifest(manifest) => {
+            work_server::RetryManifestResponse::Manifest(NextWorkBundle { work, eow }) => {
                 assert_eq!(
-                    manifest.work,
+                    work,
                     vec![
-                        NextWork::Work(WorkerTest::new(test1, INIT_RUN_NUMBER)),
-                        NextWork::Work(WorkerTest::new(test2, INIT_RUN_NUMBER)),
-                        NextWork::EndOfWork
+                        WorkerTest::new(test1, INIT_RUN_NUMBER),
+                        WorkerTest::new(test2, INIT_RUN_NUMBER),
                     ]
-                )
+                );
+                assert!(eow);
             }
             _ => panic!(),
         }

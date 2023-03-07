@@ -2036,8 +2036,11 @@ fn report_while_run_in_progress_is_error() {
 
     let mut worker0 = Abq::new(format!("{name}_worker0"))
         .args(test_args(0))
+        .env([("ABQ_LOG", "abq=debug")])
         .spawn();
+
     wait_for_live_worker(worker0.stderr.as_mut().unwrap());
+    wait_for_worker_executing(worker0.stderr.as_mut().unwrap());
 
     // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
     let report_args = {

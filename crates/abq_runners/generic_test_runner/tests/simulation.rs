@@ -19,7 +19,7 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
-    ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, WorkId, WorkerTest,
+    Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle, WorkId, WorkerTest,
     INIT_RUN_NUMBER,
 };
 use abq_utils::oneshot_notify::OneshotTx;
@@ -271,23 +271,25 @@ fn capture_output_before_and_during_tests() {
     ];
 
     fn work_bundle(proto: ProtocolWitness) -> NextWorkBundle {
-        NextWorkBundle::new(vec![
-            NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "test1", Default::default()),
-                    work_id: WorkId([1; 16]),
+        NextWorkBundle::new(
+            [
+                WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "test1", Default::default()),
+                        work_id: WorkId([1; 16]),
+                    },
+                    run_number: INIT_RUN_NUMBER,
                 },
-                run_number: INIT_RUN_NUMBER,
-            }),
-            NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "test2", Default::default()),
-                    work_id: WorkId([2; 16]),
+                WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "test2", Default::default()),
+                        work_id: WorkId([2; 16]),
+                    },
+                    run_number: INIT_RUN_NUMBER,
                 },
-                run_number: INIT_RUN_NUMBER,
-            }),
-            NextWork::EndOfWork,
-        ])
+            ],
+            Eow(true),
+        )
     }
     let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 
@@ -401,7 +403,7 @@ fn big_manifest() {
 
     let manifest: Arc<Mutex<Option<ManifestResult>>> = Default::default();
     let with_manifest = StaticManifestCollector::new(manifest.clone());
-    let get_next_tests = ImmediateTests::new(vec![NextWorkBundle::new(vec![NextWork::EndOfWork])]);
+    let get_next_tests = ImmediateTests::new(vec![NextWorkBundle::new([], Eow(true))]);
 
     let (results, _man_output, _, notified_all_ran) = run_simulated_runner(
         simulation,
@@ -471,7 +473,7 @@ fn capture_output_during_manifest_gen() {
 
     let manifest: Arc<Mutex<Option<ManifestResult>>> = Default::default();
     let with_manifest = StaticManifestCollector::new(manifest.clone());
-    let get_next_tests = ImmediateTests::new(vec![NextWorkBundle::new(vec![NextWork::EndOfWork])]);
+    let get_next_tests = ImmediateTests::new(vec![NextWorkBundle::new([], Eow(true))]);
 
     let (results, man_output, _, notified_all_ran) = run_simulated_runner(
         simulation,
@@ -505,30 +507,32 @@ fn native_runner_respawn_for_higher_run_numbers() {
 
     // Create a work bundle that should require three launches of the native runner.
     fn work_bundle(proto: ProtocolWitness) -> NextWorkBundle {
-        NextWorkBundle::new(vec![
-            NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "test1", Default::default()),
-                    work_id: WorkId([1; 16]),
+        NextWorkBundle::new(
+            vec![
+                WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "test1", Default::default()),
+                        work_id: WorkId([1; 16]),
+                    },
+                    run_number: INIT_RUN_NUMBER,
                 },
-                run_number: INIT_RUN_NUMBER,
-            }),
-            NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "test2", Default::default()),
-                    work_id: WorkId([2; 16]),
+                WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "test2", Default::default()),
+                        work_id: WorkId([2; 16]),
+                    },
+                    run_number: INIT_RUN_NUMBER + 1,
                 },
-                run_number: INIT_RUN_NUMBER + 1,
-            }),
-            NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "test3", Default::default()),
-                    work_id: WorkId([3; 16]),
+                WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "test3", Default::default()),
+                        work_id: WorkId([3; 16]),
+                    },
+                    run_number: INIT_RUN_NUMBER + 2,
                 },
-                run_number: INIT_RUN_NUMBER + 2,
-            }),
-            NextWork::EndOfWork,
-        ])
+            ],
+            Eow(true),
+        )
     }
     let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 
@@ -588,23 +592,25 @@ fn native_runner_fails_while_executing_tests() {
     ];
 
     fn work_bundle(proto: ProtocolWitness) -> NextWorkBundle {
-        NextWorkBundle::new(vec![
-            NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "test1", Default::default()),
-                    work_id: WorkId([1; 16]),
+        NextWorkBundle::new(
+            vec![
+                WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "test1", Default::default()),
+                        work_id: WorkId([1; 16]),
+                    },
+                    run_number: INIT_RUN_NUMBER,
                 },
-                run_number: INIT_RUN_NUMBER,
-            }),
-            NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "test2", Default::default()),
-                    work_id: WorkId([2; 16]),
+                WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "test2", Default::default()),
+                        work_id: WorkId([2; 16]),
+                    },
+                    run_number: INIT_RUN_NUMBER,
                 },
-                run_number: INIT_RUN_NUMBER,
-            }),
-            NextWork::EndOfWork,
-        ])
+            ],
+            Eow(true),
+        )
     }
     let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 
@@ -687,16 +693,16 @@ async fn cancellation_of_native_runner_succeeds() {
     ];
 
     fn work_bundle(proto: ProtocolWitness) -> NextWorkBundle {
-        NextWorkBundle::new(vec![
-            NextWork::Work(WorkerTest {
+        NextWorkBundle::new(
+            vec![WorkerTest {
                 spec: TestSpec {
                     test_case: TestCase::new(proto, "test1", Default::default()),
                     work_id: WorkId([1; 16]),
                 },
                 run_number: INIT_RUN_NUMBER,
-            }),
-            NextWork::EndOfWork,
-        ])
+            }],
+            Eow(true),
+        )
     }
     let get_next_tests = ImmediateTests::new(vec![work_bundle(proto)]);
 

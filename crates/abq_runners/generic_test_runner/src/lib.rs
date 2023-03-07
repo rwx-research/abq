@@ -14,7 +14,7 @@ use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
 use capture_output::OutputCapturer;
-use message_buffer::{Completed, RefillStrategy};
+use message_buffer::RefillStrategy;
 
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
@@ -31,7 +31,7 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
-    ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, WorkId,
+    Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle, ReportedManifest, WorkId,
     WorkerTest, INIT_RUN_NUMBER,
 };
 use abq_utils::{atomic, net_protocol};
@@ -942,23 +942,10 @@ impl message_buffer::FetchMessages for NextBundleFetcher {
     type T = WorkerTest;
     type Iter = std::vec::IntoIter<Self::T>;
 
-    async fn fetch(&mut self) -> (Self::Iter, Completed) {
-        let NextWorkBundle { work } = self.test_fetcher.get_next_tests().await;
+    async fn fetch(&mut self) -> (Self::Iter, Eow) {
+        let NextWorkBundle { work, eow } = self.test_fetcher.get_next_tests().await;
 
-        let recv_size = work.len();
-
-        // NB: we can get rid of this allocation by returning the filter directly, and a word
-        // for the length of the list after filtering. The allocation doesn't matter though.
-        let filtered_work: Vec<_> = work
-            .into_iter()
-            .filter_map(|test| test.into_test())
-            .collect();
-
-        // Completed if the bundle contained `EndOfWork` markers, or if there were no tests to
-        // begin with!
-        let completed = filtered_work.len() < recv_size || filtered_work.is_empty();
-
-        (filtered_work.into_iter(), Completed(completed))
+        (work.into_iter(), eow)
     }
 }
 
@@ -1362,18 +1349,18 @@ pub fn execute_wrapped_runner(
                         continue;
                     }
                 };
-                let next = match next_test {
+                match next_test {
                     Some(test_spec) => {
                         self.test_case_index.fetch_add(1, atomic::ORDERING);
 
-                        NextWork::Work(WorkerTest {
+                        let test = WorkerTest {
                             spec: test_spec.clone(),
                             run_number: INIT_RUN_NUMBER,
-                        })
+                        };
+                        return NextWorkBundle::new([test], Eow(false));
                     }
-                    None => NextWork::EndOfWork,
-                };
-                return NextWorkBundle::new(vec![next]);
+                    None => return NextWorkBundle::new([], Eow(true)),
+                }
             }
         }
     }
@@ -1676,7 +1663,7 @@ mod test_abq_jest {
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, ReportedManifest, WorkId,
+        Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle, ReportedManifest, WorkId,
         WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::{NoopResultsHandler, StaticResultsHandler};
@@ -1726,7 +1713,7 @@ mod test_abq_jest {
             }),
         };
         let get_next_test = Box::new(ImmediateTests {
-            tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
+            tests: vec![NextWorkBundle::new([], Eow(true))],
         });
         let results_handler = Box::new(StaticResultsHandler::new(test_results.clone()));
         let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
@@ -1883,13 +1870,16 @@ mod test_abq_jest {
             context: Err(RunAlreadyCompleted { cancelled: false }),
         };
         let get_next_test = ImmediateTests {
-            tests: vec![NextWorkBundle::new(vec![NextWork::Work(WorkerTest {
-                spec: TestSpec {
-                    test_case: TestCase::new(proto, "unreachable", Default::default()),
-                    work_id: WorkId::new(),
-                },
-                run_number: INIT_RUN_NUMBER,
-            })])],
+            tests: vec![NextWorkBundle::new(
+                [WorkerTest {
+                    spec: TestSpec {
+                        test_case: TestCase::new(proto, "unreachable", Default::default()),
+                        work_id: WorkId::new(),
+                    },
+                    run_number: INIT_RUN_NUMBER,
+                }],
+                Eow(false),
+            )],
         };
         let results_handler = Box::new(NoopResultsHandler);
 
@@ -1932,7 +1922,7 @@ mod test_invalid_command {
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle,
+        Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle,
     };
     use abq_utils::results_handler::NoopResultsHandler;
     use abq_utils::{atomic, oneshot_notify};
@@ -1957,7 +1947,7 @@ mod test_invalid_command {
             }),
         };
         let get_next_test = ImmediateTests {
-            tests: vec![NextWorkBundle::new(vec![NextWork::EndOfWork])],
+            tests: vec![NextWorkBundle::new([], Eow(false))],
         };
         let results_handler = Box::new(NoopResultsHandler);
 

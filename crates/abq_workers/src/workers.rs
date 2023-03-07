@@ -18,9 +18,10 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
-    ManifestResult, NativeTestRunnerParams, ReportedManifest, TestLikeRunner, WorkerTest,
+    ManifestResult, NativeTestRunnerParams, NextWorkBundle, ReportedManifest, TestLikeRunner,
+    WorkerTest,
 };
-use abq_utils::net_protocol::workers::{NextWork, RunId, RunnerKind};
+use abq_utils::net_protocol::workers::{RunId, RunnerKind};
 use abq_utils::oneshot_notify::{self, OneshotRx, OneshotTx};
 use abq_utils::results_handler::ResultsHandler;
 use async_trait::async_trait;
@@ -610,83 +611,79 @@ async fn test_like_runner_exec_loop(
     mut results_handler: ResultsHandler,
 ) -> Option<Result<TestRunnerExit, GenericRunnerError>> {
     'tests_done: loop {
-        let bundle = tests_fetcher.get_next_tests().await;
+        let NextWorkBundle { work, eow } = tests_fetcher.get_next_tests().await;
 
-        for next_work in bundle.work {
-            match next_work {
-                NextWork::EndOfWork => {
-                    // Shut down the worker
-                    break 'tests_done;
-                }
-                NextWork::Work(WorkerTest {
-                    spec: TestSpec { test_case, work_id },
-                    run_number,
-                }) => {
-                    if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == test_case.id() )
-                    {
-                        return Some(Err(GenericRunnerError::no_captures(
-                            io::Error::new(io::ErrorKind::Unsupported, "will not return test")
-                                .located(here!()),
-                        )));
-                    }
-
-                    // Try the test_id once + how ever many retries were requested.
-                    let allowed_attempts = 1;
-                    'attempts: for attempt_number in 1.. {
-                        let start_time = Instant::now();
-                        let attempt_result = attempt_test_id_for_test_like_runner(
-                            &context,
-                            runner.clone(),
-                            test_case.id().clone(),
-                            init_context.clone(),
-                            attempt_number,
-                            allowed_attempts,
-                            run_number,
-                        );
-                        let runtime = start_time.elapsed().as_millis() as f64;
-
-                        let (status, outputs) = match attempt_result {
-                            Ok(output) => (Status::Success, output),
-                            Err(AttemptError::ShouldRetry) => continue 'attempts,
-                            Err(AttemptError::Panic(msg)) => (
-                                Status::Error {
-                                    exception: None,
-                                    backtrace: None,
-                                },
-                                vec![msg],
-                            ),
-                        };
-                        let results = outputs
-                            .into_iter()
-                            .map(|output| {
-                                TestResult::new(
-                                    runner_meta,
-                                    TestResultSpec {
-                                        status: status.clone(),
-                                        id: test_case.id().clone(),
-                                        display_name: test_case.id().clone(),
-                                        output: Some(output),
-                                        runtime: TestRuntime::Milliseconds(runtime),
-                                        meta: Default::default(),
-                                        ..TestResultSpec::fake()
-                                    },
-                                )
-                            })
-                            .collect();
-
-                        let associated_result = AssociatedTestResults {
-                            work_id,
-                            run_number,
-                            results,
-                            before_any_test: CapturedOutput::empty(),
-                            after_all_tests: None,
-                        };
-
-                        results_handler.send_results(vec![associated_result]).await;
-                        break 'attempts;
-                    }
-                }
+        for WorkerTest {
+            spec: TestSpec { test_case, work_id },
+            run_number,
+        } in work
+        {
+            if matches!(&runner, TestLikeRunner::NeverReturnOnTest(t) if t == test_case.id() ) {
+                return Some(Err(GenericRunnerError::no_captures(
+                    io::Error::new(io::ErrorKind::Unsupported, "will not return test")
+                        .located(here!()),
+                )));
             }
+
+            // Try the test_id once + how ever many retries were requested.
+            let allowed_attempts = 1;
+            'attempts: for attempt_number in 1.. {
+                let start_time = Instant::now();
+                let attempt_result = attempt_test_id_for_test_like_runner(
+                    &context,
+                    runner.clone(),
+                    test_case.id().clone(),
+                    init_context.clone(),
+                    attempt_number,
+                    allowed_attempts,
+                    run_number,
+                );
+                let runtime = start_time.elapsed().as_millis() as f64;
+
+                let (status, outputs) = match attempt_result {
+                    Ok(output) => (Status::Success, output),
+                    Err(AttemptError::ShouldRetry) => continue 'attempts,
+                    Err(AttemptError::Panic(msg)) => (
+                        Status::Error {
+                            exception: None,
+                            backtrace: None,
+                        },
+                        vec![msg],
+                    ),
+                };
+                let results = outputs
+                    .into_iter()
+                    .map(|output| {
+                        TestResult::new(
+                            runner_meta,
+                            TestResultSpec {
+                                status: status.clone(),
+                                id: test_case.id().clone(),
+                                display_name: test_case.id().clone(),
+                                output: Some(output),
+                                runtime: TestRuntime::Milliseconds(runtime),
+                                meta: Default::default(),
+                                ..TestResultSpec::fake()
+                            },
+                        )
+                    })
+                    .collect();
+
+                let associated_result = AssociatedTestResults {
+                    work_id,
+                    run_number,
+                    results,
+                    before_any_test: CapturedOutput::empty(),
+                    after_all_tests: None,
+                };
+
+                results_handler.send_results(vec![associated_result]).await;
+                break 'attempts;
+            }
+        }
+
+        if eow.0 {
+            break 'tests_done;
         }
     }
 
@@ -812,8 +809,8 @@ mod test {
 
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        ManifestResult, NativeTestRunnerParams, NextWork, NextWorkBundle, TestLikeRunner,
-        WorkerTest, INIT_RUN_NUMBER,
+        Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle, TestLikeRunner, WorkerTest,
+        INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::{NotifyResults, ResultsHandler};
     use abq_utils::server_shutdown::ShutdownManager;
@@ -839,7 +836,8 @@ mod test {
     type ManifestCollector = Arc<Mutex<Option<ManifestResult>>>;
 
     struct Fetcher {
-        reader: Arc<Mutex<VecDeque<NextWork>>>,
+        reader: Arc<Mutex<VecDeque<WorkerTest>>>,
+        end: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -848,26 +846,43 @@ mod test {
             loop {
                 let head = { self.reader.lock().pop_front() };
                 match head {
-                    Some(work) => return NextWorkBundle::new(vec![work]),
-                    None => tokio::time::sleep(Duration::from_micros(10)).await,
+                    Some(work) => return NextWorkBundle::new(vec![work], Eow(false)),
+                    None => {
+                        if self.end.load(atomic::ORDERING) {
+                            return NextWorkBundle::new([], Eow(true));
+                        }
+
+                        tokio::time::sleep(Duration::from_micros(10)).await
+                    }
                 }
             }
         }
     }
 
-    fn work_writer() -> (impl Fn(NextWork), impl Fn(Entity) -> GetNextTests) {
-        let writer: Arc<Mutex<VecDeque<NextWork>>> = Default::default();
+    fn work_writer() -> (
+        impl Fn(WorkerTest),
+        Arc<AtomicBool>,
+        impl Fn(Entity) -> GetNextTests,
+    ) {
+        let writer: Arc<Mutex<VecDeque<WorkerTest>>> = Default::default();
+        let set_done = Arc::new(AtomicBool::new(false));
         let reader = Arc::clone(&writer);
         let write_work = move |work| {
             writer.lock().push_back(work);
         };
 
-        let get_next_tests = move |_| {
-            let reader = reader.clone();
-            let get_next_tests: GetNextTests = Box::new(Fetcher { reader });
-            get_next_tests
+        let get_next_tests = {
+            let set_done = set_done.clone();
+            move |_| {
+                let reader = reader.clone();
+                let get_next_tests: GetNextTests = Box::new(Fetcher {
+                    reader,
+                    end: set_done.clone(),
+                });
+                get_next_tests
+            }
         };
-        (write_work, get_next_tests)
+        (write_work, set_done, get_next_tests)
     }
 
     struct StaticResultsCollector {
@@ -991,14 +1006,14 @@ mod test {
         }
     }
 
-    fn local_work(test: TestCase, work_id: WorkId) -> NextWork {
-        NextWork::Work(WorkerTest {
+    fn local_work(test: TestCase, work_id: WorkId) -> WorkerTest {
+        WorkerTest {
             spec: TestSpec {
                 test_case: test,
                 work_id,
             },
             run_number: INIT_RUN_NUMBER,
-        })
+        }
     }
 
     pub fn echo_test(protocol: ProtocolWitness, echo_msg: String) -> TestOrGroup {
@@ -1046,7 +1061,7 @@ mod test {
     }
 
     async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
-        let (write_work, get_next_tests) = work_writer();
+        let (write_work, set_done, get_next_tests) = work_writer();
         let (results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
 
@@ -1090,9 +1105,7 @@ mod test {
             write_work(local_work(test.test_case, WorkId([i as _; 16])))
         }
 
-        for _ in 0..num_workers {
-            write_work(NextWork::EndOfWork);
-        }
+        set_done.store(true, atomic::ORDERING);
 
         // Spin until the timeout, or we got the results we expect.
         await_results(results, |results| {
@@ -1329,7 +1342,7 @@ mod test {
 
     #[tokio::test]
     async fn exit_with_error_if_worker_errors() {
-        let (_write_work, get_next_tests) = work_writer();
+        let (_write_work, _set_done, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
         let manifest_collector = ManifestCollector::default();
@@ -1368,7 +1381,7 @@ mod test {
 
     #[tokio::test]
     async fn sets_abq_native_runner_env_vars() {
-        let (_write_work, get_next_tests) = work_writer();
+        let (_write_work, _set_done, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
         let manifest_collector = ManifestCollector::default();
@@ -1413,7 +1426,7 @@ mod test {
 
     #[tokio::test]
     async fn sets_abq_native_worker_env_vars() {
-        let (_write_work, get_next_tests) = work_writer();
+        let (_write_work, _set_done, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
         let manifest_collector = ManifestCollector::default();
@@ -1457,7 +1470,7 @@ mod test {
     #[tokio::test]
     #[with_protocol_version]
     async fn worker_exits_with_runner_exit() {
-        let (_write_work, get_next_tests) = work_writer();
+        let (_write_work, _set_done, get_next_tests) = work_writer();
         let (_results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
         let manifest_collector = ManifestCollector::default();

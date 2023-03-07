@@ -381,31 +381,33 @@ pub mod workers {
     /// Higher run numbers are reserved for retries of test suites.
     pub const INIT_RUN_NUMBER: u32 = 1;
 
-    /// A unit of work sent to a worker to be run.
-    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
-    pub enum NextWork {
-        Work(WorkerTest),
-        EndOfWork,
-    }
+    /// End-of-work
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct Eow(pub bool);
 
-    impl NextWork {
-        pub fn into_test(self) -> Option<WorkerTest> {
-            match self {
-                NextWork::Work(test) => Some(test),
-                NextWork::EndOfWork => None,
-            }
+    impl std::ops::Not for Eow {
+        type Output = bool;
+
+        fn not(self) -> Self::Output {
+            !self.0
         }
     }
 
     /// A bundle of work sent to a worker to be run in sequence.
-    #[derive(Serialize, Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
     pub struct NextWorkBundle {
-        pub work: Vec<NextWork>,
+        pub work: Vec<WorkerTest>,
+        /// End of work
+        pub eow: Eow,
     }
 
     impl NextWorkBundle {
-        pub fn new(work: Vec<NextWork>) -> Self {
-            Self { work }
+        pub fn new(work: impl Into<Vec<WorkerTest>>, end_of_work: Eow) -> Self {
+            Self {
+                work: work.into(),
+                eow: end_of_work,
+            }
         }
     }
 

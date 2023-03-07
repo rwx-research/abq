@@ -668,8 +668,8 @@ mod test {
         self, InitContext, InitContextResponse, NextTestRequest, NextTestResponse,
     };
     use abq_utils::net_protocol::workers::{
-        ManifestResult, NextWork, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
-        TestLikeRunner, WorkId, WorkerTest, INIT_RUN_NUMBER,
+        Eow, ManifestResult, NextWorkBundle, ReportedManifest, RunId, RunnerKind, TestLikeRunner,
+        WorkId, WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::NoopResultsHandler;
     use abq_utils::server_shutdown::ShutdownManager;
@@ -716,14 +716,12 @@ mod test {
                             .0
                             .into_iter()
                             .enumerate()
-                            .map(|(i, spec)| {
-                                NextWork::Work(WorkerTest {
-                                    spec: TestSpec {
-                                        test_case: spec.test_case,
-                                        work_id: WorkId([i as _; 16]),
-                                    },
-                                    run_number: INIT_RUN_NUMBER,
-                                })
+                            .map(|(i, spec)| WorkerTest {
+                                spec: TestSpec {
+                                    test_case: spec.test_case,
+                                    work_id: WorkId([i as _; 16]),
+                                },
+                                run_number: INIT_RUN_NUMBER,
                             })
                             .collect();
                         break work;
@@ -758,9 +756,9 @@ mod test {
                                 net_protocol::async_read(&mut worker).await.unwrap();
                             let mut all_done = false;
                             while !all_done {
-                                let work = work_to_write.pop().unwrap_or(NextWork::EndOfWork);
-                                all_done = matches!(work, NextWork::EndOfWork);
-                                let work_bundle = NextWorkBundle::new(vec![work]);
+                                let work = work_to_write.pop().map(|work| vec![work]).unwrap_or_default();
+                                all_done = work.is_empty();
+                                let work_bundle = NextWorkBundle::new(work, Eow(all_done));
 
                                 let NextTestRequest {} =
                                     match net_protocol::async_read(&mut worker).await {

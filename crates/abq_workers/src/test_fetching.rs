@@ -2,10 +2,11 @@ use std::{net::SocketAddr, time::Duration};
 
 use abq_generic_test_runner::TestsFetcher;
 use abq_utils::{
+    log_assert,
     net_async::ConfiguredClient,
     net_protocol::{
         entity::Entity,
-        workers::{NextWork, NextWorkBundle, RunId},
+        workers::{Eow, NextWorkBundle, RunId},
     },
 };
 use async_trait::async_trait;
@@ -140,7 +141,7 @@ impl Fetcher {
 
             match initial_source {
                 Some(source) => {
-                    let mut tests = match source {
+                    let tests = match source {
                         InitialSource::Fresh(mut s) => {
                             let tests = s.get_next_tests().await;
                             // Put the source back, we may need it to fetch incremental tests again.
@@ -152,21 +153,21 @@ impl Fetcher {
 
                     let hydration_status = self
                         .retry_source
-                        .hydrate_ordered_manifest_slice(tests.work.clone());
+                        .hydrate_ordered_manifest_slice(tests.work.clone(), tests.eow);
 
                     match hydration_status {
                         retries::HydrationStatus::StillHydrating => {
                             return tests;
                         }
                         retries::HydrationStatus::EmptyManifest => {
-                            debug_assert!(matches!(tests.work.last(), Some(NextWork::EndOfWork)));
+                            log_assert!(tests.eow.0, "received empty manifest, but not EOW");
                             return tests;
                         }
                         retries::HydrationStatus::EndOfManifest => {
-                            // Remove the EndOfWork marker from the last test so that the worker returns
-                            // for the retry manifest, rather than finishing at this point.
-                            debug_assert!(matches!(tests.work.last(), Some(NextWork::EndOfWork)));
-                            tests.work.pop();
+                            log_assert!(
+                                tests.eow.0,
+                                "reached hydration end of manifest status, but not EOW"
+                            );
 
                             self.initial_source = None;
 
@@ -177,6 +178,10 @@ impl Fetcher {
                                 // once we've handled all test results.
                                 continue;
                             } else {
+                                // Set EndOfWork false so that the worker returns for the retry manifest,
+                                // rather than finishing at this point.
+                                let mut tests = tests;
+                                tests.eow = Eow(false);
                                 return tests;
                             }
                         }
@@ -185,8 +190,8 @@ impl Fetcher {
                 None => {
                     loop {
                         match self.retry_source.try_assemble_retry_manifest() {
-                            Some(work) => {
-                                return NextWorkBundle { work };
+                            Some(bundle) => {
+                                return bundle;
                             }
                             // The retry manifest is not yet ready; we must be waiting for more results
                             // to come in, before we know the status of the retry manifest.
@@ -215,8 +220,8 @@ mod test {
     use std::time::Duration;
 
     use abq_generic_test_runner::TestsFetcher;
-    use abq_test_utils::{spec, test, wid, worker_test};
-    use abq_utils::net_protocol::workers::{NextWork, NextWorkBundle, INIT_RUN_NUMBER};
+    use abq_test_utils::{spec, test, wid};
+    use abq_utils::net_protocol::workers::{Eow, NextWorkBundle, WorkerTest, INIT_RUN_NUMBER};
 
     use crate::test_fetching::retries::test::{
         associated_results, result, with_focus, FAILURE, SUCCESS,
@@ -241,15 +246,15 @@ mod test {
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(&mut conn, [NextWork::EndOfWork]).await;
+            server_send_bundle(&mut conn, [], Eow(true)).await;
         };
 
         let ((), bundle) = tokio::join!(server_task, fetcher.get_next_tests());
 
-        let NextWorkBundle { work } = bundle;
+        let NextWorkBundle { work, eow } = bundle;
 
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0], NextWork::EndOfWork);
+        assert!(work.is_empty());
+        assert!(eow.0);
     }
 
     #[tokio::test]
@@ -267,18 +272,16 @@ mod test {
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(&mut conn, [NextWork::EndOfWork]).await;
+            server_send_bundle(&mut conn, [], Eow(true)).await;
         };
 
         let ((), bundle) = tokio::join!(server_task, fetcher.get_next_tests());
 
-        let NextWorkBundle { work } = bundle;
+        let NextWorkBundle { work, eow } = bundle;
 
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0], NextWork::EndOfWork);
+        assert!(work.is_empty());
+        assert!(eow.0);
     }
-
-    use NextWork::*;
 
     #[tokio::test]
     async fn fetch_incremental_from_queue_fresh() {
@@ -298,39 +301,44 @@ mod test {
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(1), INIT_RUN_NUMBER),
-                    worker_test(spec(2), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(2), INIT_RUN_NUMBER),
                 ],
+                Eow(false),
             )
             .await;
 
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(3), INIT_RUN_NUMBER),
-                    worker_test(spec(4), INIT_RUN_NUMBER),
-                    EndOfWork,
+                    WorkerTest::new(spec(3), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(4), INIT_RUN_NUMBER),
                 ],
+                Eow(true),
             )
             .await;
         };
 
         let fetch_task = async move {
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
             assert_eq!(
-                fetcher.get_next_tests().await.work,
+                work,
                 [
-                    worker_test(spec(1), INIT_RUN_NUMBER),
-                    worker_test(spec(2), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(2), INIT_RUN_NUMBER),
                 ],
             );
+            assert!(!eow);
 
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
             assert_eq!(
-                fetcher.get_next_tests().await.work,
+                work,
                 [
-                    worker_test(spec(3), INIT_RUN_NUMBER),
-                    worker_test(spec(4), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(3), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(4), INIT_RUN_NUMBER),
                 ],
             );
+            assert!(!eow, "should come back for retry manifest");
         };
 
         let ((), ()) = tokio::join!(server_task, fetch_task);
@@ -354,26 +362,28 @@ mod test {
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(1), INIT_RUN_NUMBER),
-                    worker_test(spec(2), INIT_RUN_NUMBER),
-                    worker_test(spec(3), INIT_RUN_NUMBER),
-                    worker_test(spec(4), INIT_RUN_NUMBER),
-                    EndOfWork,
+                    WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(2), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(3), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(4), INIT_RUN_NUMBER),
                 ],
+                Eow(true),
             )
             .await;
         };
 
         let fetch_task = async move {
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
             assert_eq!(
-                fetcher.get_next_tests().await.work,
+                work,
                 [
-                    worker_test(spec(1), INIT_RUN_NUMBER),
-                    worker_test(spec(2), INIT_RUN_NUMBER),
-                    worker_test(spec(3), INIT_RUN_NUMBER),
-                    worker_test(spec(4), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(2), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(3), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(4), INIT_RUN_NUMBER),
                 ],
             );
+            assert!(!eow, "should come back for retry manifest");
         };
 
         let ((), ()) = tokio::join!(server_task, fetch_task);
@@ -397,24 +407,28 @@ mod test {
             server_send_bundle(
                 &mut conn,
                 [
-                    worker_test(spec(1), INIT_RUN_NUMBER),
-                    worker_test(spec(2), INIT_RUN_NUMBER),
-                    EndOfWork,
+                    WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(2), INIT_RUN_NUMBER),
                 ],
+                Eow(true),
             )
             .await;
         };
 
         let fetch_task = async move {
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
             assert_eq!(
-                fetcher.get_next_tests().await.work,
+                work,
                 [
-                    worker_test(spec(1), INIT_RUN_NUMBER),
-                    worker_test(spec(2), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                    WorkerTest::new(spec(2), INIT_RUN_NUMBER),
                 ],
             );
+            assert!(!eow);
 
-            assert_eq!(fetcher.get_next_tests().await.work, [EndOfWork],);
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            assert_eq!(work, []);
+            assert!(eow);
         };
 
         let ((), ()) = tokio::join!(server_task, fetch_task);
@@ -429,25 +443,27 @@ mod test {
                     server_send_bundle(
                         &mut conn,
                         [
-                            worker_test(spec(1), INIT_RUN_NUMBER),
-                            worker_test(spec(2), INIT_RUN_NUMBER),
-                            worker_test(spec(3), INIT_RUN_NUMBER),
-                            EndOfWork,
+                            WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                            WorkerTest::new(spec(2), INIT_RUN_NUMBER),
+                            WorkerTest::new(spec(3), INIT_RUN_NUMBER),
                         ],
+                        Eow(true),
                     )
                     .await;
                 };
 
                 let fetch_task = async move {
                     // Attempt 1, from online
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
                     assert_eq!(
-                        $fetcher.get_next_tests().await.work,
+                        work,
                         [
-                            worker_test(spec(1), INIT_RUN_NUMBER),
-                            worker_test(spec(2), INIT_RUN_NUMBER),
-                            worker_test(spec(3), INIT_RUN_NUMBER),
+                            WorkerTest::new(spec(1), INIT_RUN_NUMBER),
+                            WorkerTest::new(spec(2), INIT_RUN_NUMBER),
+                            WorkerTest::new(spec(3), INIT_RUN_NUMBER),
                         ],
                     );
+                    assert!(!eow);
 
                     $results_tracker.account_results([
                         &associated_results(wid(1), INIT_RUN_NUMBER, [result(test(1), FAILURE)]),
@@ -456,13 +472,15 @@ mod test {
                     ]);
 
                     // Attempt 2
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
                     assert_eq!(
-                        $fetcher.get_next_tests().await.work,
+                        work,
                         [
-                            worker_test(with_focus(spec(1), test(1)), INIT_RUN_NUMBER + 1),
-                            worker_test(with_focus(spec(2), test(2)), INIT_RUN_NUMBER + 1),
+                            WorkerTest::new(with_focus(spec(1), test(1)), INIT_RUN_NUMBER + 1),
+                            WorkerTest::new(with_focus(spec(2), test(2)), INIT_RUN_NUMBER + 1),
                         ],
                     );
+                    assert!(!eow);
 
                     $results_tracker.account_results([
                         &associated_results(
@@ -478,13 +496,15 @@ mod test {
                     ]);
 
                     // Attempt 3
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
                     assert_eq!(
-                        $fetcher.get_next_tests().await.work,
-                        [worker_test(
+                        work,
+                        [WorkerTest::new(
                             with_focus(spec(1), test(1)),
                             INIT_RUN_NUMBER + 2
                         ),],
                     );
+                    assert!(!eow);
 
                     $results_tracker.account_results([&associated_results(
                         wid(1),
@@ -493,7 +513,9 @@ mod test {
                     )]);
 
                     // Done, even though we had failures
-                    assert_eq!($fetcher.get_next_tests().await.work, [EndOfWork]);
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
+                    assert_eq!(work, []);
+                    assert!(eow);
                 };
 
                 let ((), ()) = tokio::join!(server_task, fetch_task);
@@ -546,16 +568,20 @@ mod test {
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
-            server_send_bundle(&mut conn, [worker_test(spec(1), INIT_RUN_NUMBER)]).await;
-            server_send_bundle(&mut conn, [EndOfWork]).await;
+            server_send_bundle(
+                &mut conn,
+                [WorkerTest::new(spec(1), INIT_RUN_NUMBER)],
+                Eow(false),
+            )
+            .await;
+            server_send_bundle(&mut conn, [], Eow(true)).await;
         };
 
         let fetch_task = async move {
             // Attempt 1, from online
-            assert_eq!(
-                fetcher.get_next_tests().await.work,
-                [worker_test(spec(1), INIT_RUN_NUMBER),],
-            );
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            assert_eq!(work, [WorkerTest::new(spec(1), INIT_RUN_NUMBER),],);
+            assert!(!eow);
 
             // Attempt 2 will need to fetch from retries of attempt 1.
 
@@ -566,13 +592,15 @@ mod test {
             )]);
 
             // Attempt 2
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
             assert_eq!(
-                fetcher.get_next_tests().await.work,
-                [worker_test(
+                work,
+                [WorkerTest::new(
                     with_focus(spec(1), test(1)),
                     INIT_RUN_NUMBER + 1
-                ),],
+                )],
             );
+            assert!(!eow);
 
             results_tracker.account_results([&associated_results(
                 wid(1),
@@ -581,7 +609,9 @@ mod test {
             )]);
 
             // Done, even though we had failures
-            assert_eq!(fetcher.get_next_tests().await.work, [EndOfWork]);
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            assert_eq!(work, []);
+            assert!(eow);
         };
 
         let ((), ()) = tokio::join!(server_task, fetch_task);
@@ -604,17 +634,17 @@ mod test {
             let mut conn = server_establish(&*server).await;
             server_send_bundle(
                 &mut conn,
-                [worker_test(spec(1), INIT_RUN_NUMBER), EndOfWork],
+                [WorkerTest::new(spec(1), INIT_RUN_NUMBER)],
+                Eow(true),
             )
             .await;
         };
 
         let fetch_task = async move {
             // Attempt 1, from online
-            assert_eq!(
-                fetcher.get_next_tests().await.work,
-                [worker_test(spec(1), INIT_RUN_NUMBER),],
-            );
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            assert_eq!(work, [WorkerTest::new(spec(1), INIT_RUN_NUMBER),],);
+            assert!(!eow);
 
             // Attempt 2 will need to fetch from retries of attempt 1.
 
@@ -625,13 +655,15 @@ mod test {
             )]);
 
             // Attempt 2
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
             assert_eq!(
-                fetcher.get_next_tests().await.work,
-                [worker_test(
+                work,
+                [WorkerTest::new(
                     with_focus(spec(1), test(1)),
                     INIT_RUN_NUMBER + 1
-                ),],
+                )],
             );
+            assert!(!eow);
 
             results_tracker.account_results([&associated_results(
                 wid(1),
@@ -640,7 +672,9 @@ mod test {
             )]);
 
             // Done, even though we had failures
-            assert_eq!(fetcher.get_next_tests().await.work, [EndOfWork]);
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            assert!(work.is_empty());
+            assert!(eow);
         };
 
         let ((), ()) = tokio::join!(server_task, fetch_task);
