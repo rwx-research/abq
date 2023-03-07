@@ -129,6 +129,7 @@ pub(crate) struct AbqInstance {
 enum AbqLocator {
     Remote {
         queue_negotiator: QueueNegotiatorHandle,
+        server_addr: SocketAddr,
     },
     Local(Abq, EphemeralAbqGuards),
 }
@@ -163,6 +164,13 @@ impl AbqInstance {
                 queue_negotiator, ..
             } => *queue_negotiator,
             AbqLocator::Local(abq, _) => abq.get_negotiator_handle(),
+        }
+    }
+
+    pub fn server_addr(&self) -> SocketAddr {
+        match &self.locator {
+            AbqLocator::Remote { server_addr, .. } => *server_addr,
+            AbqLocator::Local(abq, _) => abq.server_addr(),
         }
     }
 
@@ -228,7 +236,10 @@ impl AbqInstance {
             deprecations,
         )?;
 
-        let abq = AbqLocator::Remote { queue_negotiator };
+        let abq = AbqLocator::Remote {
+            queue_negotiator,
+            server_addr: queue_addr,
+        };
 
         Ok(AbqInstance {
             locator: abq,
@@ -238,5 +249,9 @@ impl AbqInstance {
 
     pub fn client_options(&self) -> &ClientOptions {
         &self.client_options
+    }
+
+    pub fn client_options_owned(self) -> ClientOptions {
+        self.client_options
     }
 }

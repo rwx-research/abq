@@ -1,6 +1,7 @@
 mod args;
 mod health;
 mod instance;
+mod report;
 mod reporting;
 mod statefile;
 mod workers;
@@ -357,6 +358,67 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 results_timeout,
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
+            )
+            .await
+        }
+        Command::Report {
+            run_id,
+            reporter,
+            color,
+            access_token,
+            timeout_seconds,
+            queue_addr,
+            token,
+            tls_cert,
+        } => {
+            let deprecations = DeprecationRecord::default();
+            let stdout_preferences = StdoutPreferences::new(color);
+
+            let run_id = run_id.or(inferred_run_id).ok_or_else (|| {
+                let mut cmd = Cli::command();
+                cmd.error(
+                    ErrorKind::InvalidValue,
+                    "`abq report` was not given a run-id and could not infer one. Consider setting `--run-id` or the `ABQ_RUN_ID` environment variable.",
+                )
+            })?;
+
+            let tls_cert = read_opt_path_bytes(tls_cert)?;
+
+            let ResolvedConfig {
+                queue_addr: resolved_queue_addr,
+                token: resolved_token,
+                tls_cert: resolved_tls,
+            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
+
+            let client_auth = resolved_token.into();
+
+            let queue_addr = resolved_queue_addr.ok_or_else(|| {
+                let mut cmd = Cli::command();
+                cmd.error(
+                    ErrorKind::InvalidValue,
+                    "`abq report` could not detect the queue to connect to. Consider setting `--access-token` or the `RWX_ACCESS_TOKEN` environment variable.",
+                )
+            })?;
+
+            let entity = Entity::local_client();
+            let abq = find_or_create_abq(
+                entity,
+                run_id.clone(),
+                Ok(queue_addr),
+                resolved_token,
+                client_auth,
+                resolved_tls,
+                deprecations,
+            )
+            .await?;
+
+            report::report_results(
+                abq,
+                entity,
+                run_id,
+                reporter,
+                stdout_preferences,
+                Duration::from_secs(timeout_seconds),
             )
             .await
         }

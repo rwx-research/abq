@@ -7,9 +7,7 @@ use abq_utils::{
 use async_trait::async_trait;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::reporting::{reporter_from_kind, ReporterKind, StdoutPreferences, SuiteResult};
-
-use super::summary;
+use crate::reporting::{summary, SuiteResult};
 
 struct ReportingTask {
     rx_results: mpsc::UnboundedReceiver<Vec<AssociatedTestResults>>,
@@ -145,17 +143,6 @@ impl SharedNotifyResults for ReportingProxy {
     fn boxed_clone(&self) -> SharedResultsHandler {
         Box::new(self.clone())
     }
-}
-
-pub fn build_reporters(
-    reporter_kinds: Vec<ReporterKind>,
-    stdout_preferences: StdoutPreferences,
-    test_suite_name: &str,
-) -> Vec<Box<dyn Reporter>> {
-    reporter_kinds
-        .into_iter()
-        .map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
-        .collect()
 }
 
 /// Spawns a task to handle reporting of results.

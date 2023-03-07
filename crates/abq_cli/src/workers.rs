@@ -14,16 +14,15 @@ use abq_workers::negotiate::{
 use abq_workers::workers::{WorkerContext, WorkersExit, WorkersExitStatus};
 
 mod reporting;
-mod summary;
 
 use futures::stream::StreamExt;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook_tokio::Signals;
 
-use crate::reporting::{ReporterKind, StdoutPreferences};
+use crate::reporting::{build_reporters, ReporterKind, StdoutPreferences};
 use crate::workers::reporting::create_reporting_task;
 
-use self::reporting::{build_reporters, ReportingTaskHandle};
+use self::reporting::ReportingTaskHandle;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 

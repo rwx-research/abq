@@ -269,9 +269,9 @@ enum ReadResultsError {
     RunNotFound,
     #[error("results cannot be read before manifest is received")]
     WaitingForManifest,
-    #[error("results cannot be read because a manifest failed to be generated")]
+    #[error("a manifest failed to be generated")]
     ManifestNeverReceived,
-    #[error("results cannot be read because the run was cancelled before any results were stored")]
+    #[error("the run was cancelled before all test results were received")]
     RunCancelled,
 }
 
@@ -388,7 +388,7 @@ impl AllRuns {
                         tracing::info!(
                             ?old_finished_state,
                             ?entity,
-                            "worker reconnecting for out-of-process retry manifest"
+                            "worker reconnecting for out-of-process retry manifest during active run"
                         );
 
                         AssignedRunStatus::Run(AssignedRun::Retry)
@@ -405,9 +405,19 @@ impl AllRuns {
                 if seen_workers.read().contains_by_tag(&entity) {
                     // This worker was already involved in this run; assume it's connecting for an
                     // out-of-process retry.
+                    tracing::info!(
+                        ?run_id,
+                        ?entity,
+                        "worker reconnecting for out-of-process retry manifest during active run"
+                    );
                     AssignedRunStatus::Run(AssignedRun::Retry)
                 } else {
                     let exit_code = *new_worker_exit_code;
+                    tracing::info!(
+                        ?run_id,
+                        ?entity,
+                        "assigning fresh worker already-completed status for run"
+                    );
                     // Fresh workers shouldn't get any new work.
                     // The worker should exit successfully locally, regardless of what the overall
                     // code was.
@@ -437,6 +447,8 @@ impl AllRuns {
 
         // NB: Always add first for conversative estimation.
         num_active.fetch_add(1, atomic::ORDERING);
+
+        tracing::info!(?run_id, entity=?worker_entity, "creating fresh run");
 
         // The run ID is fresh; create a new queue for it.
         let run = Run {
@@ -530,6 +542,11 @@ impl AllRuns {
                 ..
             } => {
                 if seen_workers.read().contains_by_tag(&entity) {
+                    tracing::debug!(
+                        ?run_id,
+                        ?entity,
+                        "assigning init metadata to out-of-process retry"
+                    );
                     // This worker was already involved in this run; assume it's connecting for an
                     // out-of-process retry.
                     InitMetadata::Metadata(init_metadata.clone())

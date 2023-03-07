@@ -894,6 +894,9 @@ async fn execute_all_tests<'a>(
                         .await
                         .located(here!())?;
 
+                        // Exit with a failure notification so the queue knows not to wait for us.
+                        notify_all_tests_run().await;
+
                         return Err(GenericRunnerErrorKind::from(native_error).located(here!()));
                     }
                 }
@@ -921,6 +924,7 @@ async fn execute_all_tests<'a>(
         Ok(ExitCode::from(exit_status))
     };
 
+    tracing::info!("starting execution of all tests");
     let ((), run_tests_result, ()) =
         tokio::join!(fetch_tests_task, run_tests_task, send_results_task);
 

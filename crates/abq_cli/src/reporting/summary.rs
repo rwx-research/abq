@@ -92,7 +92,7 @@ impl AggregatedMetrics {
     }
 }
 
-pub(super) struct SuiteTracker {
+pub struct SuiteTracker {
     start_time: Instant,
     test_time: TestRuntime,
     total_attempts: u64,
@@ -129,6 +129,7 @@ impl SuiteTracker {
 
         self.total_attempts += 1;
 
+        let mut is_new_result = false;
         if !self.tests.contains_key(&test_result.id) {
             self.tests.insert(
                 test_result.id.clone(),
@@ -137,7 +138,8 @@ impl SuiteTracker {
                     test_result.location.as_ref().map(|l| l.file.clone()),
                 ),
             );
-        }
+            is_new_result = true;
+        };
 
         let entry = self.tests.get_mut(&test_result.id).unwrap();
 
@@ -162,7 +164,12 @@ impl SuiteTracker {
             }
             _ => { /* no update */ }
         }
-        entry.overall_status.retried = run_number > INIT_RUN_NUMBER;
+
+        // If we haven't seen this result before, it must be retried.
+        // We use this over a check of the `run_number` to deal with out-of-process retries and
+        // report aggregation - if a test suite is out-of-process retried, it may consist of many
+        // results with the same INIT_RUN_NUMBER. But in fact, all of those are retries.
+        entry.overall_status.retried = !is_new_result;
     }
 
     fn load_aggregated_metrics(&self) -> AggregatedMetrics {

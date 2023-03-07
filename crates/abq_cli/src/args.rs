@@ -217,18 +217,13 @@ pub enum Command {
         /// Test result reporter to use for a test run. Options are:{n}
         ///- dot: prints a dot for each test{n}
         ///- line: prints a line for each test{n}
+        ///- progress: an interactive progress output{n}
         ///- junit-xml[=path/to/results.xml]: outputs a junit-compatible xml file to specified path. Defaults to ./abq-test-results.xml{n}
         ///- rwx-v1-json[=path/to/results.json]: outputs a rwx-v1-compatible json file to specified path. Defaults to ./abq-test-results.json
-        ///
-        /// Reporters are only actionable for `abq test` processes started with `--worker 0`. On
-        /// all other invocations of `abq test`, reporting is ignored.
         #[clap(long, default_value = "dot")]
         reporter: Vec<ReporterKind>,
 
         /// How many tests to send to a worker a time.
-        ///
-        /// The batch size is obeyed only for `abq test` processes started with `--worker 0`. On
-        /// all other invocations of `abq test`, the configured batch size is that of `--worker 0`.
         #[clap(long, default_value = "7")]
         batch_size: NonZeroU64,
 
@@ -237,8 +232,6 @@ pub enum Command {
         /// When set to `auto`, will try to emit colors unless the output channel is detected
         /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
         /// TERM is set to `dumb`, amongst other heuristics.
-        ///
-        /// Only relevant with `--worker 0`.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
@@ -258,14 +251,96 @@ pub enum Command {
         ///
         /// Hitting a timeout is typically indicative of a failure in a test suite's setup or
         /// configuration.
-        ///
-        /// Only relevant with `--worker 0`.
         #[clap(long, default_value_t = abq_queue::queue::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
         inactivity_timeout_seconds: u64,
 
         /// Arguments to the test executable.
         #[clap(required = true, num_args = 1.., allow_hyphen_values = true, last = true)]
         args: Vec<String>,
+    },
+    /// Fetches all test results for an ABQ test run and formats them with the given reporters.
+    ///
+    /// `abq report` may be only be invoked after all workers for a given test suite run have
+    /// completed. If there are outstanding workers for a given test suite run, `abq report` will
+    /// error out without reporting results.
+    ///
+    /// If a worker for a given test suite run is retried at the same time that `abq report` is
+    /// invoked, `abq report` may report test results, but may not include all results from the
+    /// retried worker.
+    #[clap(verbatim_doc_comment)]
+    #[command(group(
+        ArgGroup::new("execution") // don't allow both queue_addr and access_token params
+            .multiple(false)
+            .args(["access_token", "queue_addr"]),
+        )
+    )]
+    #[command(group(
+        ArgGroup::new("server-key-exclusion") // don't allow server-side cert key if running in non-local mode
+            .multiple(false)
+            .args(["access_token", "queue_addr"])
+            .conflicts_with("tls_key"),
+        )
+    )]
+    Report {
+        /// Run ID of the test suite for which test results should be fetched.
+        /// In CI environments, this can be inferred from CI environment variables.
+        #[clap(long, required = false, env("ABQ_RUN_ID"))]
+        run_id: Option<RunId>,
+
+        /// Test result reporter to use for a test run. Options are:{n}
+        ///- dot: prints a dot for each test{n}
+        ///- line: prints a line for each test{n}
+        ///- progress: an interactive progress output{n}
+        ///- junit-xml[=path/to/results.xml]: outputs a junit-compatible xml file to specified path. Defaults to ./abq-test-results.xml{n}
+        ///- rwx-v1-json[=path/to/results.json]: outputs a rwx-v1-compatible json file to specified path. Defaults to ./abq-test-results.json
+        #[clap(long, default_value = "dot")]
+        reporter: Vec<ReporterKind>,
+
+        /// Whether to report tests with colors.
+        ///
+        /// When set to `auto`, will try to emit colors unless the output channel is detected
+        /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
+        /// TERM is set to `dumb`, amongst other heuristics.
+        #[clap(long, default_value = "auto")]
+        color: ColorPreference,
+
+        /// The access token to use when fetching queue config information from the ABQ API.
+        ///
+        /// Cannot be used with --queue-addr (implies: not using the ABQ API).
+        #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
+        access_token: Option<AccessToken>,
+
+        /// The maximum number of seconds to wait for test results to be available.
+        ///
+        /// If there are active workers, `abq report` will exit immediately with an error. However,
+        /// if all workers are complete, test results may still be pending before delivery to `abq
+        /// report`. The command will wait up to `--timeout-seconds` before exiting with an error.
+        #[clap(long, default_value = "300")]
+        timeout_seconds: u64,
+
+        /// Address of the queue where the test command will be sent.
+        ///
+        /// Requires that abq workers be started as separate processes connected to the queue.
+        ///
+        /// Cannot be used with access_token (will fetch address from ABQ API).
+        #[clap(long, required = false)]
+        queue_addr: Option<SocketAddr>,
+
+        /// Token to authorize messages sent to the queue with.
+        /// Usually, this should be the same token that `abq start` initialized with.
+        ///
+        /// If --access-token is specified, the token will be ignored and the token fetched from the ABQ API will be used.
+        #[clap(long, required = false)]
+        token: Option<UserToken>,
+
+        /// If message should only be sent with TLS, the path of the TLS cert to
+        /// anticipate from the communicating queue.
+        ///
+        /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
+        ///
+        /// If --access-token is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
+        #[clap(long)]
+        tls_cert: Option<PathBuf>,
     },
     /// Checks the health of an abq instance.
     ///

@@ -6,7 +6,8 @@ use abq_native_runner_simulation::{pack, pack_msgs, pack_msgs_to_disk, Msg::*};
 use abq_test_utils::{artifacts_dir, s, sanitize_output, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, Status, Test, TestOrGroup,
+    AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, RawTestResultMessage,
+    Status, Test, TestOrGroup,
 };
 use abq_utils::net_protocol::runners::{
     NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
@@ -16,7 +17,7 @@ use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
-use std::process::{ExitStatus, Output};
+use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
 use std::time::Duration;
 use std::{
     io::{BufRead, BufReader},
@@ -158,7 +159,7 @@ impl Abq {
 
         cmd.envs(env);
 
-        if debug_log_for_local_run() && name.contains("_queue") {
+        if debug_log_for_local_run() {
             cmd.env("ABQ_LOGFILE", format!("{name}.debug"));
             cmd.env("ABQ_LOG", "abq=debug");
         }
@@ -305,8 +306,48 @@ macro_rules! test_all_network_config_options {
     }};
 }
 
-fn term_queue(mut queue_proc: Child) {
+fn term(mut queue_proc: Child) {
     queue_proc.kill().unwrap();
+}
+
+fn wait_for_live_queue(queue_stdout: &mut ChildStdout) {
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start") {
+                break;
+            }
+        }
+    }
+}
+
+fn wait_for_live_worker(worker_stderr: &mut ChildStderr) {
+    let mut worker_reader = BufReader::new(worker_stderr).lines();
+    // Spin until we know the worker0 is UP
+    loop {
+        if let Some(line) = worker_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Generic test runner for") {
+                break;
+            }
+        }
+    }
+}
+
+// Waits for the debug line "starting execution of all tests" in the worker.
+fn wait_for_worker_executing(worker_stderr: &mut ChildStderr) {
+    let mut worker_reader = BufReader::new(worker_stderr).lines();
+    // Spin until we know the worker0 is UP
+    loop {
+        if let Some(line) = worker_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("starting execution of all tests") {
+                break;
+            }
+        }
+    }
 }
 
 test_all_network_config_options! {
@@ -327,10 +368,6 @@ test_all_network_config_options! {
 
         assert!(exit_status.success());
         assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{}", stdout);
-        // TODO(130): add back once https://github.com/rwx-research/abq/issues/130 lands; right now
-        // this prints more than needed because we don't capture worker stdout/stderr
-        // assert_eq!(stdout, "..");
-        // assert!(stderr.is_empty(), "{:?}", stderr);
     }
 }
 
@@ -352,10 +389,6 @@ test_all_network_config_options! {
 
         assert!(exit_status.success());
         assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{}", stdout);
-        // TODO(130): add back once https://github.com/rwx-research/abq/issues/130 lands; right now
-        // this prints more than needed because we don't capture worker stdout/stderr
-        // assert_eq!(stdout, "..");
-        // assert!(stderr.is_empty(), "{:?}", stderr);
     }
 }
 
@@ -392,7 +425,7 @@ test_all_network_config_options! {
         assert!(port_active(worker_port));
         assert!(port_active(negotiator_port));
 
-        term_queue(queue_proc)
+        term(queue_proc)
     }
 }
 
@@ -419,6 +452,10 @@ fn re_run() -> Regex {
     regex::Regex::new(r"(\d+) tests, \d+ failures").unwrap()
 }
 
+fn re_failed() -> Regex {
+    regex::Regex::new(r"\d+ tests, (\d+) failures").unwrap()
+}
+
 fn assert_sum_of_run_tests<'a>(outputs: impl IntoIterator<Item = &'a str>, expected: usize) {
     assert_sum_of_re(outputs, re_run(), expected);
 }
@@ -427,8 +464,7 @@ fn assert_sum_of_run_test_failures<'a>(
     outputs: impl IntoIterator<Item = &'a str>,
     expected: usize,
 ) {
-    let re_run = regex::Regex::new(r"\d+ tests, (\d+) failures").unwrap();
-    assert_sum_of_re(outputs, re_run, expected);
+    assert_sum_of_re(outputs, re_failed(), expected);
 }
 
 fn assert_sum_of_run_test_retries<'a>(outputs: impl IntoIterator<Item = &'a str>, expected: usize) {
@@ -517,7 +553,28 @@ test_all_network_config_options! {
 
         assert_sum_of_run_tests([&worker0_output.stdout, worker1_stdout.as_ref()], 2);
 
-        term_queue(queue_proc);
+        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+        let report_args = {
+            let args = vec![
+                format!("report"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("--color=never"),
+            ];
+            conf.extend_args_for_client(args)
+        };
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report").args(report_args).run();
+
+        assert!(exit_status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+
+        term(queue_proc);
     }
 }
 
@@ -594,7 +651,7 @@ test_all_network_config_options! {
         // The worker should exit with a failure as well.
         assert!(!exit_status.success(), "EXIT:\n{:?}\nSTDOUT:\n{}\nSTDERR:\n{}", exit_status, stdout, stderr);
 
-        term_queue(queue_proc);
+        term(queue_proc);
     }
 }
 
@@ -702,7 +759,28 @@ test_all_network_config_options! {
         // At least one of the workers should fail with a non-zero code.
         assert!(!worker0_output.exit_status.success() || !worker1_output.status.success());
 
-        term_queue(queue_proc);
+        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+        let report_args = {
+            let args = vec![
+                format!("report"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("--color=never"),
+            ];
+            conf.extend_args_for_client(args)
+        };
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report").args(report_args).run();
+
+        assert!(!exit_status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+
+        term(queue_proc);
     }
 }
 
@@ -758,7 +836,7 @@ test_all_network_config_options! {
         assert!(!stdout.contains("UNHEALTHY"));
         assert!(stderr.is_empty());
 
-        term_queue(queue_proc);
+        term(queue_proc);
     }
 }
 
@@ -950,7 +1028,37 @@ fn test_with_invalid_command() {
 
     insta::assert_snapshot!(stderr);
 
-    term_queue(queue_proc);
+    // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+    // ABQ report should error with a message that the test suite failed to run.
+    let report_args = {
+        let args = vec![
+            format!("report"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--color=never"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_report")
+        .args(report_args)
+        .run();
+
+    assert!(
+        !exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("failed to fetch test results"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    term(queue_proc);
 }
 
 fn legal_spawned_message(proto: ProtocolWitness) -> RawNativeRunnerSpawnedMessage {
@@ -1200,6 +1308,7 @@ test_all_network_config_options! {
         let negotiator_port = find_free_port();
 
         let queue_addr = format!("0.0.0.0:{server_port}");
+        let run_id = "test-run-id";
 
         let mut queue_proc = Abq::new(name)
             .args(conf.extend_args_for_start(vec![
@@ -1274,7 +1383,7 @@ test_all_network_config_options! {
                 format!("test"),
                 format!("--worker={worker}"),
                 format!("--queue-addr={queue_addr}"),
-                format!("--run-id=test-run-id"),
+                format!("--run-id={run_id}"),
                 format!("-n=1"),
             ];
             let mut args = conf.extend_args_for_client(args);
@@ -1306,7 +1415,28 @@ I failed catastrophically
 For a reason explainable only by a backtrace
 "#.trim()), "STDOUT:\n{stdout}");
 
-        term_queue(queue_proc);
+        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+        let report_args = {
+            let args = vec![
+                format!("report"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("--color=never"),
+            ];
+            conf.extend_args_for_client(args)
+        };
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report").args(report_args).run();
+
+        assert!(!exit_status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("1 tests, 1 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+
+        term(queue_proc);
     }
 }
 
@@ -1446,7 +1576,36 @@ fn retries_smoke() {
     assert_sum_of_run_test_failures(stdouts.iter().map(|s| s.as_str()), 64);
     assert_sum_of_run_test_retries(stdouts.iter().map(|s| s.as_str()), 64);
 
-    term_queue(queue_proc);
+    // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+    let report_args = {
+        let args = vec![
+            format!("report"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("--color=never"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_report")
+        .args(report_args)
+        .run();
+
+    assert!(
+        !exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("64 tests, 64 failures, 64 retried"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    term(queue_proc);
 }
 
 test_all_network_config_options! {
@@ -1548,17 +1707,8 @@ test_all_network_config_options! {
 
         let mut worker0 = Abq::new(name.to_string() + "_test0").args(test_args(0)).always_capture_stderr(true).spawn();
 
-        let worker0_stderr = std::mem::take(&mut worker0.stderr).unwrap();
-        let mut worker0_reader = BufReader::new(worker0_stderr).lines();
-        // Spin until we know the worker0 is UP
-        loop {
-            if let Some(line) = worker0_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Generic test runner for") {
-                    break;
-                }
-            }
-        }
+        let mut worker0_stderr = std::mem::take(&mut worker0.stderr).unwrap();
+        wait_for_live_worker(&mut worker0_stderr);
 
         use nix::sys::signal;
         use nix::unistd::Pid;
@@ -1580,7 +1730,37 @@ test_all_network_config_options! {
 
         assert_eq!(exit_status.code().unwrap(), 1, "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
 
-        term_queue(queue_proc);
+        // ABQ report should error because the test run was cancelled.
+        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+        let report_args = {
+            let args = vec![
+                format!("report"),
+                format!("--reporter=dot"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("--color=never"),
+            ];
+            conf.extend_args_for_client(args)
+        };
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args)
+            .run();
+
+        assert!(
+            !exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("failed to fetch test results because the run was cancelled before all test results were received"),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        term(queue_proc);
     }
 }
 
@@ -1663,7 +1843,10 @@ fn out_of_process_retries_smoke() {
                     // If the socket is alive (i.e. we have a test to run), pull it and give back a
                     // faux result.
                     // Otherwise assume we ran out of tests on our node and exit.
-                    run_tests.push(IfAliveReadAndWriteFake(Status::Success));
+                    run_tests.push(IfAliveReadAndWriteFake(Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    }));
                 }
                 run_tests
             },
@@ -1694,6 +1877,7 @@ fn out_of_process_retries_smoke() {
     };
 
     let mut run_on_each_worker = vec![];
+    let mut failed_on_each_worker = vec![];
 
     for attempt in 0..attempts {
         let workers: Vec<_> = (0..num_workers)
@@ -1706,27 +1890,370 @@ fn out_of_process_retries_smoke() {
 
         let mut stdouts = vec![];
         let mut run_on_each = vec![];
+        let mut failed_on_each = vec![];
+        let mut some_is_failure = false;
         for worker in workers {
             let Output {
                 status,
                 stdout,
-                stderr,
+                stderr: _,
             } = worker.wait_with_output().unwrap();
             let stdout = String::from_utf8_lossy(&stdout).to_string();
-            let stderr = String::from_utf8_lossy(&stderr).to_string();
-            assert!(status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+            some_is_failure = some_is_failure || !status.success();
             run_on_each.push(get_num_of_re(&re_run(), &stdout));
+            failed_on_each.push(get_num_of_re(&re_failed(), &stdout));
             stdouts.push(stdout);
         }
 
+        assert!(some_is_failure);
+
         assert_sum_of_run_tests(stdouts.iter().map(|s| s.as_str()), 64);
+        assert_sum_of_run_test_failures(stdouts.iter().map(|s| s.as_str()), 64);
 
         if attempt == 0 {
             run_on_each_worker = run_on_each;
+            failed_on_each_worker = failed_on_each;
         } else {
             assert_eq!(run_on_each, run_on_each_worker);
+            assert_eq!(failed_on_each, failed_on_each_worker);
         }
     }
 
-    term_queue(queue_proc);
+    // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+    let report_args = {
+        let args = vec![
+            format!("report"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("--color=never"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_report")
+        .args(report_args)
+        .run();
+
+    assert!(
+        !exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("64 tests, 64 failures, 64 retried"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    term(queue_proc);
+}
+
+#[test]
+#[serial]
+fn report_while_run_in_progress_is_error() {
+    let name = "report_while_run_in_progress_is_error";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+
+    let mut queue_proc = Abq::new(name)
+        .args(conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]))
+        .spawn();
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    wait_for_live_queue(queue_stdout);
+
+    let run_id = "test-run-id";
+    let proto = ProtocolWitness::TEST;
+
+    let manifest = vec![TestOrGroup::test(Test::new(
+        proto,
+        "test1".to_string(),
+        [],
+        Default::default(),
+    ))];
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                //
+                // Sleep forever
+                Sleep(Duration::from_secs(600)),
+            ],
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let packed = pack_msgs_to_disk(simulation);
+    let simfile_path = packed.path;
+
+    let test_args = |worker: usize| {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = simfile_path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker={worker}"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("-n=1"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let mut worker0 = Abq::new(format!("{name}_worker0"))
+        .args(test_args(0))
+        .spawn();
+    wait_for_live_worker(worker0.stderr.as_mut().unwrap());
+
+    // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+    let report_args = {
+        let args = vec![
+            format!("report"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--color=never"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_report")
+        .args(report_args)
+        .run();
+
+    assert!(
+        !exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("failed to fetch test results because the following runners are still active: worker 0, runner 1"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    term(worker0);
+    term(queue_proc);
+}
+
+#[test]
+#[serial]
+fn report_while_run_is_out_of_process_retried_is_error() {
+    let name = "report_while_run_is_out_of_process_retried_is_error";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+
+    let mut queue_proc = Abq::new(name)
+        .args(conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]))
+        .spawn();
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    wait_for_live_queue(queue_stdout);
+
+    let run_id = "test-run-id";
+    let proto = ProtocolWitness::TEST;
+
+    let manifest = vec![TestOrGroup::test(Test::new(
+        proto,
+        "test1".to_string(),
+        [],
+        Default::default(),
+    ))];
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    // attempt 1 - complete, albeit with a failure.
+    {
+        let simulation = [
+            Connect,
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            IfGenerateManifest {
+                then_do: vec![OpaqueWrite(pack(&manifest))],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    //
+                    // Send result
+                    OpaqueRead,
+                    OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                ],
+            },
+            Exit(0),
+        ];
+
+        let packed = pack_msgs_to_disk(simulation);
+        let simfile_path = packed.path;
+
+        let test_args = |worker: usize| {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = simfile_path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        };
+
+        let CmdOutput {
+            exit_status,
+            stdout,
+            ..
+        } = Abq::new(format!("{name}_worker0")).args(test_args(0)).run();
+        assert!(exit_status.success());
+        assert_sum_of_run_tests([stdout.as_str()], 1);
+        assert_sum_of_run_test_failures([stdout.as_str()], 0);
+    }
+
+    // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+    let report_args = || {
+        let args = vec![
+            format!("report"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--color=never"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    // First ABQ report should give back the completed results
+    {
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr: _,
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args())
+            .run();
+
+        assert!(exit_status.success());
+        assert_sum_of_run_tests([stdout.as_str()], 1);
+        assert_sum_of_run_test_failures([stdout.as_str()], 0);
+    }
+
+    // Start an out-of-process retry that doesn't yield.
+    // ABQ report should error out.
+    let (mut worker0, _packed_file) = {
+        let simulation = [
+            Connect,
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            IfGenerateManifest {
+                then_do: vec![OpaqueWrite(pack(&manifest))],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    //
+                    OpaqueRead,
+                    Sleep(Duration::from_secs(600)),
+                ],
+            },
+            Exit(0),
+        ];
+
+        let packed = pack_msgs_to_disk(simulation);
+        let simfile_path = packed.path.clone();
+
+        let test_args = |worker: usize| {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = simfile_path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker={worker}"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        };
+
+        let worker0 = Abq::new(format!("{name}_worker0_retry"))
+            .args(test_args(0))
+            .env([("ABQ_LOG", "abq=debug")])
+            .spawn();
+        (worker0, packed)
+    };
+
+    wait_for_live_worker(worker0.stderr.as_mut().unwrap());
+    wait_for_worker_executing(worker0.stderr.as_mut().unwrap());
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_report")
+        .args(report_args())
+        .run();
+
+    assert!(
+        !exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("failed to fetch test results because the following runners are still active: worker 0, runner 1"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    term(worker0);
+    term(queue_proc);
 }

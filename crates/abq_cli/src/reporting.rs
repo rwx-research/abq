@@ -19,6 +19,8 @@ use abq_utils::{exit::ExitCode, net_protocol::runners::TestRuntime};
 use indicatif::ProgressDrawTarget;
 use termcolor::{ColorChoice, StandardStream};
 
+pub mod summary;
+
 static DEFAULT_XML_PATH: &str = "abq-test-results.xml";
 static DEFAULT_JSON_PATH: &str = "abq-test-results.json";
 
@@ -98,7 +100,7 @@ impl FromStr for ColorPreference {
     }
 }
 
-pub(crate) struct SuiteResult {
+pub struct SuiteResult {
     /// Exit code suggested for the test suite.
     pub suggested_exit_code: ExitCode,
     /// Total number of tests run.
@@ -295,6 +297,17 @@ pub fn reporter_from_kind(
             collector: abq_rwx_v1_json::Collector::default(),
         }),
     }
+}
+
+pub fn build_reporters(
+    reporter_kinds: Vec<ReporterKind>,
+    stdout_preferences: StdoutPreferences,
+    test_suite_name: &str,
+) -> Vec<Box<dyn Reporter>> {
+    reporter_kinds
+        .into_iter()
+        .map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
+        .collect()
 }
 
 #[cfg(test)]
