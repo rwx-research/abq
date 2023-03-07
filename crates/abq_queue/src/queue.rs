@@ -2134,6 +2134,7 @@ impl WorkScheduler {
     }
 }
 
+#[instrument(level = "info", skip_all, fields(run_id=?run_id, entity=?entity))]
 async fn run_manifest_persistence_task(
     persist_manifest: &SharedPersistManifest,
     run_id: &RunId,
@@ -2142,8 +2143,6 @@ async fn run_manifest_persistence_task(
 ) {
     let task = manifest::make_persistence_task(persist_manifest.borrowed(), persist_manifest_plan);
 
-    let span = tracing::info_span!("running manifest persistence task", ?run_id, ?entity);
-    let _enter = span.enter();
     if let Err(error) = task.await.entity(entity) {
         log_entityful_error!(error, "failed to execute manifest persistence job: {}");
     }

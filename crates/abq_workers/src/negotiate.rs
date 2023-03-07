@@ -597,8 +597,7 @@ impl QueueNegotiator {
             }
             WantsToAttach { invoke_data } => {
                 let run_id = &invoke_data.run_id;
-                let attach = tracing::debug_span!("Worker set negotiating", run_id=?run_id);
-                let _attach_span = attach.enter();
+
                 tracing::debug!(run_id=?run_id, "New worker set negotiating");
 
                 let assigned_run_result = (ctx.get_assigned_run)(entity, &invoke_data);

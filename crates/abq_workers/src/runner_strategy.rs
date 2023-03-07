@@ -16,6 +16,7 @@ use abq_utils::{
 };
 use async_trait::async_trait;
 use futures::FutureExt;
+use tracing::instrument;
 
 use crate::{
     negotiate::AssignedRun,
@@ -195,6 +196,7 @@ struct GetInitContextOnline {
 /// Blocks on the result, repeatedly pinging the server until work is available.
 #[async_trait]
 impl InitContextFetcher for GetInitContextOnline {
+    #[instrument(level = "trace", skip_all, fields(run_id=?self.run_id, work_server=?self.work_server_addr))]
     async fn get_init_context(self: Box<Self>) -> io::Result<InitContextResult> {
         use net_protocol::work_server::{InitContextResponse, Message, Request};
 
@@ -204,9 +206,6 @@ impl InitContextFetcher for GetInitContextOnline {
             client,
             work_server_addr,
         } = *self;
-
-        let span = tracing::trace_span!("get_init_context", run_id=?run_id, new_work_server=?work_server_addr);
-        let _get_init_context = span.enter();
 
         // The work server may be waiting for the manifest, which the initialization context is blocked on;
         // to avoid pinging the server too often, let's decay on the frequency of our requests.
@@ -255,6 +254,7 @@ struct SendManifestOnline {
 /// Blocks on the result, repeatedly pinging the server until work is available.
 #[async_trait]
 impl ManifestSender for SendManifestOnline {
+    #[instrument(level = "trace", skip_all, fields(run_id=?self.run_id, queue_server=?self.queue_results_addr))]
     async fn send_manifest(self: Box<Self>, manifest_result: ManifestResult) {
         let Self {
             run_id,
@@ -262,9 +262,6 @@ impl ManifestSender for SendManifestOnline {
             client,
             queue_results_addr,
         } = *self;
-
-        let span = tracing::trace_span!("notify_manifest", ?entity, run_id=?run_id, queue_server=?queue_results_addr);
-        let _notify_manifest = span.enter();
 
         let message = net_protocol::queue::Request {
             entity,
