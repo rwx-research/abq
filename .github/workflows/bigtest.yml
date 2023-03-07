@@ -23,12 +23,39 @@ on:
         required: true
 
 jobs:
-  bigtest:
+  launch:
+    runs-on: rwx-ubuntu-latest
+    env:
+      ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: START dev queue
+        run: |
+          bin/manage_dev_queue start ${{ inputs.version }}
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: dev_queue_state
+          path: .dev_queue_state/
+
+  single_benches:
     runs-on: rwx-ubuntu-latest
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
-      ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
+    needs: [launch]
+    outputs:
+      overall_success: ${{ steps.benchmark.conclusion == 'success' && steps.fuzz_result_sizes.conclusion == 'success' }}
+
+      rspec_overhead: ${{ steps.benchmark.outputs.rspec_abq_worker_overhead }}
+      rspec_raw_time: ${{ steps.benchmark.outputs.rspec_raw_time }}
+      rspec_abq_time: ${{ steps.benchmark.outputs.rspec_abq_worker_time }}
+
+      jest_overhead: ${{ steps.benchmark.outputs.jest_abq_worker_overhead }}
+      jest_raw_time: ${{ steps.benchmark.outputs.jest_raw_time }}
+      jest_abq_time: ${{ steps.benchmark.outputs.jest_abq_worker_time }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -45,23 +72,21 @@ jobs:
         run: |
           scripts/init_bigtest
 
+      - name: Load dev queue state
+        uses: actions/download-artifact@v3
+        with:
+          name: dev_queue_state
+          path: .dev_queue_state/
+
       - name: Pull down abq binary to test
         run: |
           aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
           aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
-
           ABQ_BIN="$PWD/abq-bin"
           mkdir -p "$ABQ_BIN"
-
           aws s3 cp "s3://abq-releases-staging/abq/${{ inputs.version }}/linux/x86_64/abq" "$ABQ_BIN/abq" --profile staging
-
           chmod 755 "$ABQ_BIN/abq"
-
           echo "$ABQ_BIN" >> "$GITHUB_PATH"
-
-      - name: START dev queue
-        run: |
-          bin/manage_dev_queue start ${{ inputs.version }}
 
       - name: BIGTEST benchmarks
         id: benchmark
@@ -93,11 +118,103 @@ jobs:
         run: |
           bigtest/fuzz_result_sizes/test.sh
 
+  parallel_benches_exec:
+    runs-on: rwx-ubuntu-latest
+    env:
+      AWS_DEFAULT_REGION: us-east-2
+      AWS_DEFAULT_OUTPUT: json
+    needs: [launch]
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+      - uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+          cache-dependency-path: 'bigtest/**/package-lock.json'
+
+      - name: Load testdata
+        run: |
+          scripts/init_bigtest
+
+      - name: Load dev queue state
+        uses: actions/download-artifact@v3
+        with:
+          name: dev_queue_state
+          path: .dev_queue_state/
+
+      - name: Pull down abq binary to test
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
+          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
+          ABQ_BIN="$PWD/abq-bin"
+          mkdir -p "$ABQ_BIN"
+          aws s3 cp "s3://abq-releases-staging/abq/${{ inputs.version }}/linux/x86_64/abq" "$ABQ_BIN/abq" --profile staging
+          chmod 755 "$ABQ_BIN/abq"
+          echo "$ABQ_BIN" >> "$GITHUB_PATH"
+
+      - name: BIGTEST benchmarks
+        id: benchmark
+        run: |
+          EXIT=0
+
+          ABQ_ONLY=1 node bigtest/benchmark_rspec/bench.js || EXIT=$?
+          source bigtest/benchmark_rspec/out/exports
+          jq -n \
+            --arg abq "$ABQ_WORKER_TIME" \
+            '{"shard": ${{matrix.shard}}, "abq": $abq}' \
+            > exports-${{ matrix.shard }}
+
+          exit $EXIT
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: concurrent-results-${{ matrix.shard }}
+          path: exports-${{ matrix.shard }}
+
+  parallel_benches:
+    runs-on: rwx-ubuntu-latest
+    needs: [parallel_benches_exec, single_benches]
+    outputs:
+      max_overhead: ${{ steps.collect.outputs.max_overhead }}
+      min_overhead: ${{ steps.collect.outputs.min_overhead }}
+      overhead_stddev: ${{ steps.collect.outputs.overhead_stddev }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - uses: actions/download-artifact@v3
+      - id: collect
+        run: |
+          results="$(cat ./*/exports-* | jq -c --slurp .)"
+          # shellcheck source=/dev/null
+          source <(echo "$results" | node scripts/concurrent_bench_summary.js ${{ needs.single_benches.outputs.rspec_raw_time }})
+          {
+          echo "max_overhead=$MAX_OVERHEAD"
+          echo "min_overhead=$MIN_OVERHEAD"
+          echo "overhead_stddev=$STDDEV"
+          } >> "$GITHUB_OUTPUT"
+
+  report_results:
+    runs-on: rwx-ubuntu-latest
+    needs: [single_benches, parallel_benches]
+    if: ${{ always() }}
+    env:
+      ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
       - name: Get status emoji
         id: status
         if: always()
         run: |
-          EMOJI="${{ (steps.benchmark.conclusion == 'success' && steps.fuzz_result_sizes.conclusion == 'success') && ':white_check_mark:' || ':x:' }}"
+          EMOJI="${{ needs.single_benches.outputs.overall_success && ':white_check_mark:' || ':x:' }}"
           echo "emoji=$EMOJI" >> "$GITHUB_OUTPUT"
 
       - name: Get associated PR
@@ -114,17 +231,26 @@ jobs:
             ${{ steps.status.outputs.emoji }} **Bigtest for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
 
             Benchmarks:
-              - RSpec: ${{ steps.benchmark.outputs.rspec_abq_worker_overhead }}% worker overhead
-                - RSpec time: ${{ steps.benchmark.outputs.rspec_raw_time }} seconds
-                - ABQ worker time: ${{ steps.benchmark.outputs.rspec_abq_worker_time }} seconds
-              - Jest: ${{ steps.benchmark.outputs.jest_abq_worker_overhead }}% worker overhead
-                - Jest time: ${{ steps.benchmark.outputs.jest_raw_time }} seconds
-                - ABQ worker time: ${{ steps.benchmark.outputs.jest_abq_worker_time }} seconds
+              - RSpec: ${{ needs.single_benches.outputs.rspec_overhead }}% overhead
+                - RSpec time: ${{ needs.single_benches.outputs.rspec_raw_time }} seconds
+                - ABQ time: ${{ needs.single_benches.outputs.rspec_abq_time }} seconds
+              - RSpec parallel, 10 runs: max ${{ needs.parallel_benches.outputs.max_overhead }}% overhead
+                - min ${{ needs.parallel_benches.outputs.min_overhead }}% overhead
+                - standard deviation: ${{ needs.parallel_benches.outputs.overhead_stddev }}%
+              - Jest: ${{ needs.single_benches.outputs.jest_overhead }}% overhead
+                - Jest time: ${{ needs.single_benches.outputs.jest_raw_time }} seconds
+                - ABQ time: ${{ needs.single_benches.outputs.jest_abq_time }} seconds
 
             Fuzz result sizes:
               - PASSED
 
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load dev queue state
+        uses: actions/download-artifact@v3
+        with:
+          name: dev_queue_state
+          path: .dev_queue_state/
 
       - name: STOP dev queue
         if: always()

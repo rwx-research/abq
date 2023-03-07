@@ -583,7 +583,11 @@ async fn multiple_jobs_complete() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
+            [
+                StopWorkers(Wid(1)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
             [
                 WorkerTestResults(
                     Run(1),
@@ -653,6 +657,9 @@ async fn multiple_invokers() {
                 StopWorkers(Wid(1)),
                 StopWorkers(Wid(2)),
                 WaitForCompletedRun(Run(1)),
+                WaitForCompletedRun(Run(2)),
+                WaitForNoPendingResults(Run(1)),
+                WaitForNoPendingResults(Run(2)),
             ],
             [
                 WorkerTestResults(
@@ -735,7 +742,11 @@ async fn batch_two_requests_at_a_time() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
+            [
+                StopWorkers(Wid(1)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
             [
                 WorkerTestResults(
                     Run(1),
@@ -784,7 +795,11 @@ async fn empty_manifest_exits_gracefully() {
             WorkersConfigBuilder::new(1, runner),
         )])
         .step(
-            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
+            [
+                StopWorkers(Wid(1)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
             [
                 WorkerTestResults(Run(1), Box::new(|results| results.is_empty())),
                 WorkerExitStatus(
@@ -1055,7 +1070,11 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
             WorkersConfigBuilder::new(1, runner.clone()),
         )])
         .step(
-            [StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))],
+            [
+                StopWorkers(Wid(1)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
             [
                 WorkerTestResults(
                     Run(1),
@@ -1098,6 +1117,7 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                 StopWorkers(Wid(2)),
                 // Run should still be seen as completed
                 WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
             ],
             [
                 WorkerExitStatus(
@@ -1315,6 +1335,7 @@ async fn multiple_tests_per_work_id_reported() {
                 StopWorkers(Wid(1)),
                 // Run should be seen as completed
                 WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
             ],
             [
                 WorkerTestResults(
@@ -1431,6 +1452,7 @@ async fn many_retries_complete() {
                 StopWorkers(Wid(1)),
                 // Run should be seen as completed
                 WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
             ],
             [
                 WorkerTestResults(

@@ -59,6 +59,7 @@ function runBenchmark(
   debugReuse = false
 ) {
   debugReuse = debugReuse || !!process.env["BIGTEST_DEBUG"];
+  abqOnly = !!process.env["ABQ_ONLY"];
 
   cwd = path.resolve(cwd);
   process.chdir(cwd);
@@ -93,13 +94,27 @@ function runBenchmark(
         2>&1 | tee ${ABQ_BENCHMARK_OUT}`,
       { stdio: "inherit", env: ABQENV }
     );
-    exec(`${rawCmd} 2>&1 | tee ${RAW_BENCHMARK_OUT}`, { stdio: "inherit" });
+    if (!abqOnly) {
+      exec(`${rawCmd} 2>&1 | tee ${RAW_BENCHMARK_OUT}`, { stdio: "inherit" });
+    }
   }
 
   const abq_out = fs
     .readFileSync(ABQ_BENCHMARK_OUT)
     .toString()
     .replace(RE_ANSI, "");
+
+  if (abqOnly) {
+    const abq_work_time = parseAbqWorkTime(abq_out);
+    fs.writeFileSync(
+      EXPORTS,
+      `\
+ABQ_WORKER_TIME="${abq_work_time}"
+`
+    );
+    process.exit(0);
+  }
+
   const raw_out = fs
     .readFileSync(RAW_BENCHMARK_OUT)
     .toString()
