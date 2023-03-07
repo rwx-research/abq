@@ -447,6 +447,7 @@ pub mod queue {
     use super::{
         entity::{Entity, Tag},
         meta::DeprecationRecord,
+        results::OpaqueLazyAssociatedTestResults,
         runners::{
             AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestCase, TestResult,
         },
@@ -513,7 +514,7 @@ pub mod queue {
         }
     }
 
-    #[derive(Serialize, Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
     pub struct NativeRunnerInfo {
         pub protocol_version: AbqProtocolVersion,
         pub specification: NativeRunnerSpecification,
@@ -619,6 +620,29 @@ pub mod queue {
         /// The test results are unavailable for the given reason.
         Error(String),
     }
+}
+
+pub mod results {
+    use serde_derive::{Deserialize, Serialize};
+
+    use super::queue::{AssociatedTestResults, NativeRunnerInfo};
+
+    /// A line in the results-persistence scheme.
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+    #[serde(untagged)]
+    pub enum ResultsLine {
+        /// A list of results
+        Results(Vec<AssociatedTestResults>),
+        /// Summary of information related to the test suite.
+        /// Exactly one of these will appear the results persistence scheme.
+        Summary(Summary),
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct Summary {
+        pub manifest_size_nonce: u64,
+        pub native_runner_info: NativeRunnerInfo,
+    }
 
     /// A lazy-loaded representation of [AssociatedTestResults].
     /// The implementor should store the results as JSON lines of JSON-encoded [AssociatedTestResults].
@@ -630,7 +654,7 @@ pub mod queue {
             Self(opaque_lines)
         }
 
-        pub fn decode(&self) -> serde_json::Result<Vec<Vec<AssociatedTestResults>>> {
+        pub fn decode(&self) -> serde_json::Result<Vec<ResultsLine>> {
             let mut results = Vec::with_capacity(self.0.len());
             for results_list in self.0.iter() {
                 results.push(serde_json::from_str(results_list.get())?);

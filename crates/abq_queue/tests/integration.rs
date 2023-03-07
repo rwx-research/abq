@@ -22,10 +22,8 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::{Entity, RunnerMeta, WorkerTag},
-        queue::{
-            self, AssociatedTestResults, InvokeWork, OpaqueLazyAssociatedTestResults,
-            TestResultsResponse,
-        },
+        queue::{self, AssociatedTestResults, InvokeWork, TestResultsResponse},
+        results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
         runners::{
             InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
             ProtocolWitness, RawTestResultMessage, Status, Test, TestOrGroup, TestResult,
@@ -168,26 +166,38 @@ fn sort_results_owned(results: &mut [FlatResult<'_>]) -> Vec<(u32, String)> {
         .collect()
 }
 
-fn flatten_queue_results(results: OpaqueLazyAssociatedTestResults) -> Vec<(u32, String)> {
-    let mut results: Vec<(u32, String)> = results
-        .decode()
-        .unwrap()
-        .into_iter()
-        .flatten()
-        .flat_map(
-            |AssociatedTestResults {
-                 run_number,
-                 results,
-                 ..
-             }| {
-                results
-                    .into_iter()
-                    .map(move |r| (run_number, r.output.as_ref().unwrap().clone()))
-            },
-        )
-        .collect();
-    results.sort_unstable();
-    results
+fn flatten_queue_results(
+    results: OpaqueLazyAssociatedTestResults,
+) -> (Vec<(u32, String)>, Summary) {
+    let lines = results.decode().unwrap();
+    let mut collected = Vec::with_capacity(lines.len());
+    let mut summary = None;
+    for result_line in lines {
+        match result_line {
+            ResultsLine::Results(results) => {
+                for AssociatedTestResults {
+                    run_number,
+                    results,
+                    ..
+                } in results
+                {
+                    for r in results {
+                        collected.push((run_number, r.output.as_ref().unwrap().clone()));
+                    }
+                }
+            }
+            ResultsLine::Summary(s) => {
+                let old = summary.replace(s);
+                if old.is_some() {
+                    panic!("multiple summaries received")
+                }
+            }
+        }
+    }
+
+    collected.sort_unstable();
+
+    (collected, summary.expect("summary not persisted"))
 }
 
 fn native_runner_simulation_bin() -> String {
@@ -605,10 +615,9 @@ async fn multiple_jobs_complete() {
                     Run(1),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(
-                                flatten_queue_results(r),
-                                vec![(1, s!("echo1")), (1, s!("echo2"))]
-                            );
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, vec![(1, s!("echo1")), (1, s!("echo2"))]);
+                            assert_eq!(summary.manifest_size_nonce, 2);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -692,10 +701,9 @@ async fn multiple_invokers() {
                     Run(1),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(
-                                flatten_queue_results(r),
-                                vec![(1, s!("echo1")), (1, s!("echo2"))]
-                            );
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, vec![(1, s!("echo1")), (1, s!("echo2"))]);
+                            assert_eq!(summary.manifest_size_nonce, 2);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -704,10 +712,12 @@ async fn multiple_invokers() {
                     Run(2),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
+                            let (results, summary) = flatten_queue_results(r);
                             assert_eq!(
-                                flatten_queue_results(r),
+                                results,
                                 vec![(1, s!("echo3")), (1, s!("echo4")), (1, s!("echo5"))]
                             );
+                            assert_eq!(summary.manifest_size_nonce, 3);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -764,8 +774,9 @@ async fn batch_two_requests_at_a_time() {
                     Run(1),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
+                            let (results, summary) = flatten_queue_results(r);
                             assert_eq!(
-                                flatten_queue_results(r),
+                                results,
                                 [
                                     (1, s!("echo1")),
                                     (1, s!("echo2")),
@@ -773,6 +784,7 @@ async fn batch_two_requests_at_a_time() {
                                     (1, s!("echo4"))
                                 ]
                             );
+                            assert_eq!(summary.manifest_size_nonce, 4);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -810,7 +822,9 @@ async fn empty_manifest_exits_gracefully() {
                     Run(1),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(flatten_queue_results(r), []);
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, []);
+                            assert_eq!(summary.manifest_size_nonce, 0);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1092,10 +1106,9 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                     Run(1),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(
-                                flatten_queue_results(r),
-                                [(1, s!("echo1")), (1, s!("echo2"))]
-                            );
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, [(1, s!("echo1")), (1, s!("echo2"))]);
+                            assert_eq!(summary.manifest_size_nonce, 2);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1129,10 +1142,9 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                     Run(1),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(
-                                flatten_queue_results(r),
-                                [(1, s!("echo1")), (1, s!("echo2"))]
-                            );
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, [(1, s!("echo1")), (1, s!("echo2"))]);
+                            assert_eq!(summary.manifest_size_nonce, 2);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1362,8 +1374,8 @@ async fn multiple_tests_per_work_id_reported() {
                     Run(1),
                     Box::new(|resp| match resp {
                         TestResultsResponse::Results(r) => {
+                            let (results, summary) = flatten_queue_results(r);
                             assert_eq!(
-                                flatten_queue_results(r),
                                 vec![
                                     (1, s!("echo1")),
                                     (1, s!("echo2")),
@@ -1371,8 +1383,10 @@ async fn multiple_tests_per_work_id_reported() {
                                     (1, s!("echo4")),
                                     (1, s!("echo5")),
                                     (1, s!("echo6")),
-                                ]
+                                ],
+                                results
                             );
+                            assert_eq!(summary.manifest_size_nonce, 2);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1471,7 +1485,9 @@ async fn many_retries_complete() {
                     Run(1),
                     Box::new(move |resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(flatten_queue_results(r), expected_queue_results);
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, expected_queue_results);
+                            assert_eq!(summary.manifest_size_nonce, 4);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1551,7 +1567,9 @@ async fn many_retries_many_workers_complete() {
         Run(1),
         Box::new(move |resp| match resp {
             TestResultsResponse::Results(r) => {
-                assert_eq!(flatten_queue_results(r), expected_queue_results);
+                let (results, summary) = flatten_queue_results(r);
+                assert_eq!(results, expected_queue_results);
+                assert_eq!(summary.manifest_size_nonce, num_tests);
             }
             _ => unreachable!("{resp:?}"),
         }),
@@ -1696,7 +1714,9 @@ async fn many_retries_many_workers_complete_native() {
                     Run(1),
                     Box::new(move |resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(flatten_queue_results(r), expected_queue_results);
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, expected_queue_results);
+                            assert_eq!(summary.manifest_size_nonce, num_tests);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1848,10 +1868,9 @@ async fn retry_out_of_process_worker() {
                     Run(1),
                     Box::new(move |resp| match resp {
                         TestResultsResponse::Results(r) => {
-                            assert_eq!(
-                                flatten_queue_results(r),
-                                [(1, s!("echo1")), (1, s!("echo2"))]
-                            );
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results, [(1, s!("echo1")), (1, s!("echo2"))]);
+                            assert_eq!(summary.manifest_size_nonce, 2);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1887,8 +1906,9 @@ async fn retry_out_of_process_worker() {
                     Run(1),
                     Box::new(move |resp| match resp {
                         TestResultsResponse::Results(r) => {
+                            let (results, summary) = flatten_queue_results(r);
                             assert_eq!(
-                                flatten_queue_results(r),
+                                results,
                                 [
                                     (1, s!("echo1")),
                                     (1, s!("echo1")),
@@ -1896,6 +1916,7 @@ async fn retry_out_of_process_worker() {
                                     (1, s!("echo2"))
                                 ]
                             );
+                            assert_eq!(summary.manifest_size_nonce, 2);
                         }
                         _ => unreachable!("{resp:?}"),
                     }),
@@ -1985,7 +2006,9 @@ async fn many_retries_of_many_out_of_process_workers() {
                 run,
                 Box::new(move |resp| match resp {
                     TestResultsResponse::Results(r) => {
-                        assert_eq!(flatten_queue_results(r), expected_queue_results);
+                        let (results, summary) = flatten_queue_results(r);
+                        assert_eq!(results, expected_queue_results);
+                        assert_eq!(summary.manifest_size_nonce, num_tests);
                     }
                     _ => unreachable!("{resp:?}"),
                 }),

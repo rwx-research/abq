@@ -4,7 +4,7 @@ use abq_utils::{
     error::ResultLocation,
     here,
     net_protocol::{
-        queue::{AssociatedTestResults, OpaqueLazyAssociatedTestResults},
+        results::{OpaqueLazyAssociatedTestResults, ResultsLine},
         workers::RunId,
     },
 };
@@ -83,7 +83,7 @@ impl FilesystemPersistor {
 
 #[async_trait]
 impl PersistResults for FilesystemPersistor {
-    async fn dump(&self, run_id: &RunId, results: Vec<AssociatedTestResults>) -> ArcResult<()> {
+    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()> {
         let path = self.get_path(run_id);
 
         let packed = serde_json::to_vec(&results).located(here!())?;
@@ -126,7 +126,8 @@ mod test {
     use abq_run_n_times::n_times;
     use abq_test_utils::wid;
     use abq_utils::net_protocol::{
-        queue::AssociatedTestResults, runners::TestResult, workers::RunId,
+        queue::AssociatedTestResults, results::ResultsLine::Results, runners::TestResult,
+        workers::RunId,
     };
     use tokio::task::JoinSet;
 
@@ -148,7 +149,7 @@ mod test {
     async fn dump_to_nonexistent_file_is_error() {
         let fs = FilesystemPersistor::new("__zzz_this_is_not_a_subdir__", 1);
 
-        let err = fs.dump(&RunId::unique(), vec![]).await;
+        let err = fs.dump(&RunId::unique(), Results(vec![])).await;
         assert!(err.is_err());
     }
 
@@ -167,14 +168,14 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let results1 = vec![
+        let results1 = Results(vec![
             AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
             AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
-        ];
-        let results2 = vec![
+        ]);
+        let results2 = Results(vec![
             AssociatedTestResults::fake(wid(3), vec![TestResult::fake()]),
             AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
-        ];
+        ]);
 
         fs.dump(&run_id, results1.clone()).await.unwrap();
         fs.dump(&run_id, results2.clone()).await.unwrap();
@@ -190,20 +191,20 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let results1 = vec![
+        let results1 = Results(vec![
             AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
             AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
-        ];
+        ]);
 
         fs.dump(&run_id, results1.clone()).await.unwrap();
         let results = fs.get_results(&run_id).await.unwrap().decode().unwrap();
 
         assert_eq!(results, vec![results1.clone()]);
 
-        let results2 = vec![
+        let results2 = Results(vec![
             AssociatedTestResults::fake(wid(3), vec![TestResult::fake()]),
             AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
-        ];
+        ]);
         fs.dump(&run_id, results2.clone()).await.unwrap();
         let results = fs.get_results(&run_id).await.unwrap().decode().unwrap();
 
@@ -218,10 +219,10 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let results1 = vec![
+        let results1 = Results(vec![
             AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
             AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
-        ];
+        ]);
 
         fs.dump(&run_id, results1.clone()).await.unwrap();
 
@@ -251,14 +252,14 @@ mod test {
         for _ in 0..RUNS {
             let run_id = RunId::unique();
 
-            let results1 = vec![
+            let results1 = Results(vec![
                 AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
                 AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
-            ];
-            let results2 = vec![
+            ]);
+            let results2 = Results(vec![
                 AssociatedTestResults::fake(wid(3), vec![TestResult::fake()]),
                 AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
-            ];
+            ]);
 
             let task = {
                 let fs = fs.clone();

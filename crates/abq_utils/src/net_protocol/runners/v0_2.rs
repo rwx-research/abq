@@ -16,7 +16,7 @@ pub struct AbqNativeRunnerSpawnedMessage {
     pub runner_specification: AbqNativeRunnerSpecification,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename = "abq_native_runner_specification")]
 pub struct AbqNativeRunnerSpecification {
     pub name: String,

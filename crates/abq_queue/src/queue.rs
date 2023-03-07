@@ -13,9 +13,10 @@ use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::{Entity, Tag};
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo,
-    OpaqueLazyAssociatedTestResults, Request, TestResultsResponse, TestSpec,
+    AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request,
+    TestResultsResponse, TestSpec,
 };
+use abq_utils::net_protocol::results::{self};
 use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
@@ -119,7 +120,6 @@ enum ManifestPersistence {
 enum ResultsPersistence {
     Persisted(ResultsPersistedCell),
     ManifestNeverReceived,
-    EmptyManifest,
 }
 
 struct RunData {
@@ -236,6 +236,19 @@ enum AddedManifest {
         /// For the purposes of analytics, timings of when workers first connected
         /// prior to the manifest being generated.
         worker_connection_times: WorkerTimings,
+        /// The size of the manifest.
+        manifest_size_nonce: u64,
+        /// The cell the [manifest summary][net_protocol::results::Summary] should be written into.
+        results_persistence: ResultsPersistedCell,
+    },
+    RunCancelled,
+}
+
+#[must_use]
+enum RecordedEmptyManifest {
+    Recorded {
+        /// The cell the [manifest summary][net_protocol::results::Summary] should be written into.
+        results_persistence: ResultsPersistedCell,
     },
     RunCancelled,
 }
@@ -257,8 +270,6 @@ enum WriteResultsError {
     WaitingForManifest,
     #[error("attempting to write results when manifest failed to be generated")]
     ManifestNeverReceived,
-    #[error("attempting to write results for empty manifest run")]
-    EmptyManifest,
     #[error("attempting to write results for cancelled run")]
     RunCancelled,
 }
@@ -281,7 +292,6 @@ enum ReadResultsState {
     ReadFromCell(ResultsPersistedCell),
     /// The given workers are still active.
     OutstandingRunners(Vec<Tag>),
-    EmptyManifest,
 }
 
 impl AllRuns {
@@ -494,6 +504,7 @@ impl AllRuns {
             }
         };
 
+        let manifest_size_nonce = flat_manifest.len() as u64;
         let work_from_manifest = flat_manifest.into_iter().map(|spec| WorkerTest {
             spec,
             run_number: INIT_RUN_NUMBER,
@@ -513,16 +524,20 @@ impl AllRuns {
             worker_conn_times.insert(worker, time);
         }
 
+        let results_persistence = ResultsPersistedCell::new(run_id.clone());
+
         run.state = RunState::HasWork {
             queue,
             batch_size_hint: run_data.batch_size_hint,
             init_metadata,
             active_workers: Mutex::new(active_workers),
-            results_persistence: ResultsPersistedCell::new(run_id.clone()),
+            results_persistence: results_persistence.clone(),
         };
 
         AddedManifest::Added {
             worker_connection_times: worker_conn_times,
+            manifest_size_nonce,
+            results_persistence,
         }
     }
 
@@ -700,7 +715,6 @@ impl AllRuns {
             } => match results_persistence {
                 ResultsPersistence::Persisted(cell) => Ok(cell.clone()),
                 ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
-                ResultsPersistence::EmptyManifest => Err(EmptyManifest),
             },
             RunState::Cancelled { .. } => Err(RunCancelled),
         }
@@ -758,7 +772,6 @@ impl AllRuns {
                         }
                     }
                     ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
-                    ResultsPersistence::EmptyManifest => Ok(ReadResultsState::EmptyManifest),
                 }
             }
             RunState::Cancelled { .. } => Err(RunCancelled),
@@ -989,7 +1002,7 @@ impl AllRuns {
     }
 
     /// Marks a run as complete because it had the trivial manifest.
-    pub fn mark_empty_manifest_complete(&self, run_id: RunId) {
+    pub fn mark_empty_manifest_complete(&self, run_id: RunId) -> RecordedEmptyManifest {
         let runs = self.runs.read();
 
         let mut run = runs.get(&run_id).expect("no run recorded").write();
@@ -1000,12 +1013,14 @@ impl AllRuns {
             }
             RunState::Cancelled { .. } => {
                 // No-op, since the run was already cancelled.
-                return;
+                return RecordedEmptyManifest::RunCancelled;
             }
             RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
                 unreachable!("Invalid state - can only mark complete due to manifest while waiting for manifest");
             }
         }
+
+        let results_persistence = ResultsPersistedCell::new(run_id);
 
         // Trivially successful
         run.state = RunState::InitialManifestDone {
@@ -1013,7 +1028,7 @@ impl AllRuns {
             init_metadata: Default::default(),
             seen_workers: Default::default(),
             manifest_persistence: ManifestPersistence::EmptyManifest,
-            results_persistence: ResultsPersistence::EmptyManifest,
+            results_persistence: ResultsPersistence::Persisted(results_persistence.clone()),
         };
 
         // Drop the run data, since we no longer need it.
@@ -1022,6 +1037,10 @@ impl AllRuns {
 
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
+
+        RecordedEmptyManifest::Recorded {
+            results_persistence,
+        }
     }
 
     pub fn mark_cancelled(&self, run_id: &RunId, reason: CancelReason) {
@@ -1509,8 +1528,15 @@ impl QueueServer {
                 Self::handle_run_cancellation(ctx.queues, entity, run_id).await
             }
             Message::ManifestResult(run_id, manifest_result) => {
-                Self::handle_manifest_result(ctx.queues, entity, run_id, manifest_result, stream)
-                    .await
+                Self::handle_manifest_result(
+                    ctx.queues,
+                    ctx.persist_results,
+                    entity,
+                    run_id,
+                    manifest_result,
+                    stream,
+                )
+                .await
             }
             Message::WorkerResult(run_id, results) => {
                 Self::handle_worker_results(
@@ -1630,9 +1656,10 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues, manifest_result, stream))]
+    #[instrument(level = "trace", skip_all, fields(run_id=?run_id, entity=?entity))]
     async fn handle_manifest_result(
         queues: SharedRuns,
+        persist_results: SharedPersistResults,
         entity: Entity,
         run_id: RunId,
         manifest_result: ManifestResult,
@@ -1657,6 +1684,7 @@ impl QueueServer {
                 if !flat_manifest.is_empty() {
                     Self::handle_manifest_success(
                         queues,
+                        persist_results,
                         entity,
                         run_id,
                         flat_manifest,
@@ -1668,6 +1696,7 @@ impl QueueServer {
                 } else {
                     Self::handle_manifest_empty_or_failure(
                         queues,
+                        persist_results,
                         entity,
                         run_id,
                         Ok(native_runner_info),
@@ -1679,6 +1708,7 @@ impl QueueServer {
             ManifestResult::TestRunnerError { error, output } => {
                 Self::handle_manifest_empty_or_failure(
                     queues,
+                    persist_results,
                     entity,
                     run_id,
                     Err((error, output)),
@@ -1689,9 +1719,10 @@ impl QueueServer {
         }
     }
 
-    #[instrument(level = "trace", skip(queues, flat_manifest))]
+    #[instrument(level = "trace", skip_all, fields(run_id=?run_id, entity=?entity, size=flat_manifest.len(), native_runner_info=?native_runner_info))]
     async fn handle_manifest_success(
         queues: SharedRuns,
+        persist_results: SharedPersistResults,
         entity: Entity,
         run_id: RunId,
         flat_manifest: Vec<TestSpec>,
@@ -1712,12 +1743,27 @@ impl QueueServer {
         match added_manifest {
             AddedManifest::Added {
                 worker_connection_times,
+                manifest_size_nonce,
+                results_persistence,
             } => {
                 log_workers_waited_for_manifest_latency(
                     &run_id,
                     worker_connection_times,
                     manifest_received_time,
                 );
+
+                // Write down the summary of the test suite into the persistence cell.
+                let summary = net_protocol::results::Summary {
+                    manifest_size_nonce,
+                    native_runner_info,
+                };
+                run_summary_persistence_task(
+                    entity,
+                    &persist_results,
+                    results_persistence,
+                    summary,
+                )
+                .await?;
             }
             AddedManifest::RunCancelled => {
                 // If the run was already cancelled, there is nothing for us to do.
@@ -1728,9 +1774,10 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues))]
+    #[instrument(level = "trace", skip_all, fields(entity=?entity, run_id=?run_id, is_empty=manifest_result.is_ok()))]
     async fn handle_manifest_empty_or_failure(
         queues: SharedRuns,
+        persist_results: SharedPersistResults,
         entity: Entity,
         run_id: RunId,
         manifest_result: Result<
@@ -1748,8 +1795,7 @@ impl QueueServer {
         // Either way the steps we have to take are the same, just the status of
         // the test run differs.
 
-        let is_empty_manifest = manifest_result.is_ok();
-        if is_empty_manifest {
+        if manifest_result.is_ok() {
             tracing::info!(?run_id, ?entity, "exiting early on empty manifest");
         } else {
             tracing::info!(?run_id, ?entity, "failure notification for manifest");
@@ -1765,10 +1811,30 @@ impl QueueServer {
         }
 
         // Remove the active run state.
-        if is_empty_manifest {
-            queues.mark_empty_manifest_complete(run_id);
-        } else {
-            queues.mark_failed_to_receive_manifest(run_id);
+        match manifest_result {
+            Ok(native_runner_info) => match queues.mark_empty_manifest_complete(run_id) {
+                RecordedEmptyManifest::Recorded {
+                    results_persistence,
+                } => {
+                    let summary = results::Summary {
+                        native_runner_info,
+                        manifest_size_nonce: 0,
+                    };
+                    run_summary_persistence_task(
+                        entity,
+                        &persist_results,
+                        results_persistence,
+                        summary,
+                    )
+                    .await?
+                }
+                RecordedEmptyManifest::RunCancelled => {
+                    // nothing we can do
+                }
+            },
+            Err(..) => {
+                queues.mark_failed_to_receive_manifest(run_id);
+            }
         }
 
         Ok(())
@@ -1801,7 +1867,7 @@ impl QueueServer {
         // persistence.
         let cell_result = queues.get_write_results_cell(&run_id).located(here!());
         let plan_result = match cell_result.as_ref() {
-            Ok(cell) => Ok(cell.build_persist_plan(&persist_results, results)),
+            Ok(cell) => Ok(cell.build_persist_results_plan(&persist_results, results)),
             Err(e) => Err(e),
         };
 
@@ -1854,14 +1920,6 @@ impl QueueServer {
                 }
                 ReadResultsState::OutstandingRunners(tags) => {
                     response = TestResultsResponse::OutstandingRunners(tags);
-                    result = Ok(());
-                }
-                ReadResultsState::EmptyManifest => {
-                    // Since this is an empty manifest, there must be no results; inject the empty
-                    // list.
-                    response = TestResultsResponse::Results(
-                        OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![]),
-                    );
                     result = Ok(());
                 }
             },
@@ -2149,6 +2207,18 @@ impl WorkScheduler {
             }
         }
     }
+}
+
+#[instrument(level = "info", skip_all, fields(run_id=?results_persistence.run_id(), entity=?entity))]
+async fn run_summary_persistence_task(
+    entity: Entity,
+    persist_results: &SharedPersistResults,
+    results_persistence: ResultsPersistedCell,
+    summary: results::Summary,
+) -> OpaqueResult<()> {
+    let task = results_persistence.build_persist_summary_plan(persist_results, summary);
+
+    task.execute().await.map_err(dearc_located)
 }
 
 #[instrument(level = "info", skip_all, fields(run_id=?run_id, entity=?entity))]
@@ -2807,6 +2877,7 @@ mod test {
 
             let handle_manifest_fut = QueueServer::handle_manifest_success(
                 queues.clone(),
+                persistence::results::InMemoryPersistor::new_shared(),
                 entity,
                 run_id.clone(),
                 vec![TestSpec {
@@ -2884,6 +2955,7 @@ mod test {
             async move {
                 let handle_manifest_fut = QueueServer::handle_manifest_success(
                     queues,
+                    persistence::results::InMemoryPersistor::new_shared(),
                     entity,
                     run_id,
                     vec![TestSpec {
@@ -3378,6 +3450,7 @@ mod persist_results {
             self,
             entity::{Entity, Tag},
             queue::{AssociatedTestResults, CancelReason, TestResultsResponse},
+            results::ResultsLine,
             runners::TestResult,
             workers::RunId,
         },
@@ -3436,7 +3509,7 @@ mod persist_results {
         let opt_retrieved = results_cell.retrieve(&results_persistence).await;
         assert!(opt_retrieved.is_some(), "outstanding pending results");
         let actual_results = opt_retrieved.unwrap().unwrap().decode().unwrap();
-        assert_eq!(actual_results, vec![results]);
+        assert_eq!(actual_results, vec![ResultsLine::Results(results)]);
     }
 
     #[tokio::test]
@@ -3479,7 +3552,7 @@ mod persist_results {
         let opt_retrieved = results_cell.retrieve(&results_persistence).await;
         assert!(opt_retrieved.is_some(), "outstanding pending results");
         let actual_results = opt_retrieved.unwrap().unwrap().decode().unwrap();
-        assert_eq!(actual_results, vec![results]);
+        assert_eq!(actual_results, vec![ResultsLine::Results(results)]);
     }
 
     #[tokio::test]
@@ -3593,20 +3666,6 @@ mod persist_results {
             }
         },
         Ok(ReadResultsState::OutstandingRunners(r)) if r == &[Tag::runner(2, 1)]
-    }
-
-    get_read_results_cell! {
-        get_read_results_cell_when_done_with_empty_manifest,
-        {
-            RunState::InitialManifestDone {
-                new_worker_exit_code: ExitCode::SUCCESS,
-                init_metadata: Default::default(),
-                seen_workers: Default::default(),
-                results_persistence: ResultsPersistence::EmptyManifest,
-                manifest_persistence: ManifestPersistence::EmptyManifest,
-            }
-        },
-        Ok(ReadResultsState::EmptyManifest)
     }
 
     get_read_results_cell! {
@@ -3733,7 +3792,10 @@ mod persist_results {
 
         // Fetch the state of the results after the initial manifest has been completed.
         {
-            let expected_results = vec![results1.clone(), results2.clone()];
+            let expected_results = vec![
+                ResultsLine::Results(results1.clone()),
+                ResultsLine::Results(results2.clone()),
+            ];
             let response = get_test_results_response().await;
             match response {
                 Results(results) => {
@@ -3784,7 +3846,11 @@ mod persist_results {
 
             queues.mark_worker_complete(&run_id, Entity::runner(1, 1), Instant::now());
 
-            let expected_results = vec![results1, results2, results3];
+            let expected_results = vec![
+                ResultsLine::Results(results1),
+                ResultsLine::Results(results2),
+                ResultsLine::Results(results3),
+            ];
             let response = get_test_results_response().await;
             match response {
                 Results(results) => {

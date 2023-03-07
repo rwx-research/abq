@@ -4,7 +4,7 @@ use abq_utils::{
     error::{ErrorLocation, ResultLocation},
     here,
     net_protocol::{
-        queue::{AssociatedTestResults, OpaqueLazyAssociatedTestResults},
+        results::{OpaqueLazyAssociatedTestResults, ResultsLine},
         workers::RunId,
     },
 };
@@ -27,7 +27,7 @@ impl InMemoryPersistor {
 
 #[async_trait]
 impl PersistResults for InMemoryPersistor {
-    async fn dump(&self, run_id: &RunId, results: Vec<AssociatedTestResults>) -> ArcResult<()> {
+    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()> {
         let raw_line = serde_json::value::to_raw_value(&results).located(here!())?;
         let mut results = self.results.write().await;
         let entry = results.entry(run_id.clone()).or_default();

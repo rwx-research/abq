@@ -12,7 +12,8 @@ use abq_utils::{
     atomic,
     error::LocatedError,
     net_protocol::{
-        queue::{AssociatedTestResults, OpaqueLazyAssociatedTestResults},
+        queue::AssociatedTestResults,
+        results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
         workers::RunId,
     },
 };
@@ -22,8 +23,8 @@ type ArcResult<T> = std::result::Result<T, Arc<LocatedError>>;
 
 #[async_trait]
 trait PersistResults: Send + Sync {
-    /// Dumps a set of test results.
-    async fn dump(&self, run_id: &RunId, results: Vec<AssociatedTestResults>) -> ArcResult<()>;
+    /// Dumps a summary line.
+    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()>;
 
     /// Load a set of test results as [OpaqueLazyAssociatedTestResults].
     async fn get_results(&self, run_id: &RunId) -> ArcResult<OpaqueLazyAssociatedTestResults>;
@@ -74,9 +75,14 @@ impl ResultsPersistedCell {
         }))
     }
 
+    #[inline]
+    pub fn run_id(&self) -> &RunId {
+        &self.0.run_id
+    }
+
     /// Creates a persistence job, recording the pending set of results to persist.
     #[inline]
-    pub fn build_persist_plan<'a>(
+    pub fn build_persist_results_plan<'a>(
         &'a self,
         persistence: &'a SharedPersistResults,
         results: Vec<AssociatedTestResults>,
@@ -86,7 +92,23 @@ impl ResultsPersistedCell {
         PersistencePlan {
             persist_results: &*persistence.0,
             cell: &self.0,
-            results,
+            line: ResultsLine::Results(results),
+        }
+    }
+
+    /// Creates a persistence job, recording the pending summary to persist.
+    #[inline]
+    pub fn build_persist_summary_plan<'a>(
+        &'a self,
+        persistence: &'a SharedPersistResults,
+        summary: Summary,
+    ) -> PersistencePlan<'a> {
+        self.0.processing.fetch_add(1, atomic::ORDERING);
+
+        PersistencePlan {
+            persist_results: &*persistence.0,
+            cell: &self.0,
+            line: ResultsLine::Summary(summary),
         }
     }
 
@@ -106,14 +128,14 @@ impl ResultsPersistedCell {
 pub struct PersistencePlan<'a> {
     persist_results: &'a dyn PersistResults,
     cell: &'a CellInner,
-    results: Vec<AssociatedTestResults>,
+    line: ResultsLine,
 }
 
 impl<'a> PersistencePlan<'a> {
     pub async fn execute(self) -> ArcResult<()> {
         let result = self
             .persist_results
-            .dump(&self.cell.run_id, self.results)
+            .dump(&self.cell.run_id, self.line)
             .await;
         self.cell.processing.fetch_sub(1, atomic::ORDERING);
         result
@@ -128,7 +150,9 @@ mod test {
     use abq_test_utils::wid;
     use abq_utils::{
         atomic,
-        net_protocol::{queue::AssociatedTestResults, runners::TestResult, workers::RunId},
+        net_protocol::{
+            queue::AssociatedTestResults, results::ResultsLine, runners::TestResult, workers::RunId,
+        },
     };
 
     use super::{fs::FilesystemPersistor, ResultsPersistedCell};
@@ -173,7 +197,7 @@ mod test {
             AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
         ];
 
-        let plan = cell.build_persist_plan(&persistence, results1.clone());
+        let plan = cell.build_persist_results_plan(&persistence, results1.clone());
         plan.execute().await.unwrap();
 
         // Due to our listed constraints, retrieval may finish before persistence of results2 does.
@@ -189,7 +213,7 @@ mod test {
             }
         };
         let persist_task = async {
-            let plan = cell.build_persist_plan(&persistence, results2.clone());
+            let plan = cell.build_persist_results_plan(&persistence, results2.clone());
             plan.execute().await.unwrap();
         };
         let ((), retrieve_result) = tokio::join!(persist_task, retrieve_task);
@@ -197,9 +221,10 @@ mod test {
         let retrieved = retrieve_result.unwrap();
         let results = retrieved.decode().unwrap();
 
+        use ResultsLine::Results;
         match results.len() {
-            1 => assert_eq!(results, vec![results1]),
-            2 => assert_eq!(results, vec![results1, results2]),
+            1 => assert_eq!(results, vec![Results(results1)]),
+            2 => assert_eq!(results, vec![Results(results1), Results(results2)]),
             _ => unreachable!("{results:?}"),
         }
     }

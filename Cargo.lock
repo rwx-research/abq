@@ -25,6 +25,7 @@ dependencies = [
  "async-trait",
  "atty",
  "clap",
+ "fnv",
  "futures",
  "indicatif",
  "indoc",
