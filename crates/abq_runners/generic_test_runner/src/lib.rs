@@ -12,6 +12,7 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::error::FetchTestsError;
 use abq_utils::oneshot_notify::{self, OneshotRx};
 use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
+use abq_utils::timeout_future::TimeoutFuture;
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
 use capture_output::OutputCapturer;
@@ -38,7 +39,7 @@ use abq_utils::net_protocol::workers::{
 use abq_utils::{atomic, net_protocol};
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::instrument;
@@ -286,6 +287,7 @@ pub fn run_sync(
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
     protocol_version_timeout: Duration,
+    test_timeout: Duration,
     working_dir: PathBuf,
     shutdown_immediately: OneshotRx,
     results_batch_size: u64,
@@ -304,6 +306,7 @@ pub fn run_sync(
         runner_meta,
         input,
         protocol_version_timeout,
+        test_timeout,
         working_dir,
         shutdown_immediately,
         results_batch_size,
@@ -330,6 +333,21 @@ struct NativeRunnerState {
     conn: RunnerConnection,
     runner_info: NativeRunnerInfo,
     for_manifest_generation: bool,
+}
+
+impl NativeRunnerState {
+    async fn kill(&mut self) -> io::Result<()> {
+        self.child.kill().await?;
+
+        // Close up the child pipes, replace them with the trivial task.
+        self.capture_pipes.stdout.copied_all_output.abort();
+        self.capture_pipes.stdout.copied_all_output = tokio::spawn(async { Ok(()) });
+
+        self.capture_pipes.stderr.copied_all_output.abort();
+        self.capture_pipes.stderr.copied_all_output = tokio::spawn(async { Ok(()) });
+
+        Ok(())
+    }
 }
 
 /// Representation of a native runner between one or more test suite runs.
@@ -589,11 +607,13 @@ impl<'a> NativeRunnerHandle<'a> {
 const ABQ_WORKER: &str = "ABQ_WORKER";
 
 pub const DEFAULT_PROTOCOL_VERSION_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_RUNNER_TEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 pub async fn run_async(
     runner_meta: RunnerMeta,
     input: NativeTestRunnerParams,
     protocol_version_timeout: Duration,
+    test_timeout: Duration,
     working_dir: PathBuf,
     shutdown_immediately: OneshotRx,
     results_batch_size: u64,
@@ -640,6 +660,7 @@ pub async fn run_async(
         results_handler,
         notify_all_tests_run,
         runner_meta,
+        test_timeout,
     );
 
     tokio::select! {
@@ -670,7 +691,7 @@ async fn run_help(
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     runner_meta: RunnerMeta,
-    // TODO this is already on the handle
+    test_timeout: Duration,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     // If we need to retrieve the manifest, do that first.
     // If the native runner is erroring and we are generating the manigest,
@@ -723,6 +744,7 @@ async fn run_help(
         results_handler,
         notify_all_tests_run,
         runner_meta,
+        test_timeout,
     )
     .await;
 
@@ -779,6 +801,7 @@ async fn execute_all_tests<'a>(
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     runner_meta: RunnerMeta,
+    test_timeout: Duration,
 ) -> Result<ExitCode, LocatedError> {
     let NativeRunnerInfo {
         protocol: _,
@@ -867,6 +890,7 @@ async fn execute_all_tests<'a>(
                         run_number,
                         test_case,
                         &results_tx,
+                        test_timeout,
                     )
                     .await
                     .located(here!())?;
@@ -886,6 +910,7 @@ async fn execute_all_tests<'a>(
                             runner_meta,
                             &results_tx,
                             native_runner_handle.args,
+                            &native_error,
                             final_output,
                             estimated_runtime,
                             work_id,
@@ -957,6 +982,8 @@ pub enum NativeTestRunnerError {
     Io(#[from] io::Error),
     #[error("{0}")]
     OOBError(#[from] OutOfBandError),
+    #[error("timed out running a test after {0} seconds")]
+    TimedOut(u64),
 }
 
 struct CapturePipes {
@@ -1011,6 +1038,8 @@ impl CapturePipes {
     }
 }
 
+type RunOneTestResult = Result<(), (WorkId, NativeTestRunnerError)>;
+
 async fn handle_one_test(
     runner_meta: RunnerMeta,
     native_runner: &mut NativeRunnerState,
@@ -1018,7 +1047,38 @@ async fn handle_one_test(
     run_number: u32,
     test_case: TestCase,
     results_chan: &ResultsChanRx,
-) -> Result<Result<(), (WorkId, NativeTestRunnerError)>, GenericRunnerErrorKind> {
+    test_timeout: Duration,
+) -> Result<RunOneTestResult, GenericRunnerErrorKind> {
+    let handle_test_task = handle_one_test_help(
+        runner_meta,
+        native_runner,
+        work_id,
+        run_number,
+        test_case,
+        results_chan,
+    );
+
+    match TimeoutFuture::new(handle_test_task, test_timeout)
+        .wait()
+        .await
+    {
+        Some(result) => result,
+        None => {
+            let native_runner_error = NativeTestRunnerError::TimedOut(test_timeout.as_secs());
+            native_runner.kill().await?;
+            Ok(Err((work_id, native_runner_error)))
+        }
+    }
+}
+
+async fn handle_one_test_help(
+    runner_meta: RunnerMeta,
+    native_runner: &mut NativeRunnerState,
+    work_id: WorkId,
+    run_number: u32,
+    test_case: TestCase,
+    results_chan: &ResultsChanRx,
+) -> Result<RunOneTestResult, GenericRunnerErrorKind> {
     let test_case_message = TestCaseMessage::new(test_case);
 
     let opt_test_results = send_and_wait_for_test_results(
@@ -1161,6 +1221,7 @@ async fn handle_native_runner_failure<'a, I>(
     runner_meta: RunnerMeta,
     results_chan: &ResultsChanRx,
     native_runner_args: NativeRunnerArgs<'a>,
+    error: &NativeTestRunnerError,
     final_output: CapturedOutput,
     estimated_time_to_failure: Duration,
     failed_on: WorkId,
@@ -1189,20 +1250,36 @@ where
     // enumerating as much of the problem as we're aware of.
     // Since this is an unexpected error with the native test runner, we want to provide the end
     // user with as much information as possible for a report or reproduction.
-    let mut error_message = format!(
-        indoc!(
-            r#"
-            -- Unexpected Test Runner Failure --
+    let mut error_message = match error {
+        NativeTestRunnerError::Io(_) | NativeTestRunnerError::OOBError(_) => {
+            formatdoc! {
+                r#"
+                -- Unexpected Test Runner Failure --
 
-            The test command
+                The test command
 
-            {}{}
+                {}{}
 
-            stopped communicating with its abq worker before completing all test requests.
-            "#
-        ),
-        INDENT, formatted_cmd
-    );
+                stopped communicating with its abq worker before completing all test requests.
+                "#,
+                INDENT, formatted_cmd
+            }
+        }
+        NativeTestRunnerError::TimedOut(seconds) => {
+            formatdoc! {
+                r#"
+                -- Test Timeout --
+
+                The test command
+
+                {}{}
+
+                timed out while running a test after {} seconds.
+                "#,
+                INDENT, formatted_cmd, seconds
+            }
+        }
+    };
 
     error_message.push('\n');
     error_message.push_str(&format!(
@@ -1385,6 +1462,7 @@ pub fn execute_wrapped_runner(
         RunnerMeta::fake(),
         native_runner_params,
         DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        DEFAULT_RUNNER_TEST_TIMEOUT,
         working_dir,
         shutdown_rx,
         5,
@@ -1659,6 +1737,7 @@ mod test_abq_jest {
     use crate::{
         execute_wrapped_runner, notify_all_tests_run, run_sync, ImmediateTests,
         StaticGetInitContext, StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        DEFAULT_RUNNER_TEST_TIMEOUT,
     };
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
@@ -1726,6 +1805,7 @@ mod test_abq_jest {
             RunnerMeta::fake(),
             input,
             DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+            DEFAULT_RUNNER_TEST_TIMEOUT,
             npm_jest_project_path(),
             shutdown_rx,
             5,
@@ -1893,6 +1973,7 @@ mod test_abq_jest {
             RunnerMeta::fake(),
             input,
             DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+            DEFAULT_RUNNER_TEST_TIMEOUT,
             npm_jest_project_path(),
             shutdown_rx,
             5,
@@ -1919,7 +2000,7 @@ mod test_invalid_command {
 
     use crate::{
         notify_all_tests_run, run_sync, GenericRunnerError, ImmediateTests, StaticGetInitContext,
-        StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
     };
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::work_server::InitContext;
@@ -1961,6 +2042,7 @@ mod test_invalid_command {
             RunnerMeta::fake(),
             input,
             DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+            DEFAULT_RUNNER_TEST_TIMEOUT,
             std::env::current_dir().unwrap(),
             shutdown_rx,
             5,

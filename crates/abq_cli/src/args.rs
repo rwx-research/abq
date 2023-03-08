@@ -239,19 +239,14 @@ pub enum Command {
         ///
         /// The inactivity timeout is applied in the following cases:
         ///
-        /// - If `abq test` does not receive a batch of test results (as indicated by `--batch-size`)
-        ///   within the inactivity timeout. This includes the first set of test results after a
-        ///   test run is started.
-        ///
-        /// - If after the last test in the run begins execution, the test run has not completed
-        ///   within the inactivity timeout.
+        /// - If a test takes longer than the timeout seconds to complete
         ///
         /// When setting the inactivity, it is recommended to over-estimate
         /// based on historical test runtimes you have observed for abq.
         ///
         /// Hitting a timeout is typically indicative of a failure in a test suite's setup or
         /// configuration.
-        #[clap(long, default_value_t = abq_queue::queue::DEFAULT_CLIENT_POLL_TIMEOUT.as_secs())]
+        #[clap(long, default_value_t = abq_workers::DEFAULT_RUNNER_TEST_TIMEOUT.as_secs())]
         inactivity_timeout_seconds: u64,
 
         /// Arguments to the test executable.

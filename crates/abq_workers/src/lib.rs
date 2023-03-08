@@ -7,3 +7,4 @@ mod test_like_runner;
 pub mod workers;
 
 pub use abq_generic_test_runner::DEFAULT_PROTOCOL_VERSION_TIMEOUT;
+pub use abq_generic_test_runner::DEFAULT_RUNNER_TEST_TIMEOUT;

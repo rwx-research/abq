@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{io, time};
 
 use abq_utils::auth::ServerAuthStrategy;
@@ -52,8 +52,6 @@ use crate::persistence::results::{ResultsPersistedCell, SharedPersistResults};
 use crate::prelude::*;
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
-
-pub const DEFAULT_CLIENT_POLL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug)]
 enum RunState {
@@ -1355,7 +1353,6 @@ async fn start_queue(config: QueueConfig) -> Abq {
             let InvokeWork {
                 run_id,
                 batch_size_hint,
-                test_results_timeout: _,
             } = invoke_work;
 
             let batch_size_hint = if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {

@@ -580,7 +580,6 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    #[ignore = "TODO(1.3-timeout): enforce timeout on the worker side"]
     yarn_jest_timeout_run_workers |name, conf: CSConfigOptions| {
         let server_port = find_free_port();
         let worker_port = find_free_port();
@@ -625,7 +624,7 @@ test_all_network_config_options! {
                 format!("--queue-addr={queue_addr}"),
                 format!("--working-dir={working_dir}"),
                 format!("--run-id={run_id}"),
-                format!("--num=cpu-cores"),
+                //format!("--num=cpu-cores"),
                 format!("--inactivity-timeout-seconds=0"),
             ];
             let mut args = conf.extend_args_for_client(args);
@@ -634,22 +633,12 @@ test_all_network_config_options! {
         };
 
         let CmdOutput { stdout, stderr, exit_status } =
-            Abq::new(name.to_string() + "_test0")
+            Abq::new(name.to_string() + "_worker0")
             .args(test_args(0))
             .working_dir(&testdata_project("jest/npm-jest-project"))
-            .always_capture_stderr(true)
             .run();
         assert!(!exit_status.success());
-        assert!(stderr.contains("--- ERROR ---\nThe test run timed out"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
-
-        let CmdOutput {
-            stdout,
-            stderr,
-            exit_status,
-        } = Abq::new(name.to_string() + "_test1").args(test_args(1)).run();
-
-        // The worker should exit with a failure as well.
-        assert!(!exit_status.success(), "EXIT:\n{:?}\nSTDOUT:\n{}\nSTDERR:\n{}", exit_status, stdout, stderr);
+        assert!(stdout.contains("-- Test Timeout --"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
 
         term(queue_proc);
     }
@@ -1394,7 +1383,7 @@ test_all_network_config_options! {
         // Run the test suite with an in-band worker.
         let CmdOutput {
             stdout,
-            stderr: _,
+            stderr,
             exit_status,
         } = Abq::new(name.to_string() + "_worker0")
             .args(test_args(0))
@@ -1413,7 +1402,7 @@ r#"
 I failed catastrophically
 ----- STDERR
 For a reason explainable only by a backtrace
-"#.trim()), "STDOUT:\n{stdout}");
+"#.trim()), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
 
         // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
         let report_args = {

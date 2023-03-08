@@ -36,7 +36,7 @@ pub async fn start_workers_standalone(
     reporter_kinds: Vec<ReporterKind>,
     stdout_preferences: StdoutPreferences,
     batch_size: NonZeroU64,
-    test_results_timeout: Duration,
+    test_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
 ) -> ! {
@@ -57,6 +57,7 @@ pub async fn start_workers_standalone(
         worker_context: context,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
         protocol_version_timeout: abq_workers::DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        test_timeout,
         results_batch_size_hint: batch_size.get(),
         max_run_number,
     };
@@ -69,7 +70,6 @@ pub async fn start_workers_standalone(
     let invoke_work = InvokeWork {
         run_id: run_id.clone(),
         batch_size_hint: batch_size,
-        test_results_timeout,
     };
 
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(

@@ -14,6 +14,7 @@ use abq_utils::{
         workers::{RunId, WorkId},
     },
     retry::async_retry_n,
+    timeout_future::TimeoutFuture,
 };
 use anyhow::{anyhow, bail};
 use fnv::FnvHashSet;
@@ -120,14 +121,16 @@ async fn wait_for_results(
     run_id: RunId,
     results_timeout: Duration,
 ) -> anyhow::Result<OpaqueLazyAssociatedTestResults> {
-    tokio::select! {
-        _ = tokio::time::sleep(results_timeout) => {
-            bail!("timed out waiting for pending test results from completed run after {} seconds", results_timeout.as_secs())
-        }
-        results = wait_for_results_help(abq, entity, run_id) => {
-            results
-        }
-    }
+    let task = wait_for_results_help(abq, entity, run_id);
+    TimeoutFuture::new(task, results_timeout)
+        .wait()
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "timed out waiting for pending test results from completed run after {} seconds",
+                results_timeout.as_secs()
+            )
+        })?
 }
 
 async fn wait_for_results_help(

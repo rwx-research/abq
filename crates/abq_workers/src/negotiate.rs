@@ -111,6 +111,7 @@ pub struct WorkersConfig {
     pub worker_context: WorkerContext,
     pub debug_native_runner: bool,
     pub protocol_version_timeout: Duration,
+    pub test_timeout: Duration,
     /// Hint for how many test results should be sent back in a batch.
     pub results_batch_size_hint: u64,
     /// Max number of test suite run attempts
@@ -221,6 +222,7 @@ impl WorkersNegotiator {
             results_batch_size_hint,
             max_run_number,
             protocol_version_timeout,
+            test_timeout,
         } = workers_config;
 
         // TODO each runner should get a different one of these.
@@ -261,6 +263,7 @@ impl WorkersNegotiator {
             notify_cancellation,
             debug_native_runner,
             protocol_version_timeout,
+            test_timeout,
         };
 
         tracing::debug!("Starting worker pool");
@@ -651,6 +654,7 @@ mod test {
     use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExitStatus};
+    use crate::DEFAULT_RUNNER_TEST_TIMEOUT;
     use abq_generic_test_runner::DEFAULT_PROTOCOL_VERSION_TIMEOUT;
     use abq_test_utils::one_nonzero;
     use abq_utils::auth::{
@@ -950,12 +954,12 @@ mod test {
             results_batch_size_hint: 1,
             max_run_number: INIT_RUN_NUMBER,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+            test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
         };
 
         let invoke_data = InvokeWork {
             run_id,
             batch_size_hint: one_nonzero(),
-            test_results_timeout: Duration::MAX,
         };
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(

@@ -11,7 +11,7 @@ use std::{
 use abq_native_runner_simulation::pack_msgs_to_disk;
 use abq_queue::{
     persistence,
-    queue::{Abq, QueueConfig, DEFAULT_CLIENT_POLL_TIMEOUT},
+    queue::{Abq, QueueConfig},
 };
 use abq_test_utils::{artifacts_dir, s};
 use abq_utils::{
@@ -42,7 +42,7 @@ use abq_with_protocol_version::with_protocol_version;
 use abq_workers::{
     negotiate::{NegotiatedWorkers, WorkersConfig, WorkersNegotiator},
     workers::{WorkerContext, WorkersExit, WorkersExitStatus},
-    DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+    DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
 };
 use futures::{future::BoxFuture, FutureExt};
 use ntest::timeout;
@@ -116,7 +116,6 @@ fn empty_manifest_msg() -> Box<ManifestMessage> {
 struct WorkersConfigBuilder {
     config: WorkersConfig,
     batch_size_hint: NonZeroU64,
-    test_results_timeout: Duration,
 }
 
 impl WorkersConfigBuilder {
@@ -131,11 +130,11 @@ impl WorkersConfigBuilder {
             debug_native_runner: false,
             results_batch_size_hint: 1,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+            test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
         };
         Self {
             config,
             batch_size_hint: one_nonzero(),
-            test_results_timeout: DEFAULT_CLIENT_POLL_TIMEOUT,
         }
     }
 
@@ -320,13 +319,11 @@ fn action_to_fut(
             let WorkersConfigBuilder {
                 config,
                 batch_size_hint,
-                test_results_timeout,
             } = workers_config_builder;
 
             let invoke_work = InvokeWork {
                 run_id,
                 batch_size_hint,
-                test_results_timeout,
             };
 
             let config = WorkersConfig {

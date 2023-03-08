@@ -330,7 +330,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 deprecations,
             )
             .await?;
-            let results_timeout = Duration::from_secs(inactivity_timeout_seconds);
+            let tests_timeout = Duration::from_secs(inactivity_timeout_seconds);
 
             let num_runners = match num {
                 CpuCores => {
@@ -355,7 +355,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 reporters,
                 stdout_preferences,
                 batch_size,
-                results_timeout,
+                tests_timeout,
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
             )

@@ -442,7 +442,7 @@ pub mod workers {
 }
 
 pub mod queue {
-    use std::{net::SocketAddr, num::NonZeroU64, time::Duration};
+    use std::{net::SocketAddr, num::NonZeroU64};
 
     use serde_derive::{Deserialize, Serialize};
 
@@ -476,7 +476,6 @@ pub mod queue {
     pub struct InvokeWork {
         pub run_id: RunId,
         pub batch_size_hint: NonZeroU64,
-        pub test_results_timeout: Duration,
     }
 
     /// Specification of a test case to run.

@@ -86,6 +86,7 @@ pub struct WorkerPoolConfig<'a> {
     pub debug_native_runner: bool,
     /// The maximum amount of time to wait for the protocol version message.
     pub protocol_version_timeout: Duration,
+    pub test_timeout: Duration,
 }
 
 /// Manages a pool of threads and processes upon which work is run and reported back.
@@ -158,6 +159,7 @@ impl WorkerPool {
             worker_context,
             debug_native_runner,
             protocol_version_timeout,
+            test_timeout,
         } = config;
 
         let num_workers = size.get();
@@ -198,7 +200,7 @@ impl WorkerPool {
                 notify_all_tests_run,
             } = runner_strategy_generator.generate(entity, should_generate_manifest);
 
-            let worker_env = RunnerEnv {
+            let runner_env = RunnerEnv {
                 entity,
                 runner_meta,
                 shutdown_immediately: shutdown_rx,
@@ -212,6 +214,7 @@ impl WorkerPool {
                 notify_manifest,
                 debug_native_runner,
                 protocol_version_timeout,
+                test_timeout,
             };
 
             let runner_kind = {
@@ -222,7 +225,7 @@ impl WorkerPool {
 
             runners.push((
                 runner_meta,
-                ThreadWorker::new(runner_kind, worker_env, mark_runner_complete),
+                ThreadWorker::new(runner_kind, runner_env, mark_runner_complete),
             ));
         }
 
@@ -371,6 +374,7 @@ struct RunnerEnv {
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     context: WorkerContext,
     protocol_version_timeout: Duration,
+    test_timeout: Duration,
     debug_native_runner: bool,
 }
 
@@ -422,6 +426,7 @@ async fn start_generic_test_runner(
         context,
         shutdown_immediately,
         protocol_version_timeout,
+        test_timeout,
         debug_native_runner,
     } = env;
 
@@ -446,6 +451,7 @@ async fn start_generic_test_runner(
         runner_meta,
         native_runner_params,
         protocol_version_timeout,
+        test_timeout,
         working_dir,
         shutdown_immediately,
         results_batch_size,
@@ -834,6 +840,7 @@ mod test {
     use crate::negotiate::QueueNegotiator;
     use crate::runner_strategy::{self, RunnerStrategy};
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
+    use crate::DEFAULT_RUNNER_TEST_TIMEOUT;
     use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkId};
 
     type ResultsCollector = Arc<Mutex<HashMap<WorkId, Vec<TestResult>>>>;
@@ -1007,6 +1014,7 @@ mod test {
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+            test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
         }
     }
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use abq_generic_test_runner::{
     GenericRunnerError, GetNextTests, ImmediateTests, SendManifest, StaticGetInitContext,
-    StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+    StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
 };
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
@@ -102,6 +102,7 @@ fn get_simulated_runner(
         RunnerMeta::fake(),
         input,
         DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        DEFAULT_RUNNER_TEST_TIMEOUT,
         std::env::current_dir().unwrap(),
         shutdown_rx,
         5,
@@ -201,6 +202,7 @@ fn run_simulated_runner_to_error(
         RunnerMeta::fake(),
         input,
         DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        DEFAULT_RUNNER_TEST_TIMEOUT,
         std::env::current_dir().unwrap(),
         shutdown_rx,
         5,
