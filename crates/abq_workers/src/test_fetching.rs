@@ -6,6 +6,7 @@ use abq_utils::{
     net_async::ConfiguredClient,
     net_protocol::{
         entity::Entity,
+        error::FetchTestsError,
         workers::{Eow, NextWorkBundle, RunId},
     },
 };
@@ -124,7 +125,7 @@ impl InitialSource {
 }
 
 impl Fetcher {
-    async fn fetch_next_tests(&mut self) -> NextWorkBundle {
+    async fn fetch_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
         // Test fetching works in two phases:
         //
         //   1. Fetch the schedule of the manifest to be run by the worker from the queue, either
@@ -148,7 +149,7 @@ impl Fetcher {
                             self.initial_source = Some(InitialSource::Fresh(s));
                             tests
                         }
-                        InitialSource::Retry(s) => s.get_next_tests().await,
+                        InitialSource::Retry(s) => s.get_next_tests().await?,
                     };
 
                     let hydration_status = self
@@ -157,11 +158,11 @@ impl Fetcher {
 
                     match hydration_status {
                         retries::HydrationStatus::StillHydrating => {
-                            return tests;
+                            return Ok(tests);
                         }
                         retries::HydrationStatus::EmptyManifest => {
                             log_assert!(tests.eow.0, "received empty manifest, but not EOW");
-                            return tests;
+                            return Ok(tests);
                         }
                         retries::HydrationStatus::EndOfManifest => {
                             log_assert!(
@@ -182,7 +183,7 @@ impl Fetcher {
                                 // rather than finishing at this point.
                                 let mut tests = tests;
                                 tests.eow = Eow(false);
-                                return tests;
+                                return Ok(tests);
                             }
                         }
                     }
@@ -191,7 +192,7 @@ impl Fetcher {
                     loop {
                         match self.retry_source.try_assemble_retry_manifest() {
                             Some(bundle) => {
-                                return bundle;
+                                return Ok(bundle);
                             }
                             // The retry manifest is not yet ready; we must be waiting for more results
                             // to come in, before we know the status of the retry manifest.
@@ -210,7 +211,7 @@ impl Fetcher {
 #[async_trait]
 impl TestsFetcher for Fetcher {
     #[instrument(level = "trace", skip(self))]
-    async fn get_next_tests(&mut self) -> NextWorkBundle {
+    async fn get_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
         self.fetch_next_tests().await
     }
 }
@@ -251,7 +252,7 @@ mod test {
 
         let ((), bundle) = tokio::join!(server_task, fetcher.get_next_tests());
 
-        let NextWorkBundle { work, eow } = bundle;
+        let NextWorkBundle { work, eow } = bundle.unwrap();
 
         assert!(work.is_empty());
         assert!(eow.0);
@@ -277,7 +278,7 @@ mod test {
 
         let ((), bundle) = tokio::join!(server_task, fetcher.get_next_tests());
 
-        let NextWorkBundle { work, eow } = bundle;
+        let NextWorkBundle { work, eow } = bundle.unwrap();
 
         assert!(work.is_empty());
         assert!(eow.0);
@@ -320,7 +321,7 @@ mod test {
         };
 
         let fetch_task = async move {
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(
                 work,
                 [
@@ -330,7 +331,7 @@ mod test {
             );
             assert!(!eow);
 
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(
                 work,
                 [
@@ -373,7 +374,7 @@ mod test {
         };
 
         let fetch_task = async move {
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(
                 work,
                 [
@@ -416,7 +417,7 @@ mod test {
         };
 
         let fetch_task = async move {
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(
                 work,
                 [
@@ -426,7 +427,7 @@ mod test {
             );
             assert!(!eow);
 
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(work, []);
             assert!(eow);
         };
@@ -454,7 +455,7 @@ mod test {
 
                 let fetch_task = async move {
                     // Attempt 1, from online
-                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await.unwrap();
                     assert_eq!(
                         work,
                         [
@@ -472,7 +473,7 @@ mod test {
                     ]);
 
                     // Attempt 2
-                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await.unwrap();
                     assert_eq!(
                         work,
                         [
@@ -496,7 +497,7 @@ mod test {
                     ]);
 
                     // Attempt 3
-                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await.unwrap();
                     assert_eq!(
                         work,
                         [WorkerTest::new(
@@ -513,7 +514,7 @@ mod test {
                     )]);
 
                     // Done, even though we had failures
-                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await;
+                    let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await.unwrap();
                     assert_eq!(work, []);
                     assert!(eow);
                 };
@@ -579,7 +580,7 @@ mod test {
 
         let fetch_task = async move {
             // Attempt 1, from online
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(work, [WorkerTest::new(spec(1), INIT_RUN_NUMBER),],);
             assert!(!eow);
 
@@ -592,7 +593,7 @@ mod test {
             )]);
 
             // Attempt 2
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(
                 work,
                 [WorkerTest::new(
@@ -609,7 +610,7 @@ mod test {
             )]);
 
             // Done, even though we had failures
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(work, []);
             assert!(eow);
         };
@@ -642,7 +643,7 @@ mod test {
 
         let fetch_task = async move {
             // Attempt 1, from online
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(work, [WorkerTest::new(spec(1), INIT_RUN_NUMBER),],);
             assert!(!eow);
 
@@ -655,7 +656,7 @@ mod test {
             )]);
 
             // Attempt 2
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert_eq!(
                 work,
                 [WorkerTest::new(
@@ -672,7 +673,7 @@ mod test {
             )]);
 
             // Done, even though we had failures
-            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await;
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert!(work.is_empty());
             assert!(eow);
         };

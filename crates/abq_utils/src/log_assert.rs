@@ -11,6 +11,14 @@ macro_rules! log_assert {
     }}
 }
 
+#[macro_export]
+macro_rules! illegal_state {
+    ($msg:expr, $($field:tt)*) => {{
+        debug_assert!(false, "illegal state");
+        tracing::error!($($field)*, "illegal state: {}", $msg)
+    }}
+}
+
 /// Perform a runtime assertion, but if it fails, log an error rather than
 /// issuing a runtime panic.
 #[macro_export]

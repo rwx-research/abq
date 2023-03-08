@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use abq_utils::error::{here, ErrorLocation, LocatedError, ResultLocation};
 use abq_utils::exit::ExitCode;
+use abq_utils::net_protocol::error::FetchTestsError;
 use abq_utils::oneshot_notify::{self, OneshotRx};
 use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
 use async_trait::async_trait;
@@ -258,7 +259,7 @@ pub type NotifyMaterialTestsAllRun = Box<dyn FnOnce() -> BoxFuture<'static, ()> 
 /// Asynchronously fetch a bundle of tests.
 #[async_trait]
 pub trait TestsFetcher {
-    async fn get_next_tests(&mut self) -> NextWorkBundle;
+    async fn get_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError>;
 }
 
 pub type GetNextTests = Box<dyn TestsFetcher + Send>;
@@ -925,9 +926,10 @@ async fn execute_all_tests<'a>(
     };
 
     tracing::info!("starting execution of all tests");
-    let ((), run_tests_result, ()) =
+    let (fetch_tests_result, run_tests_result, ()) =
         tokio::join!(fetch_tests_task, run_tests_task, send_results_task);
 
+    fetch_tests_result.located(here!())?;
     let test_runner_exit = run_tests_result?;
 
     Ok(test_runner_exit)
@@ -942,10 +944,10 @@ impl message_buffer::FetchMessages for NextBundleFetcher {
     type T = WorkerTest;
     type Iter = std::vec::IntoIter<Self::T>;
 
-    async fn fetch(&mut self) -> (Self::Iter, Eow) {
-        let NextWorkBundle { work, eow } = self.test_fetcher.get_next_tests().await;
+    async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError> {
+        let NextWorkBundle { work, eow } = self.test_fetcher.get_next_tests().await?;
 
-        (work.into_iter(), eow)
+        Ok((work.into_iter(), eow))
     }
 }
 
@@ -1337,7 +1339,7 @@ pub fn execute_wrapped_runner(
 
     #[async_trait]
     impl TestsFetcher for Fetcher {
-        async fn get_next_tests(&mut self) -> NextWorkBundle {
+        async fn get_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
             loop {
                 let manifest_and_data = self.manifest.lock();
                 let next_test = match &(*manifest_and_data) {
@@ -1357,9 +1359,9 @@ pub fn execute_wrapped_runner(
                             spec: test_spec.clone(),
                             run_number: INIT_RUN_NUMBER,
                         };
-                        return NextWorkBundle::new([test], Eow(false));
+                        return Ok(NextWorkBundle::new([test], Eow(false)));
                     }
-                    None => return NextWorkBundle::new([], Eow(true)),
+                    None => return Ok(NextWorkBundle::new([], Eow(true))),
                 }
             }
         }
@@ -1593,8 +1595,8 @@ impl ImmediateTests {
 
 #[async_trait]
 impl TestsFetcher for ImmediateTests {
-    async fn get_next_tests(&mut self) -> NextWorkBundle {
-        self.tests.remove(0)
+    async fn get_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
+        Ok(self.tests.remove(0))
     }
 }
 

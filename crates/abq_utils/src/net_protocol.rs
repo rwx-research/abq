@@ -689,6 +689,7 @@ pub mod work_server {
 
     use super::{
         entity::Entity,
+        error::RetryManifestError,
         runners::MetadataMap,
         workers::{self, NextWorkBundle, RunId},
     };
@@ -752,14 +753,30 @@ pub mod work_server {
         Manifest(NextWorkBundle),
         /// The manifest has not been fully persisted yet; try again later.
         NotYetPersisted,
-        /// The run associated with the manifest does not exist.
+        Error(RetryManifestError),
+    }
+}
+
+pub mod error {
+    use serde_derive::{Deserialize, Serialize};
+    use thiserror::Error;
+
+    #[derive(Debug, Error, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum FetchTestsError {
+        #[error("{0}")]
+        RetryManifest(#[from] RetryManifestError),
+    }
+
+    #[derive(Debug, Error, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum RetryManifestError {
+        #[error("attempted to retry a test run that does not exist")]
         RunDoesNotExist,
-        /// The associated run failed during manifest generation; we don't know what tests to
-        /// retry.
+        #[error("manifest has not been received for the given run, so it cannot be retried")]
         ManifestNeverReceived,
-        /// The manifest should have been persisted, but something faulted in the queue, and the
-        /// persistence failed.
+        #[error("retry manifest failed to be loaded by ABQ")]
         FailedToLoad,
+        #[error("ABQ test suite run cannot be retried because the run was previously cancelled")]
+        RunCancelled,
     }
 }
 

@@ -1,6 +1,10 @@
 //! Utilities for buffering and acting on messages (from the queue), refilling messages on-demand.
 
-use abq_utils::{log_assert, net_protocol::workers::Eow};
+use abq_utils::{
+    error::{OpaqueResult, ResultLocation},
+    here, log_assert,
+    net_protocol::{error::FetchTestsError, workers::Eow},
+};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
@@ -77,33 +81,33 @@ pub(crate) trait FetchMessages {
     type T;
     type Iter: ExactSizeIterator<Item = Self::T>;
 
-    async fn fetch(&mut self) -> (Self::Iter, Eow);
+    async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError>;
 }
 
 impl<T> BatchedProducer<T> {
     /// Returns a future that runs the producer, with a task to fetch messages.
     /// The future completes when the generator indicates that it is complete, or the consumer
     /// exits.
-    pub async fn start<F>(mut self, mut fetcher: F)
+    pub async fn start<F>(mut self, mut fetcher: F) -> OpaqueResult<()>
     where
         F: FetchMessages<T = T>,
     {
         loop {
-            let (msgs, completed) = fetcher.fetch().await;
+            let (msgs, completed) = fetcher.fetch().await.located(here!())?;
 
             // If we fail to send the message, the consumer has exited early and we have nothing
             // more to do.
             if msgs.len() > 0 {
                 if self.msg_tx.send(Msg::BatchSize(msgs.len())).await.is_err() {
-                    return;
+                    return Ok(());
                 };
                 for msg in msgs {
                     if self.msg_tx.send(Msg::Item(msg)).await.is_err() {
-                        return;
+                        return Ok(());
                     }
                 }
                 if self.msg_tx.send(Msg::ForceFlush).await.is_err() {
-                    return;
+                    return Ok(());
                 }
             } else {
                 log_assert!(
@@ -113,12 +117,12 @@ impl<T> BatchedProducer<T> {
             }
 
             if completed.0 {
-                return;
+                return Ok(());
             }
 
             if self.refill_rx.recv().await.is_none() {
                 // Consumer has exited
-                return;
+                return Ok(());
             }
         }
     }
@@ -215,7 +219,7 @@ mod test {
         sync::{atomic::AtomicU8, Arc},
     };
 
-    use abq_utils::atomic;
+    use abq_utils::{atomic, net_protocol::error::FetchTestsError};
     use async_trait::async_trait;
 
     use super::{channel, Eow, FetchMessages, RecvMsg, RefillStrategy};
@@ -246,7 +250,7 @@ mod test {
             Ok(())
         };
 
-        let ((), rx_result) = tokio::join!(tx, run_rx_to_completion);
+        let (_result, rx_result) = tokio::join!(tx, run_rx_to_completion);
         rx_result
     }
 
@@ -261,10 +265,10 @@ mod test {
             type T = u8;
             type Iter = std::array::IntoIter<u8, 1>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Eow) {
+            async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError> {
                 self.count += 1;
                 let loaded = self.count;
-                ([loaded].into_iter(), Eow(loaded == 5))
+                Ok(([loaded].into_iter(), Eow(loaded == 5)))
             }
         }
 
@@ -311,12 +315,12 @@ mod test {
             type T = u8;
             type Iter = std::vec::IntoIter<Self::T>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Eow) {
+            async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError> {
                 self.count += 1;
                 match self.count {
-                    1 => (vec![1, 2, 3].into_iter(), Eow(false)),
-                    2 => (vec![4, 5, 6].into_iter(), Eow(false)),
-                    3 => (vec![7, 8].into_iter(), Eow(true)),
+                    1 => Ok((vec![1, 2, 3].into_iter(), Eow(false))),
+                    2 => Ok((vec![4, 5, 6].into_iter(), Eow(false))),
+                    3 => Ok((vec![7, 8].into_iter(), Eow(true))),
                     _ => unreachable!(),
                 }
             }
@@ -373,11 +377,11 @@ mod test {
             type T = u8;
             type Iter = std::vec::IntoIter<Self::T>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Eow) {
+            async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError> {
                 self.count += 1;
                 match self.count {
-                    1 => (vec![1, 2, 3, 4].into_iter(), Eow(false)),
-                    2 => (vec![5, 6, 7, 8].into_iter(), Eow(false)),
+                    1 => Ok((vec![1, 2, 3, 4].into_iter(), Eow(false))),
+                    2 => Ok((vec![5, 6, 7, 8].into_iter(), Eow(false))),
                     _ => unreachable!(),
                 }
             }
@@ -408,11 +412,11 @@ mod test {
             type T = u8;
             type Iter = std::vec::IntoIter<Self::T>;
 
-            async fn fetch(&mut self) -> (Self::Iter, Eow) {
+            async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError> {
                 self.count += 1;
                 match self.count {
-                    1 => (vec![1].into_iter(), Eow(false)),
-                    2 => (vec![2].into_iter(), Eow(false)),
+                    1 => Ok((vec![1].into_iter(), Eow(false))),
+                    2 => Ok((vec![2].into_iter(), Eow(false))),
                     _ => unreachable!(),
                 }
             }
@@ -432,7 +436,7 @@ mod test {
             drop(rx);
         };
 
-        let ((), ()) = tokio::join!(tx, run_rx);
+        let (_result, ()) = tokio::join!(tx, run_rx);
 
         // Initial fetch + fetch after first pull
         assert_eq!(fetcher.count, 2);

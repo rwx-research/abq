@@ -12,6 +12,7 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_async::{self, UnverifiedServerStream};
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::{Entity, Tag};
+use abq_utils::net_protocol::error::RetryManifestError;
 use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request,
     TestResultsResponse, TestSpec,
@@ -31,7 +32,7 @@ use abq_utils::net_protocol::{meta, publicize_addr};
 use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::vec_map::VecMap;
-use abq_utils::{atomic, log_assert};
+use abq_utils::{atomic, illegal_state, log_assert};
 use abq_workers::negotiate::{
     AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
     QueueNegotiatorServerError,
@@ -256,10 +257,9 @@ enum RecordedEmptyManifest {
 #[derive(Debug)]
 enum RetryManifestState {
     Manifest(NextWorkBundle),
-    RunNotFound,
-    ManifestNeverReceived,
-    NotYetPersisted,
     FetchFromPersistence,
+    NotYetPersisted,
+    Error(RetryManifestError),
 }
 
 #[derive(Debug, Error)]
@@ -330,9 +330,9 @@ impl AllRuns {
         let run = match runs.get(run_id) {
             Some(st) => st.read(),
             None => {
-                tracing::error!(
-                    ?run_id,
-                    "illegal state - a run must always be populated when looking up for worker"
+                illegal_state!(
+                    "a run must always be populated when looking up for worker",
+                    ?run_id
                 );
                 return AssignedRunStatus::RunUnknown;
             }
@@ -493,13 +493,15 @@ impl AllRuns {
                 // expected state, pass through
                 Mutex::into_inner(std::mem::take(worker_connection_times))
             }
-            RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
-                unreachable!(
-                    "Invalid state - can only provide manifest while waiting for manifest"
-                );
-            }
             RunState::Cancelled { .. } => {
                 // If cancelled, do nothing.
+                return AddedManifest::RunCancelled;
+            }
+            RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
+                illegal_state!(
+                    "can only provide manifest while waiting for manifest",
+                    ?run_id
+                );
                 return AddedManifest::RunCancelled;
             }
         };
@@ -581,8 +583,7 @@ impl AllRuns {
 
         let run = runs.get(run_id).expect("no run recorded").read();
 
-        match &run.state
-        {
+        match &run.state {
             RunState::HasWork {
                 queue,
                 batch_size_hint,
@@ -592,41 +593,49 @@ impl AllRuns {
                 active_workers.lock().insert_by_tag_if_missing(entity, None);
                 let (bundle, status) = Self::get_next_work_online(queue, entity, *batch_size_hint);
                 match status {
-                    PulledTestsStatus::MoreTestsRemaining => {
-                        NextWorkResult {
-                            bundle, status, opt_persistent_manifest_plan: None
-                        }
-                    }
+                    PulledTestsStatus::MoreTestsRemaining => NextWorkResult {
+                        bundle,
+                        status,
+                        opt_persistent_manifest_plan: None,
+                    },
                     PulledTestsStatus::PulledLastTest { .. } | PulledTestsStatus::QueueWasEmpty => {
                         drop(run);
                         drop(runs);
                         tracing::debug!(?entity, ?run_id, "saw end of manifest for entity");
 
-                        let opt_persistent_manifest_plan = self.try_mark_reached_end_of_manifest(run_id, ExitCode::SUCCESS);
+                        let opt_persistent_manifest_plan =
+                            self.try_mark_reached_end_of_manifest(run_id, ExitCode::SUCCESS);
 
-                        NextWorkResult{
-                            bundle, status, opt_persistent_manifest_plan
+                        NextWorkResult {
+                            bundle,
+                            status,
+                            opt_persistent_manifest_plan,
                         }
                     }
                 }
             }
-            RunState::InitialManifestDone {  seen_workers, .. } => {
+            RunState::InitialManifestDone { seen_workers, .. } => {
                 // Let the worker know that we've reached the end of the queue.
                 seen_workers.write().insert_by_tag_if_missing(entity, true);
-                NextWorkResult{
+                NextWorkResult {
                     bundle: NextWorkBundle::new([], Eow(true)),
                     status: PulledTestsStatus::QueueWasEmpty,
                     opt_persistent_manifest_plan: None,
                 }
             }
-            RunState::Cancelled {..} => {
-                NextWorkResult{
+            RunState::Cancelled { .. } => NextWorkResult {
+                bundle: NextWorkBundle::new([], Eow(true)),
+                status: PulledTestsStatus::QueueWasEmpty,
+                opt_persistent_manifest_plan: None,
+            },
+            RunState::WaitingForManifest { .. } => {
+                illegal_state!("work can only be requested after initialization metadata, at which point the manifest is known.", ?run_id, ?entity);
+                NextWorkResult {
                     bundle: NextWorkBundle::new([], Eow(true)),
                     status: PulledTestsStatus::QueueWasEmpty,
                     opt_persistent_manifest_plan: None,
                 }
             }
-            RunState::WaitingForManifest {..} => unreachable!("Invalid state - work can only be requested after initialization metadata, at which point the manifest is known.")
         }
     }
 
@@ -770,17 +779,17 @@ impl AllRuns {
         let runs = self.runs.read();
         let run = match runs.get(run_id) {
             Some(run) => run.read(),
-            None => return RetryManifestState::RunNotFound,
+            None => return RetryManifestState::Error(RetryManifestError::RunDoesNotExist),
         };
 
         match &run.state {
             RunState::WaitingForManifest { .. } => {
-                tracing::error!(
+                illegal_state!(
+                    "attempting to fetch retry manifest while waiting for manifest",
                     ?run_id,
-                    ?entity,
-                    "illegal state - attempting to fetch retry manifest while waiting for manifest"
+                    ?entity
                 );
-                RetryManifestState::RunNotFound
+                RetryManifestState::Error(RetryManifestError::ManifestNeverReceived)
             }
             RunState::HasWork {
                 queue,
@@ -820,7 +829,7 @@ impl AllRuns {
                     }
                 }
                 ManifestPersistence::ManifestNeverReceived => {
-                    RetryManifestState::ManifestNeverReceived
+                    RetryManifestState::Error(RetryManifestError::ManifestNeverReceived)
                 }
                 ManifestPersistence::EmptyManifest => {
                     // Ship the empty manifest over.
@@ -831,7 +840,7 @@ impl AllRuns {
                 }
             },
             RunState::Cancelled { .. } => {
-                todo!("fetch retry manifest after cancellation")
+                RetryManifestState::Error(RetryManifestError::RunCancelled)
             }
         }
     }
@@ -923,7 +932,11 @@ impl AllRuns {
                 return None;
             }
             RunState::WaitingForManifest { .. } => {
-                unreachable!("Invalid state");
+                illegal_state!(
+                    "tried to mark end of manifest while waiting for manifest",
+                    ?run_id
+                );
+                return None;
             }
         };
 
@@ -973,7 +986,11 @@ impl AllRuns {
                 return;
             }
             RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
-                unreachable!("Invalid state - can only fail to start while waiting for manifest");
+                illegal_state!(
+                    "attempting to mark failed to receive manifest after manifest was received",
+                    ?run_id
+                );
+                return;
             }
         }
 
@@ -1008,7 +1025,11 @@ impl AllRuns {
                 return RecordedEmptyManifest::RunCancelled;
             }
             RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
-                unreachable!("Invalid state - can only mark complete due to manifest while waiting for manifest");
+                illegal_state!(
+                    "can only mark complete due to manifest while waiting for manifest",
+                    ?run_id
+                );
+                return RecordedEmptyManifest::RunCancelled;
             }
         }
 
@@ -2117,9 +2138,8 @@ impl WorkScheduler {
                     FetchFromPersistence => {
                         fetch_persisted_manifest(&ctx.persist_manifest, &run_id, entity).await
                     }
-                    RunNotFound => RetryManifestResponse::RunDoesNotExist,
-                    ManifestNeverReceived => RetryManifestResponse::ManifestNeverReceived,
                     NotYetPersisted => RetryManifestResponse::NotYetPersisted,
+                    Error(e) => RetryManifestResponse::Error(e),
                 };
 
                 net_protocol::async_write(&mut stream, &response)
@@ -2247,7 +2267,7 @@ async fn fetch_persisted_manifest(
                 error,
                 "manifest marked as persisted, but its loading failed: {}"
             );
-            RetryManifestResponse::FailedToLoad
+            RetryManifestResponse::Error(RetryManifestError::FailedToLoad)
         }
     }
 }

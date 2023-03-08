@@ -611,7 +611,10 @@ async fn test_like_runner_exec_loop(
     mut results_handler: ResultsHandler,
 ) -> Option<Result<TestRunnerExit, GenericRunnerError>> {
     'tests_done: loop {
-        let NextWorkBundle { work, eow } = tests_fetcher.get_next_tests().await;
+        let NextWorkBundle { work, eow } = match tests_fetcher.get_next_tests().await {
+            Ok(bundle) => bundle,
+            Err(e) => return Some(Err(GenericRunnerError::no_captures(e.located(here!())))),
+        };
 
         for WorkerTest {
             spec: TestSpec { test_case, work_id },
@@ -802,6 +805,7 @@ mod test {
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::entity::{Entity, WorkerTag};
+    use abq_utils::net_protocol::error::FetchTestsError;
     use abq_utils::net_protocol::queue::{AssociatedTestResults, TestSpec};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Test, TestCase, TestOrGroup, TestResult,
@@ -842,14 +846,14 @@ mod test {
 
     #[async_trait]
     impl TestsFetcher for Fetcher {
-        async fn get_next_tests(&mut self) -> NextWorkBundle {
+        async fn get_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
             loop {
                 let head = { self.reader.lock().pop_front() };
                 match head {
-                    Some(work) => return NextWorkBundle::new(vec![work], Eow(false)),
+                    Some(work) => return Ok(NextWorkBundle::new(vec![work], Eow(false))),
                     None => {
                         if self.end.load(atomic::ORDERING) {
-                            return NextWorkBundle::new([], Eow(true));
+                            return Ok(NextWorkBundle::new([], Eow(true)));
                         }
 
                         tokio::time::sleep(Duration::from_micros(10)).await
