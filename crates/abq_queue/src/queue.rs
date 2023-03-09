@@ -60,6 +60,8 @@ enum RunState {
         /// For the purposes of analytics, records timings of when workers connect prior to the
         /// manifest being generated.
         worker_connection_times: Mutex<WorkerSet<Instant>>,
+
+        batch_size_hint: NonZeroUsize,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -121,23 +123,12 @@ enum ResultsPersistence {
     ManifestNeverReceived,
 }
 
-struct RunData {
-    /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
-    batch_size_hint: NonZeroUsize,
-}
-
-static_assertions::assert_eq_size!(Option<RunData>, RunData);
-
 const MAX_BATCH_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(100) };
 
 /// A individual test run ever invoked on the queue.
 struct Run {
     /// The state of the test run.
     state: RunState,
-    /// Data for the test run, persisted only while a test run is enqueued or active.
-    /// One a run is done (or cancelled), its state is persisted, but its run data is dropped to
-    /// minimize memory leaks.
-    data: Option<RunData>,
 }
 
 /// Sync-safe storage of all runs ever invoked on the queue.
@@ -339,6 +330,7 @@ impl AllRuns {
         match &run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
+                batch_size_hint: _,
             } => {
                 let mut worker_connection_times = worker_connection_times.lock();
                 let old = worker_connection_times.insert_by_tag(entity, time::Instant::now());
@@ -408,8 +400,6 @@ impl AllRuns {
                 seen_workers,
                 ..
             } => {
-                log_assert!(run.data.is_none(), "run data exists after completed run");
-
                 if seen_workers.read().contains_by_tag(&entity) {
                     // This worker was already involved in this run; assume it's connecting for an
                     // out-of-process retry.
@@ -432,13 +422,9 @@ impl AllRuns {
                     AssignedRunStatus::AlreadyDone { exit_code }
                 }
             }
-            RunState::Cancelled { .. } => {
-                log_assert!(run.data.is_none(), "run data exists after cancelled run");
-
-                AssignedRunStatus::AlreadyDone {
-                    exit_code: ExitCode::CANCELLED,
-                }
-            }
+            RunState::Cancelled { .. } => AssignedRunStatus::AlreadyDone {
+                exit_code: ExitCode::CANCELLED,
+            },
         }
     }
 
@@ -462,8 +448,8 @@ impl AllRuns {
         let run = Run {
             state: RunState::WaitingForManifest {
                 worker_connection_times: Mutex::new(worker_timings),
+                batch_size_hint,
             },
-            data: Some(RunData { batch_size_hint }),
         };
         let old_run = runs.insert(run_id, RwLock::new(run));
         log_assert!(old_run.is_none(), "can only be called when run is fresh!");
@@ -484,12 +470,14 @@ impl AllRuns {
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
 
-        let worker_connection_times = match &mut run.state {
+        let (worker_connection_times, batch_size_hint) = match &mut run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
+                batch_size_hint,
             } => {
                 // expected state, pass through
-                Mutex::into_inner(std::mem::take(worker_connection_times))
+                let timings = Mutex::into_inner(std::mem::take(worker_connection_times));
+                (timings, *batch_size_hint)
             }
             RunState::Cancelled { .. } => {
                 // If cancelled, do nothing.
@@ -512,11 +500,6 @@ impl AllRuns {
 
         let queue = JobQueue::new(work_from_manifest.collect());
 
-        let run_data = run
-            .data
-            .as_ref()
-            .expect("illegal state - run data must exist at this step");
-
         let mut active_workers = WorkerSet::with_capacity(worker_connection_times.len());
         let mut worker_conn_times = VecMap::with_capacity(worker_connection_times.len());
         for (worker, time) in worker_connection_times {
@@ -528,7 +511,7 @@ impl AllRuns {
 
         run.state = RunState::HasWork {
             queue,
-            batch_size_hint: run_data.batch_size_hint,
+            batch_size_hint,
             init_metadata,
             active_workers: Mutex::new(active_workers),
             results_persistence: results_persistence.clone(),
@@ -960,10 +943,6 @@ impl AllRuns {
             results_persistence: ResultsPersistence::Persisted(results_persistence),
         };
 
-        // Drop the run data, since we no longer need it.
-        log_assert!(run.data.is_some(), "run data missing");
-        std::mem::take(&mut run.data);
-
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
 
@@ -999,10 +978,6 @@ impl AllRuns {
             manifest_persistence: ManifestPersistence::ManifestNeverReceived,
             results_persistence: ResultsPersistence::ManifestNeverReceived,
         };
-
-        // Drop the run data, since we no longer need it.
-        debug_assert!(run.data.is_some());
-        std::mem::take(&mut run.data);
 
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
@@ -1042,10 +1017,6 @@ impl AllRuns {
             results_persistence: ResultsPersistence::Persisted(results_persistence.clone()),
         };
 
-        // Drop the run data, since we no longer need it.
-        debug_assert!(run.data.is_some());
-        std::mem::take(&mut run.data);
-
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
 
@@ -1078,10 +1049,6 @@ impl AllRuns {
         }
 
         run.state = RunState::Cancelled { reason };
-
-        // Drop the run data if it exists, since we no longer need it.
-        // It might already be missing if this cancellation happened after we saw a run complete.
-        std::mem::take(&mut run.data);
 
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
@@ -1118,6 +1085,7 @@ impl AllRuns {
         match &run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
+                ..
             } => worker_connection_times.lock().iter().map(|p| p.0).collect(),
             RunState::HasWork { active_workers, .. } => active_workers
                 .lock()
@@ -1141,14 +1109,9 @@ impl AllRuns {
     }
 
     #[cfg(test)]
-    fn set_state(
-        &self,
-        run_id: RunId,
-        state: RunState,
-        data: Option<RunData>,
-    ) -> Option<RwLock<Run>> {
+    fn set_state(&self, run_id: RunId, state: RunState) -> Option<RwLock<Run>> {
         let mut runs = self.runs.write();
-        runs.insert(run_id, RwLock::new(Run { state, data }))
+        runs.insert(run_id, RwLock::new(Run { state }))
     }
 }
 
@@ -3082,8 +3045,8 @@ mod test_pull_work {
     use crate::{
         persistence::results::ResultsPersistedCell,
         queue::{
-            fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunData, RunState,
-            RunStatus, SharedRuns,
+            fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunState, RunStatus,
+            SharedRuns,
         },
     };
 
@@ -3114,7 +3077,7 @@ mod test_pull_work {
         };
 
         let queues = SharedRuns::default();
-        queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
+        queues.set_state(run_id.clone(), has_work);
 
         // First pull. There should be additional tests following it.
         {
@@ -3175,7 +3138,7 @@ mod retry_manifest {
             manifest::{InMemoryPersistor, SharedPersistManifest},
             results::ResultsPersistedCell,
         },
-        queue::{fake_test_spec, NextWorkResult, RunData, RunState, SharedRuns, WorkScheduler},
+        queue::{fake_test_spec, NextWorkResult, RunState, SharedRuns, WorkScheduler},
     };
     use abq_test_utils::{one_nonzero_usize, spec};
     use abq_utils::{
@@ -3313,7 +3276,7 @@ mod retry_manifest {
             };
 
             let queues = SharedRuns::default();
-            queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
+            queues.set_state(run_id.clone(), has_work);
             queues
         };
 
@@ -3492,7 +3455,7 @@ mod persist_results {
 
     use super::{
         ManifestPersistence, QueueServer, ReadResultsError, ResultsPersistence, RetryManifestState,
-        RunData, RunState, SharedRuns,
+        RunState, SharedRuns,
     };
 
     #[tokio::test]
@@ -3510,7 +3473,7 @@ mod persist_results {
                 results_persistence: results_cell.clone(),
                 batch_size_hint: one_nonzero_usize(),
             };
-            queues.set_state(run_id.clone(), done, None);
+            queues.set_state(run_id.clone(), done);
             queues
         };
 
@@ -3553,7 +3516,7 @@ mod persist_results {
                 manifest_persistence: ManifestPersistence::EmptyManifest,
                 results_persistence: ResultsPersistence::Persisted(results_cell.clone()),
             };
-            queues.set_state(run_id.clone(), has_work, None);
+            queues.set_state(run_id.clone(), has_work);
             queues
         };
 
@@ -3592,7 +3555,7 @@ mod persist_results {
             let done = RunState::Cancelled {
                 reason: CancelReason::User,
             };
-            queues.set_state(run_id.clone(), done, None);
+            queues.set_state(run_id.clone(), done);
             queues
         };
 
@@ -3629,8 +3592,7 @@ mod persist_results {
             fn $test() {
                 let run_id = RunId::unique();
                 let queues = SharedRuns::default();
-                let data = None;
-                queues.set_state(run_id.clone(), $state, data);
+                queues.set_state(run_id.clone(), $state);
                 let result = queues.get_read_results_cell(&run_id);
                 assert!(matches!(&result, $($expect_match)*), "{result:?}");
             }
@@ -3639,7 +3601,7 @@ mod persist_results {
 
     get_read_results_cell! {
         get_read_results_cell_when_waiting_for_manifest,
-        RunState::WaitingForManifest { worker_connection_times: Default::default() },
+        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize() },
         Err(ReadResultsError::WaitingForManifest)
     }
 
@@ -3738,7 +3700,7 @@ mod persist_results {
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
             };
-            queues.set_state(run_id.clone(), has_work, Some(RunData { batch_size_hint }));
+            queues.set_state(run_id.clone(), has_work);
             queues
         };
 
