@@ -2,7 +2,6 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::panic;
 use std::path::PathBuf;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind};
@@ -646,7 +645,8 @@ async fn test_like_runner_exec_loop(
                     attempt_number,
                     allowed_attempts,
                     run_number,
-                );
+                )
+                .await;
                 let runtime = start_time.elapsed().as_millis() as f64;
 
                 let (status, outputs) = match attempt_result {
@@ -700,7 +700,7 @@ async fn test_like_runner_exec_loop(
 }
 
 #[inline(always)]
-fn attempt_test_id_for_test_like_runner(
+async fn attempt_test_id_for_test_like_runner(
     _my_context: &WorkerContext,
     runner: TestLikeRunner,
     test_id: TestId,
@@ -713,12 +713,16 @@ fn attempt_test_id_for_test_like_runner(
 
     let init_context = serde_json::to_string(&init_context).unwrap();
 
-    let result_handle = thread::spawn(move || {
+    let result_handle = tokio::spawn(async move {
         let _attempt = attempt;
         match (runner, test_id) {
             (R::Echo, s) => {
                 let result = test_like_runner::echo(s);
                 vec![result]
+            }
+            (R::InduceTimeout, _) => {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                unreachable!();
             }
             (R::EchoMany { separator }, s) => {
                 let split_results = s
@@ -769,7 +773,7 @@ fn attempt_test_id_for_test_like_runner(
         }
     });
 
-    let result = result_handle.join();
+    let result = result_handle.await;
     match result {
         Ok(output) => {
             if output.is_empty() {
@@ -779,6 +783,7 @@ fn attempt_test_id_for_test_like_runner(
             }
         }
         Err(e) => {
+            let e = e.into_panic();
             if attempt < allowed_attempts {
                 Err(AttemptError::ShouldRetry)
             } else {

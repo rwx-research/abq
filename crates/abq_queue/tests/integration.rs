@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use abq_native_runner_simulation::pack_msgs_to_disk;
+use abq_native_runner_simulation::{legal_spawned_message, pack, pack_msgs_to_disk};
 use abq_queue::{
     persistence,
     queue::{Abq, QueueConfig},
@@ -439,7 +439,6 @@ fn action_to_fut(
                     use queue::TestResultsResponse::*;
                     match net_protocol::async_read(&mut conn).await.unwrap() {
                         Results(..) => {
-                            dbg!("ready");
                             break;
                         }
                         _ => {
@@ -2020,4 +2019,189 @@ async fn many_retries_of_many_out_of_process_workers() {
     }
 
     builder.test().await;
+}
+
+#[tokio::test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+
+    use abq_native_runner_simulation::Msg::*;
+
+    let sim1 = pack_msgs_to_disk([
+        Connect,
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                //
+                // Send result
+                OpaqueRead,
+                OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+            ],
+        },
+        Exit(0),
+    ]);
+    let runner1 = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+        cmd: native_runner_simulation_bin(),
+        args: vec![sim1.path.display().to_string()],
+        extra_env: Default::default(),
+    });
+
+    // Second and third attempt of the runner produces no manifest,
+    // and should be fed our retry manifest from the first pass.
+    let sim2 = pack_msgs_to_disk([
+        Connect,
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                //
+                // Send result
+                OpaqueRead,
+                Sleep(Duration::from_secs(600)),
+            ],
+        },
+        Exit(0),
+    ]);
+    let runner2 = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+        cmd: native_runner_simulation_bin(),
+        args: vec![sim2.path.display().to_string()],
+        extra_env: Default::default(),
+    });
+    let runner3 = RunnerKind::GenericNativeTestRunner(NativeTestRunnerParams {
+        cmd: native_runner_simulation_bin(),
+        args: vec![sim1.path.display().to_string()],
+        extra_env: Default::default(),
+    });
+
+    TestBuilder::default()
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner1).with_num_workers(one_nonzero_usize()),
+        )])
+        .step(
+            [
+                StopWorkers(Wid(1)),
+                // Run should now be seen as completed
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
+            [
+                WorkerTestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results.len() == 1
+                    }),
+                ),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results.len(), 1);
+                            assert_eq!(summary.manifest_size_nonce, 1);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
+        )
+        // Second attempt of the run will be cancelled, but that shouldn't impact the run.
+        .act([StartWorkers(
+            Run(1),
+            Wid(2),
+            WorkersConfigBuilder::new(1, runner2).with_num_workers(one_nonzero_usize()),
+        )])
+        .step(
+            [
+                CancelWorkers(Wid(2)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
+            [
+                WorkerTestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results.len() == 1
+                    }),
+                ),
+                WorkerExitStatus(
+                    Wid(2),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results.len(), 1);
+                            assert_eq!(summary.manifest_size_nonce, 1);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
+        )
+        // Third attempt should succeed
+        .act([StartWorkers(
+            Run(1),
+            Wid(3),
+            WorkersConfigBuilder::new(1, runner3).with_num_workers(one_nonzero_usize()),
+        )])
+        .step(
+            [
+                StopWorkers(Wid(3)),
+                WaitForCompletedRun(Run(1)),
+                WaitForNoPendingResults(Run(1)),
+            ],
+            [
+                WorkerTestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results.len() == 2
+                    }),
+                ),
+                WorkerExitStatus(
+                    Wid(3),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results(r) => {
+                            let (results, summary) = flatten_queue_results(r);
+                            assert_eq!(results.len(), 2);
+                            assert_eq!(summary.manifest_size_nonce, 1);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
+        )
+        .test()
+        .await;
 }

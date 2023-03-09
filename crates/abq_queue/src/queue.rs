@@ -1059,11 +1059,24 @@ impl AllRuns {
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
 
-        // Cancellation can happen at any time, including after the test run is determined to have
-        // completed by us (the queue).
-        //
-        // We prefer the observation of the test workers, so test cancellation is always marked
-        // as a failure.
+        match &run.state {
+            RunState::WaitingForManifest { .. }
+            | RunState::HasWork { .. }
+            | RunState::Cancelled { .. } => {
+                // legal cancellation states
+            }
+            RunState::InitialManifestDone { .. } => {
+                // Since we already have issued the full manifest out, don't mark this run as
+                // cancelled; this might be a stragling worker or a worker that cancelled an
+                // out-of-process retry.
+                tracing::info!(
+                    ?run_id,
+                    "refusing to cancel run whose manifest has already been exhausted"
+                );
+                return;
+            }
+        }
+
         run.state = RunState::Cancelled { reason };
 
         // Drop the run data if it exists, since we no longer need it.
@@ -2708,6 +2721,26 @@ mod test {
         assert!(matches!(
             queues.get_run_status(&run_id).unwrap(),
             RunStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn mark_cancellation_after_already_done_does_nothing() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
+        let _ = queues.add_manifest(&run_id, vec![], Default::default());
+        let persist_plan = queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
+        assert!(persist_plan.is_some());
+
+        queues.mark_cancelled(&run_id, CancelReason::User);
+
+        assert!(matches!(
+            queues.get_run_status(&run_id).unwrap(),
+            RunStatus::InitialManifestDone { .. },
         ));
     }
 
