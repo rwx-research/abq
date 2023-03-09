@@ -4,7 +4,7 @@ use std::panic;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind};
+use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, NotifyCancellation};
 use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{self, Entity, RunnerMeta, WorkerRunner, WorkerTag};
@@ -23,7 +23,6 @@ use abq_utils::net_protocol::workers::{
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
 use abq_utils::oneshot_notify::{self, OneshotRx, OneshotTx};
 use abq_utils::results_handler::ResultsHandler;
-use async_trait::async_trait;
 use futures::FutureExt;
 
 use crate::liveness::{CompletedSignaler, LiveCount};
@@ -38,11 +37,6 @@ pub use abq_generic_test_runner::TestsFetcher;
 
 pub type NotifyManifest = abq_generic_test_runner::SendManifest;
 pub type GetInitContext = abq_generic_test_runner::GetInitContext;
-
-#[async_trait]
-pub trait NotifyCancellation: Send {
-    async fn cancel(self: Box<Self>);
-}
 
 #[derive(Clone, Debug)]
 pub enum WorkerContext {
@@ -74,8 +68,6 @@ pub struct WorkerPoolConfig<'a> {
     pub some_runner_should_generate_manifest: bool,
     /// How runners should communicate.
     pub runner_strategy_generator: &'a dyn runner_strategy::StrategyGenerator,
-    /// How should the workers notify cancellation.
-    pub notify_cancellation: Box<dyn NotifyCancellation>,
     /// How many results should be sent back at a time?
     pub results_batch_size_hint: u64,
     /// Context under which workers should operate.
@@ -104,8 +96,6 @@ pub struct WorkerPool {
     /// `None` if shutdown has already been called.
     runners_shutdown: Option<Vec<OneshotTx>>,
     live_count: LiveCount,
-
-    notify_cancellation: Option<Box<dyn NotifyCancellation>>,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -154,7 +144,6 @@ impl WorkerPool {
             some_runner_should_generate_manifest,
             results_batch_size_hint: results_batch_size,
             runner_strategy_generator,
-            notify_cancellation,
             worker_context,
             debug_native_runner,
             protocol_version_timeout,
@@ -197,6 +186,7 @@ impl WorkerPool {
                 get_next_tests,
                 results_handler,
                 notify_all_tests_run,
+                notify_cancellation,
             } = runner_strategy_generator.generate(entity, should_generate_manifest);
 
             let runner_env = RunnerEnv {
@@ -209,6 +199,7 @@ impl WorkerPool {
                 results_batch_size,
                 results_handler,
                 notify_all_tests_run,
+                notify_cancellation,
                 context: worker_context.clone(),
                 notify_manifest,
                 debug_native_runner,
@@ -233,7 +224,6 @@ impl WorkerPool {
             runners,
             runners_shutdown: Some(runners_shutdown),
             live_count,
-            notify_cancellation: Some(notify_cancellation),
         }
     }
 
@@ -248,9 +238,14 @@ impl WorkerPool {
     }
 
     pub async fn cancel(&mut self) {
-        let notify_cancellation = std::mem::take(&mut self.notify_cancellation)
-            .expect("illegal state - cannot cancel more than once");
-        notify_cancellation.cancel().await;
+        if let Some(runners_shutdown) = std::mem::take(&mut self.runners_shutdown) {
+            for tx_shutdown in runners_shutdown {
+                // It's possible the runner already exited, for example if it already finished, or
+                // errored early. In that case, we won't be able to send across the channel, but that's okay.
+                let _ = tx_shutdown.notify();
+            }
+        }
+        self.wait().await;
     }
 
     /// Shuts down the worker pool, returning the pool [exit status][WorkersExit].
@@ -370,6 +365,7 @@ struct RunnerEnv {
     tests_fetcher: GetNextTests,
     results_batch_size: u64,
     results_handler: ResultsHandler,
+    notify_cancellation: NotifyCancellation,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     context: WorkerContext,
     protocol_version_timeout: Duration,
@@ -421,6 +417,7 @@ async fn start_generic_test_runner(
         results_handler,
         notify_manifest,
         notify_all_tests_run,
+        notify_cancellation,
         results_batch_size,
         context,
         shutdown_immediately,
@@ -459,6 +456,7 @@ async fn start_generic_test_runner(
         get_next_tests_bundle,
         results_handler,
         notify_all_tests_run,
+        notify_cancellation,
         debug_native_runner,
     )
     .await
@@ -504,6 +502,7 @@ async fn start_test_like_runner(
         notify_all_tests_run,
         context,
         notify_manifest,
+        notify_cancellation,
         ..
     } = env;
 
@@ -588,12 +587,8 @@ async fn start_test_like_runner(
             }
         }
         _ = shutdown_immediately => {
-            if matches!(runner, TestLikeRunner::NeverReturnOnTest(..)) {
-                return Err(GenericRunnerError::no_captures(
-                    io::Error::new(io::ErrorKind::Unsupported, "will not return test")
-                        .located(here!()),
-                ));
-            }
+            notify_cancellation.cancel().await;
+            return Ok(TestRunnerExit { exit_code: ExitCode::CANCELLED, native_runner_info: None, manifest_generation_output: None, final_captured_output: CapturedOutput::empty() });
         }
     }
 
@@ -809,7 +804,8 @@ mod test {
     use std::time::{Duration, Instant};
 
     use abq_generic_test_runner::{
-        StaticGetInitContext, StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        noop_notify_cancellation, StaticGetInitContext, StaticManifestCollector,
+        DEFAULT_PROTOCOL_VERSION_TIMEOUT,
     };
     use abq_test_utils::artifacts_dir;
     use abq_utils::auth::{ClientAuthStrategy, ServerAuthStrategy};
@@ -839,8 +835,8 @@ mod test {
     use tracing_test::traced_test;
 
     use super::{
-        GetNextTests, InitContextResult, NotifyCancellation, NotifyManifest,
-        NotifyMaterialTestsAllRun, TestsFetcher, WorkerContext, WorkerPool,
+        GetNextTests, InitContextResult, NotifyManifest, NotifyMaterialTestsAllRun, TestsFetcher,
+        WorkerContext, WorkerPool,
     };
     use crate::negotiate::QueueNegotiator;
     use crate::runner_strategy::{self, RunnerStrategy};
@@ -995,6 +991,7 @@ mod test {
                 get_next_tests: (self.get_next_tests_generator)(runner_entity),
                 results_handler: (self.results_handler_generator)(runner_entity),
                 notify_all_tests_run: (self.notify_all_tests_run_generator)(),
+                notify_cancellation: noop_notify_cancellation(),
             }
         }
     }
@@ -1004,7 +1001,6 @@ mod test {
         worker_pool_tag: WorkerTag,
         run_id: RunId,
         runner_strategy_generator: &'a StaticRunnerStrategy<'a>,
-        notify_cancellation: Box<dyn NotifyCancellation>,
     ) -> WorkerPoolConfig<'a> {
         WorkerPoolConfig {
             size: NonZeroUsize::new(1).unwrap(),
@@ -1015,7 +1011,6 @@ mod test {
             runner_kind,
             runner_strategy_generator,
             run_id,
-            notify_cancellation,
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
@@ -1068,15 +1063,6 @@ mod test {
         }
     }
 
-    fn noop_notify_cancellation() -> Box<dyn NotifyCancellation> {
-        struct Noop {}
-        #[async_trait]
-        impl NotifyCancellation for Noop {
-            async fn cancel(self: Box<Self>) {}
-        }
-        Box::new(Noop {})
-    }
-
     async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
         let (write_work, set_done, get_next_tests) = work_writer();
         let (results, results_handler_generator) = results_collector();
@@ -1105,7 +1091,6 @@ mod test {
             WorkerTag::new(0),
             run_id,
             &runner_strategy,
-            noop_notify_cancellation(),
         );
 
         let config = WorkerPoolConfig {
@@ -1381,7 +1366,6 @@ mod test {
             WorkerTag::new(0),
             RunId::unique(),
             &runner_strategy,
-            noop_notify_cancellation(),
         );
 
         let mut pool = WorkerPool::new(default_config).await;
@@ -1422,7 +1406,6 @@ mod test {
             WorkerTag::new(0),
             RunId::unique(),
             &runner_strategy,
-            noop_notify_cancellation(),
         );
 
         config.size = NonZeroUsize::new(5).unwrap();
@@ -1467,7 +1450,6 @@ mod test {
             WorkerTag::new(152),
             RunId::unique(),
             &runner_strategy,
-            noop_notify_cancellation(),
         );
 
         config.size = NonZeroUsize::new(3).unwrap();
@@ -1508,7 +1490,6 @@ mod test {
             WorkerTag::new(0),
             RunId::unique(),
             &runner_strategy,
-            noop_notify_cancellation(),
         );
 
         config.size = NonZeroUsize::new(1).unwrap();

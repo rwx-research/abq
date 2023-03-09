@@ -2,7 +2,9 @@
 
 use std::{io, net::SocketAddr, time::Duration};
 
-use abq_generic_test_runner::{GetNextTests, InitContextFetcher, ManifestSender};
+use abq_generic_test_runner::{
+    CancelNotifier, GetNextTests, InitContextFetcher, ManifestSender, NotifyCancellation,
+};
 use abq_utils::{
     net_async,
     net_protocol::{
@@ -32,6 +34,7 @@ pub struct RunnerStrategy {
     pub get_next_tests: GetNextTests,
     pub results_handler: ResultsHandler,
     pub notify_all_tests_run: NotifyMaterialTestsAllRun,
+    pub notify_cancellation: NotifyCancellation,
 }
 
 pub trait StrategyGenerator: Sync {
@@ -148,12 +151,20 @@ impl StrategyGenerator for RunnerStrategyGenerator {
             })
         };
 
+        let notify_cancellation = Box::new(OnlineCancelNotifier {
+            client: client.boxed_clone(),
+            entity: runner_entity,
+            run_id: run_id.clone(),
+            queue_addr: *queue_results_addr,
+        });
+
         RunnerStrategy {
             get_next_tests,
             results_handler,
             notify_all_tests_run,
             notify_manifest,
             get_init_context,
+            notify_cancellation,
         }
     }
 }
@@ -281,6 +292,48 @@ impl ManifestSender for SendManifestOnline {
             .await
             .unwrap();
         let net_protocol::queue::AckManifest {} =
+            net_protocol::async_read(&mut stream).await.unwrap();
+    }
+}
+
+struct OnlineCancelNotifier {
+    client: Box<dyn net_async::ConfiguredClient>,
+    entity: Entity,
+    run_id: RunId,
+    queue_addr: SocketAddr,
+}
+
+#[async_trait]
+impl CancelNotifier for OnlineCancelNotifier {
+    async fn cancel(self: Box<Self>) {
+        let Self {
+            client,
+            entity,
+            run_id,
+            queue_addr,
+        } = *self;
+
+        let mut stream = async_retry_n(5, Duration::from_secs(3), |attempt| {
+            if attempt > 1 {
+                tracing::info!(
+                    "reattempting connection to queue for cancellation {}",
+                    attempt
+                );
+            }
+            client.connect(queue_addr)
+        })
+        .await
+        .expect("queue server not available");
+
+        let message = net_protocol::queue::Request {
+            entity,
+            message: net_protocol::queue::Message::CancelRun(run_id),
+        };
+
+        net_protocol::async_write(&mut stream, &message)
+            .await
+            .unwrap();
+        let net_protocol::queue::AckTestCancellation {} =
             net_protocol::async_read(&mut stream).await.unwrap();
     }
 }

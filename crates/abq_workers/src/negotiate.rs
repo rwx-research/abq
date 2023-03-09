@@ -1,6 +1,5 @@
 //! Module negotiate helps worker pools attach to queues.
 
-use async_trait::async_trait;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -17,10 +16,7 @@ use tracing::{error, instrument};
 use crate::{
     negotiate,
     runner_strategy::RunnerStrategyGenerator,
-    workers::{
-        NotifyCancellation, WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit,
-        WorkersExitStatus,
-    },
+    workers::{WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus},
 };
 use abq_utils::{
     auth::User,
@@ -37,7 +33,6 @@ use abq_utils::{
         workers::{RunId, RunnerKind},
     },
     results_handler::SharedResultsHandler,
-    retry::async_retry_n,
     server_shutdown::ShutdownReceiver,
 };
 
@@ -225,14 +220,6 @@ impl WorkersNegotiator {
             test_timeout,
         } = workers_config;
 
-        // TODO each runner should get a different one of these.
-        let notify_cancellation = Box::new(CancelRunNotifier {
-            client: async_client.boxed_clone(),
-            entity: first_runner_entity,
-            run_id: run_id.clone(),
-            queue_addr: queue_results_addr,
-        });
-
         let some_runner_should_generate_manifest = match assigned {
             AssignedRun::Fresh {
                 should_generate_manifest,
@@ -260,7 +247,6 @@ impl WorkersNegotiator {
             results_batch_size_hint,
             worker_context,
             run_id,
-            notify_cancellation,
             debug_native_runner,
             protocol_version_timeout,
             test_timeout,
@@ -271,48 +257,6 @@ impl WorkersNegotiator {
         tracing::debug!("Started worker pool");
 
         Ok(NegotiatedWorkers::Pool(pool))
-    }
-}
-
-struct CancelRunNotifier {
-    client: Box<dyn net_async::ConfiguredClient>,
-    entity: Entity,
-    run_id: RunId,
-    queue_addr: SocketAddr,
-}
-
-#[async_trait]
-impl NotifyCancellation for CancelRunNotifier {
-    async fn cancel(self: Box<Self>) {
-        let Self {
-            client,
-            entity,
-            run_id,
-            queue_addr,
-        } = *self;
-
-        let mut stream = async_retry_n(5, Duration::from_secs(3), |attempt| {
-            if attempt > 1 {
-                tracing::info!(
-                    "reattempting connection to queue for cancellation {}",
-                    attempt
-                );
-            }
-            client.connect(queue_addr)
-        })
-        .await
-        .expect("queue server not available");
-
-        let message = net_protocol::queue::Request {
-            entity,
-            message: net_protocol::queue::Message::CancelRun(run_id),
-        };
-
-        net_protocol::async_write(&mut stream, &message)
-            .await
-            .unwrap();
-        let net_protocol::queue::AckTestCancellation {} =
-            net_protocol::async_read(&mut stream).await.unwrap();
     }
 }
 

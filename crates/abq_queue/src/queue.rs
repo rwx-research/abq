@@ -1025,7 +1025,7 @@ impl AllRuns {
         }
     }
 
-    pub fn mark_cancelled(&self, run_id: &RunId, reason: CancelReason) {
+    pub fn mark_cancelled(&self, run_id: &RunId, entity: Entity, reason: CancelReason) {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
@@ -1036,13 +1036,21 @@ impl AllRuns {
             | RunState::Cancelled { .. } => {
                 // legal cancellation states
             }
-            RunState::InitialManifestDone { .. } => {
+            RunState::InitialManifestDone { seen_workers, .. } => {
                 // Since we already have issued the full manifest out, don't mark this run as
                 // cancelled; this might be a stragling worker or a worker that cancelled an
                 // out-of-process retry.
                 tracing::info!(
                     ?run_id,
                     "refusing to cancel run whose manifest has already been exhausted"
+                );
+                // Mark the worker as now-inactive.
+                let old_tag = seen_workers.write().insert_by_tag(entity, false);
+                log_assert!(
+                    old_tag.is_some(),
+                    ?entity,
+                    ?run_id,
+                    "entity was not seen before it marked cancellation"
                 );
                 return;
             }
@@ -1636,7 +1644,7 @@ impl QueueServer {
         {
             // Mark the cancellation in the queue first, so that new queries from workers will be
             // told to terminate.
-            queues.mark_cancelled(&run_id, CancelReason::User);
+            queues.mark_cancelled(&run_id, entity, CancelReason::User);
         }
 
         Ok(())
@@ -2678,7 +2686,7 @@ mod test {
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
-        queues.mark_cancelled(&run_id, CancelReason::User);
+        queues.mark_cancelled(&run_id, Entity::runner(0, 1), CancelReason::User);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(
@@ -2699,11 +2707,13 @@ mod test {
         let persist_plan = queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
         assert!(persist_plan.is_some());
 
-        queues.mark_cancelled(&run_id, CancelReason::User);
+        queues.mark_cancelled(&run_id, Entity::runner(0, 1), CancelReason::User);
 
         assert!(matches!(
             queues.get_run_status(&run_id).unwrap(),
-            RunStatus::InitialManifestDone { .. },
+            RunStatus::InitialManifestDone {
+                num_active_workers: 0
+            },
         ));
     }
 
@@ -2721,7 +2731,7 @@ mod test {
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
-        queues.mark_cancelled(&run_id, CancelReason::User);
+        queues.mark_cancelled(&run_id, Entity::runner(0, 1), CancelReason::User);
 
         assert_eq!(queues.estimate_num_active_runs(), 0);
         assert!(matches!(

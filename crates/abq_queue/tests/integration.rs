@@ -2043,9 +2043,11 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
                 OpaqueRead,
                 OpaqueWrite(pack(InitSuccessMessage::new(proto))),
                 //
-                // Send result
-                OpaqueRead,
-                OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                // If we got a fast-exit message, die; otherwise, read + write the test result
+                IfOpaqueReadSocketAlive {
+                    then_do: vec![OpaqueWrite(pack(RawTestResultMessage::fake(proto)))],
+                    else_do: vec![Exit(0)],
+                },
             ],
         },
         Exit(0),
@@ -2087,11 +2089,13 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
         extra_env: Default::default(),
     });
 
+    let two = NonZeroUsize::try_from(2).unwrap();
+
     TestBuilder::default()
         .act([StartWorkers(
             Run(1),
             Wid(1),
-            WorkersConfigBuilder::new(1, runner1).with_num_workers(one_nonzero_usize()),
+            WorkersConfigBuilder::new(1, runner1).with_num_workers(two),
         )])
         .step(
             [
@@ -2130,7 +2134,7 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
         .act([StartWorkers(
             Run(1),
             Wid(2),
-            WorkersConfigBuilder::new(1, runner2).with_num_workers(one_nonzero_usize()),
+            WorkersConfigBuilder::new(1, runner2).with_num_workers(two),
         )])
         .step(
             [
@@ -2168,7 +2172,7 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
         .act([StartWorkers(
             Run(1),
             Wid(3),
-            WorkersConfigBuilder::new(1, runner3).with_num_workers(one_nonzero_usize()),
+            WorkersConfigBuilder::new(1, runner3).with_num_workers(two),
         )])
         .step(
             [

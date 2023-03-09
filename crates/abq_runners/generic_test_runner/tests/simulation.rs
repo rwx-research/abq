@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use abq_generic_test_runner::{
-    GenericRunnerError, GetNextTests, ImmediateTests, SendManifest, StaticGetInitContext,
-    StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
+    noop_notify_cancellation, GenericRunnerError, GetNextTests, ImmediateTests, SendManifest,
+    StaticGetInitContext, StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+    DEFAULT_RUNNER_TEST_TIMEOUT,
 };
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
@@ -111,6 +112,7 @@ fn get_simulated_runner(
         get_next_test,
         results_handler,
         Box::new(notify_all_tests_run),
+        noop_notify_cancellation(),
         false,
     );
 
@@ -211,6 +213,7 @@ fn run_simulated_runner_to_error(
         get_next_test,
         results_handler,
         Box::new(notify_all_tests_run),
+        noop_notify_cancellation(),
         false,
     )
     .unwrap_err();

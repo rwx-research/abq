@@ -36,7 +36,7 @@ use abq_utils::net_protocol::workers::{
     Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle, ReportedManifest, WorkId,
     WorkerTest, INIT_RUN_NUMBER,
 };
-use abq_utils::{atomic, net_protocol};
+use abq_utils::{atomic, log_assert_stderr, net_protocol};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use indoc::{formatdoc, indoc};
@@ -281,6 +281,13 @@ pub trait InitContextFetcher {
 
 pub type GetInitContext = Box<dyn InitContextFetcher + Send>;
 
+#[async_trait]
+pub trait CancelNotifier: Send {
+    async fn cancel(self: Box<Self>);
+}
+
+pub type NotifyCancellation = Box<dyn CancelNotifier>;
+
 pub type Outcome = Result<TestRunnerExit, GenericRunnerError>;
 
 pub fn run_sync(
@@ -296,6 +303,7 @@ pub fn run_sync(
     get_next_test_bundle: GetNextTests,
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
+    notify_cancellation: NotifyCancellation,
     debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
@@ -315,6 +323,7 @@ pub fn run_sync(
         get_next_test_bundle,
         results_handler,
         notify_all_tests_run,
+        notify_cancellation,
         debug_native_runner,
     ))
 }
@@ -531,6 +540,8 @@ impl<'a> NativeRunnerHandle<'a> {
             .write(&init_message)
             .await
             .located(here!())?;
+
+        self.state.conn.stream.shutdown().await.located(here!())?;
         let exit_status = self.state.child.wait().await.located(here!())?;
         Ok(exit_status.into())
     }
@@ -622,6 +633,7 @@ pub async fn run_async(
     get_next_test_bundle: GetNextTests,
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
+    notify_cancellation: NotifyCancellation,
     _debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     let NativeTestRunnerParams {
@@ -668,7 +680,9 @@ pub async fn run_async(
             result
         }
         shutdown_result = shutdown_immediately => {
-            assert!(shutdown_result.is_ok(), "somehow, shutdown-immediate resolved with an error prior to the native runner dying. This means the parent lost ownership of the runner prior to shutdown.");
+            log_assert_stderr!(shutdown_result.is_ok(), "somehow, shutdown-immediate resolved with an error prior to the native runner dying. This means the parent lost ownership of the runner prior to shutdown.");
+
+            notify_cancellation.cancel().await;
 
             // TODO: is there a reasonable way we can capture the output of the native runner after
             // cancellation here?
@@ -1471,6 +1485,7 @@ pub fn execute_wrapped_runner(
         get_next_test,
         results_handler,
         Box::new(|| async {}.boxed()),
+        noop_notify_cancellation(),
         false,
     );
 
@@ -1731,13 +1746,22 @@ impl InitContextFetcher for StaticGetInitContext {
     }
 }
 
+pub fn noop_notify_cancellation() -> NotifyCancellation {
+    struct Noop {}
+    #[async_trait]
+    impl CancelNotifier for Noop {
+        async fn cancel(self: Box<Self>) {}
+    }
+    Box::new(Noop {})
+}
+
 #[cfg(test)]
 #[cfg(feature = "test-abq-jest")]
 mod test_abq_jest {
     use crate::{
-        execute_wrapped_runner, notify_all_tests_run, run_sync, ImmediateTests,
-        StaticGetInitContext, StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT,
-        DEFAULT_RUNNER_TEST_TIMEOUT,
+        execute_wrapped_runner, noop_notify_cancellation, notify_all_tests_run, run_sync,
+        ImmediateTests, StaticGetInitContext, StaticManifestCollector,
+        DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
     };
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
@@ -1814,6 +1838,7 @@ mod test_abq_jest {
             get_next_test,
             results_handler,
             notify_all_tests_run,
+            noop_notify_cancellation(),
             false,
         )
         .unwrap();
@@ -1982,6 +2007,7 @@ mod test_abq_jest {
             Box::new(get_next_test),
             results_handler,
             notify_all_tests_run,
+            noop_notify_cancellation(),
             false,
         );
 
@@ -1999,8 +2025,9 @@ mod test_invalid_command {
     use std::sync::Arc;
 
     use crate::{
-        notify_all_tests_run, run_sync, GenericRunnerError, ImmediateTests, StaticGetInitContext,
-        StaticManifestCollector, DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
+        noop_notify_cancellation, notify_all_tests_run, run_sync, GenericRunnerError,
+        ImmediateTests, StaticGetInitContext, StaticManifestCollector,
+        DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
     };
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::work_server::InitContext;
@@ -2051,6 +2078,7 @@ mod test_invalid_command {
             Box::new(get_next_test),
             results_handler,
             notify_all_tests_run,
+            noop_notify_cancellation(),
             false,
         );
 
