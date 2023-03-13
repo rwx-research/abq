@@ -23,8 +23,8 @@ members = [
 ]
 
 [workspace.dependencies]
-serde = "1.0.152"
-serde_derive = "1.0.152"
+serde = "1.0.155"
+serde_derive = "1.0.155"
 serde_json = { version = "1.0.94", features = ["raw_value"] }
 
 rustls = "0.20.8"
@@ -42,7 +42,7 @@ tokio = { version = "1.26.0", features = [
   "process",
 ] }
 tokio-rustls = "0.23.4"
-futures = "0.3.26"
+futures = "0.3.27"
 
 parking_lot = "0.12.1"
 moka = { version = "0.10.0", features = ["future"] }
