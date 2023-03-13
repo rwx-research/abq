@@ -17,4 +17,4 @@ default-features = false
 features = ["blocking", "json", "rustls-tls"]
 
 [dev-dependencies]
-mockito = "0.32.5"
+mockito = "1.0.0"
