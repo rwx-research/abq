@@ -789,7 +789,7 @@ mod test {
         format_line_output_only_after, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
-        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
+        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 
@@ -808,7 +808,7 @@ mod test {
         format_line_output_only_after_only_stdout, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
-        &Some(CapturedOutput { stdout: b"stdout\nafter".to_vec(), stderr: b"".to_vec() }),
+        &Some(CapturedOutput { stderr: b"".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 

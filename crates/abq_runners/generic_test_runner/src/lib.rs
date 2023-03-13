@@ -15,11 +15,11 @@ use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
 use abq_utils::timeout_future::TimeoutFuture;
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
-use capture_output::OutputCapturer;
+use capture_output::{mux_output, MuxOutput, SideChannel};
 use message_buffer::RefillStrategy;
 
 use parking_lot::Mutex;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, Stderr, Stdout};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{self, ChildStderr, ChildStdout};
 
@@ -44,7 +44,6 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tracing::instrument;
 
-use crate::capture_output::capture_output;
 use crate::message_buffer::RecvMsg;
 
 mod buffered_results;
@@ -175,13 +174,13 @@ async fn retrieve_manifest<'a>(
                 let error = NativeTestRunnerError::from(failure.error).located(here!());
                 return Err(GenericRunnerError {
                     error,
-                    output: captured_output,
+                    output: captured_output.0,
                 });
             }
             Err(error) => {
                 return Err(GenericRunnerError {
                     error,
-                    output: captured_output,
+                    output: captured_output.0,
                 });
             }
         }
@@ -192,7 +191,7 @@ async fn retrieve_manifest<'a>(
         native_runner_protocol: native_runner.runner_info.protocol.get_version(),
         native_runner_specification: Box::new(native_runner.runner_info.specification.clone()),
     };
-    Ok((manifest, captured_output))
+    Ok((manifest, captured_output.0))
 }
 
 async fn retrieve_manifest_help(
@@ -480,7 +479,14 @@ impl<'a> NativeRunnerHandle<'a> {
         let mut capture_pipes = {
             let child_stdout = child.stdout.take().expect("just spawned");
             let child_stderr = child.stderr.take().expect("just spawned");
-            CapturePipes::new(child_stdout, child_stderr)
+
+            // TODO(doug): Copy output to parent streams only when using a single runner.
+            // let parent_stdout = Some(tokio::io::stdout());
+            // let parent_stderr = Some(tokio::io::stderr());
+            let parent_stdout = None;
+            let parent_stderr = None;
+
+            CapturePipes::new(child_stdout, parent_stdout, child_stderr, parent_stderr)
         };
 
         // First, get and validate the protocol version message.
@@ -495,6 +501,7 @@ impl<'a> NativeRunnerHandle<'a> {
                 let output = capture_pipes
                     .finish()
                     .await
+                    .map(|ct| ct.0)
                     .unwrap_or_else(|_| CapturedOutput::empty());
                 return Err(GenericRunnerError { error, output });
             }
@@ -767,6 +774,7 @@ async fn run_help(
         .capture_pipes
         .finish()
         .await
+        .map(|ct| ct.0)
         .unwrap_or_else(|_| CapturedOutput::empty());
 
     match opt_err {
@@ -1001,15 +1009,36 @@ pub enum NativeTestRunnerError {
 }
 
 struct CapturePipes {
-    stdout: OutputCapturer<ChildStdout>,
-    stderr: OutputCapturer<ChildStderr>,
+    stdout: MuxOutput<ChildStdout, Stdout>,
+    stderr: MuxOutput<ChildStderr, Stderr>,
+    combined_channel: SideChannel,
 }
 
 impl CapturePipes {
-    fn new(child_stdout: ChildStdout, child_stderr: ChildStderr) -> Self {
+    fn new(
+        child_stdout: ChildStdout,
+        parent_stdout: Option<Stdout>,
+        child_stderr: ChildStderr,
+        parent_stderr: Option<Stderr>,
+    ) -> Self {
+        let stdout_channel = SideChannel::default();
+        let stderr_channel = SideChannel::default();
+        let combined_channel = SideChannel::default();
+
         Self {
-            stdout: capture_output(child_stdout),
-            stderr: capture_output(child_stderr),
+            stdout: mux_output(
+                child_stdout,
+                parent_stdout,
+                stdout_channel,
+                combined_channel.clone(),
+            ),
+            stderr: mux_output(
+                child_stderr,
+                parent_stderr,
+                stderr_channel,
+                combined_channel.clone(),
+            ),
+            combined_channel,
         }
     }
 
@@ -1029,13 +1058,13 @@ impl CapturePipes {
         CapturedOutput { stderr, stdout }
     }
 
-    async fn finish(&mut self) -> io::Result<CapturedOutput> {
-        let OutputCapturer {
+    async fn finish(&mut self) -> io::Result<(CapturedOutput, Vec<u8>)> {
+        let MuxOutput {
             copied_all_output: copied_stdout,
             side_channel: side_stdout,
             ..
         } = &mut self.stdout;
-        let OutputCapturer {
+        let MuxOutput {
             copied_all_output: copied_stderr,
             side_channel: side_stderr,
             ..
@@ -1048,7 +1077,11 @@ impl CapturePipes {
         let stderr = side_stderr
             .finish()
             .expect("channel reference must be unique at this point");
-        Ok(CapturedOutput { stderr, stdout })
+        let combined = self
+            .combined_channel
+            .finish()
+            .expect("channel reference must be unique at this point");
+        Ok((CapturedOutput { stderr, stdout }, combined))
     }
 }
 
@@ -1223,7 +1256,7 @@ fn attach_pipe_output_to_test_results(test_results: &mut [TestResult], captured:
 }
 
 fn attach_pipe_output_to_test_result(test_result: &mut TestResult, captured: CapturedOutput) {
-    let CapturedOutput { stderr, stdout } = captured;
+    let CapturedOutput { stderr, stdout, .. } = captured;
     test_result.stdout = Some(stdout);
     test_result.stderr = Some(stderr);
 }
