@@ -211,8 +211,8 @@ mod test {
         assert_eq!(results, vec![results1, results2]);
     }
 
-    #[tokio::test]
     #[n_times(1000)]
+    #[tokio::test]
     async fn dump_and_load_results_after_eviction() {
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 1);
@@ -238,8 +238,8 @@ mod test {
         assert_eq!(results, vec![results1]);
     }
 
-    #[tokio::test]
     #[n_times(1000)]
+    #[tokio::test]
     async fn dump_and_load_results_multiple_concurrent() {
         const RUNS: usize = 10;
 

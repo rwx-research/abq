@@ -180,8 +180,8 @@ mod test {
         assert!(results.is_empty());
     }
 
-    #[tokio::test]
     #[n_times(10_000)]
+    #[tokio::test]
     async fn retrieve_is_linearized() {
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1);

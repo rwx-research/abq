@@ -2918,8 +2918,8 @@ mod test {
         ));
     }
 
-    #[tokio::test]
     #[n_times(1_000)]
+    #[tokio::test]
     #[with_protocol_version]
     async fn cancel_and_receive_manifest_concurrently() {
         let server_opts =
@@ -3001,8 +3001,8 @@ mod test {
         ));
     }
 
-    #[tokio::test]
     #[n_times(1_000)]
+    #[tokio::test]
     #[with_protocol_version]
     async fn receiving_cancellation_during_last_test_results_is_cancellation() {
         let run_id = RunId::unique();

@@ -156,8 +156,8 @@ mod test {
         build_persistence_plan, in_memory::InMemoryPersistor, make_persistence_task, ManifestView,
     };
 
-    #[tokio::test]
     #[n_times(1000)]
+    #[tokio::test]
     async fn eventually_persists() {
         let run_id = &RunId::unique();
         let test1 = WorkerTest::new(spec(1), INIT_RUN_NUMBER);

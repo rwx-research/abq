@@ -20,13 +20,14 @@ pub fn n_times(args: TokenStream, item: TokenStream) -> TokenStream {
     let name = fun.sig.ident.clone();
     let args = fun.sig.inputs.clone();
     let body = fun.block.clone();
+    let asyncness = fun.sig.asyncness;
     let visibility = &fun.vis;
     let attributes = fun.attrs;
 
     let new_fn = quote! {
         #(#attributes)*
-        #visibility fn #name(#args) {
-            for _ in 0..#n {
+        #visibility #asyncness fn #name(#args) {
+            for i in 0..#n {
                 #body
             }
         }

@@ -93,8 +93,8 @@ mod test {
 
     use super::LiveCount;
 
-    #[tokio::test]
     #[n_times(1_000)]
+    #[tokio::test]
     async fn smoke() {
         let count = 10;
 
@@ -114,8 +114,8 @@ mod test {
         handle.await.unwrap();
     }
 
-    #[tokio::test]
     #[n_times(1_000)]
+    #[tokio::test]
     async fn does_not_die_until_all_workers_die() {
         let count = 10;
 
@@ -141,8 +141,8 @@ mod test {
         let _ = signal;
     }
 
-    #[tokio::test]
     #[n_times(1_000)]
+    #[tokio::test]
     async fn fuzz_cancel_safety() {
         let count = 10;
 
