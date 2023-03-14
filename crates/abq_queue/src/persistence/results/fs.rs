@@ -11,7 +11,7 @@ use abq_utils::{
 use async_trait::async_trait;
 use tokio::{
     fs::{self, File},
-    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
     sync::Mutex,
 };
 
@@ -90,8 +90,11 @@ impl PersistResults for FilesystemPersistor {
 
         let fi = self.fds.get_or_insert(path).await?;
         let mut fi = fi.lock().await;
+
+        fi.seek(SeekFrom::End(0)).await.located(here!())?;
         fi.write_all(&packed).await.located(here!())?;
         fi.write_all(&[b'\n']).await.located(here!())?;
+        fi.flush().await.located(here!())?;
 
         Ok(())
     }
