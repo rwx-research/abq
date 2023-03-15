@@ -1,15 +1,10 @@
 use std::collections::HashMap;
-use std::{
-    fmt::Display,
-    io::{self},
-    path::PathBuf,
-    str::FromStr,
-    time::Duration,
-};
+use std::{fmt::Display, io, path::PathBuf, str::FromStr, time::Duration};
 
 use abq_dot_reporter::DotReporter;
 use abq_line_reporter::LineReporter;
 use abq_progress_reporter::ProgressReporter;
+use abq_quiet_reporter::QuietReporter;
 use abq_reporting::{colors::ColorProvider, CompletedSummary, ReportedResult, ReportingError};
 use abq_reporting::{
     output::{format_short_suite_summary, ShortSummary},
@@ -32,6 +27,8 @@ pub enum ReporterKind {
     Dot,
     /// Writes results to a progress bar and immediately prints output and failures
     Progress,
+    /// Silences stdout reporters, for use when redirected to parent stdio.
+    Quiet,
     /// Writes JUnit XML to a file
     JUnitXml(PathBuf),
     /// Writes RWX Test Results (https://github.com/rwx-research/test-results-schema/blob/main/v1.json) to a file
@@ -44,6 +41,7 @@ impl Display for ReporterKind {
             ReporterKind::Line => write!(f, "line"),
             ReporterKind::Dot => write!(f, "dot"),
             ReporterKind::Progress => write!(f, "progress"),
+            ReporterKind::Quiet => write!(f, "quiet"),
             ReporterKind::JUnitXml(path) => write!(f, "junit-xml={}", path.display()),
             ReporterKind::RwxV1Json(path) => write!(f, "rwx-v1-json={}", path.display()),
         }
@@ -58,6 +56,7 @@ impl FromStr for ReporterKind {
             "line" => Ok(Self::Line),
             "dot" => Ok(Self::Dot),
             "progress" => Ok(Self::Progress),
+            "quiet" => Ok(Self::Quiet),
             other => {
                 let mut splits = other.split('=');
                 let reporter = splits.next().filter(|reporter| !reporter.trim().is_empty());
@@ -288,6 +287,7 @@ pub fn reporter_from_kind(
                 opt_target,
             ))
         }
+        ReporterKind::Quiet => Box::new(QuietReporter::new()),
         ReporterKind::JUnitXml(path) => Box::new(JUnitXmlReporter {
             path,
             collector: abq_junit_xml::Collector::new(test_suite_name),
@@ -347,6 +347,11 @@ mod test_reporter_kind {
     #[test]
     fn parse_dot_reporter() {
         assert_eq!(ReporterKind::from_str("dot"), Ok(ReporterKind::Dot));
+    }
+
+    #[test]
+    fn parse_quiet_reporter() {
+        assert_eq!(ReporterKind::from_str("quiet"), Ok(ReporterKind::Quiet));
     }
 
     #[test]

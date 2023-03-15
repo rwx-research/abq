@@ -13,6 +13,7 @@ dependencies = [
  "abq_native_runner_simulation",
  "abq_progress_reporter",
  "abq_queue",
+ "abq_quiet_reporter",
  "abq_reporting",
  "abq_reporting_test_utils",
  "abq_run_n_times",
@@ -173,6 +174,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+]
+
+[[package]]
+name = "abq_quiet_reporter"
+version = "0.1.0"
+dependencies = [
+ "abq_reporting",
+ "abq_reporting_test_utils",
+ "abq_utils",
+ "insta",
+ "termcolor",
 ]
 
 [[package]]
