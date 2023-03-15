@@ -1,10 +1,4 @@
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    io::{self},
-    ops::Deref,
-    time::Duration,
-};
+use std::{borrow::Cow, collections::HashMap, io, ops::Deref, time::Duration};
 
 use crate::{colors::ColorProvider, ReportingError};
 use abq_utils::net_protocol::{
@@ -339,6 +333,12 @@ pub struct ShortSummary {
     pub failures_per_file: HashMap<String, u64>,
 }
 
+const ABQ_HEADER: &str = concat!(
+    "--------------------------------------------------------------------------------\n",
+    "------------------------------------- ABQ --------------------------------------\n",
+    "--------------------------------------------------------------------------------\n",
+);
+
 pub fn format_short_suite_summary(
     writer: &mut impl WriteColor,
     summary: ShortSummary,
@@ -354,6 +354,9 @@ pub fn format_short_suite_summary(
         num_retried,
         failures_per_file,
     } = summary;
+
+    writer.write_all(ABQ_HEADER.as_bytes())?;
+    writeln!(writer)?;
 
     with_color_spec(writer, &bold_spec(), |w| {
         write!(w, "Finished in ")?;
@@ -1161,6 +1164,10 @@ mod test {
         format_short_suite_summary_with_failing_and_retried, format_short_suite_summary,
         ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 12, num_retried: 15, failures_per_file: HashMap::from([("file2.rs".to_owned(), 10), ("file1.rs".to_owned(), 2)]) },
         @r###"
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
     <bold-green>100 tests<reset>, <bold-red>12 failures<reset>, <bold-yellow>15 retried<reset>
 
@@ -1174,6 +1181,10 @@ mod test {
         format_short_suite_summary_with_failing_without_retried, format_short_suite_summary,
         ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 10, num_retried: 0, failures_per_file: HashMap::from([("file2.rs".to_owned(), 6), ("file1.rs".to_owned(), 4)]) },
         @r###"
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
     <bold-green>100 tests<reset>, <bold-red>10 failures<reset>
 
@@ -1187,6 +1198,10 @@ mod test {
         format_short_suite_summary_with_no_failing_no_retried, format_short_suite_summary,
         ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 0, failures_per_file: HashMap::default() },
         @r###"
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
     <bold-green>100 tests<reset>, <>0 failures<reset>
     "###
@@ -1196,6 +1211,10 @@ mod test {
         format_short_suite_summary_with_no_failing_but_retried, format_short_suite_summary,
         ShortSummary { wall_time: Duration::from_secs(10), test_time: Duration::from_secs(9), num_tests: 100, num_failing: 0, num_retried: 10, failures_per_file: HashMap::default() },
         @r###"
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
     <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
     <bold-green>100 tests<reset>, <>0 failures<reset>, <bold-yellow>10 retried<reset>
     "###
