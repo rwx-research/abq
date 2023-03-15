@@ -812,26 +812,49 @@ impl InitSuccessMessage {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
-pub struct CapturedOutput {
-    pub stderr: Vec<u8>,
-    pub stdout: Vec<u8>,
+pub type ProcessOutput = Vec<u8>;
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct StdioOutput {
+    pub stderr: ProcessOutput,
+    pub stdout: ProcessOutput,
 }
 
-impl CapturedOutput {
+impl StdioOutput {
     pub fn empty() -> Self {
-        Self {
-            stderr: Default::default(),
-            stdout: Default::default(),
-        }
+        Default::default()
     }
+}
+
+impl From<CapturedOutput> for StdioOutput {
+    fn from(item: CapturedOutput) -> Self {
+        let CapturedOutput { stderr, stdout, .. } = item;
+        Self { stderr, stdout }
+    }
+}
+
+impl std::fmt::Debug for StdioOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdioOutput")
+            .field("stderr", &String::from_utf8_lossy(&self.stderr))
+            .field("stdout", &String::from_utf8_lossy(&self.stdout))
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct CapturedOutput {
+    pub stderr: ProcessOutput,
+    pub stdout: ProcessOutput,
+    pub combined: ProcessOutput,
 }
 
 impl std::fmt::Debug for CapturedOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CapturedOutput")
             .field("stderr", &String::from_utf8_lossy(&self.stderr))
-            .field("stdout", &&String::from_utf8_lossy(&self.stdout))
+            .field("stdout", &String::from_utf8_lossy(&self.stdout))
+            .field("combined", &String::from_utf8_lossy(&self.combined))
             .finish()
     }
 }
@@ -841,9 +864,11 @@ pub struct TestRunnerExit {
     pub exit_code: ExitCode,
     pub native_runner_info: Option<NativeRunnerInfo>,
     /// Output captured during manifest generation, if any.
-    pub manifest_generation_output: Option<CapturedOutput>,
-    /// Captured stdout/stderr after all tests have been run
-    pub final_captured_output: CapturedOutput,
+    pub manifest_generation_output: Option<StdioOutput>,
+    /// Captured stdout/stderr after all tests have been run.
+    pub final_stdio_output: StdioOutput,
+    /// All captured output from a runner process.
+    pub process_output: ProcessOutput,
 }
 
 #[cfg(test)]

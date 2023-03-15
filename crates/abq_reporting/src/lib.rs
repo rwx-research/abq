@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use abq_utils::net_protocol::{
     queue::NativeRunnerInfo,
-    runners::{CapturedOutput, TestResult},
+    runners::{StdioOutput, TestResult},
 };
 
 pub mod colors;
@@ -27,9 +27,9 @@ pub enum ReportingError {
 }
 
 pub struct ReportedResult {
-    pub output_before: Option<CapturedOutput>,
+    pub output_before: Option<StdioOutput>,
     pub test_result: TestResult,
-    pub output_after: Option<CapturedOutput>,
+    pub output_after: Option<StdioOutput>,
 }
 
 impl ReportedResult {

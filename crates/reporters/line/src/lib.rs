@@ -83,7 +83,7 @@ mod test {
     use abq_reporting::ReportedResult;
     use abq_utils::net_protocol::{
         entity::RunnerMeta,
-        runners::{CapturedOutput, Status, TestResult, TestResultSpec},
+        runners::{Status, StdioOutput, TestResult, TestResultSpec},
         workers::INIT_RUN_NUMBER,
     };
 
@@ -207,7 +207,7 @@ mod test {
                                 ..default_result()
                             },
                         ),
-                        output_before: Some(CapturedOutput {
+                        output_before: Some(StdioOutput {
                             stderr: b"test3-stderr".to_vec(),
                             stdout: b"test3-stdout".to_vec(),
                         }),

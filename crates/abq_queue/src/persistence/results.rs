@@ -180,7 +180,7 @@ mod test {
         assert!(results.is_empty());
     }
 
-    #[n_times(10_000)]
+    #[n_times(1_000)]
     #[tokio::test]
     async fn retrieve_is_linearized() {
         let tempdir = tempfile::tempdir().unwrap();

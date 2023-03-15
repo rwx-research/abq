@@ -12,8 +12,8 @@ use abq_utils::net_protocol::queue::{
     AssociatedTestResults, NativeRunnerInfo, RunAlreadyCompleted, TestSpec,
 };
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersion, CapturedOutput, ManifestMessage, NativeRunnerSpecification, OutOfBandError,
-    Status, TestId, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
+    AbqProtocolVersion, ManifestMessage, NativeRunnerSpecification, OutOfBandError, ProcessOutput,
+    Status, StdioOutput, TestId, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -116,9 +116,10 @@ impl WorkersExitStatus {
 pub struct WorkersExit {
     pub status: WorkersExitStatus,
     pub native_runner_info: Option<NativeRunnerInfo>,
-    pub manifest_generation_output: Option<(RunnerMeta, CapturedOutput)>,
-    /// Final captured output of each runner, after all tests were run on each runner.
-    pub final_captured_outputs: Vec<(RunnerMeta, CapturedOutput)>,
+    pub manifest_generation_output: Option<(RunnerMeta, StdioOutput)>,
+    /// Final output of each runner, after all tests were run on each runner.
+    pub final_stdio_outputs: Vec<(RunnerMeta, StdioOutput)>,
+    pub process_outputs: Vec<(RunnerMeta, ProcessOutput)>,
 }
 
 struct SignalRunnerCompletion {
@@ -264,7 +265,8 @@ impl WorkerPool {
 
         let mut errors = vec![];
         let mut highest_exit_code = ExitCode::new(0);
-        let mut final_captured_outputs = Vec::with_capacity(self.runners.len());
+        let mut final_stdio_outputs = Vec::with_capacity(self.runners.len());
+        let mut process_outputs = Vec::with_capacity(self.runners.len());
         let mut manifest_generation_output = None;
         let mut native_runner_info = None;
         for (runner_meta, runner_thread) in self.runners.iter_mut() {
@@ -275,11 +277,12 @@ impl WorkerPool {
                 .await
                 .expect("runner thread panicked rather than erroring");
 
-            let final_captured_output = match opt_err {
+            let (final_stdio_output, process_output) = match opt_err {
                 Ok(TestRunnerExit {
                     exit_code,
                     manifest_generation_output: this_manifest_output,
-                    final_captured_output,
+                    final_stdio_output,
+                    process_output,
                     native_runner_info: this_native_runner_info,
                 }) => {
                     native_runner_info = native_runner_info.or(this_native_runner_info);
@@ -294,7 +297,7 @@ impl WorkerPool {
                     // Choose the highest exit code of all the test runners this worker started to
                     // be the exit code of the worker.
                     highest_exit_code = exit_code.max(exit_code);
-                    final_captured_output
+                    (final_stdio_output, process_output)
                 }
                 Err(GenericRunnerError {
                     error: kind,
@@ -314,10 +317,11 @@ impl WorkerPool {
                     );
 
                     errors.push(kind.to_string());
-                    output
+                    (output, Default::default())
                 }
             };
-            final_captured_outputs.push((*runner_meta, final_captured_output));
+            final_stdio_outputs.push((*runner_meta, final_stdio_output));
+            process_outputs.push((*runner_meta, process_output));
         }
 
         let status = if !errors.is_empty() {
@@ -328,7 +332,8 @@ impl WorkerPool {
 
         WorkersExit {
             manifest_generation_output,
-            final_captured_outputs,
+            final_stdio_outputs,
+            process_outputs,
             status,
             native_runner_info,
         }
@@ -517,7 +522,8 @@ async fn start_test_like_runner(
             return Ok(TestRunnerExit {
                 exit_code: ExitCode::new(ec),
                 manifest_generation_output: None,
-                final_captured_output: CapturedOutput::empty(),
+                final_stdio_output: StdioOutput::empty(),
+                process_output: Default::default(),
                 native_runner_info: None,
             });
         }
@@ -539,7 +545,7 @@ async fn start_test_like_runner(
                 notify_manifest
                     .send_manifest(ManifestResult::TestRunnerError {
                         error: oob.to_string(),
-                        output: CapturedOutput::empty(),
+                        output: StdioOutput::empty(),
                     })
                     .await;
                 return Err(GenericRunnerError::no_captures(
@@ -563,7 +569,8 @@ async fn start_test_like_runner(
                 return Ok(TestRunnerExit {
                     exit_code,
                     manifest_generation_output: None,
-                    final_captured_output: CapturedOutput::empty(),
+                    final_stdio_output: StdioOutput::empty(),
+                    process_output: Default::default(),
                     native_runner_info: None,
                 });
             }
@@ -573,7 +580,8 @@ async fn start_test_like_runner(
             return Ok(TestRunnerExit {
                 exit_code: ExitCode::ABQ_ERROR,
                 manifest_generation_output: None,
-                final_captured_output: CapturedOutput::empty(),
+                final_stdio_output: StdioOutput::empty(),
+                process_output: Default::default(),
                 native_runner_info: None,
             });
         }
@@ -588,7 +596,7 @@ async fn start_test_like_runner(
         }
         _ = shutdown_immediately => {
             notify_cancellation.cancel().await;
-            return Ok(TestRunnerExit { exit_code: ExitCode::CANCELLED, native_runner_info: None, manifest_generation_output: None, final_captured_output: CapturedOutput::empty() });
+            return Ok(TestRunnerExit { exit_code: ExitCode::CANCELLED, native_runner_info: None, manifest_generation_output: None, final_stdio_output: StdioOutput::empty(), process_output: Default::default() });
         }
     }
 
@@ -597,7 +605,8 @@ async fn start_test_like_runner(
     Ok(TestRunnerExit {
         exit_code: ExitCode::SUCCESS,
         manifest_generation_output: None,
-        final_captured_output: CapturedOutput::empty(),
+        final_stdio_output: StdioOutput::empty(),
+        process_output: Default::default(),
         native_runner_info: None,
     })
 }
@@ -677,7 +686,7 @@ async fn test_like_runner_exec_loop(
                     work_id,
                     run_number,
                     results,
-                    before_any_test: CapturedOutput::empty(),
+                    before_any_test: StdioOutput::empty(),
                     after_all_tests: None,
                 };
 

@@ -14,9 +14,9 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, TestSpec};
 use abq_utils::net_protocol::runners::{
-    CapturedOutput, InitSuccessMessage, Manifest, ManifestMessage, NativeRunnerSpecification,
-    ProtocolWitness, RawNativeRunnerSpawnedMessage, RawTestResultMessage, Test, TestCase,
-    TestOrGroup, TestRunnerExit,
+    InitSuccessMessage, Manifest, ManifestMessage, NativeRunnerSpecification, ProtocolWitness,
+    RawNativeRunnerSpawnedMessage, RawTestResultMessage, StdioOutput, Test, TestCase, TestOrGroup,
+    TestRunnerExit,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -132,8 +132,8 @@ fn run_simulated_runner(
     get_next_test: GetNextTests,
 ) -> (
     Vec<AssociatedTestResults>,
-    Option<CapturedOutput>,
-    CapturedOutput,
+    Option<StdioOutput>,
+    StdioOutput,
     bool,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -146,10 +146,10 @@ fn run_simulated_runner(
     let runner_result = rt.block_on(runner_task);
 
     let TestRunnerExit {
-        final_captured_output,
+        final_stdio_output,
         manifest_generation_output,
         exit_code,
-        native_runner_info: _,
+        ..
     } = runner_result.unwrap();
 
     assert_eq!(exit_code, ExitCode::SUCCESS);
@@ -159,7 +159,7 @@ fn run_simulated_runner(
             .expect("outstanding refs to all results")
             .into_inner(),
         manifest_generation_output,
-        final_captured_output,
+        final_stdio_output,
         state.all_tests_run.load(atomic::ORDERING),
     )
 }
@@ -716,12 +716,7 @@ async fn cancellation_of_native_runner_succeeds() {
     let runner_handle = tokio::spawn(run_tests_task);
     state.shutdown.notify().unwrap();
     let runner_result = runner_handle.await.unwrap();
-    let TestRunnerExit {
-        exit_code,
-        native_runner_info: _,
-        manifest_generation_output: _,
-        final_captured_output: _,
-    } = runner_result.unwrap();
+    let TestRunnerExit { exit_code, .. } = runner_result.unwrap();
     assert_eq!(exit_code, ExitCode::CANCELLED);
 
     assert!(state.all_results.lock().is_empty());

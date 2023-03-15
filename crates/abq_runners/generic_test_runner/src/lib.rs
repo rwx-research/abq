@@ -28,8 +28,9 @@ use abq_utils::net_protocol::queue::{self, AssociatedTestResults, RunAlreadyComp
 use abq_utils::net_protocol::runners::{
     CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
     NativeRunnerSpawnedMessage, NativeRunnerSpecification, OutOfBandError, ProtocolWitness,
-    RawNativeRunnerSpawnedMessage, RawTestResultMessage, Status, TestCase, TestCaseMessage,
-    TestResult, TestResultSpec, TestRunnerExit, TestRuntime, ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
+    RawNativeRunnerSpawnedMessage, RawTestResultMessage, Status, StdioOutput, TestCase,
+    TestCaseMessage, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
+    ABQ_GENERATE_MANIFEST, ABQ_SOCKET,
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
@@ -145,7 +146,7 @@ macro_rules! try_setup {
     ($err:expr) => {
         $err.located(here!()).map_err(|e| GenericRunnerError {
             error: e,
-            output: CapturedOutput::empty(),
+            output: StdioOutput::empty(),
         })?
     };
 }
@@ -160,27 +161,27 @@ pub async fn wait_for_manifest(runner_conn: &mut RunnerConnection) -> io::Result
 #[instrument(level = "trace", skip(native_runner))]
 async fn retrieve_manifest<'a>(
     native_runner: &mut NativeRunnerHandle<'a>,
-) -> Result<(ReportedManifest, CapturedOutput), GenericRunnerError> {
+) -> Result<(ReportedManifest, StdioOutput), GenericRunnerError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
-    let (manifest, captured_output) = {
+    let (manifest, stdio_output) = {
         let manifest_result = retrieve_manifest_help(native_runner).await;
 
-        let captured_output = try_setup!(native_runner.capture_pipes.finish().await);
+        let final_stdio_output = try_setup!(native_runner.capture_pipes.finish().await);
 
         match manifest_result {
-            Ok(ManifestMessage::Success(manifest)) => (manifest.manifest, captured_output),
+            Ok(ManifestMessage::Success(manifest)) => (manifest.manifest, final_stdio_output),
             Ok(ManifestMessage::Failure(failure)) => {
                 let error = NativeTestRunnerError::from(failure.error).located(here!());
                 return Err(GenericRunnerError {
                     error,
-                    output: captured_output.0,
+                    output: final_stdio_output.into(),
                 });
             }
             Err(error) => {
                 return Err(GenericRunnerError {
                     error,
-                    output: captured_output.0,
+                    output: final_stdio_output.into(),
                 });
             }
         }
@@ -191,7 +192,7 @@ async fn retrieve_manifest<'a>(
         native_runner_protocol: native_runner.runner_info.protocol.get_version(),
         native_runner_specification: Box::new(native_runner.runner_info.specification.clone()),
     };
-    Ok((manifest, captured_output.0))
+    Ok((manifest, stdio_output.into()))
 }
 
 async fn retrieve_manifest_help(
@@ -231,7 +232,7 @@ pub enum GenericRunnerErrorKind {
 #[derive(Debug, Error)]
 pub struct GenericRunnerError {
     pub error: LocatedError,
-    pub output: CapturedOutput,
+    pub output: StdioOutput,
 }
 
 impl std::fmt::Display for GenericRunnerError {
@@ -244,7 +245,7 @@ impl GenericRunnerError {
     pub fn no_captures(kind: LocatedError) -> Self {
         Self {
             error: kind,
-            output: CapturedOutput::empty(),
+            output: StdioOutput::empty(),
         }
     }
 }
@@ -501,8 +502,8 @@ impl<'a> NativeRunnerHandle<'a> {
                 let output = capture_pipes
                     .finish()
                     .await
-                    .map(|ct| ct.0)
-                    .unwrap_or_else(|_| CapturedOutput::empty());
+                    .map(|ct| ct.into())
+                    .unwrap_or_default();
                 return Err(GenericRunnerError { error, output });
             }
         };
@@ -697,7 +698,8 @@ pub async fn run_async(
                 exit_code: ExitCode::CANCELLED,
                 native_runner_info: None,
                 manifest_generation_output: None,
-                final_captured_output: CapturedOutput::empty(),
+                final_stdio_output: Default::default(),
+                process_output: Default::default(),
             })
         }
     }
@@ -732,9 +734,9 @@ async fn run_help(
         };
 
         match manifest_or_error {
-            Ok(((manifest, captured_output), handle)) => {
+            Ok(((manifest, stdio_output), handle)) => {
                 native_runner_handle = handle;
-                manifest_generation_output = Some(captured_output);
+                manifest_generation_output = Some(stdio_output);
                 send_manifest
                     .send_manifest(ManifestResult::Manifest(manifest))
                     .await;
@@ -769,22 +771,29 @@ async fn run_help(
     )
     .await;
 
-    let output = native_runner_handle
+    let CapturedOutput {
+        stderr,
+        stdout,
+        combined,
+    } = native_runner_handle
         .state
         .capture_pipes
         .finish()
         .await
-        .map(|ct| ct.0)
-        .unwrap_or_else(|_| CapturedOutput::empty());
+        .unwrap_or_default();
 
     match opt_err {
         Ok(exit) => Ok(TestRunnerExit {
             exit_code: exit,
             native_runner_info: Some(native_runner_handle.get_native_runner_info()),
             manifest_generation_output,
-            final_captured_output: output,
+            final_stdio_output: StdioOutput { stderr, stdout },
+            process_output: combined,
         }),
-        Err(err) => Err(GenericRunnerError { error: err, output }),
+        Err(err) => Err(GenericRunnerError {
+            error: err,
+            output: StdioOutput { stderr, stdout },
+        }),
     }
 }
 
@@ -1042,23 +1051,23 @@ impl CapturePipes {
         }
     }
 
-    fn get_captured(&self) -> CapturedOutput {
+    fn get_captured(&self) -> StdioOutput {
         // NB: if we ever measure this to be compute-expensive, consider making `end_capture` async
         let stdout = self.stdout.side_channel.get_captured();
         let stderr = self.stderr.side_channel.get_captured();
 
-        CapturedOutput { stderr, stdout }
+        StdioOutput { stderr, stdout }
     }
 
     /// Like get_captured, but does not slice off the captured buffer.
-    fn get_captured_ref(&self) -> CapturedOutput {
+    fn get_captured_ref(&self) -> StdioOutput {
         let stdout = self.stdout.side_channel.get_captured_ref();
         let stderr = self.stderr.side_channel.get_captured_ref();
 
-        CapturedOutput { stderr, stdout }
+        StdioOutput { stderr, stdout }
     }
 
-    async fn finish(&mut self) -> io::Result<(CapturedOutput, Vec<u8>)> {
+    async fn finish(&mut self) -> io::Result<CapturedOutput> {
         let MuxOutput {
             copied_all_output: copied_stdout,
             side_channel: side_stdout,
@@ -1081,7 +1090,11 @@ impl CapturePipes {
             .combined_channel
             .finish()
             .expect("channel reference must be unique at this point");
-        Ok((CapturedOutput { stderr, stdout }, combined))
+        Ok(CapturedOutput {
+            stderr,
+            stdout,
+            combined,
+        })
     }
 }
 
@@ -1239,7 +1252,7 @@ async fn send_and_wait_for_test_results(
     })
 }
 
-fn attach_pipe_output_to_test_results(test_results: &mut [TestResult], captured: CapturedOutput) {
+fn attach_pipe_output_to_test_results(test_results: &mut [TestResult], captured: StdioOutput) {
     // Happier path: exactly one test result, we can hand over the output uniquely.
     // TODO: can we pass stdout/stderr to `TestResult` as borrowed for the purposes of sending?
     match test_results {
@@ -1255,8 +1268,8 @@ fn attach_pipe_output_to_test_results(test_results: &mut [TestResult], captured:
     }
 }
 
-fn attach_pipe_output_to_test_result(test_result: &mut TestResult, captured: CapturedOutput) {
-    let CapturedOutput { stderr, stdout, .. } = captured;
+fn attach_pipe_output_to_test_result(test_result: &mut TestResult, captured: StdioOutput) {
+    let StdioOutput { stderr, stdout, .. } = captured;
     test_result.stdout = Some(stdout);
     test_result.stderr = Some(stderr);
 }
@@ -1269,7 +1282,7 @@ async fn handle_native_runner_failure<'a, I>(
     results_chan: &ResultsChanRx,
     native_runner_args: NativeRunnerArgs<'a>,
     error: &NativeTestRunnerError,
-    final_output: CapturedOutput,
+    final_output: StdioOutput,
     estimated_time_to_failure: Duration,
     failed_on: WorkId,
     run_number: u32,
@@ -1525,7 +1538,7 @@ pub fn execute_wrapped_runner(
     if let Some(error) = Arc::try_unwrap(opt_error_cell).unwrap().into_inner() {
         return Err(GenericRunnerError {
             error: io::Error::new(io::ErrorKind::InvalidInput, error).located(here!()),
-            output: CapturedOutput::empty(),
+            output: StdioOutput::empty(),
         });
     }
 

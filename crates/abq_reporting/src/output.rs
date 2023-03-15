@@ -9,7 +9,7 @@ use std::{
 use crate::{colors::ColorProvider, ReportingError};
 use abq_utils::net_protocol::{
     entity::RunnerMeta,
-    runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
+    runners::{Status, StdioOutput, TestResult, TestResultSpec, TestRuntime},
 };
 use indoc::formatdoc;
 use termcolor::{Color, ColorSpec, WriteColor};
@@ -19,8 +19,8 @@ pub fn format_result_line(
     writer: &mut impl WriteColor,
     result: &TestResult,
     is_first_result: bool,
-    output_before: &Option<CapturedOutput>,
-    output_after: &Option<CapturedOutput>,
+    output_before: &Option<StdioOutput>,
+    output_after: &Option<StdioOutput>,
 ) -> io::Result<()> {
     if let Some(output_before) = output_before {
         if !is_first_result && would_write_output(Some(output_before)) {
@@ -73,7 +73,7 @@ pub enum SummaryKind<'a> {
     Output {
         when: OutputOrdering<'a>,
         runner: RunnerMeta,
-        output: CapturedOutput,
+        output: StdioOutput,
     },
 }
 
@@ -162,7 +162,7 @@ pub fn format_test_result_summary(
     writeln!(writer, ")")
 }
 
-pub fn would_write_output(output: Option<&CapturedOutput>) -> bool {
+pub fn would_write_output(output: Option<&StdioOutput>) -> bool {
     match output {
         Some(o) => !o.stderr.is_empty() || !o.stdout.is_empty(),
         None => false,
@@ -191,7 +191,7 @@ pub fn format_runner_output(
     writer: &mut impl io::Write,
     runner: RunnerMeta,
     when: OutputOrdering,
-    output: &CapturedOutput,
+    output: &StdioOutput,
 ) -> io::Result<()> {
     // --- [worker {worker_id}, runner {runner_id}] DURING|BEFORE|AFTER test_name ---
     // ----- STDOUT
@@ -204,7 +204,7 @@ pub fn format_runner_output(
         return Ok(());
     }
 
-    let CapturedOutput { stderr, stdout } = output;
+    let StdioOutput { stderr, stdout } = output;
 
     write!(writer, "--- ")?;
     format_runner_name(writer, runner)?;
@@ -244,7 +244,7 @@ pub fn format_runner_output(
 pub fn format_final_runner_output(
     writer: &mut impl io::Write,
     runner: RunnerMeta,
-    output: &CapturedOutput,
+    output: &StdioOutput,
 ) -> io::Result<()> {
     // --- [worker {worker_id}, runner {runner_id}] AFTER completion ---
     let after = "AFTER completion".to_string();
@@ -259,7 +259,7 @@ pub fn format_final_runner_output(
 pub fn format_manifest_generation_output(
     writer: &mut impl io::Write,
     runner: RunnerMeta,
-    output: &CapturedOutput,
+    output: &StdioOutput,
 ) -> io::Result<()> {
     // --- [worker {worker_id}, runner {runner_id}] MANIFEST GENERATION ---
     format_runner_output(
@@ -557,7 +557,7 @@ pub fn format_duration_to_partial_seconds(
 mod test {
     use abq_utils::net_protocol::{
         entity::{RunnerMeta, WorkerRunner},
-        runners::{CapturedOutput, Status, TestResult, TestResultSpec, TestRuntime},
+        runners::{Status, StdioOutput, TestResult, TestResultSpec, TestRuntime},
     };
 
     use super::{
@@ -713,8 +713,8 @@ mod test {
     test_format!(
         format_line_output_before_after, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
-        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
-        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
         @r###"
     --- [worker 0] BEFORE abq/test ---
     ----- STDOUT
@@ -740,7 +740,7 @@ mod test {
     test_format!(
         format_line_output_only_before, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
-        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
         &None,
         @r###"
     --- [worker 0] BEFORE abq/test ---
@@ -758,7 +758,7 @@ mod test {
     test_format!(
         format_line_output_only_before_only_stdout, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
-        &Some(CapturedOutput { stderr: b"".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &Some(StdioOutput { stderr: b"".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
         &None,
         @r###"
     --- [worker 0] BEFORE abq/test ---
@@ -773,7 +773,7 @@ mod test {
     test_format!(
         format_line_output_only_before_only_stderr, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
-        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"".to_vec() }),
         &None,
         @r###"
     --- [worker 0] BEFORE abq/test ---
@@ -789,7 +789,7 @@ mod test {
         format_line_output_only_after, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
-        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 
@@ -808,7 +808,7 @@ mod test {
         format_line_output_only_after_only_stdout, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
-        &Some(CapturedOutput { stderr: b"".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
+        &Some(StdioOutput { stderr: b"".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 
@@ -824,7 +824,7 @@ mod test {
         format_line_output_only_after_only_stderr, format_result_line,
         &TestResult::new(RunnerMeta::singleton(0),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &None,
-        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"".to_vec() }),
         @r###"
     abq/test: <yellow>skipped<reset>
 
@@ -839,8 +839,8 @@ mod test {
     test_format!(
         format_line_output_before_after_non_singleton, format_result_line,
         &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
-        &Some(CapturedOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
-        &Some(CapturedOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
+        &Some(StdioOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
         @r###"
     --- [worker 5, runner 6] BEFORE abq/test ---
     ----- STDOUT

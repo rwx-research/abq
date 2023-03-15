@@ -18,7 +18,7 @@ use abq_utils::net_protocol::queue::{
     TestResultsResponse, TestSpec,
 };
 use abq_utils::net_protocol::results::{self};
-use abq_utils::net_protocol::runners::{CapturedOutput, MetadataMap};
+use abq_utils::net_protocol::runners::{MetadataMap, StdioOutput};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
     Eow, ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
@@ -1775,8 +1775,8 @@ impl QueueServer {
         entity: Entity,
         run_id: RunId,
         manifest_result: Result<
-            NativeRunnerInfo,         /* empty manifest */
-            (String, CapturedOutput), /* error manifest */
+            NativeRunnerInfo,      /* empty manifest */
+            (String, StdioOutput), /* error manifest */
         >,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {

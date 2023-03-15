@@ -187,7 +187,7 @@ mod test {
     use abq_reporting_test_utils::{default_result, mock_summary, MockWriter};
     use abq_utils::net_protocol::{
         entity::RunnerMeta,
-        runners::{CapturedOutput, Status, TestResult, TestResultSpec},
+        runners::{Status, StdioOutput, TestResult, TestResultSpec},
         workers::INIT_RUN_NUMBER,
     };
     use indicatif::{ProgressDrawTarget, TermLike};
@@ -329,7 +329,7 @@ mod test {
                                 ..default_result()
                             },
                         ),
-                        output_before: Some(CapturedOutput {
+                        output_before: Some(StdioOutput {
                             stderr: b"test3-stderr".to_vec(),
                             stdout: b"test3-stdout".to_vec(),
                         }),
@@ -516,7 +516,7 @@ mod test {
                                 ..default_result()
                             },
                         ),
-                        output_before: Some(CapturedOutput {
+                        output_before: Some(StdioOutput {
                             stderr: b"test3-stderr".to_vec(),
                             stdout: b"test3-stdout".to_vec(),
                         }),

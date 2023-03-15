@@ -355,7 +355,7 @@ pub mod test {
     use abq_run_n_times::n_times;
     use abq_utils::net_protocol::{
         queue::{AssociatedTestResults, TestSpec},
-        runners::{CapturedOutput, Status, TestCase, TestId, TestResult},
+        runners::{Status, StdioOutput, TestCase, TestId, TestResult},
         workers::{Eow, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
     };
     use abq_with_protocol_version::with_protocol_version;
@@ -567,7 +567,7 @@ pub mod test {
             work_id,
             run_number,
             results: results.into_iter().collect(),
-            before_any_test: CapturedOutput::empty(),
+            before_any_test: StdioOutput::empty(),
             after_all_tests: None,
         }
     }

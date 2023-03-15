@@ -7,7 +7,7 @@ use abq_reporting::{
     },
     CompletedSummary, ReportedResult, Reporter, ReportingError,
 };
-use abq_utils::net_protocol::runners::{CapturedOutput, Status, TestResult};
+use abq_utils::net_protocol::runners::{Status, StdioOutput, TestResult};
 
 /// Max number of dots to print per line.
 const DOT_REPORTER_LINE_LIMIT: u64 = 80;
@@ -34,7 +34,7 @@ impl DotReporter {
     fn maybe_push_delayed_output(
         &mut self,
         test_result: &TestResult,
-        opt_output: &Option<CapturedOutput>,
+        opt_output: &Option<StdioOutput>,
         when: OutputOrdering<'static>,
     ) {
         if let Some(output) = opt_output.as_ref() {
@@ -124,7 +124,7 @@ mod test_dot_reporter {
     use abq_reporting::ReportedResult;
     use abq_utils::net_protocol::{
         entity::RunnerMeta,
-        runners::{CapturedOutput, Status, TestResult, TestResultSpec},
+        runners::{Status, StdioOutput, TestResult, TestResultSpec},
         workers::INIT_RUN_NUMBER,
     };
 
@@ -248,7 +248,7 @@ mod test_dot_reporter {
                                 ..default_result()
                             },
                         ),
-                        output_before: Some(CapturedOutput {
+                        output_before: Some(StdioOutput {
                             stderr: b"test3-stderr".to_vec(),
                             stdout: b"test3-stdout".to_vec(),
                         }),

@@ -216,8 +216,7 @@ pub mod workers {
     use super::{
         queue::TestSpec,
         runners::{
-            AbqProtocolVersion, CapturedOutput, Manifest, ManifestMessage,
-            NativeRunnerSpecification,
+            AbqProtocolVersion, Manifest, ManifestMessage, NativeRunnerSpecification, StdioOutput,
         },
     };
     use serde_derive::{Deserialize, Serialize};
@@ -434,7 +433,7 @@ pub mod workers {
             /// Opaque error message from the failing test runner.
             error: String,
             /// Captured stdout/stderr from the failing runner.
-            output: CapturedOutput,
+            output: StdioOutput,
         },
     }
 
@@ -451,7 +450,7 @@ pub mod queue {
         meta::DeprecationRecord,
         results::OpaqueLazyAssociatedTestResults,
         runners::{
-            AbqProtocolVersion, CapturedOutput, NativeRunnerSpecification, TestCase, TestResult,
+            AbqProtocolVersion, NativeRunnerSpecification, StdioOutput, TestCase, TestResult,
         },
         workers::{ManifestResult, RunId, WorkId},
     };
@@ -494,8 +493,8 @@ pub mod queue {
         pub work_id: WorkId,
         pub run_number: u32,
         pub results: Vec<TestResult>,
-        pub before_any_test: CapturedOutput,
-        pub after_all_tests: Option<CapturedOutput>,
+        pub before_any_test: StdioOutput,
+        pub after_all_tests: Option<StdioOutput>,
     }
 
     impl AssociatedTestResults {
@@ -509,7 +508,7 @@ pub mod queue {
                 work_id,
                 results,
                 run_number: 1,
-                before_any_test: CapturedOutput::empty(),
+                before_any_test: StdioOutput::empty(),
                 after_all_tests: None,
             }
         }

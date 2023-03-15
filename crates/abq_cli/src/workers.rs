@@ -6,7 +6,7 @@ use abq_reporting::CompletedSummary;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
 use abq_utils::net_protocol::queue::InvokeWork;
-use abq_utils::net_protocol::runners::CapturedOutput;
+use abq_utils::net_protocol::runners::StdioOutput;
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
@@ -107,7 +107,8 @@ async fn do_shutdown(
         status,
         native_runner_info,
         manifest_generation_output,
-        final_captured_outputs,
+        final_stdio_outputs,
+        ..
     } = worker_pool.shutdown().await;
 
     tracing::debug!("Workers shutdown");
@@ -117,7 +118,7 @@ async fn do_shutdown(
     if let Some((runner, manifest_output)) = manifest_generation_output {
         print_manifest_generation_output(runner, manifest_output);
     }
-    print_final_runner_outputs(final_captured_outputs);
+    print_final_runner_outputs(final_stdio_outputs);
 
     let completed_summary = CompletedSummary { native_runner_info };
 
@@ -153,23 +154,18 @@ async fn do_cancellation_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
     worker_pool.cancel().await;
 
     let WorkersExit {
-        status: _,
-        native_runner_info: _,
-        manifest_generation_output: _,
-        final_captured_outputs,
+        final_stdio_outputs,
+        ..
     } = worker_pool.shutdown().await;
 
     tracing::debug!("Workers cancelled");
 
-    print_final_runner_outputs(final_captured_outputs);
+    print_final_runner_outputs(final_stdio_outputs);
 
     std::process::exit(ExitCode::CANCELLED.get());
 }
 
-pub(crate) fn print_manifest_generation_output(
-    runner: RunnerMeta,
-    manifest_output: CapturedOutput,
-) {
+pub(crate) fn print_manifest_generation_output(runner: RunnerMeta, manifest_output: StdioOutput) {
     // NB: there is no reasonable way to surface the error at this point, since we are
     // about to shut down.
     let _opt_err = abq_reporting::output::format_manifest_generation_output(
@@ -180,7 +176,7 @@ pub(crate) fn print_manifest_generation_output(
 }
 
 pub(crate) fn print_final_runner_outputs(
-    final_captured_runner_outputs: Vec<(RunnerMeta, CapturedOutput)>,
+    final_captured_runner_outputs: Vec<(RunnerMeta, StdioOutput)>,
 ) {
     for (runner, runner_out) in final_captured_runner_outputs {
         // NB: there is no reasonable way to surface the error at this point, since we are

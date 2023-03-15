@@ -139,7 +139,8 @@ impl NegotiatedWorkers {
             &mut NegotiatedWorkers::Redundant { exit_code } => WorkersExit {
                 status: WorkersExitStatus::Completed(exit_code),
                 manifest_generation_output: None,
-                final_captured_outputs: Default::default(),
+                final_stdio_outputs: Default::default(),
+                process_outputs: Default::default(),
                 native_runner_info: None,
             },
             NegotiatedWorkers::Pool(pool) => pool.shutdown().await,
