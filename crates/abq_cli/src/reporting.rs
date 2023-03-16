@@ -4,7 +4,6 @@ use std::{fmt::Display, io, path::PathBuf, str::FromStr, time::Duration};
 use abq_dot_reporter::DotReporter;
 use abq_line_reporter::LineReporter;
 use abq_progress_reporter::ProgressReporter;
-use abq_quiet_reporter::QuietReporter;
 use abq_reporting::{colors::ColorProvider, CompletedSummary, ReportedResult, ReportingError};
 use abq_reporting::{
     output::{format_short_suite_summary, ShortSummary},
@@ -257,16 +256,16 @@ impl StdoutPreferences {
     }
 }
 
-pub fn reporter_from_kind(
+fn reporter_from_kind(
     kind: ReporterKind,
     stdout_preferences: StdoutPreferences,
     test_suite_name: &str,
-) -> Box<dyn Reporter> {
+) -> Option<Box<dyn Reporter>> {
     let stdout = stdout_preferences.stdout_stream();
 
     match kind {
-        ReporterKind::Line => Box::new(LineReporter::new(Box::new(stdout))),
-        ReporterKind::Dot => Box::new(DotReporter::new(Box::new(stdout))),
+        ReporterKind::Line => Some(Box::new(LineReporter::new(Box::new(stdout)))),
+        ReporterKind::Dot => Some(Box::new(DotReporter::new(Box::new(stdout)))),
         ReporterKind::Progress => {
             let color_provider = match stdout_preferences.color {
                 ColorChoice::Always | ColorChoice::AlwaysAnsi | ColorChoice::Auto => {
@@ -281,21 +280,21 @@ pub fn reporter_from_kind(
                 None
             };
 
-            Box::new(ProgressReporter::new(
+            Some(Box::new(ProgressReporter::new(
                 Box::new(stdout),
                 color_provider,
                 opt_target,
-            ))
+            )))
         }
-        ReporterKind::Quiet => Box::new(QuietReporter::new()),
-        ReporterKind::JUnitXml(path) => Box::new(JUnitXmlReporter {
+        ReporterKind::JUnitXml(path) => Some(Box::new(JUnitXmlReporter {
             path,
             collector: abq_junit_xml::Collector::new(test_suite_name),
-        }),
-        ReporterKind::RwxV1Json(path) => Box::new(RwxV1JsonReporter {
+        })),
+        ReporterKind::RwxV1Json(path) => Some(Box::new(RwxV1JsonReporter {
             path,
             collector: abq_rwx_v1_json::Collector::default(),
-        }),
+        })),
+        ReporterKind::Quiet => None,
     }
 }
 
@@ -306,7 +305,7 @@ pub fn build_reporters(
 ) -> Vec<Box<dyn Reporter>> {
     reporter_kinds
         .into_iter()
-        .map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
+        .filter_map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
         .collect()
 }
 

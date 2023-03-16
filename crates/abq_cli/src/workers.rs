@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -107,7 +108,7 @@ async fn do_shutdown(
         status,
         native_runner_info,
         manifest_generation_output,
-        final_stdio_outputs,
+        process_outputs,
         ..
     } = worker_pool.shutdown().await;
 
@@ -118,7 +119,21 @@ async fn do_shutdown(
     if let Some((runner, manifest_output)) = manifest_generation_output {
         print_manifest_generation_output(runner, manifest_output);
     }
-    print_final_runner_outputs(final_stdio_outputs);
+
+    // TODO(doug): Only do this if we haven't been streaming (eg. !runner.is_singleton)
+    let mut stdout = stdout_preferences.stdout_stream();
+    for (runner_meta, process_output) in process_outputs {
+        if process_output.is_empty() {
+            continue;
+        }
+        stdout
+            .write_fmt(format_args!(
+                "\n{:-^80}\n",
+                format!(" [{}] ", runner_meta.runner)
+            ))
+            .unwrap();
+        stdout.write_all(&process_output).unwrap();
+    }
 
     let completed_summary = CompletedSummary { native_runner_info };
 
@@ -129,9 +144,7 @@ async fn do_shutdown(
     }
 
     print!("\n\n");
-    suite_result
-        .write_short_summary_lines(&mut stdout_preferences.stdout_stream())
-        .unwrap();
+    suite_result.write_short_summary_lines(&mut stdout).unwrap();
 
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,
     // indicate the worker fault.
@@ -153,14 +166,9 @@ async fn do_shutdown(
 async fn do_cancellation_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
     worker_pool.cancel().await;
 
-    let WorkersExit {
-        final_stdio_outputs,
-        ..
-    } = worker_pool.shutdown().await;
+    let _ = worker_pool.shutdown().await;
 
     tracing::debug!("Workers cancelled");
-
-    print_final_runner_outputs(final_stdio_outputs);
 
     std::process::exit(ExitCode::CANCELLED.get());
 }
@@ -173,18 +181,4 @@ pub(crate) fn print_manifest_generation_output(runner: RunnerMeta, manifest_outp
         runner,
         &manifest_output,
     );
-}
-
-pub(crate) fn print_final_runner_outputs(
-    final_captured_runner_outputs: Vec<(RunnerMeta, StdioOutput)>,
-) {
-    for (runner, runner_out) in final_captured_runner_outputs {
-        // NB: there is no reasonable way to surface the error at this point, since we are
-        // about to shut down.
-        let _opt_err = abq_reporting::output::format_final_runner_output(
-            &mut std::io::stdout(),
-            runner,
-            &runner_out,
-        );
-    }
 }

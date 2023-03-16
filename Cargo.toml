@@ -18,7 +18,6 @@ members = [
   "crates/reporters/dot",
   "crates/reporters/line",
   "crates/reporters/progress",
-  "crates/reporters/quiet",
   "crates/reporters/junit_xml",
   "crates/reporters/rwx_v1_json",
 ]

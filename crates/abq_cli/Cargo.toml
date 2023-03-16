@@ -13,7 +13,6 @@ abq_hosted = { path = "../abq_hosted" }
 abq_dot_reporter = { path = "../reporters/dot" }
 abq_line_reporter = { path = "../reporters/line" }
 abq_progress_reporter = { path = "../reporters/progress" }
-abq_quiet_reporter = { path = "../reporters/quiet" }
 abq_junit_xml = { path = "../reporters/junit_xml" }
 abq_rwx_v1_json = { path = "../reporters/rwx_v1_json" }
 

@@ -341,6 +341,7 @@ struct NativeRunnerState {
     capture_pipes: CapturePipes,
     conn: RunnerConnection,
     runner_info: NativeRunnerInfo,
+    runner_meta: RunnerMeta,
     for_manifest_generation: bool,
 }
 
@@ -392,6 +393,7 @@ impl<'a> NativeRunnerHandle<'a> {
         args: NativeRunnerArgs<'a>,
         should_generate_manifest: bool,
         protocol_version_timeout: Duration,
+        runner_meta: RunnerMeta,
     ) -> Result<NativeRunnerHandle<'a>, GenericRunnerError> {
         let run_number = INIT_RUN_NUMBER;
         let native_runner_state = Self::new_native_runner(
@@ -399,6 +401,7 @@ impl<'a> NativeRunnerHandle<'a> {
             args,
             should_generate_manifest,
             protocol_version_timeout,
+            runner_meta,
         )
         .await?;
         Ok(Self {
@@ -439,6 +442,7 @@ impl<'a> NativeRunnerHandle<'a> {
         args: NativeRunnerArgs<'a>,
         should_generate_manifest: bool,
         protocol_version_timeout: Duration,
+        runner_meta: RunnerMeta,
     ) -> Result<NativeRunnerState, GenericRunnerError> {
         let our_addr = try_setup!(listener.local_addr());
 
@@ -481,11 +485,13 @@ impl<'a> NativeRunnerHandle<'a> {
             let child_stdout = child.stdout.take().expect("just spawned");
             let child_stderr = child.stderr.take().expect("just spawned");
 
-            // TODO(doug): Copy output to parent streams only when using a single runner.
-            // let parent_stdout = Some(tokio::io::stdout());
-            // let parent_stderr = Some(tokio::io::stderr());
-            let parent_stdout = None;
-            let parent_stderr = None;
+            // TODO(doug): Only enable when using the quiet reporter.
+            #[allow(clippy::overly_complex_bool_expr)]
+            let (parent_stdout, parent_stderr) = if false && runner_meta.is_singleton {
+                (Some(tokio::io::stdout()), Some(tokio::io::stderr()))
+            } else {
+                (None, None)
+            };
 
             CapturePipes::new(child_stdout, parent_stdout, child_stderr, parent_stderr)
         };
@@ -513,6 +519,7 @@ impl<'a> NativeRunnerHandle<'a> {
             capture_pipes,
             conn: runner_conn,
             runner_info,
+            runner_meta,
             for_manifest_generation: should_generate_manifest,
         })
     }
@@ -561,11 +568,14 @@ impl<'a> NativeRunnerHandle<'a> {
             return Ok(());
         }
 
+        let runner_meta = self.runner_meta;
+
         self.state = Self::new_native_runner(
             &mut self.listener,
             self.args,
             false,
             self.protocol_version_timeout,
+            runner_meta,
         )
         .await?;
 
@@ -594,6 +604,7 @@ impl<'a> NativeRunnerHandle<'a> {
         // TODO: record exit status, captures and pass it up when whole run completes.
         let _exit_status = self.state.child.wait().await.located(here!())?;
         let _captures = self.state.capture_pipes.get_captured();
+        let runner_meta = self.runner_meta;
 
         // Prime the new runner.
         self.state = Self::new_native_runner(
@@ -601,6 +612,7 @@ impl<'a> NativeRunnerHandle<'a> {
             self.args,
             false,
             self.protocol_version_timeout,
+            runner_meta,
         )
         .await
         .map_err(|e| e.error)?;
@@ -668,6 +680,7 @@ pub async fn run_async(
         native_runner_args,
         send_manifest.is_some(),
         protocol_version_timeout,
+        runner_meta,
     )
     .await;
 

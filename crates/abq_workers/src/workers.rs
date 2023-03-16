@@ -317,9 +317,26 @@ impl WorkerPool {
                     );
 
                     errors.push(kind.to_string());
-                    (output, Default::default())
+
+                    let combined = {
+                        let mut merge = Vec::new();
+
+                        if !output.stdout.is_empty() {
+                            merge.extend_from_slice(&output.stdout);
+                            merge.push(b'\n');
+                        }
+
+                        if !output.stderr.is_empty() {
+                            merge.extend_from_slice(&output.stderr);
+                            merge.push(b'\n');
+                        }
+                        merge
+                    };
+
+                    (output, combined)
                 }
             };
+
             final_stdio_outputs.push((*runner_meta, final_stdio_output));
             process_outputs.push((*runner_meta, process_output));
         }

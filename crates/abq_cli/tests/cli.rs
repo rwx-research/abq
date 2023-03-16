@@ -569,7 +569,10 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = Abq::new(name.to_string() + "_report").args(report_args).run();
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args)
+            .always_capture_stderr(true)
+            .run();
 
         assert!(exit_status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert!(stdout.contains("2 tests, 0 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
@@ -764,7 +767,10 @@ test_all_network_config_options! {
             stdout,
             stderr,
             exit_status,
-        } = Abq::new(name.to_string() + "_report").args(report_args).run();
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args)
+            .always_capture_stderr(true)
+            .run();
 
         assert!(!exit_status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
@@ -1036,6 +1042,7 @@ fn test_with_invalid_command() {
         exit_status,
     } = Abq::new(name.to_string() + "_report")
         .args(report_args)
+        .always_capture_stderr(true)
         .run();
 
     assert!(
@@ -1397,10 +1404,8 @@ test_all_network_config_options! {
 
         assert!(stdout.contains(
 r#"
---- [worker 0] AFTER completion ---
------ STDOUT
+----------------------------- [worker 0, runner 1] -----------------------------
 I failed catastrophically
------ STDERR
 For a reason explainable only by a backtrace
 "#.trim()), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
 
@@ -1420,7 +1425,10 @@ For a reason explainable only by a backtrace
             stdout,
             stderr,
             exit_status,
-        } = Abq::new(name.to_string() + "_report").args(report_args).run();
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args)
+            .always_capture_stderr(true)
+            .run();
 
         assert!(!exit_status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert!(stdout.contains("1 tests, 1 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
@@ -1583,6 +1591,7 @@ fn retries_smoke() {
         exit_status,
     } = Abq::new(name.to_string() + "_report")
         .args(report_args)
+        .always_capture_stderr(true)
         .run();
 
     assert!(
@@ -1738,6 +1747,7 @@ test_all_network_config_options! {
             exit_status,
         } = Abq::new(name.to_string() + "_report")
             .args(report_args)
+            .always_capture_stderr(true)
             .run();
 
         assert!(
@@ -1926,6 +1936,7 @@ fn out_of_process_retries_smoke() {
         exit_status,
     } = Abq::new(name.to_string() + "_report")
         .args(report_args)
+        .always_capture_stderr(true)
         .run();
 
     assert!(
@@ -2026,6 +2037,7 @@ fn report_while_run_in_progress_is_error() {
     let mut worker0 = Abq::new(format!("{name}_worker0"))
         .args(test_args(0))
         .env([("ABQ_LOG", "abq=debug")])
+        .always_capture_stderr(true)
         .spawn();
 
     wait_for_live_worker(worker0.stderr.as_mut().unwrap());
@@ -2049,6 +2061,7 @@ fn report_while_run_in_progress_is_error() {
         exit_status,
     } = Abq::new(name.to_string() + "_report")
         .args(report_args)
+        .always_capture_stderr(true)
         .run();
 
     assert!(
@@ -2222,6 +2235,7 @@ fn report_while_run_is_out_of_process_retried_is_error() {
         let worker0 = Abq::new(format!("{name}_worker0_retry"))
             .args(test_args(0))
             .env([("ABQ_LOG", "abq=debug")])
+            .always_capture_stderr(true)
             .spawn();
         (worker0, packed)
     };
@@ -2235,6 +2249,7 @@ fn report_while_run_is_out_of_process_retried_is_error() {
         exit_status,
     } = Abq::new(name.to_string() + "_report")
         .args(report_args())
+        .always_capture_stderr(true)
         .run();
 
     assert!(
