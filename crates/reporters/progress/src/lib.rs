@@ -98,10 +98,6 @@ impl ProgressReporter {
 }
 
 impl Reporter for ProgressReporter {
-    fn outputs_to_stdout(&self) -> bool {
-        true
-    }
-
     fn push_result(
         &mut self,
         run_number: u32,

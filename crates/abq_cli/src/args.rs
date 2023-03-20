@@ -215,12 +215,13 @@ pub enum Command {
         tls_key: Option<PathBuf>,
 
         /// Test result reporter to use for a test run. Options are:{n}
+        ///- default: pass-through native runner when using a single runner, otherwise "dot"{n}
         ///- dot: prints a dot for each test{n}
         ///- line: prints a line for each test{n}
         ///- progress: an interactive progress output{n}
         ///- junit-xml[=path/to/results.xml]: outputs a junit-compatible xml file to specified path. Defaults to ./abq-test-results.xml{n}
         ///- rwx-v1-json[=path/to/results.json]: outputs a rwx-v1-compatible json file to specified path. Defaults to ./abq-test-results.json
-        #[clap(long, default_value = "dot")]
+        #[clap(long, default_value = "default")]
         reporter: Vec<ReporterKind>,
 
         /// How many tests to send to a worker a time.

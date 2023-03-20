@@ -1380,6 +1380,7 @@ test_all_network_config_options! {
                 format!("--worker={worker}"),
                 format!("--queue-addr={queue_addr}"),
                 format!("--run-id={run_id}"),
+                format!("--reporter=dot"),
                 format!("-n=1"),
             ];
             let mut args = conf.extend_args_for_client(args);

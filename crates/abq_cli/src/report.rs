@@ -38,8 +38,10 @@ pub(crate) async fn report_results(
     stdout_preferences: StdoutPreferences,
     results_timeout: Duration,
 ) -> anyhow::Result<ExitCode> {
+    use crate::reporting::ONE;
+
     let test_suite_name = "suite"; // TODO: determine this correctly
-    let mut reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name);
+    let mut reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name, ONE);
     let mut overall_tracker = summary::SuiteTracker::new();
 
     let mut seen_work_ids = FnvHashSet::default();

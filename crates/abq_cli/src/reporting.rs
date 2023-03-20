@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::{fmt::Display, io, path::PathBuf, str::FromStr, time::Duration};
 
 use abq_dot_reporter::DotReporter;
@@ -20,27 +21,40 @@ static DEFAULT_JSON_PATH: &str = "abq-test-results.json";
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum ReporterKind {
+    /// When using a single runner and no ABQ reporters that output to stdout, pass through native
+    /// runner output. Otherwise, default to "dot" reporter.
+    Default,
     /// Writes results line-by-line to stdout
     Line,
     /// Writes results as dots to stdout
     Dot,
     /// Writes results to a progress bar and immediately prints output and failures
     Progress,
-    /// Silences stdout reporters, for use when redirected to parent stdio.
-    Quiet,
     /// Writes JUnit XML to a file
     JUnitXml(PathBuf),
     /// Writes RWX Test Results (https://github.com/rwx-research/test-results-schema/blob/main/v1.json) to a file
     RwxV1Json(PathBuf),
 }
 
+pub(crate) const ONE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(1) };
+
+impl ReporterKind {
+    pub fn outputs_to_stdout(&self, num_runners: NonZeroUsize) -> bool {
+        match self {
+            ReporterKind::Default => num_runners != ONE,
+            ReporterKind::Dot | ReporterKind::Line | ReporterKind::Progress => true,
+            ReporterKind::JUnitXml(_) | ReporterKind::RwxV1Json(_) => false,
+        }
+    }
+}
+
 impl Display for ReporterKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ReporterKind::Default => write!(f, "default"),
             ReporterKind::Line => write!(f, "line"),
             ReporterKind::Dot => write!(f, "dot"),
             ReporterKind::Progress => write!(f, "progress"),
-            ReporterKind::Quiet => write!(f, "quiet"),
             ReporterKind::JUnitXml(path) => write!(f, "junit-xml={}", path.display()),
             ReporterKind::RwxV1Json(path) => write!(f, "rwx-v1-json={}", path.display()),
         }
@@ -52,10 +66,10 @@ impl FromStr for ReporterKind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "default" => Ok(Self::Default),
             "line" => Ok(Self::Line),
             "dot" => Ok(Self::Dot),
             "progress" => Ok(Self::Progress),
-            "quiet" => Ok(Self::Quiet),
             other => {
                 let mut splits = other.split('=');
                 let reporter = splits.next().filter(|reporter| !reporter.trim().is_empty());
@@ -148,10 +162,6 @@ struct JUnitXmlReporter {
 }
 
 impl Reporter for JUnitXmlReporter {
-    fn outputs_to_stdout(&self) -> bool {
-        false
-    }
-
     fn push_result(
         &mut self,
         _run_number: u32,
@@ -190,10 +200,6 @@ struct RwxV1JsonReporter {
 }
 
 impl Reporter for RwxV1JsonReporter {
-    fn outputs_to_stdout(&self) -> bool {
-        false
-    }
-
     fn push_result(
         &mut self,
         _run_number: u32,
@@ -268,12 +274,20 @@ fn reporter_from_kind(
     kind: ReporterKind,
     stdout_preferences: StdoutPreferences,
     test_suite_name: &str,
+    any_reporters_output_to_stdout: bool,
 ) -> Option<Box<dyn Reporter>> {
     let stdout = stdout_preferences.stdout_stream();
 
     match kind {
-        ReporterKind::Line => Some(Box::new(LineReporter::new(Box::new(stdout)))),
+        ReporterKind::Default => {
+            if any_reporters_output_to_stdout {
+                Some(Box::new(DotReporter::new(Box::new(stdout))))
+            } else {
+                None
+            }
+        }
         ReporterKind::Dot => Some(Box::new(DotReporter::new(Box::new(stdout)))),
+        ReporterKind::Line => Some(Box::new(LineReporter::new(Box::new(stdout)))),
         ReporterKind::Progress => {
             let color_provider = match stdout_preferences.color {
                 ColorChoice::Always | ColorChoice::AlwaysAnsi | ColorChoice::Auto => {
@@ -302,7 +316,6 @@ fn reporter_from_kind(
             path,
             collector: abq_rwx_v1_json::Collector::default(),
         })),
-        ReporterKind::Quiet => None,
     }
 }
 
@@ -310,10 +323,21 @@ pub fn build_reporters(
     reporter_kinds: Vec<ReporterKind>,
     stdout_preferences: StdoutPreferences,
     test_suite_name: &str,
+    num_runners: NonZeroUsize,
 ) -> Vec<Box<dyn Reporter>> {
+    let any_reporters_output_to_stdout = reporter_kinds
+        .iter()
+        .any(|kind| kind.outputs_to_stdout(num_runners));
     reporter_kinds
         .into_iter()
-        .filter_map(|kind| reporter_from_kind(kind, stdout_preferences, test_suite_name))
+        .filter_map(|kind| {
+            reporter_from_kind(
+                kind,
+                stdout_preferences,
+                test_suite_name,
+                any_reporters_output_to_stdout,
+            )
+        })
         .collect()
 }
 
@@ -357,8 +381,8 @@ mod test_reporter_kind {
     }
 
     #[test]
-    fn parse_quiet_reporter() {
-        assert_eq!(ReporterKind::from_str("quiet"), Ok(ReporterKind::Quiet));
+    fn parse_default_reporter() {
+        assert_eq!(ReporterKind::from_str("default"), Ok(ReporterKind::Default));
     }
 
     #[test]

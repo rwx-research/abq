@@ -42,8 +42,15 @@ pub async fn start_workers_standalone(
     client_opts: ClientOptions,
 ) -> ! {
     let test_suite_name = "suite"; // TODO: determine this correctly
-    let reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name);
-    let has_stdout_reporters = reporters.iter().any(|r| r.outputs_to_stdout());
+    let has_stdout_reporters = reporter_kinds
+        .iter()
+        .any(|r| r.outputs_to_stdout(num_workers));
+    let reporters = build_reporters(
+        reporter_kinds,
+        stdout_preferences,
+        test_suite_name,
+        num_workers,
+    );
 
     let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
 
