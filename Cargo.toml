@@ -23,8 +23,8 @@ members = [
 ]
 
 [workspace.dependencies]
-serde = "1.0.155"
-serde_derive = "1.0.155"
+serde = "1.0.157"
+serde_derive = "1.0.157"
 serde_json = { version = "1.0.94", features = ["raw_value"] }
 
 rustls = "0.20.8"
@@ -58,17 +58,17 @@ tracing = { version = "0.1.37", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3.16", features = ["env-filter", "json"] }
 tracing-appender = "0.2.2"
 
-thiserror = "1.0.39"
-anyhow = "1.0.69"
+thiserror = "1.0.40"
+anyhow = "1.0.70"
 indoc = "2.0.1"
 
-clap = { version = "4.1.8", features = ["derive", "env"] }
+clap = { version = "4.1.11", features = ["derive", "env"] }
 atty = "0.2.14"
 num_cpus = "1.15.0"
 termcolor = "1.2.0"
 indicatif = "0.17.3"
 
-async-trait = "0.1.66"
+async-trait = "0.1.67"
 static_assertions = "1.1.0"
 derive_more = "0.99.17"
 
