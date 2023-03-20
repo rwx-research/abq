@@ -46,6 +46,8 @@ impl ReportedResult {
 ///
 /// A reporter is allowed to be side-effectful.
 pub trait Reporter: Send {
+    fn outputs_to_stdout(&self) -> bool;
+
     /// Consume the next test result.
     fn push_result(
         &mut self,

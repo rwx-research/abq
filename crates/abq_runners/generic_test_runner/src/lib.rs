@@ -485,9 +485,7 @@ impl<'a> NativeRunnerHandle<'a> {
             let child_stdout = child.stdout.take().expect("just spawned");
             let child_stderr = child.stderr.take().expect("just spawned");
 
-            // TODO(doug): Only enable when using the quiet reporter.
-            #[allow(clippy::overly_complex_bool_expr)]
-            let (parent_stdout, parent_stderr) = if false && runner_meta.is_singleton {
+            let (parent_stdout, parent_stderr) = if runner_meta.pipes_to_parent_stdio() {
                 (Some(tokio::io::stdout()), Some(tokio::io::stderr()))
             } else {
                 (None, None)

@@ -524,7 +524,7 @@ mod test {
         );
 
         collector.push_result(&TestResult::new(
-            RunnerMeta::new(WorkerRunner::new(3, 1), false),
+            RunnerMeta::new(WorkerRunner::new(3, 1), false, false),
             TestResultSpec {
                 status: Status::Success,
                 id: "id1".to_string(),
@@ -536,7 +536,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::new(WorkerRunner::new(2, 4), false),
+            RunnerMeta::new(WorkerRunner::new(2, 4), false, false),
             TestResultSpec {
                 status: Status::Failure {
                     exception: Some("test-exception".to_string()),
@@ -551,7 +551,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::new(WorkerRunner::new(1, 8), false),
+            RunnerMeta::new(WorkerRunner::new(1, 8), false, false),
             TestResultSpec {
                 status: Status::Error {
                     exception: None,
@@ -566,7 +566,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::new(WorkerRunner::new(0, 3), false),
+            RunnerMeta::new(WorkerRunner::new(0, 3), false, false),
             TestResultSpec {
                 status: Status::Pending,
                 id: "id4".to_string(),
@@ -578,7 +578,7 @@ mod test {
             },
         ));
         collector.push_result(&TestResult::new(
-            RunnerMeta::new(WorkerRunner::new(5, 1), false),
+            RunnerMeta::new(WorkerRunner::new(5, 1), false, false),
             TestResultSpec {
                 status: Status::Skipped,
                 id: "id5".to_string(),

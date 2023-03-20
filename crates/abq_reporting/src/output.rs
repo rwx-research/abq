@@ -167,6 +167,7 @@ fn format_runner_name(writer: &mut impl io::Write, runner: RunnerMeta) -> io::Re
     let RunnerMeta {
         runner,
         is_singleton,
+        ..
     } = runner;
 
     if is_singleton {
@@ -841,7 +842,7 @@ mod test {
 
     test_format!(
         format_line_output_before_after_non_singleton, format_result_line,
-        &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
+        &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false, false),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         &Some(StdioOutput { stderr: b"stderr\nbefore".to_vec(), stdout: b"stdout\nbefore\n".to_vec() }),
         &Some(StdioOutput { stderr: b"stderr\nafter".to_vec(), stdout: b"stdout\nafter\n".to_vec() }),
         @r###"
@@ -1133,7 +1134,7 @@ mod test {
     test_format!(
         format_summary_failure_non_singleton_runner, format_test_result_summary,
         attempt 1,
-        &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false, false),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
         @r###"
     --- abq/test: <red>FAILED<reset> ---
     Assertion failed: 1 != 2

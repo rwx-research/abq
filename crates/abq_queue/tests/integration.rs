@@ -128,6 +128,7 @@ impl WorkersConfigBuilder {
             local_results_handler: Box::new(NoopResultsHandler),
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
+            has_stdout_reporters: false,
             results_batch_size_hint: 1,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,

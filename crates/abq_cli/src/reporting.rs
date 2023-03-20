@@ -148,6 +148,10 @@ struct JUnitXmlReporter {
 }
 
 impl Reporter for JUnitXmlReporter {
+    fn outputs_to_stdout(&self) -> bool {
+        false
+    }
+
     fn push_result(
         &mut self,
         _run_number: u32,
@@ -186,6 +190,10 @@ struct RwxV1JsonReporter {
 }
 
 impl Reporter for RwxV1JsonReporter {
+    fn outputs_to_stdout(&self) -> bool {
+        false
+    }
+
     fn push_result(
         &mut self,
         _run_number: u32,

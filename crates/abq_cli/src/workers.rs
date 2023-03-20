@@ -43,6 +43,7 @@ pub async fn start_workers_standalone(
 ) -> ! {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name);
+    let has_stdout_reporters = reporters.iter().any(|r| r.outputs_to_stdout());
 
     let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
 
@@ -57,6 +58,7 @@ pub async fn start_workers_standalone(
         local_results_handler: Box::new(reporting_proxy),
         worker_context: context,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
+        has_stdout_reporters,
         protocol_version_timeout: abq_workers::DEFAULT_PROTOCOL_VERSION_TIMEOUT,
         test_timeout,
         results_batch_size_hint: batch_size.get(),
@@ -120,10 +122,9 @@ async fn do_shutdown(
         print_manifest_generation_output(runner, manifest_output);
     }
 
-    // TODO(doug): Only do this if we haven't been streaming (eg. !runner.is_singleton)
     let mut stdout = stdout_preferences.stdout_stream();
     for (runner_meta, process_output) in process_outputs {
-        if process_output.is_empty() {
+        if runner_meta.pipes_to_parent_stdio() || process_output.is_empty() {
             continue;
         }
         stdout

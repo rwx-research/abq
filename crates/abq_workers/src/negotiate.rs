@@ -105,6 +105,7 @@ pub struct WorkersConfig {
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,
     pub debug_native_runner: bool,
+    pub has_stdout_reporters: bool,
     pub protocol_version_timeout: Duration,
     pub test_timeout: Duration,
     /// Hint for how many test results should be sent back in a batch.
@@ -215,6 +216,7 @@ impl WorkersNegotiator {
             local_results_handler,
             worker_context,
             debug_native_runner,
+            has_stdout_reporters,
             results_batch_size_hint,
             max_run_number,
             protocol_version_timeout,
@@ -249,6 +251,7 @@ impl WorkersNegotiator {
             worker_context,
             run_id,
             debug_native_runner,
+            has_stdout_reporters,
             protocol_version_timeout,
             test_timeout,
         };
@@ -896,6 +899,7 @@ mod test {
             local_results_handler: Box::new(NoopResultsHandler),
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
+            has_stdout_reporters: false,
             results_batch_size_hint: 1,
             max_run_number: INIT_RUN_NUMBER,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,

@@ -114,22 +114,33 @@ pub mod entity {
         pub runner: WorkerRunner,
         /// Is this the only runner in the associated worker pool?
         pub is_singleton: bool,
+        /// Does this runner have any reporters that output to stdout?
+        pub has_stdout_reporters: bool,
     }
 
     impl RunnerMeta {
-        pub fn new(runner: impl Into<WorkerRunner>, is_singleton: bool) -> Self {
+        pub fn new(
+            runner: impl Into<WorkerRunner>,
+            is_singleton: bool,
+            has_stdout_reporters: bool,
+        ) -> Self {
             Self {
                 runner: runner.into(),
                 is_singleton,
+                has_stdout_reporters,
             }
         }
 
         pub fn singleton(worker: impl Into<WorkerTag>) -> Self {
-            Self::new(WorkerRunner::new(worker, 1), true)
+            Self::new(WorkerRunner::new(worker, 1), true, false)
         }
 
         pub fn fake() -> Self {
             Self::singleton(0)
+        }
+
+        pub fn pipes_to_parent_stdio(&self) -> bool {
+            self.is_singleton && !self.has_stdout_reporters
         }
     }
 

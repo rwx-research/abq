@@ -75,6 +75,8 @@ pub struct WorkerPoolConfig<'a> {
 
     /// Whether to allow passthrough of stdout/stderr from the native runner process.
     pub debug_native_runner: bool,
+    /// Whether any stdout reporters have been registered.
+    pub has_stdout_reporters: bool,
     /// The maximum amount of time to wait for the protocol version message.
     pub protocol_version_timeout: Duration,
     pub test_timeout: Duration,
@@ -147,6 +149,7 @@ impl WorkerPool {
             runner_strategy_generator,
             worker_context,
             debug_native_runner,
+            has_stdout_reporters,
             protocol_version_timeout,
             test_timeout,
         } = config;
@@ -176,7 +179,7 @@ impl WorkerPool {
                 Entity::runner(workers_tag, runner_id as u32)
             };
             let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(runner_id as u32));
-            let runner_meta = RunnerMeta::new(runner, is_singleton_runner);
+            let runner_meta = RunnerMeta::new(runner, is_singleton_runner, has_stdout_reporters);
 
             // Have the first runner generate the manifest, if applicable.
             let should_generate_manifest = some_runner_should_generate_manifest && runner_id == 1;
@@ -1039,6 +1042,7 @@ mod test {
             run_id,
             worker_context: WorkerContext::AssumeLocal,
             debug_native_runner: false,
+            has_stdout_reporters: false,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
         }
