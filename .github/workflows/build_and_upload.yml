@@ -15,7 +15,6 @@ on:
         options:
         - "v1"
         - "unstable"
-        - "develop"
 
   # for automatic release from main on the unstable release channel
   workflow_call:
