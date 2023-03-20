@@ -1881,11 +1881,7 @@ async fn retry_out_of_process_worker() {
             WorkersConfigBuilder::new(1, runner2),
         )])
         .step(
-            [
-                StopWorkers(Wid(2)),
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [StopWorkers(Wid(2)), WaitForCompletedRun(Run(1))],
             [
                 WorkerTestResults(
                     Run(1),
@@ -1899,26 +1895,29 @@ async fn retry_out_of_process_worker() {
                     Wid(2),
                     Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
                 ),
-                QueueTestResults(
-                    Run(1),
-                    Box::new(move |resp| match resp {
-                        TestResultsResponse::Results(r) => {
-                            let (results, summary) = flatten_queue_results(r);
-                            assert_eq!(
-                                results,
-                                [
-                                    (1, s!("echo1")),
-                                    (1, s!("echo1")),
-                                    (1, s!("echo2")),
-                                    (1, s!("echo2"))
-                                ]
-                            );
-                            assert_eq!(summary.manifest_size_nonce, 2);
-                        }
-                        _ => unreachable!("{resp:?}"),
-                    }),
-                ),
             ],
+        )
+        .step(
+            [WaitForNoPendingResults(Run(1))],
+            [QueueTestResults(
+                Run(1),
+                Box::new(move |resp| match resp {
+                    TestResultsResponse::Results(r) => {
+                        let (results, summary) = flatten_queue_results(r);
+                        assert_eq!(
+                            results,
+                            [
+                                (1, s!("echo1")),
+                                (1, s!("echo1")),
+                                (1, s!("echo2")),
+                                (1, s!("echo2"))
+                            ]
+                        );
+                        assert_eq!(summary.manifest_size_nonce, 2);
+                    }
+                    _ => unreachable!("{resp:?}"),
+                }),
+            )],
         )
         .test()
         .await;
