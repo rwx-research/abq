@@ -67,7 +67,6 @@ struct RunIdEnvironment {
     buildkite_build_id: Result<String, std::env::VarError>,
     circle_workflow_id: Result<String, std::env::VarError>,
     github_run_id: Result<String, std::env::VarError>,
-    github_run_attempt: Result<String, std::env::VarError>,
 }
 
 impl RunIdEnvironment {
@@ -78,7 +77,6 @@ impl RunIdEnvironment {
             buildkite_build_id: std::env::var("BUILDKITE_BUILD_ID"),
             circle_workflow_id: std::env::var("CIRCLE_WORKFLOW_ID"),
             github_run_id: std::env::var("GITHUB_RUN_ID"),
-            github_run_attempt: std::env::var("GITHUB_RUN_ATTEMPT"),
         }
     }
 }
@@ -201,7 +199,6 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
         buildkite_build_id,
         circle_workflow_id,
         github_run_id,
-        github_run_attempt,
     } = run_id_environment;
 
     if abq_run_id.is_ok() || ci.unwrap_or_else(|_| String::from("false")) == *"false" {
@@ -209,18 +206,7 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
     }
     // note: if you change this, change it in setup-abq, too
     // https://github.com/rwx-research/setup-abq/blob/8c5044343fceef53b4efea83d64062f006bf6758/src/index.ts#L23-L28
-    let github_actions_run_id = github_run_id.map({
-        |run_id| {
-            format!(
-                "{}-{}",
-                run_id,
-                github_run_attempt.unwrap_or_else(|_| String::from("1"))
-            )
-        }
-    });
-    let run_id_result = buildkite_build_id
-        .or(circle_workflow_id)
-        .or(github_actions_run_id);
+    let run_id_result = buildkite_build_id.or(circle_workflow_id).or(github_run_id);
     run_id_result.ok().map(RunId)
 }
 
@@ -641,7 +627,6 @@ mod test {
                 buildkite_build_id: Err(VarError::NotPresent),
                 circle_workflow_id: Err(VarError::NotPresent),
                 github_run_id: Err(VarError::NotPresent),
-                github_run_attempt: Err(VarError::NotPresent),
             }
         }
     }
@@ -692,22 +677,10 @@ mod test {
         let run_id = get_inferred_run_id(RunIdEnvironment {
             ci: Ok(String::from("true")),
             github_run_id: Ok(String::from("github-id")),
-            github_run_attempt: Ok(String::from("2")),
             ..Default::default()
         });
 
-        assert_eq!(run_id.unwrap(), RunId::from_str("github-id-2").unwrap());
-    }
-
-    #[test]
-    fn get_inferred_run_id_github_actions_no_attempt_envvar() {
-        let run_id = get_inferred_run_id(RunIdEnvironment {
-            ci: Ok(String::from("true")),
-            github_run_id: Ok(String::from("github-id")),
-            ..Default::default()
-        });
-
-        assert_eq!(run_id.unwrap(), RunId::from_str("github-id-1").unwrap());
+        assert_eq!(run_id.unwrap(), RunId::from_str("github-id").unwrap());
     }
 
     #[test]
