@@ -2153,7 +2153,6 @@ impl WorkScheduler {
                     // timing out the test run when the last test in the queue is handed out.
                     // However, the behavior could still be made better, in particular by
                     // re-enqueuing dropped tests.
-                    // See https://github.com/rwx-research/abq/issues/185.
                     opt_read_error.located(here!())?
                 }
             };

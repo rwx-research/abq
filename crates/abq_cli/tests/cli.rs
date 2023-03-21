@@ -675,10 +675,6 @@ test_all_network_config_options! {
         assert_eq!(code, 1);
 
         let stdout_lines = stdout.lines();
-        // TODO(130): add back once https://github.com/rwx-research/abq/issues/130 lands; right now
-        // this prints more than needed because we don't capture worker stdout/stderr
-        // assert_eq!(stdout_lines.next().unwrap(), "F");
-        // assert!(stderr.is_empty(), "{:?}", stderr);
         assert!(stdout_lines.into_iter().any(|line| line.contains('F')));
         assert!(stdout.contains("2 tests, 2 failures"), "STDOUT:\n{}", stdout);
     }
