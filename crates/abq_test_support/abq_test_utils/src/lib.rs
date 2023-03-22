@@ -80,12 +80,14 @@ pub fn sanitize_output(s: &str) -> String {
     let re_simulation_path = regex::Regex::new(r".*abqtest_native_runner_simulation.*").unwrap();
     let re_finished_seconds = regex::Regex::new(r"Finished in .*").unwrap();
     let re_generic_runner = regex::Regex::new(r"Generic test runner for .*").unwrap();
+    let re_ran_on_runner = regex::Regex::new(r", runner \d+").unwrap();
 
     let s = re_paths.replace_all(s, "at <stripped path>");
     let s = re_simulation_path.replace(&s, "<simulation cmd>");
     let s =
         re_finished_seconds.replace(&s, "Finished in XX seconds (XX seconds spent in test code)");
     let s = re_generic_runner.replace(&s, "Generic test runner started on <stripped>");
+    let s = re_ran_on_runner.replace_all(&s, ", runner X");
 
     s.into_owned()
 }

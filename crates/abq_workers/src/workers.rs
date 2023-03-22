@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use abq_generic_test_runner::{GenericRunnerError, GenericRunnerErrorKind, NotifyCancellation};
+use abq_utils::capture_output::CaptureChildOutputStrategy;
 use abq_utils::error::{here, ErrorLocation, LocatedError, Location};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{self, Entity, RunnerMeta, WorkerRunner, WorkerTag};
@@ -467,6 +468,9 @@ async fn start_generic_test_runner(
         WorkerContext::AlwaysWorkIn { working_dir } => working_dir,
     };
 
+    let child_output_strategy =
+        CaptureChildOutputStrategy::new(runner_meta.pipes_to_parent_stdio());
+
     // Running in its own thread.
     abq_generic_test_runner::run_async(
         runner_meta,
@@ -482,6 +486,7 @@ async fn start_generic_test_runner(
         results_handler,
         notify_all_tests_run,
         notify_cancellation,
+        Box::new(child_output_strategy),
         debug_native_runner,
     )
     .await

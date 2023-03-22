@@ -10,6 +10,7 @@ use abq_generic_test_runner::{
 };
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
+use abq_utils::capture_output::CaptureChildOutputStrategy;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, TestSpec};
@@ -99,6 +100,8 @@ fn get_simulated_runner(
 
     let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
+    let child_output_strategy = CaptureChildOutputStrategy::new(true);
+
     let runner_task = abq_generic_test_runner::run_async(
         RunnerMeta::fake(),
         input,
@@ -113,6 +116,7 @@ fn get_simulated_runner(
         results_handler,
         Box::new(notify_all_tests_run),
         noop_notify_cancellation(),
+        Box::new(child_output_strategy),
         false,
     );
 
@@ -200,6 +204,8 @@ fn run_simulated_runner_to_error(
 
     let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
+    let child_output_strategy = CaptureChildOutputStrategy::new(true);
+
     let err = abq_generic_test_runner::run_sync(
         RunnerMeta::fake(),
         input,
@@ -214,6 +220,7 @@ fn run_simulated_runner_to_error(
         results_handler,
         Box::new(notify_all_tests_run),
         noop_notify_cancellation(),
+        Box::new(child_output_strategy),
         false,
     )
     .unwrap_err();
@@ -673,7 +680,7 @@ fn native_runner_fails_while_executing_tests() {
 
         For a reason explainable only by a backtrace
 
-        Please see worker 0, runner 1 for more details.
+        Please see worker 0, runner X for more details.
         "###);
     }
 }

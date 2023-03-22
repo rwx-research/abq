@@ -226,10 +226,9 @@ pub mod entity {
 pub mod workers {
     use super::{
         queue::TestSpec,
-        runners::{
-            AbqProtocolVersion, Manifest, ManifestMessage, NativeRunnerSpecification, StdioOutput,
-        },
+        runners::{AbqProtocolVersion, Manifest, ManifestMessage, NativeRunnerSpecification},
     };
+    use crate::capture_output::StdioOutput;
     use serde_derive::{Deserialize, Serialize};
     use std::{
         collections::HashMap,
@@ -460,11 +459,10 @@ pub mod queue {
         entity::{Entity, Tag},
         meta::DeprecationRecord,
         results::OpaqueLazyAssociatedTestResults,
-        runners::{
-            AbqProtocolVersion, NativeRunnerSpecification, StdioOutput, TestCase, TestResult,
-        },
+        runners::{AbqProtocolVersion, NativeRunnerSpecification, TestCase, TestResult},
         workers::{ManifestResult, RunId, WorkId},
     };
+    use crate::capture_output::StdioOutput;
 
     /// Information about the queue and its negotiation server.
     #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -7,6 +7,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use abq_utils::capture_output::{
+    CaptureChildOutputStrategy, ChildOutputHandler, ChildOutputStrategyBox,
+};
 use abq_utils::error::{here, ErrorLocation, LocatedError, ResultLocation};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::error::FetchTestsError;
@@ -15,13 +18,12 @@ use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
 use abq_utils::timeout_future::TimeoutFuture;
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
-use capture_output::{mux_output, MuxOutput, SideChannel};
 use message_buffer::RefillStrategy;
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncWriteExt, Stderr, Stdout};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{self, ChildStderr, ChildStdout};
+use tokio::process;
 
 use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{self, AssociatedTestResults, RunAlreadyCompleted, TestSpec};
@@ -48,7 +50,6 @@ use tracing::instrument;
 use crate::message_buffer::RecvMsg;
 
 mod buffered_results;
-mod capture_output;
 mod message_buffer;
 
 pub struct GenericTestRunner;
@@ -167,7 +168,7 @@ async fn retrieve_manifest<'a>(
     let (manifest, stdio_output) = {
         let manifest_result = retrieve_manifest_help(native_runner).await;
 
-        let final_stdio_output = try_setup!(native_runner.capture_pipes.finish().await);
+        let final_stdio_output = try_setup!(native_runner.child_output.finish().await);
 
         match manifest_result {
             Ok(ManifestMessage::Success(manifest)) => (manifest.manifest, final_stdio_output),
@@ -304,6 +305,7 @@ pub fn run_sync(
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     notify_cancellation: NotifyCancellation,
+    child_output_strategy: ChildOutputStrategyBox,
     debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     let rt = try_setup!(tokio::runtime::Builder::new_current_thread()
@@ -324,6 +326,7 @@ pub fn run_sync(
         results_handler,
         notify_all_tests_run,
         notify_cancellation,
+        child_output_strategy,
         debug_native_runner,
     ))
 }
@@ -338,7 +341,7 @@ struct NativeRunnerArgs<'a> {
 
 struct NativeRunnerState {
     child: process::Child,
-    capture_pipes: CapturePipes,
+    child_output: ChildOutputHandler,
     conn: RunnerConnection,
     runner_info: NativeRunnerInfo,
     runner_meta: RunnerMeta,
@@ -348,14 +351,7 @@ struct NativeRunnerState {
 impl NativeRunnerState {
     async fn kill(&mut self) -> io::Result<()> {
         self.child.kill().await?;
-
-        // Close up the child pipes, replace them with the trivial task.
-        self.capture_pipes.stdout.copied_all_output.abort();
-        self.capture_pipes.stdout.copied_all_output = tokio::spawn(async { Ok(()) });
-
-        self.capture_pipes.stderr.copied_all_output.abort();
-        self.capture_pipes.stderr.copied_all_output = tokio::spawn(async { Ok(()) });
-
+        self.child_output.close();
         Ok(())
     }
 }
@@ -369,6 +365,8 @@ struct NativeRunnerHandle<'a> {
     run_number: u32,
     /// State of the native runner for the current [run_number].
     state: NativeRunnerState,
+    /// How to deal with the output pipes of our native runner child.
+    child_output_strategy: ChildOutputStrategyBox,
 }
 
 // Allow access to a current native runner's state directly through the handle.
@@ -394,14 +392,18 @@ impl<'a> NativeRunnerHandle<'a> {
         should_generate_manifest: bool,
         protocol_version_timeout: Duration,
         runner_meta: RunnerMeta,
+
+        child_output_strategy: ChildOutputStrategyBox,
     ) -> Result<NativeRunnerHandle<'a>, GenericRunnerError> {
         let run_number = INIT_RUN_NUMBER;
         let native_runner_state = Self::new_native_runner(
             &mut listener,
             args,
             should_generate_manifest,
+            false, // is not a retry at this point
             protocol_version_timeout,
             runner_meta,
+            &child_output_strategy,
         )
         .await?;
         Ok(Self {
@@ -410,6 +412,7 @@ impl<'a> NativeRunnerHandle<'a> {
             args,
             run_number,
             state: native_runner_state,
+            child_output_strategy,
         })
     }
 
@@ -441,8 +444,10 @@ impl<'a> NativeRunnerHandle<'a> {
         listener: &mut TcpListener,
         args: NativeRunnerArgs<'a>,
         should_generate_manifest: bool,
+        is_retry: bool,
         protocol_version_timeout: Duration,
         runner_meta: RunnerMeta,
+        child_output_strategy: &ChildOutputStrategyBox,
     ) -> Result<NativeRunnerState, GenericRunnerError> {
         let our_addr = try_setup!(listener.local_addr());
 
@@ -478,21 +483,11 @@ impl<'a> NativeRunnerHandle<'a> {
         // exiting silently itself.
         let mut child = try_setup!(native_runner.spawn());
 
-        // Set up capturing of the native runner's stdout/stderr.
-        // We want both standard pipes of the child to point to managed buffers from which
-        // we'll extract output when an individual test completes.
-        let mut capture_pipes = {
-            let child_stdout = child.stdout.take().expect("just spawned");
-            let child_stderr = child.stderr.take().expect("just spawned");
-
-            let (parent_stdout, parent_stderr) = if runner_meta.pipes_to_parent_stdio() {
-                (Some(tokio::io::stdout()), Some(tokio::io::stderr()))
-            } else {
-                (None, None)
-            };
-
-            CapturePipes::new(child_stdout, parent_stdout, child_stderr, parent_stderr)
-        };
+        let mut child_output = child_output_strategy.create(
+            child.stdout.take().expect("just spawned"),
+            child.stderr.take().expect("just spawned"),
+            is_retry,
+        );
 
         // First, get and validate the protocol version message.
         let opt_open_connection_err =
@@ -503,7 +498,7 @@ impl<'a> NativeRunnerHandle<'a> {
         let (runner_info, runner_conn) = match opt_open_connection_err {
             Ok(r) => r,
             Err(error) => {
-                let output = capture_pipes
+                let output = child_output
                     .finish()
                     .await
                     .map(|ct| ct.into())
@@ -514,7 +509,7 @@ impl<'a> NativeRunnerHandle<'a> {
 
         Ok(NativeRunnerState {
             child,
-            capture_pipes,
+            child_output,
             conn: runner_conn,
             runner_info,
             runner_meta,
@@ -571,9 +566,11 @@ impl<'a> NativeRunnerHandle<'a> {
         self.state = Self::new_native_runner(
             &mut self.listener,
             self.args,
-            false,
+            false, // don't generate manifest
+            false, // this is start-of-run, not a retry
             self.protocol_version_timeout,
             runner_meta,
+            &self.child_output_strategy,
         )
         .await?;
 
@@ -601,16 +598,21 @@ impl<'a> NativeRunnerHandle<'a> {
         self.state.conn.stream.shutdown().await.located(here!())?;
         // TODO: record exit status, captures and pass it up when whole run completes.
         let _exit_status = self.state.child.wait().await.located(here!())?;
-        let _captures = self.state.capture_pipes.get_captured();
+        let _captures = self.state.child_output.get_captured();
         let runner_meta = self.runner_meta;
 
         // Prime the new runner.
+        let should_generate_manifest = false;
+        let is_retry = true;
+
         self.state = Self::new_native_runner(
             &mut self.listener,
             self.args,
-            false,
+            should_generate_manifest,
+            is_retry,
             self.protocol_version_timeout,
             runner_meta,
+            &self.child_output_strategy,
         )
         .await
         .map_err(|e| e.error)?;
@@ -652,6 +654,7 @@ pub async fn run_async(
     results_handler: ResultsHandler,
     notify_all_tests_run: NotifyMaterialTestsAllRun,
     notify_cancellation: NotifyCancellation,
+    child_output_strategy: ChildOutputStrategyBox,
     _debug_native_runner: bool,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     let NativeTestRunnerParams {
@@ -679,6 +682,7 @@ pub async fn run_async(
         send_manifest.is_some(),
         protocol_version_timeout,
         runner_meta,
+        child_output_strategy,
     )
     .await;
 
@@ -788,7 +792,7 @@ async fn run_help(
         combined,
     } = native_runner_handle
         .state
-        .capture_pipes
+        .child_output
         .finish()
         .await
         .unwrap_or_default();
@@ -946,7 +950,7 @@ async fn execute_all_tests<'a>(
                         // steal the captured output when handling the error below for display
                         // in the returned overall error.
                         let _ = native_runner_handle.child.wait().await;
-                        let final_output = native_runner_handle.capture_pipes.get_captured_ref();
+                        let final_output = native_runner_handle.child_output.get_captured_ref();
 
                         handle_native_runner_failure(
                             runner_meta,
@@ -1026,87 +1030,6 @@ pub enum NativeTestRunnerError {
     OOBError(#[from] OutOfBandError),
     #[error("timed out running a test after {0} seconds")]
     TimedOut(u64),
-}
-
-struct CapturePipes {
-    stdout: MuxOutput<ChildStdout, Stdout>,
-    stderr: MuxOutput<ChildStderr, Stderr>,
-    combined_channel: SideChannel,
-}
-
-impl CapturePipes {
-    fn new(
-        child_stdout: ChildStdout,
-        parent_stdout: Option<Stdout>,
-        child_stderr: ChildStderr,
-        parent_stderr: Option<Stderr>,
-    ) -> Self {
-        let stdout_channel = SideChannel::default();
-        let stderr_channel = SideChannel::default();
-        let combined_channel = SideChannel::default();
-
-        Self {
-            stdout: mux_output(
-                child_stdout,
-                parent_stdout,
-                stdout_channel,
-                combined_channel.clone(),
-            ),
-            stderr: mux_output(
-                child_stderr,
-                parent_stderr,
-                stderr_channel,
-                combined_channel.clone(),
-            ),
-            combined_channel,
-        }
-    }
-
-    fn get_captured(&self) -> StdioOutput {
-        // NB: if we ever measure this to be compute-expensive, consider making `end_capture` async
-        let stdout = self.stdout.side_channel.get_captured();
-        let stderr = self.stderr.side_channel.get_captured();
-
-        StdioOutput { stderr, stdout }
-    }
-
-    /// Like get_captured, but does not slice off the captured buffer.
-    fn get_captured_ref(&self) -> StdioOutput {
-        let stdout = self.stdout.side_channel.get_captured_ref();
-        let stderr = self.stderr.side_channel.get_captured_ref();
-
-        StdioOutput { stderr, stdout }
-    }
-
-    async fn finish(&mut self) -> io::Result<CapturedOutput> {
-        let MuxOutput {
-            copied_all_output: copied_stdout,
-            side_channel: side_stdout,
-            ..
-        } = &mut self.stdout;
-        let MuxOutput {
-            copied_all_output: copied_stderr,
-            side_channel: side_stderr,
-            ..
-        } = &mut self.stderr;
-        copied_stdout.await.unwrap()?;
-        copied_stderr.await.unwrap()?;
-        let stdout = side_stdout
-            .finish()
-            .expect("channel reference must be unique at this point");
-        let stderr = side_stderr
-            .finish()
-            .expect("channel reference must be unique at this point");
-        let combined = self
-            .combined_channel
-            .finish()
-            .expect("channel reference must be unique at this point");
-        Ok(CapturedOutput {
-            stderr,
-            stdout,
-            combined,
-        })
-    }
 }
 
 type RunOneTestResult = Result<(), (WorkId, NativeTestRunnerError)>;
@@ -1193,7 +1116,7 @@ async fn send_and_wait_for_test_results(
     }
 
     // Grab the "before-any-test" output.
-    let before_any_test = native_runner.capture_pipes.get_captured();
+    let before_any_test = native_runner.child_output.get_captured();
 
     // Prime the "after-all-tests" output.
     // Today, this is empty by default, since in general we associate output outside of a test to
@@ -1211,7 +1134,7 @@ async fn send_and_wait_for_test_results(
 
     // stop capturing stdout after we receive a test result message, since it necessarily
     // corresponds to at least one test result notification
-    let mut captured = native_runner.capture_pipes.get_captured();
+    let mut captured = native_runner.child_output.get_captured();
 
     let results = match raw_msg.into_test_results(runner_meta) {
         TestResultSet::All(mut results) => {
@@ -1235,7 +1158,7 @@ async fn send_and_wait_for_test_results(
 
                         // Get the captured output for the test result that just completed, in
                         // `raw_increment`.
-                        captured = native_runner.capture_pipes.get_captured();
+                        captured = native_runner.child_output.get_captured();
 
                         step = raw_increment.into_step(runner_meta);
                     }
@@ -1529,6 +1452,8 @@ pub fn execute_wrapped_runner(
 
     let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
+    let child_output_strategy = CaptureChildOutputStrategy::new(true);
+
     let _opt_exit_error = run_sync(
         RunnerMeta::fake(),
         native_runner_params,
@@ -1543,6 +1468,7 @@ pub fn execute_wrapped_runner(
         results_handler,
         Box::new(|| async {}.boxed()),
         noop_notify_cancellation(),
+        Box::new(child_output_strategy),
         false,
     );
 
@@ -1820,6 +1746,7 @@ mod test_abq_jest {
         ImmediateTests, StaticGetInitContext, StaticManifestCollector,
         DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
     };
+    use abq_utils::capture_output::CaptureChildOutputStrategy;
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::queue::{RunAlreadyCompleted, TestSpec};
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
@@ -1882,6 +1809,8 @@ mod test_abq_jest {
 
         let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
+        let child_output_strategy = CaptureChildOutputStrategy::new(true);
+
         run_sync(
             RunnerMeta::fake(),
             input,
@@ -1896,6 +1825,7 @@ mod test_abq_jest {
             results_handler,
             notify_all_tests_run,
             noop_notify_cancellation(),
+            Box::new(child_output_strategy),
             false,
         )
         .unwrap();
@@ -2051,6 +1981,8 @@ mod test_abq_jest {
 
         let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
+        let child_output_strategy = CaptureChildOutputStrategy::new(true);
+
         let runner_result = run_sync(
             RunnerMeta::fake(),
             input,
@@ -2065,6 +1997,7 @@ mod test_abq_jest {
             results_handler,
             notify_all_tests_run,
             noop_notify_cancellation(),
+            Box::new(child_output_strategy),
             false,
         );
 
@@ -2086,6 +2019,7 @@ mod test_invalid_command {
         ImmediateTests, StaticGetInitContext, StaticManifestCollector,
         DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
     };
+    use abq_utils::capture_output::CaptureChildOutputStrategy;
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
@@ -2122,6 +2056,8 @@ mod test_invalid_command {
 
         let (_shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
 
+        let child_output_strategy = CaptureChildOutputStrategy::new(true);
+
         let runner_result = run_sync(
             RunnerMeta::fake(),
             input,
@@ -2136,6 +2072,7 @@ mod test_invalid_command {
             results_handler,
             notify_all_tests_run,
             noop_notify_cancellation(),
+            Box::new(child_output_strategy),
             false,
         );
 

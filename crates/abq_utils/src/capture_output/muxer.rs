@@ -1,13 +1,11 @@
-//! Utilities for multiplexing child output to parent stdout/stderr, and into managed buffers.
-#![allow(unused)]
-
 use std::borrow::BorrowMut;
+use std::io;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{pin::Pin, task};
 
 use parking_lot::Mutex;
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinHandle;
 
 struct Muxer<P>
@@ -81,24 +79,59 @@ pub struct MuxOutput<C, P> {
     _witness: PhantomData<(C, P)>,
 }
 
+pub struct MuxOutputConfig<Parent> {
+    prefix: &'static str,
+    parent: Option<Parent>,
+    side_channel: SideChannel,
+    combined_channel: SideChannel,
+}
+
+impl<Parent> MuxOutputConfig<Parent> {
+    pub fn new(
+        parent: Option<Parent>,
+        side_channel: SideChannel,
+        combined_channel: SideChannel,
+    ) -> Self {
+        Self {
+            prefix: "",
+            parent,
+            side_channel,
+            combined_channel,
+        }
+    }
+
+    pub fn with_prefix(self, prefix: &'static str) -> Self {
+        Self { prefix, ..self }
+    }
+}
+
 /// Multiplexes output from `child` to `parent` and into [SideChannel]s.
 /// Spawns a tokio task that completes when all output has been copied
 /// from the child to the parent.
 pub fn mux_output<Child, Parent>(
     mut child: Child,
-    parent: Option<Parent>,
-    side_channel: SideChannel,
-    combined_channel: SideChannel,
+    config: MuxOutputConfig<Parent>,
 ) -> MuxOutput<Child, Parent>
 where
     Child: AsyncRead + Unpin + Send + Sized + 'static,
     Parent: AsyncWrite + Unpin + Send + Sized + 'static,
 {
+    let MuxOutputConfig {
+        prefix,
+        parent,
+        side_channel,
+        combined_channel,
+    } = config;
+
     let copy_all_output_task = {
         let side_channels = vec![side_channel.clone(), combined_channel];
         async move {
             let mut mux_out = Muxer::new(parent, side_channels);
-            let _written_out = io::copy(&mut child, &mut mux_out).await?;
+
+            // Write leading header before we begin copying from the child.
+            tokio::io::AsyncWriteExt::write_all(&mut mux_out, prefix.as_bytes()).await?;
+
+            let _written_out = tokio::io::copy(&mut child, &mut mux_out).await?;
             io::Result::<()>::Ok(())
         }
     };
@@ -155,7 +188,7 @@ impl SideChannel {
 impl AsyncWrite for SideChannel {
     fn poll_write(
         self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
+        _cx: &mut task::Context<'_>,
         buf: &[u8],
     ) -> task::Poll<Result<usize, std::io::Error>> {
         self.write(buf);
@@ -164,14 +197,14 @@ impl AsyncWrite for SideChannel {
 
     fn poll_flush(
         self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
+        _cx: &mut task::Context<'_>,
     ) -> task::Poll<Result<(), std::io::Error>> {
         task::Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(
         self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
+        _cx: &mut task::Context<'_>,
     ) -> task::Poll<Result<(), std::io::Error>> {
         task::Poll::Ready(Ok(()))
     }
@@ -189,7 +222,7 @@ mod test {
     use parking_lot::{Mutex, MutexGuard};
     use tokio::io::{self, AsyncRead, AsyncWrite};
 
-    use super::{mux_output, MuxOutput, SideChannel};
+    use super::{mux_output, MuxOutput, MuxOutputConfig, SideChannel};
 
     #[derive(Default, Clone)]
     struct SharedBuf {
@@ -295,9 +328,11 @@ mod test {
             _witness,
         } = mux_output(
             inc.clone(),
-            Some(parent.clone()),
-            SideChannel::default(),
-            SideChannel::default(),
+            MuxOutputConfig::new(
+                Some(parent.clone()),
+                SideChannel::default(),
+                SideChannel::default(),
+            ),
         );
 
         {
@@ -322,9 +357,11 @@ mod test {
             _witness,
         } = mux_output(
             inc.clone(),
-            Some(parent.clone()),
-            SideChannel::default(),
-            SideChannel::default(),
+            MuxOutputConfig::new(
+                Some(parent.clone()),
+                SideChannel::default(),
+                SideChannel::default(),
+            ),
         );
 
         // First write - should end up in Capture 1
@@ -380,9 +417,7 @@ mod test {
             _witness,
         } = mux_output(
             inc.clone(),
-            Some(parent.clone()),
-            side1.clone(),
-            side2.clone(),
+            MuxOutputConfig::new(Some(parent.clone()), side1.clone(), side2.clone()),
         );
 
         inc.push_buf(&[1, 2, 3]);
@@ -405,7 +440,10 @@ mod test {
             copied_all_output,
             side_channel: _,
             _witness,
-        } = mux_output(inc.clone(), None::<SharedBuf>, side1.clone(), side2.clone());
+        } = mux_output(
+            inc.clone(),
+            MuxOutputConfig::new(None::<SharedBuf>, side1.clone(), side2.clone()),
+        );
 
         inc.push_buf(&[1, 2, 3]);
         inc.push_buf(&[4, 5, 6]);

@@ -1401,7 +1401,7 @@ test_all_network_config_options! {
 
         assert!(stdout.contains(
 r#"
------------------------------ [worker 0, runner 1] -----------------------------
+----------------------------- [worker 0, runner X] -----------------------------
 I failed catastrophically
 For a reason explainable only by a backtrace
 "#.trim()), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
@@ -1601,6 +1601,268 @@ fn retries_smoke() {
     );
 
     term(queue_proc);
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn retries_displays_retry_banners() {
+    let name = "retries_displays_retry_banners";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let attempts = 4;
+    let num_tests = 64;
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+
+    let mut queue_proc = Abq::new(name)
+        .args(conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]))
+        .spawn();
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start") {
+                break;
+            }
+        }
+    }
+
+    let mut manifest = vec![];
+
+    for t in 1..=num_tests {
+        manifest.push(TestOrGroup::test(Test::new(
+            proto,
+            t.to_string(),
+            [],
+            Default::default(),
+        )));
+    }
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: {
+                let mut run_tests = vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                ];
+
+                for _ in 0..num_tests {
+                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
+                    // faux result.
+                    // Otherwise assume we ran out of tests on our node and exit.
+                    run_tests.push(IfAliveReadAndWriteFake(Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    }));
+                }
+                run_tests
+            },
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+    let test_args = |worker: usize| {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = simfile_path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker={worker}"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("--retries={attempts}"),
+            format!("-n=1"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr: _,
+        exit_status,
+    } = Abq::new(format!("{name}_worker0")).args(test_args(0)).run();
+
+    assert!(!exit_status.success());
+
+    assert_sum_of_run_tests([stdout.as_str()], 64);
+    assert_sum_of_run_test_failures([stdout.as_str()], 64);
+    assert_sum_of_run_test_retries([stdout.as_str()], 64);
+
+    insta::assert_snapshot!(sanitize_output(&stdout));
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn retries_with_multiple_runners_on_one_worker_displays_retry_banner_at_end() {
+    let name = "retries_displays_retry_banners";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let attempts = 4;
+    let num_tests = 2;
+
+    let server_port = find_free_port();
+    let worker_port = find_free_port();
+    let negotiator_port = find_free_port();
+
+    let queue_addr = format!("0.0.0.0:{server_port}");
+
+    let mut queue_proc = Abq::new(name)
+        .args(conf.extend_args_for_start(vec![
+            format!("start"),
+            format!("--bind=0.0.0.0"),
+            format!("--port={server_port}"),
+            format!("--work-port={worker_port}"),
+            format!("--negotiator-port={negotiator_port}"),
+        ]))
+        .spawn();
+
+    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+    let mut queue_reader = BufReader::new(queue_stdout).lines();
+    // Spin until we know the queue is UP
+    loop {
+        if let Some(line) = queue_reader.next() {
+            let line = line.expect("line is not a string");
+            if line.contains("Run the following to start") {
+                break;
+            }
+        }
+    }
+
+    let mut manifest = vec![];
+
+    for t in 1..=num_tests {
+        manifest.push(TestOrGroup::test(Test::new(
+            proto,
+            t.to_string(),
+            [],
+            Default::default(),
+        )));
+    }
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: {
+                let mut run_tests = vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                ];
+
+                for _ in 0..num_tests {
+                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
+                    // faux result.
+                    // Otherwise assume we ran out of tests on our node and exit.
+                    run_tests.push(IfAliveReadAndWriteFake(Status::Failure {
+                        exception: None,
+                        backtrace: None,
+                    }));
+                }
+                run_tests
+            },
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let simulation_msg = pack_msgs(simulation);
+    let simfile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+    let simfile_path = simfile.to_path_buf();
+    std::fs::write(&simfile_path, simulation_msg).unwrap();
+
+    let test_args = |worker: usize| {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = simfile_path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker={worker}"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("--retries={attempts}"),
+            format!("-n=2"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr: _,
+        exit_status,
+    } = Abq::new(format!("{name}_worker0")).args(test_args(0)).run();
+
+    assert!(!exit_status.success());
+
+    assert_sum_of_run_tests([stdout.as_str()], 2);
+    assert_sum_of_run_test_failures([stdout.as_str()], 2);
+    assert_sum_of_run_test_retries([stdout.as_str()], 2);
+
+    // We should see at least `attempts - 1` RETRY headers.
+    // We may see more if there multiple runners on the worker are participating in the retries.
+    let mut start_search = 0;
+    for n in 1..=(attempts - 1) {
+        let found = stdout[start_search..].find("ABQ RETRY").unwrap_or_else(|| {
+            panic!("Retry header for {n}th attempt not found.\nSTDOUT:\n{stdout}")
+        });
+        start_search = found + 1;
+    }
 }
 
 test_all_network_config_options! {

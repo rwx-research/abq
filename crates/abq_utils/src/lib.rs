@@ -1,5 +1,6 @@
 pub mod atomic;
 pub mod auth;
+pub mod capture_output;
 pub mod decay;
 pub mod error;
 pub mod exit;
