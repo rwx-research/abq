@@ -342,6 +342,7 @@ struct NativeRunnerArgs<'a> {
 struct NativeRunnerState {
     child: process::Child,
     child_output: ChildOutputHandler,
+    previous_child_output: Option<CapturedOutput>,
     conn: RunnerConnection,
     runner_info: NativeRunnerInfo,
     runner_meta: RunnerMeta,
@@ -404,6 +405,7 @@ impl<'a> NativeRunnerHandle<'a> {
             protocol_version_timeout,
             runner_meta,
             &child_output_strategy,
+            None,
         )
         .await?;
         Ok(Self {
@@ -448,6 +450,7 @@ impl<'a> NativeRunnerHandle<'a> {
         protocol_version_timeout: Duration,
         runner_meta: RunnerMeta,
         child_output_strategy: &ChildOutputStrategyBox,
+        previous_child_output: Option<CapturedOutput>,
     ) -> Result<NativeRunnerState, GenericRunnerError> {
         let our_addr = try_setup!(listener.local_addr());
 
@@ -514,6 +517,7 @@ impl<'a> NativeRunnerHandle<'a> {
             runner_info,
             runner_meta,
             for_manifest_generation: should_generate_manifest,
+            previous_child_output,
         })
     }
 
@@ -571,6 +575,7 @@ impl<'a> NativeRunnerHandle<'a> {
             self.protocol_version_timeout,
             runner_meta,
             &self.child_output_strategy,
+            None,
         )
         .await?;
 
@@ -598,12 +603,18 @@ impl<'a> NativeRunnerHandle<'a> {
         self.state.conn.stream.shutdown().await.located(here!())?;
         // TODO: record exit status, captures and pass it up when whole run completes.
         let _exit_status = self.state.child.wait().await.located(here!())?;
-        let _captures = self.state.child_output.get_captured();
         let runner_meta = self.runner_meta;
+
+        let captured_output = self.state.child_output.finish().await.located(here!())?;
+        match &mut self.previous_child_output {
+            Some(previous_output) => previous_output.append(captured_output),
+            None => self.previous_child_output = Some(captured_output),
+        }
 
         // Prime the new runner.
         let should_generate_manifest = false;
         let is_retry = true;
+        let previous_child_output = self.previous_child_output.take();
 
         self.state = Self::new_native_runner(
             &mut self.listener,
@@ -613,6 +624,7 @@ impl<'a> NativeRunnerHandle<'a> {
             self.protocol_version_timeout,
             runner_meta,
             &self.child_output_strategy,
+            previous_child_output,
         )
         .await
         .map_err(|e| e.error)?;
@@ -786,16 +798,26 @@ async fn run_help(
     )
     .await;
 
-    let CapturedOutput {
-        stderr,
-        stdout,
-        combined,
-    } = native_runner_handle
+    let previous_output = native_runner_handle.state.previous_child_output.take();
+    let current_output = native_runner_handle
         .state
         .child_output
         .finish()
         .await
-        .unwrap_or_default();
+        .unwrap();
+    let captured_output = match previous_output {
+        Some(mut previous_output) => {
+            previous_output.append(current_output);
+            previous_output
+        }
+        None => current_output,
+    };
+
+    let CapturedOutput {
+        stderr,
+        stdout,
+        combined,
+    } = captured_output;
 
     match opt_err {
         Ok(exit) => Ok(TestRunnerExit {

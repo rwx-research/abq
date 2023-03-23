@@ -859,6 +859,14 @@ impl std::fmt::Debug for CapturedOutput {
     }
 }
 
+impl CapturedOutput {
+    pub fn append(&mut self, other: Self) {
+        self.stdout.extend(other.stdout);
+        self.stderr.extend(other.stderr);
+        self.combined.extend(other.combined);
+    }
+}
+
 #[derive(Debug)]
 pub struct TestRunnerExit {
     pub exit_code: ExitCode,
