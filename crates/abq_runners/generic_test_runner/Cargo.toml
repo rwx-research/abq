@@ -8,7 +8,7 @@ name = "abq_generic_test_runner"
 path = "src/lib.rs"
 
 [[bin]]
-name = "abq_worker_harness"
+name = "abq_tester_harness"
 path = "src/test_harness.rs"
 
 [dependencies]

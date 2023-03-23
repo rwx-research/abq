@@ -151,8 +151,12 @@ jobs:
           echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE"
           echo "RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
           echo "RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/abq_nightly_${{ matrix.deprecated-platform }}"
+
           echo "NEW_RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/${{ matrix.os }}/${{ matrix.architecture }}/abq"
           echo "NEW_RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/${{ matrix.os }}/${{ matrix.architecture }}/abq"
+
+          echo "NEW_RELEASE_S3_OBJECT_TESTER_HARNESS=abq/${ABQ_VERSION}/${{ matrix.os }}/${{ matrix.architecture }}/abq_tester_harness"
+          echo "NEW_RELEASE_S3_NIGHTLY_OBJECT_TESTER_HARNESS=abq/nightly/${{ matrix.os }}/${{ matrix.architecture }}/abq_tester_harness"
           } >> "$GITHUB_ENV"
 
       - name: Move release to consistent directory
@@ -160,8 +164,10 @@ jobs:
           mkdir "${RELEASE_DIR}"
           if [ -z "${{ matrix.cross-target }}" ]; then
             cp target/release/abq "${RELEASE_DIR}/"
+            cp target/release/abq_tester_harness "${RELEASE_DIR}/"
           else
             cp target/${{ matrix.cross-target }}/release/abq "${RELEASE_DIR}/"
+            cp target/release/abq_tester_harness "${RELEASE_DIR}/"
           fi
 
       - name: Sign & Notarize Release

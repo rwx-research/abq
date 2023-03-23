@@ -142,8 +142,12 @@ jobs:
             echo "RELEASE_ARCHIVE=$RELEASE_ARCHIVE"
             echo "RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
             echo "RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/abq_nightly_linux_x86-64"
+
             echo "NEW_RELEASE_S3_OBJECT=abq/${ABQ_VERSION}/linux/x86_64/abq"
             echo "NEW_RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/linux/x86_64/abq"
+
+            echo "NEW_RELEASE_S3_OBJECT_TESTER_HARNESS=abq/${ABQ_VERSION}/linux/x86_64/abq_tester_harness"
+            echo "NEW_RELEASE_S3_NIGHTLY_OBJECT_TESTER_HARNESS=abq/nightly/linux/x86_64/abq_tester_harness"
           } >> "$GITHUB_ENV"
 
       - name: Prepare release
@@ -151,6 +155,7 @@ jobs:
         run: |
           mkdir "${RELEASE_DIR}"
           cp "target/$RUST_TARGET/release-unstable/abq" "${RELEASE_DIR}"
+          cp "target/$RUST_TARGET/release-unstable/abq_tester_harness" "${RELEASE_DIR}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
           echo "filesize=$(wc -c "$RELEASE_ARCHIVE" | awk '{ print $1}')" >> "$GITHUB_OUTPUT"
 

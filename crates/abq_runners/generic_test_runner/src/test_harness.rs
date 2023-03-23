@@ -26,18 +26,22 @@ enum Command {
     /// A non-zero exit code indicates some failure. In the future we'll try to print a nice
     /// diagnostic message in such cases.
     E2e {
-        /// Native runner executable.
+        /// File to write the JSON test output to.
         #[clap(long, required = true)]
-        cmd: String,
+        results: PathBuf,
 
-        /// Arguments to the native runner.
-        #[clap(long, required = false)]
-        args: Vec<String>,
+        /// File to write the manifest output to.
+        #[clap(long, required = true)]
+        manifest: PathBuf,
 
         /// Working directory the native runner should run in.
         /// When not specified, uses cwd this executable is running in.
         #[clap(long, required = false)]
         working_dir: Option<PathBuf>,
+
+        /// Arguments to the test executable.
+        #[clap(required = true, num_args = 1.., allow_hyphen_values = true, last = true)]
+        args: Vec<String>,
     },
 
     /// Starts a server waiting for a manifest from a native test runner.
@@ -59,14 +63,17 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::E2e {
-            cmd,
-            args,
             working_dir,
+            results,
+            manifest,
+            mut args,
         } => {
             let working_dir = match working_dir {
                 Some(working_dir) => working_dir,
                 None => std::env::current_dir()?,
             };
+
+            let cmd = args.remove(0);
 
             let native_runner_params = NativeTestRunnerParams {
                 cmd,
@@ -75,15 +82,35 @@ fn main() -> anyhow::Result<()> {
                 extra_env: Default::default(),
             };
 
-            let (_manifest, test_results) =
+            let (manifest_data, test_results) =
                 execute_wrapped_runner(native_runner_params, working_dir)?;
 
-            serde_json::to_writer(std::io::stdout(), &test_results)?;
+            {
+                let results_fs = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(results)?;
+
+                serde_json::to_writer(results_fs, &test_results)?;
+            }
+
+            {
+                let manifest_fs = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(manifest)?;
+
+                serde_json::to_writer(manifest_fs, &manifest_data)?;
+            }
 
             Ok(())
         }
         Command::Manifest { server_addr } => {
-            let rt = tokio::runtime::Builder::new_current_thread().build()?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
             rt.block_on(async {
                 let mut server = tokio::net::TcpListener::bind(server_addr).await?;
 
