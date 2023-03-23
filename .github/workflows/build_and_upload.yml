@@ -167,7 +167,7 @@ jobs:
             cp target/release/abq_tester_harness "${RELEASE_DIR}/"
           else
             cp target/${{ matrix.cross-target }}/release/abq "${RELEASE_DIR}/"
-            cp target/release/abq_tester_harness "${RELEASE_DIR}/"
+            cp target/${{ matrix.cross-target }}/release/abq_tester_harness "${RELEASE_DIR}/"
           fi
 
       - name: Sign & Notarize Release
