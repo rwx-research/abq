@@ -71,11 +71,6 @@ pub async fn start_abq_forever(
         "\tabq test --queue-addr={} --run-id <a-unique-run-id> -- <your test args here>",
         publicize_addr(abq.server_addr(), public_ip),
     );
-    println!("Run the following to start one or more workers for that test run:");
-    println!(
-        "\tabq work --queue-addr={} --run-id <the-same-run-id>",
-        publicize_addr(abq.server_addr(), public_ip)
-    );
 
     // Register signal handlers, so we know to shutdown (or kill) the queue if
     // we get a termination signal.

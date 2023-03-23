@@ -316,7 +316,7 @@ fn wait_for_live_queue(queue_stdout: &mut ChildStdout) {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start") {
+            if line.contains("Run the following to invoke a test run") {
                 break;
             }
         }
@@ -415,7 +415,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start") {
+                if line.contains("Run the following to invoke a test run") {
                     break;
                 }
             }
@@ -511,7 +511,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start") {
+                if line.contains("Run the following to invoke a test run") {
                     break;
                 }
             }
@@ -610,7 +610,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start") {
+                if line.contains("Run the following to invoke a test run") {
                     break;
                 }
             }
@@ -709,7 +709,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start") {
+                if line.contains("Run the following to invoke a test run") {
                     break;
                 }
             }
@@ -802,7 +802,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start one or more workers") {
+                if line.contains("Run the following to invoke a test run") {
                     break;
                 }
             }
@@ -984,7 +984,7 @@ fn test_with_invalid_command() {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start") {
+            if line.contains("Run the following to invoke a test run") {
                 break;
             }
         }
@@ -1246,7 +1246,7 @@ fn write_statefile_for_worker() {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start") {
+            if line.contains("Run the following to invoke a test run") {
                 break;
             }
         }
@@ -1318,7 +1318,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start") {
+                if line.contains("Run the following to invoke a test run") {
                     break;
                 }
             }
@@ -1472,7 +1472,7 @@ fn retries_smoke() {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start") {
+            if line.contains("Run the following to invoke a test run") {
                 break;
             }
         }
@@ -1638,7 +1638,7 @@ fn retries_displays_retry_banners() {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start") {
+            if line.contains("Run the following to invoke a test run") {
                 break;
             }
         }
@@ -1765,7 +1765,7 @@ fn retries_with_multiple_runners_on_one_worker_displays_retry_banner_at_end() {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start") {
+            if line.contains("Run the following to invoke a test run") {
                 break;
             }
         }
@@ -1891,7 +1891,7 @@ test_all_network_config_options! {
         loop {
             if let Some(line) = queue_reader.next() {
                 let line = line.expect("line is not a string");
-                if line.contains("Run the following to start") {
+                if line.contains("Run the following to invoke a test run") {
                     break;
                 }
             }
@@ -2058,7 +2058,7 @@ fn out_of_process_retries_smoke() {
     loop {
         if let Some(line) = queue_reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("Run the following to start") {
+            if line.contains("Run the following to invoke a test run") {
                 break;
             }
         }

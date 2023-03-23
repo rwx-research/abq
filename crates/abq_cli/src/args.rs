@@ -77,7 +77,7 @@ pub enum Command {
         negotiator_port: u16,
 
         /// Host IP address to advertise the queue as running on.
-        /// When not specified, falls back on `bin`; otherwise, the unspecified address 0.0.0.0 is
+        /// When not specified, falls back to the value supplied to `--bind`; otherwise, the unspecified address 0.0.0.0 is
         /// used.
         #[clap(long, required = false)]
         public_ip: Option<IpAddr>,
@@ -286,7 +286,6 @@ pub enum Command {
         /// Test result reporter to use for a test run. Options are:{n}
         ///- dot: prints a dot for each test{n}
         ///- line: prints a line for each test{n}
-        ///- progress: an interactive progress output{n}
         ///- junit-xml[=path/to/results.xml]: outputs a junit-compatible xml file to specified path. Defaults to ./abq-test-results.xml{n}
         ///- rwx-v1-json[=path/to/results.json]: outputs a rwx-v1-compatible json file to specified path. Defaults to ./abq-test-results.json
         #[clap(long, default_value = "dot")]
@@ -314,9 +313,7 @@ pub enum Command {
         #[clap(long, default_value = "300")]
         timeout_seconds: u64,
 
-        /// Address of the queue where the test command will be sent.
-        ///
-        /// Requires that abq workers be started as separate processes connected to the queue.
+        /// Address of the queue where the report will be fetched from.
         ///
         /// Cannot be used with access_token (will fetch address from ABQ API).
         #[clap(long, required = false)]
@@ -355,7 +352,7 @@ pub enum Command {
         negotiator: Vec<SocketAddr>,
 
         /// Token to authorize messages sent to the services.
-        /// Usually, this should be the same token that `abq start` initialized with.
+        /// Usually, this should be the admin token that `abq start` initialized with.
         #[clap(long, required = false)]
         token: Option<UserToken>,
 
@@ -373,9 +370,9 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum Token {
-    /// Generate a new auth token for a queue to authenticate against, and for workers and `abq test` to authenticate with.
+    /// Generate a new auth token for a queue to authenticate against, and for `abq test` to authenticate with.
     ///
     /// This only generates a well-formed token; you must still pass it when instantiating
-    /// `abq start`, `abq work`, or `abq test` for it to be used.
+    /// `abq start` or `abq test` for it to be used.
     New,
 }
