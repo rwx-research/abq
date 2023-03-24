@@ -145,6 +145,8 @@ impl SuiteTracker {
 
         let is_fail_like = test_result.status.is_fail_like();
 
+        self.test_time += test_result.runtime;
+
         match entry.overall_status.tag {
             NeverFailed if is_fail_like => {
                 if run_number == INIT_RUN_NUMBER {
@@ -225,14 +227,13 @@ impl SuiteTracker {
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use abq_utils::{
         exit::ExitCode,
         net_protocol::{
             entity::RunnerMeta,
-            queue::TestSpec,
-            runners::{ProtocolWitness, Status, TestCase, TestResult, TestResultSpec},
+            runners::{Status, TestResult, TestResultSpec, TestRuntime},
             workers::{WorkId, INIT_RUN_NUMBER},
         },
     };
@@ -352,20 +353,10 @@ mod test {
         results: impl IntoIterator<Item = (&'static str, u32, Status)>,
     ) -> (SuiteTracker, IdToWorkId) {
         let mut id_to_work_id: IdToWorkId = HashMap::new();
-        let mut manifest = vec![];
         let mut results_to_inject = vec![];
 
-        let proto = ProtocolWitness::iter_all().next().unwrap();
-
         for (id, run_number, status) in results {
-            let work_id = id_to_work_id.entry(id).or_insert_with(|| {
-                let work_id = WorkId::new();
-                manifest.push(TestSpec {
-                    work_id,
-                    test_case: TestCase::new(proto, id, Default::default()),
-                });
-                work_id
-            });
+            let work_id = id_to_work_id.entry(id).or_insert_with(WorkId::new);
 
             let test_result = TestResult::new(
                 RunnerMeta::fake(),
@@ -567,5 +558,30 @@ mod test {
             assert_eq!(count_failed, 0);
             assert_eq!(tests_retried, 2);
         }
+    }
+
+    #[test]
+    fn account_test_runtime() {
+        let mut tracker = SuiteTracker::new();
+        for i in 0..10 {
+            let test_result = TestResult::new(
+                RunnerMeta::fake(),
+                TestResultSpec {
+                    id: format!("test{i}"),
+                    status: Status::Success,
+                    runtime: TestRuntime::Nanoseconds(2_000_000_000),
+                    ..TestResultSpec::fake()
+                },
+            );
+            tracker.account_result(INIT_RUN_NUMBER, &test_result);
+        }
+
+        let expected = Duration::from_secs(20);
+
+        assert_eq!(tracker.test_time.duration(), expected);
+
+        let summary = tracker.suite_result();
+
+        assert_eq!(summary.test_time.duration(), expected);
     }
 }

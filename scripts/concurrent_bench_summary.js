@@ -6,7 +6,7 @@ const data = JSON.parse(stdin);
 const rawTime = process.argv[2];
 
 const overheads = data.map(rcd => Number((((rcd.abq - rawTime) / rawTime) * 100).toFixed(2)));
-overheads.sort();
+overheads.sort((a, b) => a - b);
 
 function stddev(times) {
   const avg = times.reduce((a, b) => a + b) / times.length;
