@@ -1196,9 +1196,11 @@ test_all_network_config_options! {
 
         assert!(exit_status.success(), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert!(stdout.contains("0 tests, 0 failures"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
-        assert!(stdout.contains("MANIFEST GENERATION ---"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
-        assert!(stdout.contains("init stdouthello from manifest stdout"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
-        assert!(stdout.contains("init stderrhello from manifest stderr"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("--- MANIFEST GENERATION ---"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("init stdout"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("hello from manifest stdout"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("init stderr"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(stdout.contains("hello from manifest stderr"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
     }
 }
 

@@ -119,7 +119,7 @@ impl WorkersExitStatus {
 pub struct WorkersExit {
     pub status: WorkersExitStatus,
     pub native_runner_info: Option<NativeRunnerInfo>,
-    pub manifest_generation_output: Option<(RunnerMeta, StdioOutput)>,
+    pub manifest_generation_output: Option<(RunnerMeta, ProcessOutput)>,
     /// Final output of each runner, after all tests were run on each runner.
     pub final_stdio_outputs: Vec<(RunnerMeta, StdioOutput)>,
     pub process_outputs: Vec<(RunnerMeta, ProcessOutput)>,

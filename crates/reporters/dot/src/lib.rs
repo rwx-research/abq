@@ -1,10 +1,7 @@
 use std::borrow::Cow;
 
 use abq_reporting::{
-    output::{
-        format_result_dot, format_summary_results, format_test_result_summary, write,
-        OutputOrdering, SummaryKind,
-    },
+    output::{format_result_dot, write, OutputOrdering, SummaryKind},
     CompletedSummary, ReportedResult, Reporter, ReportingError,
 };
 use abq_utils::net_protocol::runners::{Status, StdioOutput, TestResult};
@@ -80,7 +77,8 @@ impl Reporter for DotReporter {
         );
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
-            format_test_result_summary(&mut self.buffer, run_number, test_result)?;
+            let output = test_result.output.as_deref().unwrap_or("<no output>");
+            writeln!(&mut self.buffer, "{output}")?;
         } else if test_result.status.is_fail_like() {
             self.delayed_summaries.push(SummaryKind::Test {
                 run_number,
@@ -103,11 +101,6 @@ impl Reporter for DotReporter {
         if self.num_results % DOT_REPORTER_LINE_LIMIT != 0 {
             let _ = write(&mut self.buffer, &[b'\n']);
         }
-
-        let _ = format_summary_results(
-            &mut self.buffer,
-            std::mem::take(&mut self.delayed_summaries),
-        );
     }
 
     fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
@@ -297,29 +290,6 @@ mod test_dot_reporter {
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
         insta::assert_snapshot!(output, @r###"
         .FSEP
-
-        --- abq/test2: FAILED ---
-        Assertion failed: 1 != 2
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
-
-        --- [worker 0] BEFORE abq/test3 ---
-        ----- STDOUT
-        test3-stdout
-        ----- STDERR
-        test3-stderr
-
-
-        --- abq/test4: ERRORED ---
-        Process 28821 terminated early via SIGTERM
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 
@@ -433,14 +403,6 @@ mod test_dot_reporter {
         .F..............................................................................
         ................................................................................
         ..........................
-
-        --- default name: FAILED ---
-        default output
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 
@@ -483,14 +445,6 @@ mod test_dot_reporter {
         insta::assert_snapshot!(output, @r###"
         .F..............................................................................
         ................................................................................
-
-        --- default name: FAILED ---
-        default output
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 }

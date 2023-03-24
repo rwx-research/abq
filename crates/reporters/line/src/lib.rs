@@ -1,5 +1,5 @@
 use abq_reporting::{
-    output::{format_result_line, format_summary_results, format_test_result_summary, SummaryKind},
+    output::{format_result_line, SummaryKind},
     CompletedSummary, ReportedResult, Reporter, ReportingError,
 };
 use abq_utils::net_protocol::runners::Status;
@@ -32,24 +32,15 @@ impl Reporter for LineReporter {
         run_number: u32,
         result: &ReportedResult,
     ) -> Result<(), ReportingError> {
-        let ReportedResult {
-            output_before,
-            output_after,
-            test_result,
-        } = result;
+        let ReportedResult { test_result, .. } = result;
 
-        format_result_line(
-            &mut self.buffer,
-            test_result,
-            !self.seen_first,
-            output_before,
-            output_after,
-        )?;
+        format_result_line(&mut self.buffer, test_result)?;
 
         self.seen_first = true;
 
         if matches!(test_result.status, Status::PrivateNativeRunnerError) {
-            format_test_result_summary(&mut self.buffer, run_number, test_result)?;
+            let output = test_result.output.as_deref().unwrap_or("<no output>");
+            writeln!(&mut self.buffer, "{output}")?;
         } else if test_result.status.is_fail_like() {
             self.delayed_summaries.push(SummaryKind::Test {
                 run_number,
@@ -62,12 +53,7 @@ impl Reporter for LineReporter {
 
     fn tick(&mut self) {}
 
-    fn after_all_results(&mut self) {
-        let _ = format_summary_results(
-            &mut self.buffer,
-            std::mem::take(&mut self.delayed_summaries),
-        );
-    }
+    fn after_all_results(&mut self) {}
 
     fn finish(mut self: Box<Self>, _summary: &CompletedSummary) -> Result<(), ReportingError> {
         self.buffer
@@ -257,32 +243,9 @@ mod test {
         insta::assert_snapshot!(output, @r###"
         abq/test1: ok
         abq/test2: FAILED
-
-        --- [worker 0] BEFORE abq/test3 ---
-        ----- STDOUT
-        test3-stdout
-        ----- STDERR
-        test3-stderr
-
         abq/test3: skipped
         abq/test4: ERRORED
         abq/test5: pending
-
-        --- abq/test2: FAILED ---
-        Assertion failed: 1 != 2
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
-
-        --- abq/test4: ERRORED ---
-        Process 28821 terminated early via SIGTERM
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
         "###);
     }
 }

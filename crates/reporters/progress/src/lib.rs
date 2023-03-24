@@ -1,10 +1,9 @@
-use std::{borrow::Cow, io, time::Instant};
+use std::{io, time::Instant};
 
 use abq_reporting::{
     colors::ColorProvider,
     output::{
-        self, format_interactive_progress, format_non_interactive_progress, format_runner_output,
-        format_test_result_summary, would_write_output, OutputOrdering,
+        self, format_interactive_progress, format_non_interactive_progress, format_result_line,
     },
     CompletedSummary, ReportedResult, Reporter, ReportingError,
 };
@@ -100,14 +99,10 @@ impl ProgressReporter {
 impl Reporter for ProgressReporter {
     fn push_result(
         &mut self,
-        run_number: u32,
+        _run_number: u32,
         result: &ReportedResult,
     ) -> Result<(), ReportingError> {
-        let ReportedResult {
-            output_before,
-            output_after,
-            test_result,
-        } = result;
+        let ReportedResult { test_result, .. } = result;
 
         self.num_results += 1;
 
@@ -115,36 +110,13 @@ impl Reporter for ProgressReporter {
             let is_fail_like = test_result.status.is_fail_like();
             self.num_failing += is_fail_like as u64;
 
-            let something_to_write = is_fail_like
-                || would_write_output(output_before.as_ref())
-                || would_write_output(output_after.as_ref());
-            if something_to_write && self.wrote_first_output {
-                output::write(&mut self.buffer, &[b'\n'])?;
-            }
-
-            if let Some(output) = output_before {
-                format_runner_output(
-                    &mut self.buffer,
-                    test_result.source,
-                    OutputOrdering::Before(Cow::Owned(test_result.display_name.clone())),
-                    output,
-                )?;
-            }
-
             if is_fail_like {
-                format_test_result_summary(&mut self.buffer, run_number, test_result)?;
+                if self.wrote_first_output {
+                    output::write(&mut self.buffer, &[b'\n'])?;
+                }
+                format_result_line(&mut self.buffer, test_result)?;
+                self.wrote_first_output = true;
             }
-
-            if let Some(output) = output_after {
-                format_runner_output(
-                    &mut self.buffer,
-                    test_result.source,
-                    OutputOrdering::Before(Cow::Owned(test_result.display_name.clone())),
-                    output,
-                )?;
-            }
-
-            self.wrote_first_output = self.wrote_first_output || something_to_write;
 
             Result::<(), ReportingError>::Ok(())
         };
@@ -377,28 +349,9 @@ mod test {
 
         let output = String::from_utf8(buffer).expect("output should be formatted as utf8");
         insta::assert_snapshot!(output, @r###"
-        --- abq/test2: FAILED ---
-        Assertion failed: 1 != 2
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
+        abq/test2: FAILED
 
-        --- [worker 0] BEFORE abq/test3 ---
-        ----- STDOUT
-        test3-stdout
-        ----- STDERR
-        test3-stderr
-
-
-        --- abq/test4: ERRORED ---
-        Process 28821 terminated early via SIGTERM
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
+        abq/test4: ERRORED
         "###);
 
         insta::assert_snapshot!(progress_bar_cmds.join("\n"), @r###"
@@ -579,31 +532,12 @@ mod test {
         --- [abq progress] 0 seconds ---
         0 tests run, 0 passed, 0 failing
 
-        --- abq/test2: FAILED ---
-        Assertion failed: 1 != 2
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
-
-        --- [worker 0] BEFORE abq/test3 ---
-        ----- STDOUT
-        test3-stdout
-        ----- STDERR
-        test3-stderr
-
+        abq/test2: FAILED
 
         --- [abq progress] 0 seconds ---
         3 tests run, 2 passed, 1 failing
 
-        --- abq/test4: ERRORED ---
-        Process 28821 terminated early via SIGTERM
-        ----- STDOUT
-        my stderr
-        ----- STDERR
-        my stdout
-        (completed in 1 m, 15 s, 3 ms [worker 0])
+        abq/test4: ERRORED
 
         --- [abq progress] 0 seconds ---
         5 tests run, 3 passed, 2 failing

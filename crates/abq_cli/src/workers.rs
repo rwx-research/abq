@@ -4,10 +4,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use abq_reporting::CompletedSummary;
+use abq_utils::capture_output::ProcessOutput;
 use abq_utils::exit::ExitCode;
-use abq_utils::net_protocol::entity::{RunnerMeta, WorkerTag};
+use abq_utils::net_protocol::entity::{WorkerRunner, WorkerTag};
 use abq_utils::net_protocol::queue::InvokeWork;
-use abq_utils::net_protocol::runners::StdioOutput;
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
@@ -108,6 +108,10 @@ pub async fn start_workers_standalone(
     }
 }
 
+fn runner_header(runner: &WorkerRunner) -> String {
+    format!("\n{:-^80}\n", format!(" [{}] ", runner))
+}
+
 async fn do_shutdown(
     mut worker_pool: NegotiatedWorkers,
     reporting_handle: ReportingTaskHandle,
@@ -125,20 +129,19 @@ async fn do_shutdown(
 
     let finalized_reporters = reporting_handle.join().await;
 
-    if let Some((runner, manifest_output)) = manifest_generation_output {
-        print_manifest_generation_output(runner, manifest_output);
+    let mut stdout = stdout_preferences.stdout_stream();
+    if let Some((_, manifest_output)) = manifest_generation_output {
+        // NB: there is no reasonable way to surface the error at this point, since we are
+        // about to shut down.
+        let _ = print_manifest_generation_output(&mut stdout, manifest_output);
     }
 
-    let mut stdout = stdout_preferences.stdout_stream();
     for (runner_meta, process_output) in process_outputs {
         if runner_meta.pipes_to_parent_stdio() || process_output.is_empty() {
             continue;
         }
         stdout
-            .write_fmt(format_args!(
-                "\n{:-^80}\n",
-                format!(" [{}] ", runner_meta.runner)
-            ))
+            .write_all(runner_header(&runner_meta.runner).as_bytes())
             .unwrap();
         stdout.write_all(&process_output).unwrap();
     }
@@ -181,12 +184,19 @@ async fn do_cancellation_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
     std::process::exit(ExitCode::CANCELLED.get());
 }
 
-pub(crate) fn print_manifest_generation_output(runner: RunnerMeta, manifest_output: StdioOutput) {
-    // NB: there is no reasonable way to surface the error at this point, since we are
-    // about to shut down.
-    let _opt_err = abq_reporting::output::format_manifest_generation_output(
-        &mut std::io::stdout(),
-        runner,
-        &manifest_output,
-    );
+const MANIFEST_GENERATION_HEADER: &str =
+    "----------------------------- MANIFEST GENERATION ------------------------------\n";
+
+pub(crate) fn print_manifest_generation_output(
+    mut writer: impl Write,
+    manifest_output: ProcessOutput,
+) -> std::io::Result<()> {
+    if manifest_output.is_empty() {
+        return Ok(());
+    }
+
+    writer.write_all(MANIFEST_GENERATION_HEADER.as_bytes())?;
+    writer.write_all(&manifest_output)?;
+    writer.write_all("\n".as_bytes())?;
+    writer.flush()
 }

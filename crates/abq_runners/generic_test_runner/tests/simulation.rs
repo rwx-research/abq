@@ -10,7 +10,7 @@ use abq_generic_test_runner::{
 };
 use abq_native_runner_simulation::{pack, pack_msgs, Msg};
 use abq_test_utils::{artifacts_dir, sanitize_output};
-use abq_utils::capture_output::CaptureChildOutputStrategy;
+use abq_utils::capture_output::{CaptureChildOutputStrategy, ProcessOutput};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{AssociatedTestResults, TestSpec};
@@ -136,7 +136,7 @@ fn run_simulated_runner(
     get_next_test: GetNextTests,
 ) -> (
     Vec<AssociatedTestResults>,
-    Option<StdioOutput>,
+    Option<ProcessOutput>,
     StdioOutput,
     bool,
 ) {
@@ -498,9 +498,20 @@ fn capture_output_during_manifest_gen() {
     assert!(results.is_empty());
 
     assert!(man_output.is_some());
+
     let man_output = man_output.unwrap();
-    assert_eq!(man_output.stdout, b"init stdouthello from manifest stdout");
-    assert_eq!(man_output.stderr, b"init stderrhello from manifest stderr");
+    let man_output = String::from_utf8_lossy(&man_output);
+    // The output isn't strictly ordered between stdout and stderr.
+    assert!(man_output.contains("init stdout"), "output:\n{man_output}");
+    assert!(man_output.contains("init stderr"), "output:\n{man_output}");
+    assert!(
+        man_output.contains("hello from manifest stdout"),
+        "output:\n{man_output}"
+    );
+    assert!(
+        man_output.contains("hello from manifest stderr"),
+        "output:\n{man_output}"
+    );
 
     let manifest = Arc::try_unwrap(manifest).unwrap().into_inner().unwrap();
     let manifest = match manifest {

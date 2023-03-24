@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use abq_utils::capture_output::{
-    CaptureChildOutputStrategy, ChildOutputHandler, ChildOutputStrategyBox,
+    CaptureChildOutputStrategy, ChildOutputHandler, ChildOutputStrategyBox, ProcessOutput,
 };
 use abq_utils::error::{here, ErrorLocation, LocatedError, ResultLocation};
 use abq_utils::exit::ExitCode;
@@ -162,7 +162,7 @@ pub async fn wait_for_manifest(runner_conn: &mut RunnerConnection) -> io::Result
 #[instrument(level = "trace", skip(native_runner))]
 async fn retrieve_manifest<'a>(
     native_runner: &mut NativeRunnerHandle<'a>,
-) -> Result<(ReportedManifest, StdioOutput), GenericRunnerError> {
+) -> Result<(ReportedManifest, ProcessOutput), GenericRunnerError> {
     // One-shot the native runner. Since we set the manifest generation flag, expect exactly one
     // message to be received, namely the manifest.
     let (manifest, stdio_output) = {
@@ -193,7 +193,7 @@ async fn retrieve_manifest<'a>(
         native_runner_protocol: native_runner.runner_info.protocol.get_version(),
         native_runner_specification: Box::new(native_runner.runner_info.specification.clone()),
     };
-    Ok((manifest, stdio_output.into()))
+    Ok((manifest, stdio_output.combined))
 }
 
 async fn retrieve_manifest_help(

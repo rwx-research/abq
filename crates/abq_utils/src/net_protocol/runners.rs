@@ -872,7 +872,7 @@ pub struct TestRunnerExit {
     pub exit_code: ExitCode,
     pub native_runner_info: Option<NativeRunnerInfo>,
     /// Output captured during manifest generation, if any.
-    pub manifest_generation_output: Option<StdioOutput>,
+    pub manifest_generation_output: Option<ProcessOutput>,
     /// Captured stdout/stderr after all tests have been run.
     pub final_stdio_output: StdioOutput,
     /// All captured output from a runner process.
