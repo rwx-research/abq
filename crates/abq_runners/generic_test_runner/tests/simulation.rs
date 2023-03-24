@@ -386,10 +386,7 @@ fn big_manifest() {
 
     let huge_manifest = ManifestMessage::new(Manifest::new(members, Default::default()));
 
-    assert!(abq_utils::net_protocol::validate_max_message_size(
-        serde_json::to_vec(&huge_manifest).unwrap().len() as _
-    )
-    .is_err());
+    assert!(abq_utils::net_protocol::is_large_message(&huge_manifest).unwrap());
 
     let simulation = [
         Connect,
