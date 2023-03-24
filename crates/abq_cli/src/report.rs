@@ -1,11 +1,11 @@
 //! Implements the report command.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
 use abq_reporting::{CompletedSummary, ReportedResult, Reporter};
 use abq_utils::{
     exit::ExitCode,
-    log_assert_stderr,
+    log_assert_stderr, net_async,
     net_protocol::{
         self,
         entity::Entity,
@@ -46,33 +46,36 @@ pub(crate) async fn report_results(
 
     let mut seen_work_ids = FnvHashSet::default();
 
-    let all_results: OpaqueLazyAssociatedTestResults =
+    let all_results: Vec<OpaqueLazyAssociatedTestResults> =
         wait_for_results(abq, entity, run_id, results_timeout).await?;
-    let all_results = all_results.decode().map_err(|e| {
-        anyhow!(
-            "failed to decode corrupted test results message: {}",
-            e.to_string()
-        )
-    })?;
 
     let mut run_summary = None;
 
-    for result_line in all_results.into_iter() {
-        match result_line {
-            ResultsLine::Results(results) => {
-                handle_results(
-                    results,
-                    &mut seen_work_ids,
-                    &mut reporters,
-                    &mut overall_tracker,
-                )?;
-            }
-            ResultsLine::Summary(summary) => {
-                let old_summary = run_summary.replace(summary);
-                log_assert_stderr!(
-                    old_summary.is_none(),
-                    "ABQ sent two summaries for a test run; this is an error."
-                )
+    for results_chunk in all_results {
+        let results = results_chunk.decode().map_err(|e| {
+            anyhow!(
+                "failed to decode corrupted test results message: {}",
+                e.to_string()
+            )
+        })?;
+
+        for result_line in results.into_iter() {
+            match result_line {
+                ResultsLine::Results(results) => {
+                    handle_results(
+                        results,
+                        &mut seen_work_ids,
+                        &mut reporters,
+                        &mut overall_tracker,
+                    )?;
+                }
+                ResultsLine::Summary(summary) => {
+                    let old_summary = run_summary.replace(summary);
+                    log_assert_stderr!(
+                        old_summary.is_none(),
+                        "ABQ sent two summaries for a test run; this is an error."
+                    )
+                }
             }
         }
     }
@@ -122,8 +125,12 @@ async fn wait_for_results(
     entity: Entity,
     run_id: RunId,
     results_timeout: Duration,
-) -> anyhow::Result<OpaqueLazyAssociatedTestResults> {
-    let task = wait_for_results_help(abq, entity, run_id);
+) -> anyhow::Result<Vec<OpaqueLazyAssociatedTestResults>> {
+    let queue_addr = abq.server_addr();
+    let client = abq.client_options_owned().build_async()?;
+
+    let task = wait_for_results_help(queue_addr, client, entity, run_id);
+
     TimeoutFuture::new(task, results_timeout)
         .wait()
         .await
@@ -136,13 +143,11 @@ async fn wait_for_results(
 }
 
 async fn wait_for_results_help(
-    abq: AbqInstance,
+    queue_addr: SocketAddr,
+    client: Box<dyn net_async::ConfiguredClient>,
     entity: Entity,
     run_id: RunId,
-) -> anyhow::Result<OpaqueLazyAssociatedTestResults> {
-    let queue_addr = abq.server_addr();
-    let client = abq.client_options_owned().build_async()?;
-
+) -> anyhow::Result<Vec<OpaqueLazyAssociatedTestResults>> {
     let mut attempt = 1;
     loop {
         let client = &client;
@@ -158,29 +163,42 @@ async fn wait_for_results_help(
         };
         net_protocol::async_write(&mut conn, &request).await?;
 
-        use net_protocol::queue::TestResultsResponse::*;
-        let response = net_protocol::async_read(&mut conn).await?;
-        match response {
-            Results(results) => return Ok(results),
-            Pending => {
-                tracing::debug!(
-                    attempt,
-                    "deferring fetching results do to pending notification"
-                );
-                tokio::time::sleep(PENDING_RESULTS_DELAY).await;
-                attempt += 1;
-                continue;
-            }
-            OutstandingRunners(tags) => {
-                let active_runners = tags
-                    .into_iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+        let mut results = Vec::with_capacity(1);
 
-                bail!("failed to fetch test results because the following runners are still active: {active_runners}")
+        // TODO: as this is a hot loop of just fetching results, reporting would be more
+        // interactive if we wrote results into a channel as they came in, with the
+        // results processing happening on a separate thread.
+        loop {
+            use net_protocol::queue::TestResultsResponse::*;
+            let response = net_protocol::async_read(&mut conn).await?;
+            match response {
+                Results { chunk, final_chunk } => {
+                    results.push(chunk);
+                    match final_chunk {
+                        true => return Ok(results),
+                        false => continue,
+                    }
+                }
+                Pending => {
+                    tracing::debug!(
+                        attempt,
+                        "deferring fetching results do to pending notification"
+                    );
+                    tokio::time::sleep(PENDING_RESULTS_DELAY).await;
+                    attempt += 1;
+                    continue;
+                }
+                OutstandingRunners(tags) => {
+                    let active_runners = tags
+                        .into_iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+
+                    bail!("failed to fetch test results because the following runners are still active: {active_runners}")
+                }
+                Error(reason) => bail!("failed to fetch test results because {reason}"),
             }
-            Error(reason) => bail!("failed to fetch test results because {reason}"),
         }
     }
 }
@@ -231,4 +249,70 @@ fn handle_results(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use abq_test_utils::build_fake_server_client;
+    use abq_utils::net_protocol::{
+        self, entity::Entity, results::OpaqueLazyAssociatedTestResults, workers::RunId,
+    };
+
+    use super::wait_for_results_help;
+
+    #[tokio::test]
+    async fn fetches_chunked_tests() {
+        let (server, client) = build_fake_server_client().await;
+        let server_addr = server.local_addr().unwrap();
+
+        let server_task = async move {
+            use net_protocol::queue;
+
+            let (conn, _) = server.accept().await.unwrap();
+            let mut conn = server.handshake_ctx().handshake(conn).await.unwrap();
+            let msg = net_protocol::async_read(&mut conn).await.unwrap();
+            assert!(matches!(
+                msg,
+                queue::Request {
+                    message: queue::Message::TestResults(_),
+                    ..
+                }
+            ));
+
+            let chunks = [
+                queue::TestResultsResponse::Results {
+                    chunk: OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                        serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
+                    ]),
+                    final_chunk: false,
+                },
+                queue::TestResultsResponse::Results {
+                    chunk: OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                        serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
+                    ]),
+                    final_chunk: true,
+                },
+            ];
+
+            for chunk in chunks {
+                net_protocol::async_write(&mut conn, &chunk).await.unwrap();
+            }
+        };
+
+        let client_task =
+            wait_for_results_help(server_addr, client, Entity::local_client(), RunId::unique());
+
+        let ((), results) = tokio::join!(server_task, client_task);
+
+        let results = results.unwrap();
+        let expected = [
+            OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
+            ]),
+            OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
+            ]),
+        ];
+        assert_eq!(results, expected);
+    }
 }

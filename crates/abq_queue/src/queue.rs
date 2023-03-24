@@ -17,7 +17,7 @@ use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request,
     TestResultsResponse, TestSpec,
 };
-use abq_utils::net_protocol::results::{self};
+use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
 use abq_utils::net_protocol::runners::{MetadataMap, StdioOutput};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
@@ -1893,39 +1893,76 @@ impl QueueServer {
         let response;
         let result;
 
+        enum Response {
+            One(TestResultsResponse),
+            Chunk(OpaqueLazyAssociatedTestResults),
+        }
+        use Response::*;
+
         match queues.get_read_results_cell(&run_id).located(here!()) {
             Ok(state) => match state {
                 ReadResultsState::ReadFromCell(cell) => {
                     // Happy path: actually attempt the retrieval. Let's see what comes up.
                     match cell.retrieve(&persist_results).await {
                         Some(Ok(results)) => {
-                            response = TestResultsResponse::Results(results);
+                            response = Chunk(results);
                             result = Ok(());
                         }
                         None => {
-                            response = TestResultsResponse::Pending;
+                            response = One(TestResultsResponse::Pending);
                             result = Ok(());
                         }
                         Some(Err(e)) => {
-                            response = TestResultsResponse::Error(e.to_string());
+                            response = One(TestResultsResponse::Error(e.to_string()));
                             result = Err(e.error.to_string().located(here!()));
                         }
                     };
                 }
                 ReadResultsState::OutstandingRunners(tags) => {
-                    response = TestResultsResponse::OutstandingRunners(tags);
+                    response = One(TestResultsResponse::OutstandingRunners(tags));
                     result = Ok(());
                 }
             },
             Err(e) => {
-                response = TestResultsResponse::Error(e.error.to_string());
+                response = One(TestResultsResponse::Error(e.error.to_string()));
                 result = Err(e);
             }
         };
 
-        net_protocol::async_write(&mut stream, &response)
-            .await
-            .located(here!())?;
+        match response {
+            One(response) => {
+                net_protocol::async_write(&mut stream, &response)
+                    .await
+                    .located(here!())?;
+            }
+            Chunk(results) => {
+                // Split the results into chunks that will fit in individual messages over the
+                // network.
+                //
+                // Chunking is CPU-bound and typically quite fast if there are no chunks,
+                // but might eat allocations if there is indeed material chunking to do.
+                // Since this is usually run by a client after the critical section of a test run,
+                // move it to a dedicated CPU region to avoid starving the main queue responder
+                // threads.
+                let chunks = tokio::task::spawn_blocking(|| {
+                    TestResultsResponse::chunk_results(results).located(here!())
+                })
+                .await
+                .located(here!())??;
+
+                let mut iter = chunks.into_iter().peekable();
+                while let Some(chunk) = iter.next() {
+                    let response = TestResultsResponse::Results {
+                        chunk,
+                        final_chunk: iter.peek().is_none(),
+                    };
+                    net_protocol::async_write(&mut stream, &response)
+                        .await
+                        .located(here!())?;
+                }
+            }
+        }
+
         result
     }
 
@@ -3795,7 +3832,10 @@ mod persist_results {
             ];
             let response = get_test_results_response().await;
             match response {
-                Results(results) => {
+                Results {
+                    chunk: results,
+                    final_chunk: true,
+                } => {
                     let results = results.decode().unwrap();
                     assert_eq!(results, expected_results);
                 }
@@ -3850,7 +3890,10 @@ mod persist_results {
             ];
             let response = get_test_results_response().await;
             match response {
-                Results(results) => {
+                Results {
+                    chunk: results,
+                    final_chunk: true,
+                } => {
                     let results = results.decode().unwrap();
                     assert_eq!(results, expected_results);
                 }

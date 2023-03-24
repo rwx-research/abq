@@ -123,23 +123,30 @@ pub fn build_primitive_opts() -> (ServerOptions, ClientOptions<User>) {
     (server_opts, client_opts)
 }
 
+pub async fn build_fake_server_client() -> (
+    Box<dyn net_async::ServerListener>,
+    Box<dyn net_async::ConfiguredClient>,
+) {
+    let (server_opts, client_opts) = build_primitive_opts();
+    let server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
+
+    let client = client_opts.build_async().unwrap();
+
+    (server, client)
+}
+
 pub async fn build_fake_connection() -> (
     Box<dyn net_async::ServerListener>,
     Box<dyn net_async::ServerStream>,
     Box<dyn net_async::ClientStream>,
 ) {
-    let (server_opts, client_opts) = build_primitive_opts();
-    let fake_server = server_opts.bind_async("0.0.0.0:0").await.unwrap();
-    let fake_server_addr = fake_server.local_addr().unwrap();
+    let (server, client) = build_fake_server_client().await;
+    let server_addr = server.local_addr().unwrap();
 
-    let client = client_opts.build_async().unwrap();
-
-    let (client_res, server_res) = tokio::join!(
-        client.connect(fake_server_addr),
-        accept_handshake(&*fake_server)
-    );
+    let (client_res, server_res) =
+        tokio::join!(client.connect(server_addr), accept_handshake(&*server));
     let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
-    (fake_server, server_conn, client_conn)
+    (server, server_conn, client_conn)
 }
 
 #[macro_export]

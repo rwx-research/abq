@@ -451,7 +451,7 @@ pub mod workers {
 }
 
 pub mod queue {
-    use std::{net::SocketAddr, num::NonZeroU64};
+    use std::{io, net::SocketAddr, num::NonZeroU64};
 
     use serde_derive::{Deserialize, Serialize};
 
@@ -461,6 +461,7 @@ pub mod queue {
         results::OpaqueLazyAssociatedTestResults,
         runners::{AbqProtocolVersion, NativeRunnerSpecification, TestCase, TestResult},
         workers::{ManifestResult, RunId, WorkId},
+        MAX_MESSAGE_SIZE_USIZE,
     };
     use crate::capture_output::StdioOutput;
 
@@ -620,7 +621,12 @@ pub mod queue {
     #[derive(Serialize, Deserialize, Debug)]
     pub enum TestResultsResponse {
         /// The test results are available.
-        Results(OpaqueLazyAssociatedTestResults),
+        Results {
+            /// A slice of test results.
+            /// May be split off the full list to avoid exceeding the maximum network message size.
+            chunk: OpaqueLazyAssociatedTestResults,
+            final_chunk: bool,
+        },
         /// Some test results are still being persisted, the request for test results should
         /// re-query in the future.
         Pending,
@@ -629,12 +635,62 @@ pub mod queue {
         /// The test results are unavailable for the given reason.
         Error(String),
     }
+
+    impl TestResultsResponse {
+        const MAX_OVERHEAD_OF_RESPONSE_FOR_RESULTS: usize = 50;
+
+        /// Splits [OpaqueLazyAssociatedTestResults] into network-safe chunks ready for wrapping by
+        /// this response type.
+        pub fn chunk_results(
+            results: OpaqueLazyAssociatedTestResults,
+        ) -> io::Result<Vec<OpaqueLazyAssociatedTestResults>> {
+            results.into_network_safe_chunks(
+                MAX_MESSAGE_SIZE_USIZE - Self::MAX_OVERHEAD_OF_RESPONSE_FOR_RESULTS,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+        use crate::net_protocol::results::OpaqueLazyAssociatedTestResults;
+
+        use super::TestResultsResponse;
+
+        #[test]
+        fn max_overhead_of_response_for_results() {
+            let results = OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                serde_json::value::to_raw_value(r#"RWXRWX"#).unwrap(),
+                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
+            ]);
+            let results_len = serde_json::to_vec(&results).unwrap().len();
+
+            for final_chunk in [true, false] {
+                let response = TestResultsResponse::Results {
+                    chunk: results.clone(),
+                    final_chunk,
+                };
+                let response_len = serde_json::to_vec(&response).unwrap().len();
+
+                let overhead = response_len - results_len;
+
+                assert!(
+                    overhead <= TestResultsResponse::MAX_OVERHEAD_OF_RESPONSE_FOR_RESULTS,
+                    "{overhead}"
+                );
+            }
+        }
+    }
 }
 
 pub mod results {
+    use std::io;
+
     use serde_derive::{Deserialize, Serialize};
 
-    use super::queue::{AssociatedTestResults, NativeRunnerInfo};
+    use super::{
+        queue::{AssociatedTestResults, NativeRunnerInfo},
+        write_message_bytes_help,
+    };
 
     /// A line in the results-persistence scheme.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -655,12 +711,56 @@ pub mod results {
 
     /// A lazy-loaded representation of [AssociatedTestResults].
     /// The implementor should store the results as JSON lines of JSON-encoded [AssociatedTestResults].
-    #[derive(Serialize, Deserialize, Debug)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct OpaqueLazyAssociatedTestResults(Vec<Box<serde_json::value::RawValue>>);
 
     impl OpaqueLazyAssociatedTestResults {
         pub fn from_raw_json_lines(opaque_lines: Vec<Box<serde_json::value::RawValue>>) -> Self {
             Self(opaque_lines)
+        }
+
+        /// Splits the results into chunks that respect the [maximum network message size][MAX_MESSAGE_SIZE].
+        /// Assumes DOS_PROTECT is turned on, with the possibility of gz-encoded messages.
+        pub(super) fn into_network_safe_chunks(
+            self,
+            max_message_size: usize,
+        ) -> io::Result<Vec<Self>> {
+            // Preserve the order of test result lines across chunks.
+            // This is useful for reproducibility, even though the lines are opaque and can be
+            // processed out-of-order.
+            // As such, we keep a stack to process, initially populated in the same order as the
+            // opaque chunks.
+            let mut to_process = vec![self];
+            let mut processed = Vec::with_capacity(1);
+            while let Some(chunk) = to_process.pop() {
+                let (encoded_msg, _) = write_message_bytes_help::<_, true /* DOS_PROTECT on */>(
+                    &chunk,
+                    max_message_size,
+                )?;
+                if encoded_msg.len() > max_message_size {
+                    // Split the chunk in two.
+                    let half = chunk.0.len() / 2;
+                    let mut left = chunk.0;
+                    let right = left.split_off(half);
+                    if left.is_empty() || right.is_empty() {
+                        // The chunk was a singleton, and unfortunately, we can't split it any
+                        // further here.
+                        // TODO: we could get further by decoding the chunk into test results and
+                        // splitting those. However, I (Ayaz) suspect this will not be a problem in
+                        // practice unless someone is using a very large batch size.
+                        processed.push(OpaqueLazyAssociatedTestResults(left));
+                        processed.push(OpaqueLazyAssociatedTestResults(right));
+                    } else {
+                        // Push the chunks back on so that the first half (the left one) will be
+                        // processed first.
+                        to_process.push(OpaqueLazyAssociatedTestResults(right));
+                        to_process.push(OpaqueLazyAssociatedTestResults(left));
+                    }
+                } else {
+                    processed.push(chunk);
+                }
+            }
+            Ok(processed)
         }
 
         pub fn decode(&self) -> serde_json::Result<Vec<ResultsLine>> {
@@ -669,6 +769,20 @@ pub mod results {
                 results.push(serde_json::from_str(results_list.get())?);
             }
             Ok(results)
+        }
+    }
+
+    impl PartialEq for OpaqueLazyAssociatedTestResults {
+        fn eq(&self, other: &Self) -> bool {
+            if self.0.len() != other.0.len() {
+                return false;
+            }
+            for (l, r) in self.0.iter().zip(other.0.iter()) {
+                if l.get() != r.get() {
+                    return false;
+                }
+            }
+            true
         }
     }
 
@@ -687,6 +801,43 @@ pub mod results {
             let decoded: OpaqueLazyAssociatedTestResults = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded.0.len(), 1);
             assert_eq!(decoded.0[0].get(), r#""hello""#);
+        }
+
+        #[test]
+        fn chunking() {
+            let results = OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                // ["RWXRWX"] <- 10 bytes
+                serde_json::value::to_raw_value(r#"RWXRWX"#).unwrap(),
+                // ["R","R"] <- 9 bytes
+                serde_json::value::to_raw_value(r#"R"#).unwrap(),
+                serde_json::value::to_raw_value(r#"R"#).unwrap(),
+                // ["rwxrwx"] <- 10 bytes
+                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
+                // ["r","r"] <- 9 bytes
+                serde_json::value::to_raw_value(r#"r"#).unwrap(),
+                serde_json::value::to_raw_value(r#"r"#).unwrap(),
+            ]);
+
+            let expected_chunks = vec![
+                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                    serde_json::value::to_raw_value(r#"RWXRWX"#).unwrap(),
+                ]),
+                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                    serde_json::value::to_raw_value(r#"R"#).unwrap(),
+                    serde_json::value::to_raw_value(r#"R"#).unwrap(),
+                ]),
+                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                    serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
+                ]),
+                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                    serde_json::value::to_raw_value(r#"r"#).unwrap(),
+                    serde_json::value::to_raw_value(r#"r"#).unwrap(),
+                ]),
+            ];
+
+            let chunks = results.into_network_safe_chunks(10).unwrap();
+            assert_eq!(chunks.len(), 4, "{chunks:?}");
+            assert_eq!(chunks, expected_chunks);
         }
     }
 }
@@ -895,14 +1046,8 @@ fn read_exact_help(
 
 /// Writes a message to a stream communicating with abq.
 pub fn write<T: serde::Serialize>(writer: &mut impl Write, msg: T) -> Result<(), std::io::Error> {
-    let (msg_bytes, compressed) = {
-        let msg_json = serde_json::to_vec(&msg)?;
-        if msg_json.len() > MAX_MESSAGE_SIZE_USIZE {
-            (gz_encode(&msg_json)?, true)
-        } else {
-            (msg_json, false)
-        }
-    };
+    let (msg_bytes, compressed) =
+        write_message_bytes_help::<_, true>(&msg, MAX_MESSAGE_SIZE_USIZE)?;
 
     let msg_size_buf = {
         let mut msg_size = msg_bytes.len() as i32;
@@ -1120,14 +1265,8 @@ async fn async_write_help<R, T: serde::Serialize, const DOS_PROTECT: bool>(
 where
     R: tokio::io::AsyncWriteExt + Unpin,
 {
-    let (msg_bytes, compressed) = {
-        let msg_json = serde_json::to_vec(msg)?;
-        if DOS_PROTECT && msg_json.len() > MAX_MESSAGE_SIZE_USIZE {
-            (gz_encode(&msg_json)?, true)
-        } else {
-            (msg_json, false)
-        }
-    };
+    let (msg_bytes, compressed) =
+        write_message_bytes_help::<_, DOS_PROTECT>(msg, MAX_MESSAGE_SIZE_USIZE)?;
 
     let msg_size_buf = {
         let mut msg_size = msg_bytes.len() as i32;
@@ -1153,6 +1292,22 @@ where
     writer.flush().await?;
 
     Ok(())
+}
+
+#[inline]
+fn write_message_bytes_help<T: serde::Serialize, const DOS_PROTECT: bool>(
+    msg: &T,
+    max_message_size: usize,
+) -> io::Result<(Vec<u8>, bool)> {
+    let (msg_bytes, compressed) = {
+        let msg_json = serde_json::to_vec(msg)?;
+        if DOS_PROTECT && msg_json.len() > max_message_size {
+            (gz_encode(&msg_json)?, true)
+        } else {
+            (msg_json, false)
+        }
+    };
+    Ok((msg_bytes, compressed))
 }
 
 #[cfg(test)]
