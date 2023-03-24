@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       ref:
-        description: 'ref to build'
+        description: "ref to build"
         required: true
         type: string
     outputs:
@@ -100,9 +100,9 @@ jobs:
       # setup testdata
       - uses: actions/setup-node@v3
         with:
-          node-version: '14'
-          cache: 'npm'
-          cache-dependency-path: 'testdata/**/package-lock.json'
+          node-version: "14"
+          cache: "npm"
+          cache-dependency-path: "testdata/**/package-lock.json"
 
       - name: Load test dependencies
         run: |
@@ -157,7 +157,6 @@ jobs:
           cp "target/$RUST_TARGET/release-unstable/abq" "${RELEASE_DIR}"
           cp "target/$RUST_TARGET/release-unstable/abq_tester_harness" "${RELEASE_DIR}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
-          echo "filesize=$(wc -c "$RELEASE_ARCHIVE" | awk '{ print $1}')" >> "$GITHUB_OUTPUT"
 
       - name: Push release to staging S3
         env:
@@ -169,34 +168,6 @@ jobs:
         id: abq_version
         run: |
           echo "abq_version=${ABQ_VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Analyze filesize
-        id: filesize
-        run: |
-          {
-            echo "formatted_filesize=$(printf "%'d" "$FILESIZE")"
-            echo "filesize=$FILESIZE"
-            echo "smaller_than_60mb=${{ steps.prepare_release.outputs.filesize < 60000000 && 'true' || 'false' }}"
-          } >> "$GITHUB_OUTPUT"
-        env:
-          FILESIZE: ${{ steps.prepare_release.outputs.filesize }}
-
-      - name: Get associated PR
-        uses: 8BitJonny/gh-get-current-pr@f4d16fd424adba1334de83b538f6cac7529d4683 # v2.2.0, locking to a ref to avoid supply chain attacks
-        id: pr
-
-      - name: Report filesize
-        uses: thollander/actions-comment-pull-request@632cf9ce90574d125be56b5f3405cda41a84e2fd # v2.3.1, locking to a ref to avoid supply chain attacks
-        if: steps.pr.outputs.pr_found == 'true'
-        with:
-          pr_number: ${{ steps.pr.outputs.number }}
-          message: |
-            **Zipped Filesize for ${{ github.sha }}** ([run](https://github.com/rwx-research/abq/actions/runs/${{ github.run_id }}))
-            ${{ steps.filesize.outputs.smaller_than_60mb == 'true' && ':white_check_mark: smaller than 60MB' || ':x: greater than 60MB' }}
-            ${{ steps.filesize.outputs.formatted_filesize }} bytes
-            Note: this is a dev build where we don't do any size optimizations. We expect the filesizes to be much larger than the production builds (last checked: < 4mb)
-
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   notify-api:
     name: Release new abq to staging API
