@@ -1894,15 +1894,11 @@ mod test_abq_jest {
         assert_eq!(test_results.len(), 2, "{:#?}", test_results);
 
         assert_eq!(test_results[0].status, Status::Success);
-        assert_eq!(
-            test_results[0].id, "add.test.js@3:1#0",
-            "{:?}",
-            &test_results
-        );
+        assert_eq!(test_results[0].id, "add.test.js#0:0", "{:?}", &test_results);
 
         assert_eq!(test_results[1].status, Status::Success);
         assert_eq!(
-            test_results[1].id, "names.test.js@3:1#0",
+            test_results[1].id, "names.test.js#0:0",
             "{:?}",
             &test_results
         );
@@ -1932,7 +1928,7 @@ mod test_abq_jest {
 
         {
             assert!(matches!(test_results[0].status, Status::Failure { .. }));
-            assert_eq!(test_results[0].id, "add.test.js@3:1#0");
+            assert_eq!(test_results[0].id, "add.test.js#0:0");
             assert!(
                 matches!(&test_results[0].stderr, Some(s) if s.is_empty()),
                 "{:?}",
@@ -1953,7 +1949,7 @@ mod test_abq_jest {
 
         {
             assert!(matches!(test_results[1].status, Status::Failure { .. }));
-            assert_eq!(test_results[1].id, "add2.test.js@3:1#0");
+            assert_eq!(test_results[1].id, "add2.test.js#0:0");
             assert!(
                 matches!(&test_results[0].stderr, Some(s) if s.is_empty()),
                 "{:?}",
