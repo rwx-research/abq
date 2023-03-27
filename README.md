@@ -21,10 +21,16 @@ ABQ invokes any test command passed to it, so you can continue using your native
 ## Test Frameworks
 
 :octocat: [rwx-research/rspec-abq](https://github.com/rwx-research/rspec-abq) &ensp;
-:octocat: [rwx-research/jest](https://github.com/rwx-research/jest) &ensp;
-:octocat: [rwx-research/playwright](https://github.com/rwx-research/playwright)
+:octocat: [rwx-research/jest-abq](https://github.com/rwx-research/jest) &ensp;
+:octocat: [rwx-research/playwright-abq](https://github.com/rwx-research/playwright) &ensp;
+:octocat: [rwx-research/pytest-abq](https://github.com/rwx-research/pytest-abq)
 
-ABQ is currently compatible with RSpec, Jest, and Playwright.
+ABQ is currently compatible with
+
+- [RSpec][rspec-abq-docs]
+- [Jest][jest-abq-docs]
+- [Playwright][playwright-abq-docs]
+- [Pytest][playwright-abq-docs]
 
 Open source sponsorship is available for anybody interested in implementing
 bindings for other test frameworks. Get in touch on [discord](https://discord.gg/h4ha5Cue7j)
@@ -33,3 +39,8 @@ or by emailing oss@rwx.com
 ## Development
 
 For notes on working on abq, see [development.md](development.md)
+
+[rspec-abq-docs]: https://www.rwx.com/docs/abq/test-frameworks/rspec
+[jest-abq-docs]: https://www.rwx.com/docs/abq/test-frameworks/jest
+[playwright-abq-docs]: https://www.rwx.com/docs/abq/test-frameworks/playwright
+[pytest-abq-docs]: https://www.rwx.com/docs/abq/test-frameworks/pytest
