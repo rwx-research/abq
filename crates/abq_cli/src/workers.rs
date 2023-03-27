@@ -9,6 +9,7 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{WorkerRunner, WorkerTag};
 use abq_utils::net_protocol::queue::InvokeWork;
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
+use abq_utils::whitespace::trim_whitespace;
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
 };
@@ -191,7 +192,7 @@ pub(crate) fn print_manifest_generation_output(
     mut writer: impl Write,
     manifest_output: ProcessOutput,
 ) -> std::io::Result<()> {
-    if manifest_output.is_empty() {
+    if trim_whitespace(&manifest_output).is_empty() {
         return Ok(());
     }
 

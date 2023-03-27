@@ -16,6 +16,7 @@ pub mod server_shutdown;
 pub mod timeout_future;
 pub mod tls;
 pub mod vec_map;
+pub mod whitespace;
 
 pub const VERSION: &str = include_str!(concat!(
     env!("ABQ_WORKSPACE_DIR"),
