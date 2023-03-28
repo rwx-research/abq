@@ -1,6 +1,6 @@
 //! Utilities for one-shot notification, particularly of shutdown messages.
 
-use std::{future::Future, io, pin::Pin, sync::mpsc::TryRecvError, task};
+use std::{future::Future, io, pin::Pin, task};
 
 use tokio::sync::oneshot::{self, Receiver, Sender};
 
@@ -31,15 +31,6 @@ impl Future for OneshotRx {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         Pin::new(&mut self.0).poll(cx).map_err(|_| failed_recv())
-    }
-}
-
-impl OneshotRx {
-    pub fn try_recv(&mut self) -> Result<(), TryRecvError> {
-        self.0.try_recv().map_err(|e| match e {
-            oneshot::error::TryRecvError::Empty => TryRecvError::Empty,
-            oneshot::error::TryRecvError::Closed => TryRecvError::Disconnected,
-        })
     }
 }
 

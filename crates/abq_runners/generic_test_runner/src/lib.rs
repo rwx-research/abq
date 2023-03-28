@@ -687,31 +687,34 @@ pub async fn run_async(
         working_dir: &working_dir,
     };
 
-    let listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
-    let opt_native_runner_handle = NativeRunnerHandle::new(
-        listener,
-        native_runner_args,
-        send_manifest.is_some(),
-        protocol_version_timeout,
-        runner_meta,
-        child_output_strategy,
-    )
-    .await;
+    let build_runner_and_run_to_completion = async move {
+        let listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
+        let opt_native_runner_handle = NativeRunnerHandle::new(
+            listener,
+            native_runner_args,
+            send_manifest.is_some(),
+            protocol_version_timeout,
+            runner_meta,
+            child_output_strategy,
+        )
+        .await;
 
-    let run_to_completion_task = run_help(
-        send_manifest,
-        opt_native_runner_handle,
-        get_init_context,
-        results_batch_size,
-        get_next_test_bundle,
-        results_handler,
-        notify_all_tests_run,
-        runner_meta,
-        test_timeout,
-    );
+        run_help(
+            send_manifest,
+            opt_native_runner_handle,
+            get_init_context,
+            results_batch_size,
+            get_next_test_bundle,
+            results_handler,
+            notify_all_tests_run,
+            runner_meta,
+            test_timeout,
+        )
+        .await
+    };
 
     tokio::select! {
-        result = run_to_completion_task => {
+        result = build_runner_and_run_to_completion => {
             result
         }
         shutdown_result = shutdown_immediately => {
@@ -2033,11 +2036,12 @@ mod test_invalid_command {
     use std::sync::Arc;
 
     use crate::{
-        noop_notify_cancellation, notify_all_tests_run, run_sync, GenericRunnerError,
+        noop_notify_cancellation, notify_all_tests_run, run_async, run_sync, GenericRunnerError,
         ImmediateTests, StaticGetInitContext, StaticManifestCollector,
         DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
     };
     use abq_utils::capture_output::CaptureChildOutputStrategy;
+    use abq_utils::exit::ExitCode;
     use abq_utils::net_protocol::entity::RunnerMeta;
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
@@ -2108,5 +2112,61 @@ mod test_invalid_command {
             !all_tests_run.load(atomic::ORDERING),
             "invalid command should not notify completion"
         );
+    }
+
+    #[tokio::test]
+    #[ntest::timeout(1000)] // 1 second
+    async fn shutdown_stops_runner_immediately() {
+        let input = NativeTestRunnerParams {
+            cmd: "sleep".to_string(),
+            args: vec!["1000".to_string()],
+            extra_env: Default::default(),
+        };
+
+        let get_init_context = StaticGetInitContext {
+            context: Ok(InitContext {
+                init_meta: Default::default(),
+            }),
+        };
+        let get_next_test = ImmediateTests {
+            tests: vec![NextWorkBundle::new([], Eow(false))],
+        };
+        let results_handler = Box::new(NoopResultsHandler);
+
+        let (all_tests_run, notify_all_tests_run) = notify_all_tests_run();
+
+        let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
+
+        let child_output_strategy = CaptureChildOutputStrategy::new(true);
+
+        let run_task = run_async(
+            RunnerMeta::fake(),
+            input,
+            DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+            DEFAULT_RUNNER_TEST_TIMEOUT,
+            std::env::current_dir().unwrap(),
+            shutdown_rx,
+            1,
+            None,
+            Box::new(get_init_context),
+            Box::new(get_next_test),
+            results_handler,
+            notify_all_tests_run,
+            noop_notify_cancellation(),
+            Box::new(child_output_strategy),
+            false,
+        );
+
+        let wait_and_kill_task = async move {
+            // Give the runner enough time to start up.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            shutdown_tx.notify().unwrap();
+        };
+
+        let (result, ()) = tokio::join!(run_task, wait_and_kill_task);
+        let test_runner_exit = result.unwrap();
+        assert_eq!(test_runner_exit.exit_code, ExitCode::CANCELLED);
+
+        assert!(!all_tests_run.load(atomic::ORDERING));
     }
 }

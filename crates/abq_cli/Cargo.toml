@@ -57,6 +57,7 @@ insta.workspace = true
 paste.workspace = true
 serial_test.workspace = true
 nix.workspace = true
+ntest.workspace = true
 tempfile.workspace = true
 rand.workspace = true
 regex.workspace = true

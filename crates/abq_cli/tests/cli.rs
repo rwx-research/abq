@@ -3169,3 +3169,54 @@ fn report_while_run_is_out_of_process_retried_is_error() {
     term(worker0);
     term(queue_proc);
 }
+
+macro_rules! test_signal_runner_stops_immediately {
+    ($($test_name:ident, $signal:ident)*) => {$(
+    #[test]
+    #[ntest::timeout(1000)] // 1 second
+    #[serial]
+    fn $test_name() {
+        let name = stringify!($test_name);
+        let conf = CSConfigOptions {
+            use_auth_token: false,
+            tls: false,
+        };
+
+        let mut test_proc = Abq::new(name)
+            .args({
+                let mut args = conf.extend_args_for_client(vec![s!("test")]);
+                args.extend([s!("--"), s!("yes"), s!("WORKERLIVE")]);
+                args
+            })
+            .spawn();
+
+        let stdout = test_proc.stdout.as_mut().unwrap();
+        let mut reader = BufReader::new(stdout).lines();
+        // Spin until we see WORKERLIVE
+        loop {
+            if let Some(line) = reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("WORKERLIVE") {
+                    break;
+                }
+            }
+        }
+
+        use nix::sys::signal;
+        use nix::unistd::Pid;
+
+        // Stop the worker.
+        signal::kill(Pid::from_raw(test_proc.id() as _), signal::Signal::$signal).unwrap();
+
+        let test_exit = test_proc.wait().unwrap();
+        assert!(!test_exit.success());
+        assert_eq!(test_exit.code(), Some(1));
+    }
+    )*}
+}
+
+test_signal_runner_stops_immediately! {
+    test_signal_runner_stops_immediately_sigterm, SIGTERM
+    test_signal_runner_stops_immediately_sigint, SIGINT
+    test_signal_runner_stops_immediately_sigquit, SIGQUIT
+}
