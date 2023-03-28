@@ -1,10 +1,16 @@
 //! Tracks summary of a test suite run.
 
-use std::{cell::Cell, collections::HashMap, time::Instant};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, HashMap},
+    time::Instant,
+};
 
+use abq_reporting::output::RunnerSummary;
 use abq_utils::{
     exit::ExitCode,
     net_protocol::{
+        entity::WorkerRunner,
         runners::{Status, TestId, TestResult, TestRuntime},
         workers::INIT_RUN_NUMBER,
     },
@@ -43,13 +49,19 @@ impl OverallStatus {
 struct TestStatus {
     overall_status: OverallStatus,
     file_path: Option<String>,
+    runner: WorkerRunner,
 }
 
 impl TestStatus {
-    const fn new(overall_status: OverallStatus, file_path: Option<String>) -> Self {
+    const fn new(
+        overall_status: OverallStatus,
+        file_path: Option<String>,
+        runner: WorkerRunner,
+    ) -> Self {
         Self {
             overall_status,
             file_path,
+            runner,
         }
     }
 }
@@ -136,6 +148,7 @@ impl SuiteTracker {
                 TestStatus::new(
                     OverallStatus::new(NeverFailed, false),
                     test_result.location.as_ref().map(|l| l.file.clone()),
+                    test_result.source.runner,
                 ),
             );
             is_new_result = true;
@@ -203,15 +216,30 @@ impl SuiteTracker {
             retried,
         } = self.load_aggregated_metrics();
 
-        let failed_file_paths = tests
-            .values()
-            .filter_map(|ts| match ts.overall_status.tag {
+        let mut runner_summaries: BTreeMap<WorkerRunner, RunnerSummary> = BTreeMap::new();
+
+        for test in tests.values() {
+            let runner_summary =
+                runner_summaries
+                    .entry(test.runner)
+                    .or_insert_with(|| RunnerSummary {
+                        runner: test.runner,
+                        failures_per_file: Default::default(),
+                    });
+
+            match test.overall_status.tag {
                 StatusTag::AlwaysFailed { internal_error } if !internal_error => {
-                    ts.file_path.clone()
+                    if let Some(file_path) = &test.file_path {
+                        runner_summary
+                            .failures_per_file
+                            .entry(file_path.clone())
+                            .and_modify(|counter| *counter += 1)
+                            .or_insert(1);
+                    }
                 }
-                _ => None,
-            })
-            .collect();
+                _ => {}
+            }
+        }
 
         SuiteResult {
             suggested_exit_code,
@@ -220,7 +248,7 @@ impl SuiteTracker {
             tests_retried: retried,
             wall_time: start_time.elapsed(),
             test_time: *test_time,
-            failed_file_paths,
+            runner_summaries: runner_summaries.into_values().collect(),
         }
     }
 }
@@ -393,7 +421,7 @@ mod test {
                     tests_retried,
                     wall_time: _,
                     test_time: _,
-                    failed_file_paths: _,
+                    runner_summaries: _,
                 } = tracker.suite_result();
 
                 assert_eq!(suggested_exit_code, $expect_exit);

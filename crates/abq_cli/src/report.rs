@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use abq_reporting::{CompletedSummary, ReportedResult, Reporter};
+use abq_reporting::{output::ShortSummaryGrouping, CompletedSummary, ReportedResult, Reporter};
 use abq_utils::{
     exit::ExitCode,
     log_assert_stderr, net_async,
@@ -114,7 +114,10 @@ pub(crate) async fn report_results(
 
     print!("\n\n");
     suite_result
-        .write_short_summary_lines(&mut stdout_preferences.stdout_stream())
+        .write_short_summary_lines(
+            &mut stdout_preferences.stdout_stream(),
+            ShortSummaryGrouping::Worker,
+        )
         .unwrap();
 
     Ok(suite_result.suggested_exit_code())

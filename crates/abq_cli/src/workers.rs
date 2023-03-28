@@ -3,6 +3,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use abq_reporting::output::ShortSummaryGrouping;
 use abq_reporting::CompletedSummary;
 use abq_utils::capture_output::ProcessOutput;
 use abq_utils::exit::ExitCode;
@@ -156,7 +157,9 @@ async fn do_shutdown(
     }
 
     print!("\n\n");
-    suite_result.write_short_summary_lines(&mut stdout).unwrap();
+    suite_result
+        .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)
+        .unwrap();
 
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,
     // indicate the worker fault.

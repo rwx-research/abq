@@ -52,7 +52,7 @@ pub mod meta {
 pub mod entity {
     use serde_derive::{Deserialize, Serialize};
 
-    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Debug)]
     #[repr(transparent)]
     pub struct RunnerTag(u32);
 
@@ -68,7 +68,7 @@ pub mod entity {
         }
     }
 
-    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Debug)]
     #[repr(transparent)]
     pub struct WorkerTag(u32);
 
@@ -85,13 +85,19 @@ pub mod entity {
         }
     }
 
-    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Debug)]
     pub struct WorkerRunner(WorkerTag, RunnerTag);
 
     impl std::fmt::Display for WorkerRunner {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             let Self(WorkerTag(worker), RunnerTag(runner)) = self;
             write!(f, "worker {worker}, runner {runner}")
+        }
+    }
+
+    impl From<(u32, u32)> for WorkerRunner {
+        fn from(tags: (u32, u32)) -> Self {
+            Self::new(tags.0, tags.1)
         }
     }
 

@@ -10,6 +10,7 @@ node_modules/
 # Produced as debug output in CLI tests
 *.debug
 build_artifact/
+.*.rs.pending-snap
 
 .DS_Store
 

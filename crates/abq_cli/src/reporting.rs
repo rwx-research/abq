@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::{fmt::Display, io, path::PathBuf, str::FromStr, time::Duration};
 
 use abq_dot_reporter::DotReporter;
 use abq_line_reporter::LineReporter;
 use abq_progress_reporter::ProgressReporter;
+use abq_reporting::output::{RunnerSummary, ShortSummaryGrouping};
 use abq_reporting::{colors::ColorProvider, CompletedSummary, ReportedResult, ReportingError};
 use abq_reporting::{
     output::{format_short_suite_summary, ShortSummary},
@@ -126,17 +126,15 @@ pub struct SuiteResult {
     pub wall_time: Duration,
     /// Runtime of the test suite, as accounted for in the actual time in tests.
     pub test_time: TestRuntime,
-    /// File paths of test failures, one entry per failure.
-    pub failed_file_paths: Vec<String>,
+    pub runner_summaries: Vec<RunnerSummary>,
 }
 
 impl SuiteResult {
-    pub fn write_short_summary_lines(&self, w: &mut impl termcolor::WriteColor) -> io::Result<()> {
-        let mut failures_per_file = HashMap::new();
-        for file in &self.failed_file_paths {
-            *failures_per_file.entry(file.clone()).or_insert(0) += 1;
-        }
-
+    pub fn write_short_summary_lines(
+        &self,
+        w: &mut impl termcolor::WriteColor,
+        grouping: ShortSummaryGrouping,
+    ) -> io::Result<()> {
         format_short_suite_summary(
             w,
             ShortSummary {
@@ -145,7 +143,8 @@ impl SuiteResult {
                 num_tests: self.count,
                 num_failing: self.count_failed,
                 num_retried: self.tests_retried,
-                failures_per_file,
+                runner_summaries: self.runner_summaries.clone(),
+                grouping,
             },
         )
     }
@@ -478,6 +477,7 @@ mod test_reporter_kind {
 mod suite {
     use std::time::Duration;
 
+    use abq_reporting::output::{RunnerSummary, ShortSummaryGrouping};
     use abq_reporting_test_utils::MockWriter;
     use abq_utils::net_protocol::runners::TestRuntime;
 
@@ -488,7 +488,7 @@ mod suite {
     fn get_short_summary_lines(summary: SuiteResult) -> String {
         let mut mock_writer = MockWriter::default();
         summary
-            .write_short_summary_lines(&mut &mut mock_writer)
+            .write_short_summary_lines(&mut &mut mock_writer, ShortSummaryGrouping::Runner)
             .unwrap();
         String::from_utf8(mock_writer.buffer).unwrap()
     }
@@ -502,7 +502,7 @@ mod suite {
             tests_retried: 0,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
-            failed_file_paths: vec![],
+            runner_summaries: vec![RunnerSummary::empty((0, 1).into())],
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         --------------------------------------------------------------------------------
@@ -523,7 +523,7 @@ mod suite {
             tests_retried: 0,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
-            failed_file_paths: vec![],
+            runner_summaries: vec![RunnerSummary::empty((0, 1).into())],
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         --------------------------------------------------------------------------------
@@ -544,7 +544,7 @@ mod suite {
             tests_retried: 3,
             wall_time: Duration::from_secs(78),
             test_time: TestRuntime::Milliseconds(70200.),
-            failed_file_paths: vec![],
+            runner_summaries: vec![RunnerSummary::empty((0, 1).into())],
         };
         insta::assert_snapshot!(get_short_summary_lines(summary), @r###"
         --------------------------------------------------------------------------------

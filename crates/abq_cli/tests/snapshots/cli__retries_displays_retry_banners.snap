@@ -28,5 +28,7 @@ Finished in XX seconds (XX seconds spent in test code)
 64 tests, 64 failures, 64 retried
 
 Failures:
-    64   a/b/x.file
+
+    runner N:
+       64   a/b/x.file
 
