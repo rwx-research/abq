@@ -106,6 +106,7 @@ pub fn format_non_interactive_progress(
 pub struct RunnerSummary {
     pub runner: WorkerRunner,
     pub failures_per_file: HashMap<String, u64>,
+    pub retries_per_file: HashMap<String, u64>,
 }
 
 impl RunnerSummary {
@@ -113,11 +114,28 @@ impl RunnerSummary {
         Self {
             runner,
             failures_per_file: HashMap::new(),
+            retries_per_file: HashMap::new(),
         }
     }
 
     pub fn has_failures(&self) -> bool {
         !self.failures_per_file.is_empty()
+    }
+
+    pub fn has_retries(&self) -> bool {
+        !self.retries_per_file.is_empty()
+    }
+
+    fn union(&mut self, other: &RunnerSummary) {
+        for (file, other_failures) in other.failures_per_file.iter() {
+            let total_failures = self.failures_per_file.entry(file.into()).or_insert(0);
+            *total_failures += other_failures;
+        }
+
+        for (file, other_retries) in other.retries_per_file.iter() {
+            let total_retries = self.retries_per_file.entry(file.into()).or_insert(0);
+            *total_retries += other_retries;
+        }
     }
 }
 
@@ -142,34 +160,40 @@ pub struct ShortSummary {
 }
 
 impl ShortSummary {
-    pub fn failure_summaries(&self) -> Vec<RunnerSummary> {
+    /// Group runner summaries and sum counts for all (worker, runner) instances.
+    pub fn grouped_runner_summaries(&self) -> Vec<RunnerSummary> {
         let mut summaries: BTreeMap<u32, RunnerSummary> = BTreeMap::new();
         for runner_summary in &self.runner_summaries {
-            if !runner_summary.has_failures() {
-                continue;
-            }
-
-            let key = match self.grouping {
-                ShortSummaryGrouping::Runner => runner_summary.runner.runner(),
-                ShortSummaryGrouping::Worker => runner_summary.runner.worker(),
-            };
+            let key = self.grouping_key(runner_summary.runner);
 
             match summaries.get_mut(&key) {
                 None => {
                     summaries.insert(key, runner_summary.clone());
                 }
                 Some(existing_summary) => {
-                    for (file, failures) in runner_summary.failures_per_file.iter() {
-                        let total_failures = existing_summary
-                            .failures_per_file
-                            .entry(file.into())
-                            .or_default();
-                        *total_failures += failures;
-                    }
+                    existing_summary.union(runner_summary);
                 }
             };
         }
         summaries.into_values().collect()
+    }
+
+    fn grouping_key(&self, runner: WorkerRunner) -> u32 {
+        match self.grouping {
+            ShortSummaryGrouping::Runner => runner.runner(),
+            ShortSummaryGrouping::Worker => runner.worker(),
+        }
+    }
+
+    fn grouping_label(&self, runner: WorkerRunner) -> String {
+        match self.grouping {
+            ShortSummaryGrouping::Runner => {
+                format!("runner {}", runner.runner())
+            }
+            ShortSummaryGrouping::Worker => {
+                format!("worker {}", runner.worker())
+            }
+        }
     }
 }
 
@@ -220,7 +244,40 @@ pub fn format_short_suite_summary(
     }
     writeln!(writer)?;
 
-    let failure_summaries = summary.failure_summaries();
+    let summaries = summary.grouped_runner_summaries();
+
+    let retry_summaries: Vec<_> = summaries.iter().filter(|s| s.has_retries()).collect();
+    if !retry_summaries.is_empty() {
+        writeln!(writer)?;
+        writeln!(writer, "Retries:")?;
+        writeln!(writer)?;
+
+        for (i, retry_summary) in retry_summaries.iter().enumerate() {
+            if i > 0 {
+                writeln!(writer)?;
+            }
+
+            let ordered_files: BTreeMap<String, u64> = retry_summary
+                .retries_per_file
+                .iter()
+                .map(|(k, v)| (k.to_string(), *v))
+                .collect();
+
+            writeln!(
+                writer,
+                "    {}:",
+                summary.grouping_label(retry_summary.runner)
+            )?;
+
+            for (file, count) in ordered_files {
+                write!(writer, "    {: >5}", count)?;
+                write!(writer, "   ")?;
+                writeln!(writer, "{file}")?;
+            }
+        }
+    }
+
+    let failure_summaries: Vec<_> = summaries.iter().filter(|s| s.has_failures()).collect();
     if !failure_summaries.is_empty() {
         writeln!(writer)?;
         writeln!(writer, "Failures:")?;
@@ -231,15 +288,11 @@ pub fn format_short_suite_summary(
                 writeln!(writer)?;
             }
 
-            let label = match summary.grouping {
-                ShortSummaryGrouping::Runner => {
-                    format!("runner {}", failure_summary.runner.runner())
-                }
-                ShortSummaryGrouping::Worker => {
-                    format!("worker {}", failure_summary.runner.worker())
-                }
-            };
-            writeln!(writer, "    {}:", label)?;
+            writeln!(
+                writer,
+                "    {}:",
+                summary.grouping_label(failure_summary.runner)
+            )?;
 
             let ordered_files: BTreeMap<String, u64> = failure_summary
                 .failures_per_file
@@ -682,6 +735,7 @@ mod test {
                 RunnerSummary {
                     runner: (0, 1).into(),
                     failures_per_file: HashMap::from([("file2.rs".to_owned(), 6), ("file1.rs".to_owned(), 10)]),
+                    retries_per_file: HashMap::new(),
                 },
             ],
             grouping: ShortSummaryGrouping::Runner,
@@ -703,6 +757,45 @@ mod test {
     );
 
     test_format!(
+        format_short_suite_summary_with_failing_with_retried_single_runner, format_short_suite_summary,
+        ShortSummary {
+            wall_time: Duration::from_secs(10),
+            test_time: Duration::from_secs(9),
+            num_tests: 100,
+            num_failing: 16,
+            num_retried: 12,
+            runner_summaries: vec![
+                RunnerSummary {
+                    runner: (0, 1).into(),
+                    failures_per_file: HashMap::from([("file2.rs".to_owned(), 6), ("file1.rs".to_owned(), 10)]),
+                    retries_per_file: HashMap::from([("file2.rs".to_owned(), 2), ("file1.rs".to_owned(), 10)]),
+                },
+            ],
+            grouping: ShortSummaryGrouping::Runner,
+        },
+        @r###"
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
+    <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
+    <bold-green>100 tests<reset>, <bold-red>16 failures<reset>, <bold-yellow>12 retried<reset>
+
+    Retries:
+
+        runner 1:
+           10   file1.rs
+            2   file2.rs
+
+    Failures:
+
+        runner 1:
+           10   file1.rs
+            6   file2.rs
+    "###
+    );
+
+    test_format!(
         format_short_suite_summary_with_failing_without_retried_multiple_runners, format_short_suite_summary,
         ShortSummary {
             wall_time: Duration::from_secs(10),
@@ -714,10 +807,12 @@ mod test {
                 RunnerSummary {
                     runner: (0, 1).into(),
                     failures_per_file: HashMap::from([("file2.rs".to_owned(), 1), ("file1.rs".to_owned(), 10)]),
+                    retries_per_file: HashMap::new(),
                 },
                 RunnerSummary {
                     runner: (0, 3).into(),
                     failures_per_file: HashMap::from([("file2.rs".to_owned(), 5)]),
+                    retries_per_file: HashMap::new(),
                 },
             ],
             grouping: ShortSummaryGrouping::Runner,
@@ -742,6 +837,55 @@ mod test {
     );
 
     test_format!(
+        format_short_suite_summary_with_failing_with_retried_multiple_runners, format_short_suite_summary,
+        ShortSummary {
+            wall_time: Duration::from_secs(10),
+            test_time: Duration::from_secs(9),
+            num_tests: 100,
+            num_failing: 16,
+            num_retried: 0,
+            runner_summaries: vec![
+                RunnerSummary {
+                    runner: (0, 1).into(),
+                    failures_per_file: HashMap::from([("file2.rs".to_owned(), 1), ("file1.rs".to_owned(), 10)]),
+                    retries_per_file: HashMap::from([("file1.rs".to_owned(), 10)]),
+                },
+                RunnerSummary {
+                    runner: (0, 3).into(),
+                    failures_per_file: HashMap::from([("file2.rs".to_owned(), 5)]),
+                    retries_per_file: HashMap::from([("file2.rs".to_owned(), 1)]),
+                },
+            ],
+            grouping: ShortSummaryGrouping::Runner,
+        },
+        @r###"
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
+    <bold>Finished in 10.00 seconds<reset> (9.00 seconds spent in test code)
+    <bold-green>100 tests<reset>, <bold-red>16 failures<reset>
+
+    Retries:
+
+        runner 1:
+           10   file1.rs
+
+        runner 3:
+            1   file2.rs
+
+    Failures:
+
+        runner 1:
+           10   file1.rs
+            1   file2.rs
+
+        runner 3:
+            5   file2.rs
+    "###
+    );
+
+    test_format!(
         format_short_suite_summary_with_failing_without_retried_multiple_workers, format_short_suite_summary,
         ShortSummary {
             wall_time: Duration::from_secs(10),
@@ -753,14 +897,17 @@ mod test {
                 RunnerSummary {
                     runner: (0, 1).into(),
                     failures_per_file: HashMap::from([("file2.rs".to_owned(), 1), ("file1.rs".to_owned(), 10)]),
+                    retries_per_file: HashMap::new(),
                 },
                 RunnerSummary {
                     runner: (0, 3).into(),
                     failures_per_file: HashMap::from([("file2.rs".to_owned(), 3)]),
+                    retries_per_file: HashMap::new(),
                 },
                 RunnerSummary {
                     runner: (2, 4).into(),
                     failures_per_file: HashMap::from([("file2.rs".to_owned(), 2)]),
+                    retries_per_file: HashMap::new(),
                 },
             ],
             grouping: ShortSummaryGrouping::Worker,

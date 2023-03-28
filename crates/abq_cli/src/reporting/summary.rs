@@ -19,6 +19,7 @@ use abq_utils::{
 use crate::reporting::SuiteResult;
 
 /// Status of a test, possibly across multiple attempts.
+#[derive(Debug)]
 enum StatusTag {
     /// The test never failed.
     NeverFailed,
@@ -35,6 +36,7 @@ enum StatusTag {
     UltimatelyFailed,
 }
 
+#[derive(Debug)]
 struct OverallStatus {
     tag: StatusTag,
     retried: bool,
@@ -46,6 +48,7 @@ impl OverallStatus {
     }
 }
 
+#[derive(Debug)]
 struct TestStatus {
     overall_status: OverallStatus,
     file_path: Option<String>,
@@ -66,7 +69,7 @@ impl TestStatus {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct AggregatedMetrics {
     failed: u64,
     retried: u64,
@@ -225,6 +228,7 @@ impl SuiteTracker {
                     .or_insert_with(|| RunnerSummary {
                         runner: test.runner,
                         failures_per_file: Default::default(),
+                        retries_per_file: Default::default(),
                     });
 
             match test.overall_status.tag {
@@ -238,6 +242,16 @@ impl SuiteTracker {
                     }
                 }
                 _ => {}
+            }
+
+            if test.overall_status.retried {
+                if let Some(file_path) = &test.file_path {
+                    runner_summary
+                        .retries_per_file
+                        .entry(file_path.clone())
+                        .and_modify(|counter| *counter += 1)
+                        .or_insert(1);
+                }
             }
         }
 
