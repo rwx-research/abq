@@ -181,6 +181,7 @@ dependencies = [
 name = "abq_reporting"
 version = "0.1.0"
 dependencies = [
+ "abq_test_utils",
  "abq_utils",
  "indoc",
  "insta",
@@ -224,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "abq_utils",
  "regex",
+ "termcolor",
  "tokio",
  "tracing-test",
 ]

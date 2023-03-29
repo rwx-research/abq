@@ -14,3 +14,4 @@ thiserror.workspace = true
 [dev-dependencies]
 insta.workspace = true
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
+abq_test_utils = { path = "../abq_test_support/abq_test_utils" }

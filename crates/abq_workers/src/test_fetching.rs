@@ -221,12 +221,12 @@ mod test {
     use std::time::Duration;
 
     use abq_generic_test_runner::TestsFetcher;
-    use abq_test_utils::{spec, test, wid};
+    use abq_test_utils::{
+        spec, test, wid, with_focus, AssociatedTestResultsBuilder, TestResultBuilder,
+    };
     use abq_utils::net_protocol::workers::{Eow, NextWorkBundle, WorkerTest, INIT_RUN_NUMBER};
 
-    use crate::test_fetching::retries::test::{
-        associated_results, result, with_focus, FAILURE, SUCCESS,
-    };
+    use crate::test_fetching::retries::test::{FAILURE, SUCCESS};
 
     use super::{
         out_of_process_retry_manifest_fetcher, persistent_test_fetcher, Fetcher, InitialSource,
@@ -467,9 +467,24 @@ mod test {
                     assert!(!eow);
 
                     $results_tracker.account_results([
-                        &associated_results(wid(1), INIT_RUN_NUMBER, [result(test(1), FAILURE)]),
-                        &associated_results(wid(2), INIT_RUN_NUMBER, [result(test(2), FAILURE)]),
-                        &associated_results(wid(3), INIT_RUN_NUMBER, [result(test(3), SUCCESS)]),
+                        &AssociatedTestResultsBuilder::new(
+                            wid(1),
+                            INIT_RUN_NUMBER,
+                            [TestResultBuilder::new(test(1), FAILURE)],
+                        )
+                        .build(),
+                        &AssociatedTestResultsBuilder::new(
+                            wid(2),
+                            INIT_RUN_NUMBER,
+                            [TestResultBuilder::new(test(2), FAILURE)],
+                        )
+                        .build(),
+                        &AssociatedTestResultsBuilder::new(
+                            wid(3),
+                            INIT_RUN_NUMBER,
+                            [TestResultBuilder::new(test(3), SUCCESS)],
+                        )
+                        .build(),
                     ]);
 
                     // Attempt 2
@@ -484,16 +499,18 @@ mod test {
                     assert!(!eow);
 
                     $results_tracker.account_results([
-                        &associated_results(
+                        &AssociatedTestResultsBuilder::new(
                             wid(1),
                             INIT_RUN_NUMBER + 1,
-                            [result(test(1), FAILURE)],
-                        ),
-                        &associated_results(
+                            [TestResultBuilder::new(test(1), FAILURE)],
+                        )
+                        .build(),
+                        &AssociatedTestResultsBuilder::new(
                             wid(2),
                             INIT_RUN_NUMBER + 1,
-                            [result(test(2), SUCCESS)],
-                        ),
+                            [TestResultBuilder::new(test(2), SUCCESS)],
+                        )
+                        .build(),
                     ]);
 
                     // Attempt 3
@@ -507,11 +524,12 @@ mod test {
                     );
                     assert!(!eow);
 
-                    $results_tracker.account_results([&associated_results(
+                    $results_tracker.account_results([&AssociatedTestResultsBuilder::new(
                         wid(1),
                         INIT_RUN_NUMBER + 2,
-                        [result(test(1), FAILURE)],
-                    )]);
+                        [TestResultBuilder::new(test(1), FAILURE)],
+                    )
+                    .build()]);
 
                     // Done, even though we had failures
                     let NextWorkBundle { work, eow } = $fetcher.get_next_tests().await.unwrap();
@@ -586,11 +604,12 @@ mod test {
 
             // Attempt 2 will need to fetch from retries of attempt 1.
 
-            results_tracker.account_results([&associated_results(
+            results_tracker.account_results([&AssociatedTestResultsBuilder::new(
                 wid(1),
                 INIT_RUN_NUMBER,
-                [result(test(1), FAILURE)],
-            )]);
+                [TestResultBuilder::new(test(1), FAILURE)],
+            )
+            .build()]);
 
             // Attempt 2
             let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
@@ -603,11 +622,12 @@ mod test {
             );
             assert!(!eow);
 
-            results_tracker.account_results([&associated_results(
+            results_tracker.account_results([&AssociatedTestResultsBuilder::new(
                 wid(1),
                 INIT_RUN_NUMBER + 1,
-                [result(test(1), FAILURE)],
-            )]);
+                [TestResultBuilder::new(test(1), FAILURE)],
+            )
+            .build()]);
 
             // Done, even though we had failures
             let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
@@ -649,11 +669,12 @@ mod test {
 
             // Attempt 2 will need to fetch from retries of attempt 1.
 
-            results_tracker.account_results([&associated_results(
+            results_tracker.account_results([&AssociatedTestResultsBuilder::new(
                 wid(1),
                 INIT_RUN_NUMBER,
-                [result(test(1), FAILURE)],
-            )]);
+                [TestResultBuilder::new(test(1), FAILURE)],
+            )
+            .build()]);
 
             // Attempt 2
             let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
@@ -666,11 +687,12 @@ mod test {
             );
             assert!(!eow);
 
-            results_tracker.account_results([&associated_results(
+            results_tracker.account_results([&AssociatedTestResultsBuilder::new(
                 wid(1),
                 INIT_RUN_NUMBER + 1,
-                [result(test(1), FAILURE)],
-            )]);
+                [TestResultBuilder::new(test(1), FAILURE)],
+            )
+            .build()]);
 
             // Done, even though we had failures
             let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();

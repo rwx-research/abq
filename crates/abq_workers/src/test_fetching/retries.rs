@@ -353,9 +353,10 @@ pub fn build_tracking_pair(max_run_number: u32) -> (RetryTracker, ResultsTracker
 #[cfg(test)]
 pub mod test {
     use abq_run_n_times::n_times;
+    use abq_test_utils::{with_focus, AssociatedTestResultsBuilder, TestResultBuilder};
     use abq_utils::net_protocol::{
-        queue::{AssociatedTestResults, TestSpec},
-        runners::{Status, StdioOutput, TestCase, TestId, TestResult},
+        queue::TestSpec,
+        runners::{Status, TestCase},
         workers::{Eow, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
     };
     use abq_with_protocol_version::with_protocol_version;
@@ -545,33 +546,6 @@ pub mod test {
         backtrace: None,
     };
 
-    pub fn result(test_id: impl Into<TestId>, status: Status) -> TestResult {
-        let mut result = TestResult::fake();
-        result.result.id = test_id.into();
-        result.result.status = status;
-        result
-    }
-
-    pub fn with_focus(test_spec: impl Into<TestSpec>, focus: impl Into<TestId>) -> TestSpec {
-        let mut test_spec: TestSpec = test_spec.into();
-        test_spec.test_case.add_test_focus(focus.into());
-        test_spec
-    }
-
-    pub fn associated_results(
-        work_id: WorkId,
-        run_number: u32,
-        results: impl IntoIterator<Item = TestResult>,
-    ) -> AssociatedTestResults {
-        AssociatedTestResults {
-            work_id,
-            run_number,
-            results: results.into_iter().collect(),
-            before_any_test: StdioOutput::empty(),
-            after_all_tests: None,
-        }
-    }
-
     #[test]
     #[with_protocol_version]
     fn hydrate_empty_manifest() {
@@ -614,9 +588,24 @@ pub mod test {
         assert_eq!(hydrated, HydrationStatus::StillHydrating);
 
         tracker.account_results([
-            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
-            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", FAILURE)]),
-            &associated_results(id3, INIT_RUN_NUMBER, [result("test3", FAILURE)]),
+            &AssociatedTestResultsBuilder::new(
+                id1,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id2,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test2", FAILURE)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id3,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test3", FAILURE)],
+            )
+            .build(),
         ]);
 
         assert!(tracker.try_assemble_retry_manifest().is_none());
@@ -655,8 +644,18 @@ pub mod test {
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
-            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
-            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", FAILURE)]),
+            &AssociatedTestResultsBuilder::new(
+                id1,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id2,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test2", FAILURE)],
+            )
+            .build(),
         ]);
 
         assert!(tracker.try_assemble_retry_manifest().is_none());
@@ -695,9 +694,24 @@ pub mod test {
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
-            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
-            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", FAILURE)]),
-            &associated_results(id3, INIT_RUN_NUMBER, [result("test3", FAILURE)]),
+            &AssociatedTestResultsBuilder::new(
+                id1,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id2,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test2", FAILURE)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id3,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test3", FAILURE)],
+            )
+            .build(),
         ]);
 
         let manifest = tracker.try_assemble_retry_manifest();
@@ -760,9 +774,24 @@ pub mod test {
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
-            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
-            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", SUCCESS)]),
-            &associated_results(id3, INIT_RUN_NUMBER, [result("test3", SUCCESS)]),
+            &AssociatedTestResultsBuilder::new(
+                id1,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id2,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test2", SUCCESS)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id3,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test3", SUCCESS)],
+            )
+            .build(),
         ]);
 
         let manifest = tracker.try_assemble_retry_manifest();
@@ -811,8 +840,18 @@ pub mod test {
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
-            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", SUCCESS)]),
-            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", SUCCESS)]),
+            &AssociatedTestResultsBuilder::new(
+                id1,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test1", SUCCESS)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id2,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test2", SUCCESS)],
+            )
+            .build(),
         ]);
 
         let manifest = tracker.try_assemble_retry_manifest();
@@ -850,8 +889,18 @@ pub mod test {
         assert_eq!(hydrated, HydrationStatus::EndOfManifest);
 
         tracker.account_results([
-            &associated_results(id1, INIT_RUN_NUMBER, [result("test1", FAILURE)]),
-            &associated_results(id2, INIT_RUN_NUMBER, [result("test2", SUCCESS)]),
+            &AssociatedTestResultsBuilder::new(
+                id1,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build(),
+            &AssociatedTestResultsBuilder::new(
+                id2,
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new("test2", SUCCESS)],
+            )
+            .build(),
         ]);
 
         let manifest = tracker.try_assemble_retry_manifest();
@@ -901,11 +950,12 @@ pub mod test {
 
         // First retry
         {
-            tracker.account_results([&associated_results(
+            tracker.account_results([&AssociatedTestResultsBuilder::new(
                 id1,
                 INIT_RUN_NUMBER,
-                [result("test1", FAILURE)],
-            )]);
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build()]);
 
             let manifest = tracker.try_assemble_retry_manifest();
             assert!(manifest.is_some());
@@ -928,11 +978,12 @@ pub mod test {
 
         // Second retry
         {
-            tracker.account_results([&associated_results(
+            tracker.account_results([&AssociatedTestResultsBuilder::new(
                 id1,
                 INIT_RUN_NUMBER + 1,
-                [result("test1", FAILURE)],
-            )]);
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build()]);
 
             let manifest = tracker.try_assemble_retry_manifest();
             assert!(manifest.is_some());
@@ -951,11 +1002,12 @@ pub mod test {
 
         // Third retry - should be done
         {
-            tracker.account_results([&associated_results(
+            tracker.account_results([&AssociatedTestResultsBuilder::new(
                 id1,
                 INIT_RUN_NUMBER + 2,
-                [result("test1", FAILURE)],
-            )]);
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build()]);
 
             for _ in 0..2 {
                 // No matter how many times we request the retry manifest now, we should get
@@ -1024,11 +1076,12 @@ pub mod test {
 
         // Account first test result
         {
-            tracker.account_results([&associated_results(
+            tracker.account_results([&AssociatedTestResultsBuilder::new(
                 id1,
                 INIT_RUN_NUMBER,
-                [result("test1", FAILURE)],
-            )]);
+                [TestResultBuilder::new("test1", FAILURE)],
+            )
+            .build()]);
             assert_eq!(
                 tracker.assembled_state,
                 AssembledState::WaitingForEndOfHydration {
@@ -1056,11 +1109,12 @@ pub mod test {
 
         // Account second test result
         {
-            tracker.account_results([&associated_results(
+            tracker.account_results([&AssociatedTestResultsBuilder::new(
                 id2,
                 INIT_RUN_NUMBER,
-                [result("test2", SUCCESS)],
-            )]);
+                [TestResultBuilder::new("test2", SUCCESS)],
+            )
+            .build()]);
             assert_eq!(
                 tracker.assembled_state,
                 AssembledState::WaitingForEndOfHydration {

@@ -42,6 +42,7 @@ impl Collector {
             other_errors: _,
             stderr: _,
             stdout: _,
+            timestamp: _,
         } = test_result.deref();
 
         let duration = match runtime {

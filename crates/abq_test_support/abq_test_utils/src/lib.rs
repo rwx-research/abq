@@ -10,15 +10,19 @@ use abq_utils::{
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
         UserToken,
     },
+    capture_output::StdioOutput,
     net_async,
     net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
-        queue::TestSpec,
-        runners::{ProtocolWitness, TestCase, TestId},
+        queue::{AssociatedTestResults, TestSpec},
+        runners::{ProtocolWitness, Status, TestCase, TestId, TestResult},
         workers::WorkId,
     },
+    time::EpochMillis,
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
+
+pub mod color_writer;
 
 pub const WORKSPACE: &str = env!("ABQ_WORKSPACE_DIR");
 
@@ -107,6 +111,82 @@ pub fn spec(id: usize) -> TestSpec {
     TestSpec {
         test_case: TestCase::new(ProtocolWitness::TEST, test(id), Default::default()),
         work_id: wid(id),
+    }
+}
+
+pub struct TestResultBuilder {
+    result: TestResult,
+}
+
+impl TestResultBuilder {
+    pub fn new(test_id: impl Into<TestId>, status: Status) -> Self {
+        let mut result = TestResult::fake();
+        let test_id = test_id.into();
+        result.result.id = test_id.clone();
+        result.result.display_name = test_id;
+        result.result.status = status;
+        Self { result }
+    }
+
+    pub fn output(mut self, output: impl ToString) -> Self {
+        self.result.result.output = Some(output.to_string());
+        self
+    }
+
+    pub fn timestamp(mut self, timestamp: EpochMillis) -> Self {
+        self.result.result.timestamp = timestamp;
+        self
+    }
+
+    pub fn build(self) -> TestResult {
+        self.result
+    }
+}
+
+impl From<TestResultBuilder> for TestResult {
+    fn from(tb: TestResultBuilder) -> Self {
+        tb.build()
+    }
+}
+
+pub fn with_focus(test_spec: impl Into<TestSpec>, focus: impl Into<TestId>) -> TestSpec {
+    let mut test_spec: TestSpec = test_spec.into();
+    test_spec.test_case.add_test_focus(focus.into());
+    test_spec
+}
+
+pub struct AssociatedTestResultsBuilder {
+    results: AssociatedTestResults,
+}
+
+impl AssociatedTestResultsBuilder {
+    pub fn new<T: Into<TestResult>>(
+        work_id: WorkId,
+        run_number: u32,
+        results: impl IntoIterator<Item = T>,
+    ) -> Self {
+        let results = AssociatedTestResults {
+            work_id,
+            run_number,
+            results: results.into_iter().map(Into::into).collect(),
+            before_any_test: StdioOutput::empty(),
+            after_all_tests: None,
+        };
+        Self { results }
+    }
+
+    pub fn before_any_test(mut self, before_any_test: StdioOutput) -> Self {
+        self.results.before_any_test = before_any_test;
+        self
+    }
+
+    pub fn after_all_tests(mut self, after_all_tests: StdioOutput) -> Self {
+        self.results.after_all_tests = Some(after_all_tests);
+        self
+    }
+
+    pub fn build(self) -> AssociatedTestResults {
+        self.results
     }
 }
 

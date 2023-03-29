@@ -510,6 +510,7 @@ pub use v0_2::OutOfBandError;
 
 use crate::exit::ExitCode;
 use crate::net_protocol::workers::WorkId;
+use crate::time::EpochMillis;
 
 use super::entity::RunnerMeta;
 use super::queue::{NativeRunnerInfo, TestSpec};
@@ -567,6 +568,8 @@ pub struct TestResultSpec {
     pub stderr: Option<Vec<u8>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdout: Option<Vec<u8>>,
+
+    pub timestamp: EpochMillis,
 }
 
 impl TestResultSpec {
@@ -591,6 +594,7 @@ impl TestResultSpec {
             other_errors: None,
             stderr: Some(b"my stdout".to_vec()),
             stdout: Some(b"my stderr".to_vec()),
+            timestamp: EpochMillis::from_millis(0),
         }
     }
 }
@@ -632,6 +636,7 @@ impl From<v0_2::TestResult> for TestResultSpec {
             other_errors,
             stderr: None,
             stdout: None,
+            timestamp: EpochMillis::now(),
         }
     }
 }

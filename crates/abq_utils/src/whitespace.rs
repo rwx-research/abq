@@ -1,26 +1,34 @@
-pub fn trim_whitespace(buf: &[u8]) -> &[u8] {
-    let mut start = 0;
-    let mut end = buf.len();
-    while start < end && buf[start].is_ascii_whitespace() {
-        start += 1;
+pub fn is_blank(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
     }
-    while end > start && buf[end - 1].is_ascii_whitespace() {
-        end -= 1;
+
+    for &byte in bytes.iter() {
+        if !byte.is_ascii_whitespace() {
+            return false;
+        }
     }
-    &buf[start..end]
+
+    true
 }
 
 #[cfg(test)]
 mod test {
-    use super::trim_whitespace;
+    #[test]
+    fn test_is_blank() {
+        assert!(super::is_blank(b""));
+        assert!(super::is_blank(b" "));
+        assert!(super::is_blank(b"  "));
+        assert!(super::is_blank(b" \t"));
+        assert!(super::is_blank(b" \n "));
+    }
 
     #[test]
-    fn test_trim_whitespace() {
-        assert_eq!(trim_whitespace(b"  hello world  "), b"hello world");
-        assert_eq!(trim_whitespace(b"  hello world"), b"hello world");
-        assert_eq!(trim_whitespace(b"hello world  "), b"hello world");
-        assert_eq!(trim_whitespace(b"hello world"), b"hello world");
-        assert_eq!(trim_whitespace(b"  "), b"");
-        assert_eq!(trim_whitespace(b""), b"");
+    fn test_is_not_blank() {
+        assert!(!super::is_blank(b"a"));
+        assert!(!super::is_blank(b" a"));
+        assert!(!super::is_blank(b"a "));
+        assert!(!super::is_blank(b" a "));
+        assert!(!super::is_blank(b" a b "));
     }
 }

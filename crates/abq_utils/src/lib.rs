@@ -13,6 +13,7 @@ pub mod oneshot_notify;
 pub mod results_handler;
 pub mod retry;
 pub mod server_shutdown;
+pub mod time;
 pub mod timeout_future;
 pub mod tls;
 pub mod vec_map;

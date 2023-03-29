@@ -2,13 +2,17 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     io,
+    ops::Deref,
     time::Duration,
 };
 
 use crate::{colors::ColorProvider, ReportingError};
-use abq_utils::net_protocol::{
-    entity::{RunnerMeta, WorkerRunner},
-    runners::{Status, StdioOutput, TestResult, TestRuntime},
+use abq_utils::{
+    net_protocol::{
+        entity::{RunnerMeta, WorkerRunner},
+        runners::{Status, StdioOutput, TestResult, TestResultSpec, TestRuntime},
+    },
+    whitespace::is_blank,
 };
 use indoc::formatdoc;
 use termcolor::{Color, ColorSpec, WriteColor};
@@ -311,6 +315,81 @@ pub fn format_short_suite_summary(
     Ok(())
 }
 
+/// Formats a test result as a summary, possibly across multiple lines.
+pub fn format_test_result_summary(
+    writer: &mut impl WriteColor,
+    run_number: u32,
+    result: &TestResult,
+) -> io::Result<()> {
+    // --- test/name: {status} (attempt {run_number})? ---
+    // {output}
+    // ------ STDOUT
+    // {stdout}
+    // ------ STDERR
+    // {stderr}
+
+    let TestResultSpec {
+        status,
+        id: _,
+        display_name,
+        output,
+        runtime: _,
+        meta: _,
+        // TODO
+        location: _,
+        started_at: _,
+        finished_at: _,
+        lineage: _,
+        past_attempts: _,
+        other_errors: _,
+        stderr,
+        stdout,
+        timestamp: _,
+    } = result.deref();
+
+    write!(writer, "--- {display_name}: ")?;
+    format_status(writer, status)?;
+    if run_number != 1 {
+        write!(writer, " (attempt {run_number})")?;
+    }
+    writeln!(writer, " --- [worker {}]", result.source.runner.worker())?;
+
+    match output.as_deref() {
+        Some(output) if !is_blank(output.as_bytes()) => {
+            writeln!(writer, "{output}")?;
+        }
+        _ => {}
+    };
+
+    for (stdoutput, kind) in [(stdout, "STDOUT"), (stderr, "STDERR")] {
+        if let Some(output) = stdoutput {
+            if is_blank(output) {
+                continue;
+            }
+
+            writeln!(writer, "------ {kind}")?;
+            writer.write_all(output)?;
+            push_newline_if_needed(writer, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn push_newline_if_needed(writer: &mut impl io::Write, bytes: &[u8]) -> io::Result<usize> {
+    let mut trailing_newlines = 0;
+    for &byte in bytes.iter().rev() {
+        if !byte.is_ascii_whitespace() {
+            break;
+        }
+        trailing_newlines += (byte == b'\n') as usize;
+    }
+    if trailing_newlines == 0 {
+        writeln!(writer)?;
+        trailing_newlines += 1;
+    }
+    Ok(trailing_newlines)
+}
+
 pub fn write(writer: &mut impl io::Write, buf: &[u8]) -> Result<(), ReportingError> {
     writer
         .write_all(buf)
@@ -459,16 +538,19 @@ pub fn format_duration_to_partial_seconds(
 
 #[cfg(test)]
 mod test {
+    use abq_test_utils::color_writer::TestColorWriter;
     use abq_utils::net_protocol::{
-        entity::RunnerMeta,
+        entity::{RunnerMeta, WorkerRunner},
         runners::{Status, TestResult, TestResultSpec, TestRuntime},
     };
+
+    use crate::output::format_test_result_summary;
 
     use super::{
         format_duration, format_duration_to_partial_seconds, format_result_dot, format_result_line,
         format_short_suite_summary, RunnerSummary, ShortSummary, ShortSummaryGrouping,
     };
-    use std::{collections::HashMap, io, time::Duration};
+    use std::{collections::HashMap, time::Duration};
 
     #[allow(clippy::identity_op)]
     fn default_result() -> TestResultSpec {
@@ -483,67 +565,14 @@ mod test {
         }
     }
 
-    struct TestColorWriter<W: io::Write>(W);
-
-    impl<W: io::Write> io::Write for TestColorWriter<W> {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.flush()
-        }
-    }
-
-    impl<W: io::Write> termcolor::WriteColor for TestColorWriter<W> {
-        fn supports_color(&self) -> bool {
-            true
-        }
-
-        fn set_color(&mut self, spec: &termcolor::ColorSpec) -> io::Result<()> {
-            assert!(spec.bg().is_none());
-            assert!(!spec.intense());
-            assert!(!spec.underline());
-            assert!(!spec.dimmed());
-            assert!(!spec.italic());
-            assert!(spec.reset());
-
-            use termcolor::Color::*;
-            let mut spec_parts = vec![];
-            if spec.bold() {
-                spec_parts.push("bold")
-            }
-            if let Some(color) = spec.fg() {
-                let co = match color {
-                    Black => "black",
-                    Blue => "blue",
-                    Green => "green",
-                    Red => "red",
-                    Cyan => "cyan",
-                    Magenta => "magenta",
-                    Yellow => "yellow",
-                    White => "white",
-                    _ => unreachable!(),
-                };
-                spec_parts.push(co);
-            }
-
-            write!(&mut self.0, "<{}>", spec_parts.join("-"))
-        }
-
-        fn reset(&mut self) -> io::Result<()> {
-            write!(&mut self.0, "<reset>")
-        }
-    }
-
     macro_rules! test_format {
         ($name:ident, $fn:ident, $item:expr, @$expect_colored:literal) => {
             #[test]
             fn $name() {
                 // Test colored output
-                let mut buf = TestColorWriter(vec![]);
+                let mut buf = TestColorWriter::new(vec![]);
                 $fn(&mut buf, $item).unwrap();
-                let formatted = String::from_utf8(buf.0).unwrap();
+                let formatted = String::from_utf8(buf.get()).unwrap();
                 insta::assert_snapshot!(formatted, @$expect_colored);
             }
         };
@@ -551,19 +580,9 @@ mod test {
             #[test]
             fn $name() {
                 // Test colored output
-                let mut buf = TestColorWriter(vec![]);
+                let mut buf = TestColorWriter::new(vec![]);
                 $fn(&mut buf, $attempt, $item).unwrap();
-                let formatted = String::from_utf8(buf.0).unwrap();
-                insta::assert_snapshot!(formatted, @$expect_colored);
-            }
-        };
-        ($name:ident, $fn:ident, $item:expr, $out_before:expr, $out_after:expr, @$expect_colored:literal) => {
-            #[test]
-            fn $name() {
-                // Test colored output
-                let mut buf = TestColorWriter(vec![]);
-                $fn(&mut buf, $item, true, $out_before, $out_after).unwrap();
-                let formatted = String::from_utf8(buf.0).unwrap();
+                let formatted = String::from_utf8(buf.get()).unwrap();
                 insta::assert_snapshot!(formatted, @$expect_colored);
             }
         };
@@ -637,6 +656,174 @@ mod test {
         format_dot_skipped, format_result_dot,
         &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), ..default_result() }),
         @"<yellow>S<reset>"
+    );
+
+    test_format!(
+        format_summary_success, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <green>ok<reset> --- [worker 0]
+    Test passed!
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_failure, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <red>FAILED<reset> --- [worker 0]
+    Assertion failed: 1 != 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_error, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Error { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Process at pid 72818 exited early with SIGTERM".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <red>ERRORED<reset> --- [worker 0]
+    Process at pid 72818 exited early with SIGTERM
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_pending, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Pending, display_name: "abq/test".to_string(), output: Some(r#"Test not implemented yet for reason: "need to implement feature A""#.to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <yellow>pending<reset> --- [worker 0]
+    Test not implemented yet for reason: "need to implement feature A"
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_skipped, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Skipped, display_name: "abq/test".to_string(), output: Some(r#"Test skipped for reason: "only enabled on summer Fridays""#.to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <yellow>skipped<reset> --- [worker 0]
+    Test skipped for reason: "only enabled on summer Fridays"
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_multiline, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!\nTo see rendered webpage, see:\n\thttps://example.com\n".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <green>ok<reset> --- [worker 0]
+    Test passed!
+    To see rendered webpage, see:
+    	https://example.com
+
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_no_output, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Success, display_name: "abq/test".to_string(), output: None, ..default_result() }),
+        @r###"
+    --- abq/test: <green>ok<reset> --- [worker 0]
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_only_stdout, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()),
+                stdout: Some(b"my stdout1\nmy stdout2".to_vec()),
+                stderr: Some(b"".to_vec()),
+                ..default_result()
+            }),
+        @r###"
+    --- abq/test: <green>ok<reset> --- [worker 0]
+    Test passed!
+    ------ STDOUT
+    my stdout1
+    my stdout2
+    "###
+    );
+
+    test_format!(
+        format_summary_only_stderr, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Success, display_name: "abq/test".to_string(), output: Some("Test passed!".to_string()),
+                stdout: Some(b"".to_vec()),
+                stderr: Some(b"my stderr1\nmy stderr2".to_vec()),
+                ..default_result()
+            }),
+        @r###"
+    --- abq/test: <green>ok<reset> --- [worker 0]
+    Test passed!
+    ------ STDERR
+    my stderr1
+    my stderr2
+    "###
+    );
+
+    test_format!(
+        format_summary_failure_non_singleton_runner, format_test_result_summary,
+        attempt 1,
+        &TestResult::new(RunnerMeta::new(WorkerRunner::new(5, 6), false, false),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <red>FAILED<reset> --- [worker 5]
+    Assertion failed: 1 != 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
+    );
+
+    test_format!(
+        format_summary_failure_multi_attempt, format_test_result_summary,
+        attempt 3,
+        &TestResult::new(RunnerMeta::fake(),TestResultSpec {status: Status::Failure { exception: None, backtrace: None }, display_name: "abq/test".to_string(), output: Some("Assertion failed: 1 != 2".to_string()), ..default_result() }),
+        @r###"
+    --- abq/test: <red>FAILED<reset> (attempt 3) --- [worker 0]
+    Assertion failed: 1 != 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    "###
     );
 
     test_format!(

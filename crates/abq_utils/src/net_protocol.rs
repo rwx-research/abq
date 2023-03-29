@@ -700,7 +700,6 @@ pub mod results {
 
     /// A line in the results-persistence scheme.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-    #[serde(untagged)]
     pub enum ResultsLine {
         /// A list of results
         Results(Vec<AssociatedTestResults>),

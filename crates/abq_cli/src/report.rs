@@ -2,7 +2,10 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use abq_reporting::{output::ShortSummaryGrouping, CompletedSummary, ReportedResult, Reporter};
+use abq_reporting::{
+    output::{format_test_result_summary, ShortSummaryGrouping},
+    CompletedSummary, ReportedResult, Reporter,
+};
 use abq_utils::{
     exit::ExitCode,
     log_assert_stderr, net_async,
@@ -10,7 +13,8 @@ use abq_utils::{
         self,
         entity::Entity,
         queue::AssociatedTestResults,
-        results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
+        results::{ResultsLine, Summary},
+        runners::TestResult,
         workers::{RunId, WorkId},
     },
     retry::async_retry_n,
@@ -22,8 +26,12 @@ use indoc::formatdoc;
 
 use crate::{
     instance::AbqInstance,
-    reporting::{build_reporters, summary, ReporterKind, StdoutPreferences},
+    reporting::{build_reporters, summary, ReporterKind, StdoutPreferences, SuiteResult},
 };
+
+use self::ordered_results::OrderedAssociatedResults;
+
+mod ordered_results;
 
 const RECONNECT_ATTEMPTS: usize = 5;
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
@@ -41,43 +49,53 @@ pub(crate) async fn report_results(
     use crate::reporting::ONE;
 
     let test_suite_name = "suite"; // TODO: determine this correctly
-    let mut reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name, ONE);
-    let mut overall_tracker = summary::SuiteTracker::new();
+    let reporters = build_reporters(reporter_kinds, stdout_preferences, test_suite_name, ONE);
+    let mut stdout = stdout_preferences.stdout_stream();
 
-    let mut seen_work_ids = FnvHashSet::default();
-
-    let all_results: Vec<OpaqueLazyAssociatedTestResults> =
+    let all_results: Vec<Vec<ResultsLine>> =
         wait_for_results(abq, entity, run_id, results_timeout).await?;
 
+    process_results(&mut stdout, reporters, all_results.into_iter().flatten())
+}
+
+fn process_results(
+    writer: &mut impl termcolor::WriteColor,
+    mut reporters: Vec<Box<dyn Reporter>>,
+    all_results: impl IntoIterator<Item = ResultsLine>,
+) -> anyhow::Result<ExitCode> {
+    let mut seen_work_ids = FnvHashSet::default();
+    let mut overall_tracker = summary::SuiteTracker::new();
+    let mut tracked_results: Vec<ReportTestResult> = Vec::new();
     let mut run_summary = None;
 
-    for results_chunk in all_results {
-        let results = results_chunk.decode().map_err(|e| {
-            anyhow!(
-                "failed to decode corrupted test results message: {}",
-                e.to_string()
-            )
-        })?;
+    let all_results = all_results.into_iter();
+    let (min_size, max_size) = all_results.size_hint();
 
-        for result_line in results.into_iter() {
-            match result_line {
-                ResultsLine::Results(results) => {
-                    handle_results(
-                        results,
-                        &mut seen_work_ids,
-                        &mut reporters,
-                        &mut overall_tracker,
-                    )?;
-                }
-                ResultsLine::Summary(summary) => {
-                    let old_summary = run_summary.replace(summary);
-                    log_assert_stderr!(
-                        old_summary.is_none(),
-                        "ABQ sent two summaries for a test run; this is an error."
-                    )
-                }
+    let mut ordered_results = OrderedAssociatedResults::with_capacity(max_size.unwrap_or(min_size));
+
+    for result_line in all_results {
+        match result_line {
+            ResultsLine::Results(results) => {
+                ordered_results.extend(results);
+            }
+            ResultsLine::Summary(summary) => {
+                let old_summary = run_summary.replace(summary);
+                log_assert_stderr!(
+                    old_summary.is_none(),
+                    "ABQ sent two summaries for a test run; this is an error."
+                )
             }
         }
+    }
+
+    for result in ordered_results.into_iter() {
+        handle_result(
+            result,
+            &mut seen_work_ids,
+            &mut reporters,
+            &mut overall_tracker,
+            &mut tracked_results,
+        )?;
     }
 
     reporters
@@ -112,13 +130,39 @@ pub(crate) async fn report_results(
         reporter.finish(completed_summary)?;
     }
 
-    print!("\n\n");
-    suite_result
-        .write_short_summary_lines(
-            &mut stdout_preferences.stdout_stream(),
-            ShortSummaryGrouping::Worker,
-        )
-        .unwrap();
+    writer.write_all(b"\n\n")?;
+
+    print_report(writer, &suite_result, &tracked_results)
+}
+
+fn print_report(
+    writer: &mut impl termcolor::WriteColor,
+    suite_result: &SuiteResult,
+    report_results: &Vec<ReportTestResult>,
+) -> anyhow::Result<ExitCode> {
+    let mut formatted_one_failure = false;
+
+    for report_result in report_results {
+        use abq_utils::net_protocol::runners::Status::*;
+
+        match report_result.test_result.status {
+            Failure { .. } | Error { .. } | PrivateNativeRunnerError | TimedOut => {
+                if formatted_one_failure {
+                    writeln!(writer)?;
+                }
+                formatted_one_failure = true;
+
+                format_test_result_summary(
+                    writer,
+                    report_result.run_number,
+                    &report_result.test_result,
+                )?;
+            }
+            Success | Pending | Todo | Skipped => {}
+        }
+    }
+
+    suite_result.write_short_summary_lines(writer, ShortSummaryGrouping::Worker)?;
 
     Ok(suite_result.suggested_exit_code())
 }
@@ -128,7 +172,7 @@ async fn wait_for_results(
     entity: Entity,
     run_id: RunId,
     results_timeout: Duration,
-) -> anyhow::Result<Vec<OpaqueLazyAssociatedTestResults>> {
+) -> anyhow::Result<Vec<Vec<ResultsLine>>> {
     let queue_addr = abq.server_addr();
     let client = abq.client_options_owned().build_async()?;
 
@@ -150,7 +194,7 @@ async fn wait_for_results_help(
     client: Box<dyn net_async::ConfiguredClient>,
     entity: Entity,
     run_id: RunId,
-) -> anyhow::Result<Vec<OpaqueLazyAssociatedTestResults>> {
+) -> anyhow::Result<Vec<Vec<ResultsLine>>> {
     let mut attempt = 1;
     loop {
         let client = &client;
@@ -176,7 +220,15 @@ async fn wait_for_results_help(
             let response = net_protocol::async_read(&mut conn).await?;
             match response {
                 Results { chunk, final_chunk } => {
+                    let chunk = chunk.decode().map_err(|e| {
+                        anyhow!(
+                            "failed to decode corrupted test results message: {}",
+                            e.to_string()
+                        )
+                    })?;
+
                     results.push(chunk);
+
                     match final_chunk {
                         true => return Ok(results),
                         false => continue,
@@ -207,98 +259,138 @@ async fn wait_for_results_help(
 }
 
 #[inline]
-fn handle_results(
-    results: Vec<AssociatedTestResults>,
+fn handle_result(
+    result: AssociatedTestResults,
     seen_work_ids: &mut FnvHashSet<WorkId>,
     reporters: &mut [Box<dyn Reporter>],
     overall_tracker: &mut summary::SuiteTracker,
+    tracked_results: &mut Vec<ReportTestResult>,
 ) -> anyhow::Result<()> {
-    for AssociatedTestResults {
+    let AssociatedTestResults {
         work_id,
         run_number,
         results,
         before_any_test,
         after_all_tests,
-    } in results
-    {
-        seen_work_ids.insert(work_id);
+    } = result;
+    seen_work_ids.insert(work_id);
 
-        let mut output_before = Some(before_any_test);
-        let mut output_after = after_all_tests;
+    let mut output_before = Some(before_any_test);
+    let mut output_after = after_all_tests;
 
-        let mut results = results.into_iter().peekable();
+    let mut results = results.into_iter().peekable();
 
-        while let Some(test_result) = results.next() {
-            overall_tracker.account_result(run_number, &test_result);
+    while let Some(test_result) = results.next() {
+        overall_tracker.account_result(run_number, &test_result);
 
-            let output_before = std::mem::take(&mut output_before);
-            let output_after = if results.peek().is_none() {
-                // This is the last test result, the output-after is associated
-                // with it
-                std::mem::take(&mut output_after)
-            } else {
-                None
-            };
+        let output_before = std::mem::take(&mut output_before);
+        let output_after = if results.peek().is_none() {
+            // This is the last test result, the output-after is associated
+            // with it
+            std::mem::take(&mut output_after)
+        } else {
+            None
+        };
 
-            let reported_result = ReportedResult {
-                output_before,
-                test_result,
-                output_after,
-            };
+        let reported_result = ReportedResult {
+            output_before,
+            test_result,
+            output_after,
+        };
 
-            for reporter in reporters.iter_mut() {
-                reporter.push_result(run_number, &reported_result)?;
-            }
+        for reporter in reporters.iter_mut() {
+            reporter.push_result(run_number, &reported_result)?;
         }
+
+        let ReportedResult { test_result, .. } = reported_result;
+        tracked_results.push(ReportTestResult {
+            run_number,
+            test_result,
+        });
     }
+
     Ok(())
+}
+
+#[derive(Debug)]
+struct ReportTestResult {
+    run_number: u32,
+    test_result: TestResult,
 }
 
 #[cfg(test)]
 mod test {
-    use abq_test_utils::build_fake_server_client;
-    use abq_utils::net_protocol::{
-        self, entity::Entity, results::OpaqueLazyAssociatedTestResults, workers::RunId,
+    use abq_dot_reporter::DotReporter;
+    use abq_line_reporter::LineReporter;
+    use abq_reporting::Reporter;
+    use abq_test_utils::{
+        build_fake_server_client, color_writer::SharedTestColorWriter, wid,
+        AssociatedTestResultsBuilder, TestResultBuilder,
     };
+    use abq_utils::net_protocol::{
+        self,
+        entity::Entity,
+        queue::NativeRunnerInfo,
+        results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
+        runners::{AbqProtocolVersion, NativeRunnerSpecification, Status},
+        workers::{RunId, INIT_RUN_NUMBER},
+    };
+    use abq_utils::time::EpochMillis;
 
-    use super::wait_for_results_help;
+    use super::{process_results, wait_for_results_help};
 
     #[tokio::test]
     async fn fetches_chunked_tests() {
         let (server, client) = build_fake_server_client().await;
         let server_addr = server.local_addr().unwrap();
 
-        let server_task = async move {
-            use net_protocol::queue;
+        let results1 = ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+            wid(1),
+            INIT_RUN_NUMBER,
+            [TestResultBuilder::new("test1", Status::Success)],
+        )
+        .build()]);
+        let results2 = ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+            wid(2),
+            INIT_RUN_NUMBER,
+            [TestResultBuilder::new("test1", Status::Success)],
+        )
+        .build()]);
 
-            let (conn, _) = server.accept().await.unwrap();
-            let mut conn = server.handshake_ctx().handshake(conn).await.unwrap();
-            let msg = net_protocol::async_read(&mut conn).await.unwrap();
-            assert!(matches!(
-                msg,
-                queue::Request {
-                    message: queue::Message::TestResults(_),
-                    ..
+        let server_task = {
+            let (results1, results2) = (&results1, &results2);
+            async move {
+                use net_protocol::queue;
+
+                let (conn, _) = server.accept().await.unwrap();
+                let mut conn = server.handshake_ctx().handshake(conn).await.unwrap();
+                let msg = net_protocol::async_read(&mut conn).await.unwrap();
+                assert!(matches!(
+                    msg,
+                    queue::Request {
+                        message: queue::Message::TestResults(_),
+                        ..
+                    }
+                ));
+
+                let chunks = [
+                    queue::TestResultsResponse::Results {
+                        chunk: OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                            serde_json::value::to_raw_value(results1).unwrap(),
+                        ]),
+                        final_chunk: false,
+                    },
+                    queue::TestResultsResponse::Results {
+                        chunk: OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
+                            serde_json::value::to_raw_value(results2).unwrap(),
+                        ]),
+                        final_chunk: true,
+                    },
+                ];
+
+                for chunk in chunks {
+                    net_protocol::async_write(&mut conn, &chunk).await.unwrap();
                 }
-            ));
-
-            let chunks = [
-                queue::TestResultsResponse::Results {
-                    chunk: OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                        serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
-                    ]),
-                    final_chunk: false,
-                },
-                queue::TestResultsResponse::Results {
-                    chunk: OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                        serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
-                    ]),
-                    final_chunk: true,
-                },
-            ];
-
-            for chunk in chunks {
-                net_protocol::async_write(&mut conn, &chunk).await.unwrap();
             }
         };
 
@@ -308,14 +400,542 @@ mod test {
         let ((), results) = tokio::join!(server_task, client_task);
 
         let results = results.unwrap();
-        let expected = [
-            OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
-            ]),
-            OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
-            ]),
-        ];
+        let expected = [[results1], [results2]];
         assert_eq!(results, expected);
     }
+
+    macro_rules! test_print_results_summary {
+        ($test:ident, $reporter:ident, @$expect:literal) => {
+        #[test]
+        fn $test() {
+            let mut buf = SharedTestColorWriter::new(vec![]);
+            let reporter = $reporter::new(Box::new(buf.clone()));
+
+            let reporters: Vec<Box<dyn Reporter>> = vec![Box::new(reporter)];
+
+            let all_results = [
+                ResultsLine::Summary(Summary {
+                    manifest_size_nonce: 7,
+                    native_runner_info: NativeRunnerInfo {
+                        protocol_version: AbqProtocolVersion::V0_2,
+                        specification: NativeRunnerSpecification::fake(),
+                    },
+                }),
+                ResultsLine::Results(vec![
+                    AssociatedTestResultsBuilder::new(
+                        wid(1),
+                        INIT_RUN_NUMBER,
+                        [TestResultBuilder::new("test1", Status::Success)],
+                    )
+                    .build(),
+                    AssociatedTestResultsBuilder::new(
+                        wid(2),
+                        INIT_RUN_NUMBER,
+                        [TestResultBuilder::new(
+                            "test2",
+                            Status::Failure {
+                                exception: None,
+                                backtrace: None,
+                            },
+                        )
+                        .output("my test2 failed")],
+                    )
+                    .build(),
+                ]),
+                ResultsLine::Results(vec![
+                    AssociatedTestResultsBuilder::new(
+                        wid(3),
+                        INIT_RUN_NUMBER,
+                        [TestResultBuilder::new("test3", Status::Skipped)],
+                    )
+                    .build(),
+                    AssociatedTestResultsBuilder::new(
+                        wid(4),
+                        INIT_RUN_NUMBER,
+                        [TestResultBuilder::new(
+                            "test4",
+                            Status::Error {
+                                exception: None,
+                                backtrace: None,
+                            },
+                        )
+                        .output("my test4 errored")],
+                    )
+                    .build(),
+                ]),
+                ResultsLine::Results(vec![
+                    AssociatedTestResultsBuilder::new(
+                        wid(5),
+                        INIT_RUN_NUMBER,
+                        [TestResultBuilder::new("test5", Status::TimedOut).output("i timed out")],
+                    )
+                    .build(),
+                    AssociatedTestResultsBuilder::new(
+                        wid(6),
+                        INIT_RUN_NUMBER,
+                        [
+                            TestResultBuilder::new("test6", Status::PrivateNativeRunnerError)
+                                .output("native runner exception"),
+                        ],
+                    )
+                    .build(),
+                ]),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    wid(7),
+                    INIT_RUN_NUMBER,
+                    [
+                        TestResultBuilder::new("test7", Status::Pending).output("i am pending"),
+                        TestResultBuilder::new("test8", Status::Pending).output("i was skipped"),
+                    ],
+                )
+                .build()]),
+            ];
+
+            process_results(&mut buf, reporters, all_results).unwrap();
+
+            let snapshot = String::from_utf8(buf.get()).unwrap();
+
+            insta::assert_snapshot!(snapshot, @$expect);
+        }
+        }
+    }
+
+    test_print_results_summary!(
+        test_print_results_summary_line, LineReporter, @r###"
+    test1: <green>ok<reset>
+    test2: <red>FAILED<reset>
+    test3: <yellow>skipped<reset>
+    test4: <red>ERRORED<reset>
+    test5: <red>TIMED OUT<reset>
+    test6: <red>ERRORED<reset>
+    native runner exception
+    test7: <yellow>pending<reset>
+    test8: <yellow>pending<reset>
+
+
+    --- test2: <red>FAILED<reset> --- [worker 0]
+    my test2 failed
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test4: <red>ERRORED<reset> --- [worker 0]
+    my test4 errored
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test5: <red>TIMED OUT<reset> --- [worker 0]
+    i timed out
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test6: <red>ERRORED<reset> --- [worker 0]
+    native runner exception
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
+    <bold>Finished in 0.00 seconds<reset> (0.00 seconds spent in test code)
+    <bold-green>8 tests<reset>, <bold-red>4 failures<reset>
+
+    Failures:
+
+        worker 0:
+            3   a/b/x.file
+    "###
+    );
+
+    test_print_results_summary!(
+        test_print_results_summary_dot, DotReporter, @r###"
+    <green>.<reset><red>F<reset><yellow>S<reset><red>E<reset><red>F<reset><red>E<reset>native runner exception
+    <yellow>P<reset><yellow>P<reset>
+
+
+    --- test2: <red>FAILED<reset> --- [worker 0]
+    my test2 failed
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test4: <red>ERRORED<reset> --- [worker 0]
+    my test4 errored
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test5: <red>TIMED OUT<reset> --- [worker 0]
+    i timed out
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test6: <red>ERRORED<reset> --- [worker 0]
+    native runner exception
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
+    <bold>Finished in 0.00 seconds<reset> (0.00 seconds spent in test code)
+    <bold-green>8 tests<reset>, <bold-red>4 failures<reset>
+
+    Failures:
+
+        worker 0:
+            3   a/b/x.file
+    "###
+    );
+
+    macro_rules! test_print_results_with_retries {
+        ($test:ident, $reporter:ident, @$expect:literal) => {
+        #[test]
+        fn $test() {
+            let mut buf = SharedTestColorWriter::new(vec![]);
+            let reporter = $reporter::new(Box::new(buf.clone()));
+
+            let reporters: Vec<Box<dyn Reporter>> = vec![Box::new(reporter)];
+
+            let work1 = wid(1);
+
+            let test1 = "test1";
+            let test2 = "test2";
+
+            const SUCCESS: Status = Status::Success;
+            const FAILURE: Status = Status::Failure { exception: None, backtrace: None };
+
+            let all_results = [
+                ResultsLine::Summary(Summary {
+                    manifest_size_nonce: 1,
+                    native_runner_info: NativeRunnerInfo {
+                        protocol_version: AbqProtocolVersion::V0_2,
+                        specification: NativeRunnerSpecification::fake(),
+                    },
+                }),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    work1,
+                    INIT_RUN_NUMBER,
+                    [
+                        TestResultBuilder::new(test1, FAILURE).output("test 1, failure 1"),
+                        TestResultBuilder::new(test2, FAILURE).output("test 2, failure 1"),
+                    ],
+                )
+                .build()]),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    work1,
+                    INIT_RUN_NUMBER + 1,
+                    [
+                        TestResultBuilder::new(test1, FAILURE).output("test 1, failure 2"),
+                        TestResultBuilder::new(test2, FAILURE).output("test 2, failure 2"),
+                    ],
+                )
+                .build()]),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    work1,
+                    INIT_RUN_NUMBER + 2,
+                    [
+                        TestResultBuilder::new(test1, FAILURE).output("test 1, failure 3"),
+                        TestResultBuilder::new(test2, SUCCESS).output("test 2, success"),
+                    ],
+                )
+                .build()]),
+            ];
+
+            process_results(&mut buf, reporters, all_results).unwrap();
+
+            let snapshot = String::from_utf8(buf.get()).unwrap();
+
+            insta::assert_snapshot!(snapshot, @$expect);
+        }
+        }
+    }
+
+    test_print_results_with_retries!(
+        test_print_results_with_retries_line, LineReporter, @r###"
+    test1: <red>FAILED<reset>
+    test2: <red>FAILED<reset>
+    test1: <red>FAILED<reset>
+    test2: <red>FAILED<reset>
+    test1: <red>FAILED<reset>
+    test2: <green>ok<reset>
+
+
+    --- test1: <red>FAILED<reset> --- [worker 0]
+    test 1, failure 1
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test2: <red>FAILED<reset> --- [worker 0]
+    test 2, failure 1
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test1: <red>FAILED<reset> (attempt 2) --- [worker 0]
+    test 1, failure 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test2: <red>FAILED<reset> (attempt 2) --- [worker 0]
+    test 2, failure 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test1: <red>FAILED<reset> (attempt 3) --- [worker 0]
+    test 1, failure 3
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
+    <bold>Finished in 0.00 seconds<reset> (0.00 seconds spent in test code)
+    <bold-green>2 tests<reset>, <bold-red>1 failures<reset>, <bold-yellow>2 retried<reset>
+
+    Retries:
+
+        worker 0:
+            2   a/b/x.file
+
+    Failures:
+
+        worker 0:
+            1   a/b/x.file
+    "###
+    );
+
+    test_print_results_with_retries!(
+        test_print_results_with_retries_dot, DotReporter, @r###"
+    <red>F<reset><red>F<reset><red>F<reset><red>F<reset><red>F<reset><green>.<reset>
+
+
+    --- test1: <red>FAILED<reset> --- [worker 0]
+    test 1, failure 1
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test2: <red>FAILED<reset> --- [worker 0]
+    test 2, failure 1
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test1: <red>FAILED<reset> (attempt 2) --- [worker 0]
+    test 1, failure 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test2: <red>FAILED<reset> (attempt 2) --- [worker 0]
+    test 2, failure 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test1: <red>FAILED<reset> (attempt 3) --- [worker 0]
+    test 1, failure 3
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
+    <bold>Finished in 0.00 seconds<reset> (0.00 seconds spent in test code)
+    <bold-green>2 tests<reset>, <bold-red>1 failures<reset>, <bold-yellow>2 retried<reset>
+
+    Retries:
+
+        worker 0:
+            2   a/b/x.file
+
+    Failures:
+
+        worker 0:
+            1   a/b/x.file
+    "###
+    );
+
+    macro_rules! test_print_results_with_retries_out_of_order {
+        ($test:ident, $reporter:ident, @$expect:literal) => {
+        #[test]
+        fn $test() {
+            let mut buf = SharedTestColorWriter::new(vec![]);
+            let reporter = $reporter::new(Box::new(buf.clone()));
+
+            let reporters: Vec<Box<dyn Reporter>> = vec![Box::new(reporter)];
+
+            let work1 = wid(1);
+
+            let test1 = "test1";
+            let test2 = "test2";
+
+            let time1 = EpochMillis::from_millis(1);
+            let time2 = EpochMillis::from_millis(2);
+
+            const SUCCESS: Status = Status::Success;
+            const FAILURE: Status = Status::Failure { exception: None, backtrace: None };
+
+            let all_results = [
+                ResultsLine::Summary(Summary {
+                    manifest_size_nonce: 1,
+                    native_runner_info: NativeRunnerInfo {
+                        protocol_version: AbqProtocolVersion::V0_2,
+                        specification: NativeRunnerSpecification::fake(),
+                    },
+                }),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    work1,
+                    INIT_RUN_NUMBER + 2,
+                    [
+                        TestResultBuilder::new(test1, FAILURE).output("test 1, failure 4").timestamp(time2),
+                        TestResultBuilder::new(test2, SUCCESS).output("test 2, success").timestamp(time2),
+                    ],
+                )
+                .build()]),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    work1,
+                    INIT_RUN_NUMBER + 1,
+                    [
+                        TestResultBuilder::new(test1, FAILURE).output("test 1, failure 3").timestamp(time2),
+                        TestResultBuilder::new(test2, FAILURE).output("test 2, failure 3").timestamp(time2),
+                    ],
+                )
+                .build()]),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    work1,
+                    INIT_RUN_NUMBER,
+                    [
+                        TestResultBuilder::new(test1, FAILURE).output("test 1, failure 2").timestamp(time2),
+                        TestResultBuilder::new(test2, FAILURE).output("test 2, failure 2").timestamp(time2),
+                    ],
+                )
+                .build()]),
+                ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                    work1,
+                    INIT_RUN_NUMBER,
+                    [
+                        TestResultBuilder::new(test1, FAILURE).output("test 1, failure 1").timestamp(time1),
+                        TestResultBuilder::new(test2, FAILURE).output("test 2, failure 1").timestamp(time1),
+                    ],
+                )
+                .build()]),
+            ];
+
+            process_results(&mut buf, reporters, all_results).unwrap();
+
+            let snapshot = String::from_utf8(buf.get()).unwrap();
+
+            insta::assert_snapshot!(snapshot, @$expect);
+        }
+        }
+    }
+
+    test_print_results_with_retries_out_of_order!(
+        test_print_results_with_retries_out_of_order_line, LineReporter, @r###"
+    test1: <red>FAILED<reset>
+    test2: <red>FAILED<reset>
+    test1: <red>FAILED<reset>
+    test2: <red>FAILED<reset>
+    test1: <red>FAILED<reset>
+    test2: <red>FAILED<reset>
+    test1: <red>FAILED<reset>
+    test2: <green>ok<reset>
+
+
+    --- test1: <red>FAILED<reset> --- [worker 0]
+    test 1, failure 1
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test2: <red>FAILED<reset> --- [worker 0]
+    test 2, failure 1
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test1: <red>FAILED<reset> --- [worker 0]
+    test 1, failure 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test2: <red>FAILED<reset> --- [worker 0]
+    test 2, failure 2
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test1: <red>FAILED<reset> (attempt 2) --- [worker 0]
+    test 1, failure 3
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test2: <red>FAILED<reset> (attempt 2) --- [worker 0]
+    test 2, failure 3
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+
+    --- test1: <red>FAILED<reset> (attempt 3) --- [worker 0]
+    test 1, failure 4
+    ------ STDOUT
+    my stderr
+    ------ STDERR
+    my stdout
+    --------------------------------------------------------------------------------
+    ------------------------------------- ABQ --------------------------------------
+    --------------------------------------------------------------------------------
+
+    <bold>Finished in 0.00 seconds<reset> (0.00 seconds spent in test code)
+    <bold-green>2 tests<reset>, <bold-red>1 failures<reset>, <bold-yellow>2 retried<reset>
+
+    Retries:
+
+        worker 0:
+            2   a/b/x.file
+
+    Failures:
+
+        worker 0:
+            1   a/b/x.file
+    "###
+    );
 }
