@@ -21,8 +21,8 @@ ABQ invokes any test command passed to it, so you can continue using your native
 ## Test Frameworks
 
 :octocat: [rwx-research/rspec-abq](https://github.com/rwx-research/rspec-abq) &ensp;
-:octocat: [rwx-research/jest-abq](https://github.com/rwx-research/jest) &ensp;
-:octocat: [rwx-research/playwright-abq](https://github.com/rwx-research/playwright) &ensp;
+:octocat: [rwx-research/jest-abq](https://github.com/rwx-research/jest-abq) &ensp;
+:octocat: [rwx-research/playwright-abq](https://github.com/rwx-research/playwright-abq) &ensp;
 :octocat: [rwx-research/pytest-abq](https://github.com/rwx-research/pytest-abq)
 
 ABQ is currently compatible with
