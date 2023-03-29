@@ -24,7 +24,7 @@ Tips:
   "rust-analyzer.checkOnSave.extraArgs": ["--target-dir", "/tmp/rust-analyzer-check"],
   ```
 
-### Dev queues
+## Dev queues
 
 [Automated tests](.github/workflows/bigtest.yml) are run against remote instances of
 feature-branch queues when you submit a PR. These feature-branch queues are
@@ -55,7 +55,7 @@ aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN
   - Only one dev queue can be active at a time.
 - `bin/manage_dev_queue stop` - stops the active dev queue instance, if any.
 
-#### Running dev-queue integration tests
+### Running dev-queue integration tests
 
 Set up the integration tests:
 
@@ -74,9 +74,9 @@ node bigtest/benchmark_rspec/bench.js
 node bigtest/benchmark_jest/bench.js
 ```
 
-## Operations
+# Operations
 
-### Releasing a new version
+## Releasing a new version
 
 1. create a new branch
 2. bump the version in crates/abq_cli/Cargo.toml
@@ -85,7 +85,7 @@ node bigtest/benchmark_jest/bench.js
 5. push a signed tag against the merge commit in master, e.g. `git tag v1.2.3 -s -m "version message" && git push --tags`
 6. [run the build and upload workflow](https://github.com/rwx-research/abq/actions/workflows/build_and_upload.yml) with your new tag as the ref
 
-### SSL Certificates
+## SSL Certificates
 
 When TLS is enabled, clients are designed to communicate with a queue instance
 with SAN DNS name `abq.rwx` and a self-signed certificate that is passed to the
@@ -106,3 +106,23 @@ openssl \
     echo '[san]'; \
     echo 'subjectAltName=DNS:abq.rwx' )
 ```
+
+# New ABQ integrations
+
+Test frameworks integrate with ABQ by implementing the [ABQ native runner
+protocol][native_runner_protocol]. We suggest implementing an ABQ integration as
+a plugin to a test framework whenever possible. As an example, refer to the
+[rspec-abq](https://github.com/rwx-research/rspec-abq) plugin for RSpec.
+
+The best way to test a successful integration with ABQ is via the ABQ tester
+harness, which you can retrieve by building ABQ.
+
+```
+# In a clone of the abq repo
+cargo build
+
+# The tester harness binary
+target/debug/abq_tester_harness --help
+```
+
+[native_runner_protocol]: https://rwx.notion.site/ABQ-Native-Runner-Protocol-0-2-70b3ec70b2f64b84aa3253a558eba16f
