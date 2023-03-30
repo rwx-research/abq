@@ -369,16 +369,7 @@ macro_rules! setup_queue {
             .spawn();
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
+        wait_for_live_queue(queue_stdout);
 
         (queue_proc, queue_addr)
     }};
@@ -444,16 +435,7 @@ test_all_network_config_options! {
             .spawn();
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
+        wait_for_live_queue(queue_stdout);
 
         assert!(port_active(server_port));
         assert!(port_active(worker_port));
@@ -518,38 +500,11 @@ fn assert_sum_of_run_test_retries<'a>(outputs: impl IntoIterator<Item = &'a str>
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_separate_queue_numbered_workers_test_without_failure |name, conf: CSConfigOptions| {
-        let server_port = find_free_port();
-        let worker_port = find_free_port();
-        let negotiator_port = find_free_port();
+        let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
-        let queue_addr = format!("0.0.0.0:{server_port}");
         let run_id = RunId::unique().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
-
-        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = Abq::new(name)
-            .args(
-                conf.extend_args_for_start(vec![
-                format!("start"),
-                format!("--bind=0.0.0.0"),
-                format!("--port={server_port}"),
-                format!("--work-port={worker_port}"),
-                format!("--negotiator-port={negotiator_port}"),
-            ]))
-            .spawn();
-
-        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
 
         let working_dir = npm_jest_project_path.display();
 
@@ -618,37 +573,11 @@ test_all_network_config_options! {
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_timeout_run_workers |name, conf: CSConfigOptions| {
-        let server_port = find_free_port();
-        let worker_port = find_free_port();
-        let negotiator_port = find_free_port();
+        let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
-        let queue_addr = format!("0.0.0.0:{server_port}");
         let run_id = RunId::unique().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project");
-
-        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = Abq::new(name)
-            .args(conf.extend_args_for_start(vec![
-                format!("start"),
-                format!("--bind=0.0.0.0"),
-                format!("--port={server_port}"),
-                format!("--work-port={worker_port}"),
-                format!("--negotiator-port={negotiator_port}"),
-            ]))
-            .spawn();
-
-        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
 
         let working_dir = npm_jest_project_path.display();
 
@@ -717,38 +646,11 @@ test_all_network_config_options! {
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_separate_queue_workers_with_failing_tests |name, conf: CSConfigOptions| {
-        let server_port = find_free_port();
-        let worker_port = find_free_port();
-        let negotiator_port = find_free_port();
+        let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
-        let queue_addr = format!("0.0.0.0:{server_port}");
         let run_id = RunId::unique().to_string();
 
         let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
-
-        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = Abq::new(name)
-            .args(conf.extend_args_for_start(vec![
-                format!("start"),
-                format!("--bind=0.0.0.0"),
-                format!("--port={server_port}"),
-                format!("--work-port={worker_port}"),
-                format!("--negotiator-port={negotiator_port}"),
-            ]))
-            .spawn();
-
-        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
-
         let working_dir = npm_jest_project_path.display();
 
         // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
@@ -831,16 +733,7 @@ test_all_network_config_options! {
             .spawn();
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
+        wait_for_live_queue(queue_stdout);
 
         // Check health
         // abq health --queue ... --work-scheduler ... --negotiator ... (--token ...)?
@@ -990,39 +883,9 @@ fn test_with_invalid_command() {
         tls: false,
     };
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
-    let queue_addr = format!("0.0.0.0:{server_port}");
     let run_id = RunId::unique().to_string();
-
-    // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind"),
-            format!("0.0.0.0"),
-            format!("--port"),
-            format!("{server_port}"),
-            format!("--work-port"),
-            format!("{worker_port}"),
-            format!("--negotiator-port"),
-            format!("{negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
 
     let test_args = |worker: usize| {
         let args = vec![
@@ -1253,36 +1116,16 @@ fn verify_and_sanitize_state(state: &mut json::Map<String, json::Value>) {
 
 #[test]
 fn write_statefile_for_worker() {
+    let name = "write_statefile_for_worker";
+    let conf = CSConfigOptions {
+        use_auth_token: false,
+        tls: false,
+    };
+
     let statefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
     let statefile = statefile.to_path_buf();
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new("write_statefile_for_worker_queue")
-        .args([
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ])
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let test_args = |worker: usize| {
         vec![
@@ -1309,7 +1152,7 @@ fn write_statefile_for_worker() {
         .run();
 
     worker0.kill().unwrap();
-    queue_proc.kill().unwrap();
+    term(queue_proc);
 
     let statefile = File::open(&statefile).unwrap();
     let mut state = serde_json::from_reader(&statefile).unwrap();
@@ -1327,34 +1170,9 @@ fn write_statefile_for_worker() {
 
 test_all_network_config_options! {
     native_runner_fails_while_executing_test |name, conf: CSConfigOptions| {
-        let server_port = find_free_port();
-        let worker_port = find_free_port();
-        let negotiator_port = find_free_port();
+        let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
-        let queue_addr = format!("0.0.0.0:{server_port}");
         let run_id = "test-run-id";
-
-        let mut queue_proc = Abq::new(name)
-            .args(conf.extend_args_for_start(vec![
-                format!("start"),
-                format!("--bind=0.0.0.0"),
-                format!("--port={server_port}"),
-                format!("--work-port={worker_port}"),
-                format!("--negotiator-port={negotiator_port}"),
-            ]))
-            .spawn();
-
-        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
 
         // Create a simulation test run to launch a worker with.
         use abq_utils::net_protocol::runners::{ManifestMessage, Manifest, AbqProtocolVersion, InitSuccessMessage, TestOrGroup, Test};
@@ -1482,33 +1300,7 @@ fn retries_smoke() {
     let num_tests = 64;
     let num_workers = 6;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -1650,33 +1442,7 @@ fn test_grouping_without_failures() {
     let num_tests = 64;
     let num_runners = 6;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -1803,33 +1569,7 @@ fn test_grouping_with_failures_without_retries() {
     let num_tests = 64;
     let num_runners = 6;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -1959,33 +1699,7 @@ fn test_grouping_failures_retries() {
     let num_tests = 64;
     let num_runners = 6;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -2115,33 +1829,7 @@ fn report_grouping_failures_retries() {
     let num_tests = 64;
     let num_workers = 6;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -2296,33 +1984,7 @@ fn retries_displays_retry_banners() {
     let retries = 4;
     let num_tests = 64;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -2408,6 +2070,8 @@ fn retries_displays_retry_banners() {
     assert_sum_of_run_test_retries([stdout.as_str()], 64);
 
     insta::assert_snapshot!(sanitize_output(&stdout));
+
+    term(queue_proc);
 }
 
 #[test]
@@ -2423,33 +2087,7 @@ fn retries_with_multiple_runners_on_one_worker_displays_retry_banner_at_end() {
     let retries = 4;
     let num_tests = 2;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -2543,39 +2181,15 @@ fn retries_with_multiple_runners_on_one_worker_displays_retry_banner_at_end() {
         });
         start_search = found + 1;
     }
+
+    term(queue_proc);
 }
 
 test_all_network_config_options! {
     cancellation_of_active_run_for_workers |name, conf: CSConfigOptions| {
-        let server_port = find_free_port();
-        let worker_port = find_free_port();
-        let negotiator_port = find_free_port();
-
-        let queue_addr = format!("0.0.0.0:{server_port}");
         let run_id = RunId::unique().to_string();
 
-        // abq start --bind ... --port ... --work-port ... --negotiator-port ... (--token ...)?
-        let mut queue_proc = Abq::new(name.to_string() + "_queue")
-            .args(conf.extend_args_for_start(vec![
-                format!("start"),
-                format!("--bind=0.0.0.0"),
-                format!("--port={server_port}"),
-                format!("--work-port={worker_port}"),
-                format!("--negotiator-port={negotiator_port}"),
-            ]))
-            .spawn();
-
-        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-        let mut queue_reader = BufReader::new(queue_stdout).lines();
-        // Spin until we know the queue is UP
-        loop {
-            if let Some(line) = queue_reader.next() {
-                let line = line.expect("line is not a string");
-                if line.contains("Run the following to invoke a test run") {
-                    break;
-                }
-            }
-        }
+        let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
         let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
 
@@ -2716,33 +2330,7 @@ fn out_of_process_retries_smoke() {
     let num_tests = 64;
     let num_workers = 6;
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    let mut queue_reader = BufReader::new(queue_stdout).lines();
-    // Spin until we know the queue is UP
-    loop {
-        if let Some(line) = queue_reader.next() {
-            let line = line.expect("line is not a string");
-            if line.contains("Run the following to invoke a test run") {
-                break;
-            }
-        }
-    }
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let mut manifest = vec![];
 
@@ -2899,24 +2487,7 @@ fn report_while_run_in_progress_is_error() {
         tls: true,
     };
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    wait_for_live_queue(queue_stdout);
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let run_id = "test-run-id";
     let proto = ProtocolWitness::TEST;
@@ -3025,24 +2596,7 @@ fn report_while_run_is_out_of_process_retried_is_error() {
         tls: true,
     };
 
-    let server_port = find_free_port();
-    let worker_port = find_free_port();
-    let negotiator_port = find_free_port();
-
-    let queue_addr = format!("0.0.0.0:{server_port}");
-
-    let mut queue_proc = Abq::new(name)
-        .args(conf.extend_args_for_start(vec![
-            format!("start"),
-            format!("--bind=0.0.0.0"),
-            format!("--port={server_port}"),
-            format!("--work-port={worker_port}"),
-            format!("--negotiator-port={negotiator_port}"),
-        ]))
-        .spawn();
-
-    let queue_stdout = queue_proc.stdout.as_mut().unwrap();
-    wait_for_live_queue(queue_stdout);
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let run_id = "test-run-id";
     let proto = ProtocolWitness::TEST;
