@@ -51,7 +51,7 @@ impl ReportingTask {
 
     fn handle_associated_results(&mut self, results: AssociatedTestResults) {
         let AssociatedTestResults {
-            work_id: _,
+            work_id,
             run_number,
             results,
             before_any_test,
@@ -70,7 +70,7 @@ impl ReportingTask {
 
         while let Some(test_result) = results.next() {
             self.overall_tracker
-                .account_result(run_number, &test_result);
+                .account_result(run_number, work_id, &test_result);
 
             let output_before = std::mem::take(&mut output_before);
             let output_after = if results.peek().is_none() {

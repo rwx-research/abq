@@ -281,7 +281,7 @@ fn handle_result(
     let mut results = results.into_iter().peekable();
 
     while let Some(test_result) = results.next() {
-        overall_tracker.account_result(run_number, &test_result);
+        overall_tracker.account_result(run_number, work_id, &test_result);
 
         let output_before = std::mem::take(&mut output_before);
         let output_after = if results.peek().is_none() {

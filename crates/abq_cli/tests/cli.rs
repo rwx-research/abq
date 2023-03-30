@@ -350,6 +350,40 @@ fn wait_for_worker_executing(worker_stderr: &mut ChildStderr) {
     }
 }
 
+macro_rules! setup_queue {
+    ($name:expr, $conf:expr) => {{
+        let server_port = find_free_port();
+        let worker_port = find_free_port();
+        let negotiator_port = find_free_port();
+
+        let queue_addr = format!("0.0.0.0:{server_port}");
+
+        let mut queue_proc = Abq::new($name)
+            .args($conf.extend_args_for_start(vec![
+                format!("start"),
+                format!("--bind=0.0.0.0"),
+                format!("--port={server_port}"),
+                format!("--work-port={worker_port}"),
+                format!("--negotiator-port={negotiator_port}"),
+            ]))
+            .spawn();
+
+        let queue_stdout = queue_proc.stdout.as_mut().unwrap();
+        let mut queue_reader = BufReader::new(queue_stdout).lines();
+        // Spin until we know the queue is UP
+        loop {
+            if let Some(line) = queue_reader.next() {
+                let line = line.expect("line is not a string");
+                if line.contains("Run the following to invoke a test run") {
+                    break;
+                }
+            }
+        }
+
+        (queue_proc, queue_addr)
+    }};
+}
+
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
     yarn_jest_auto_workers_without_failure |name, conf: CSConfigOptions| {
@@ -3219,4 +3253,181 @@ test_signal_runner_stops_immediately! {
     test_signal_runner_stops_immediately_sigterm, SIGTERM
     test_signal_runner_stops_immediately_sigint, SIGINT
     test_signal_runner_stops_immediately_sigquit, SIGQUIT
+}
+
+#[test]
+#[serial]
+fn native_runner_fault_followed_by_success_results_in_report_success() {
+    let name = "native_runner_fault_followed_by_success_results_in_report_success";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
+
+    let run_id = "test-run-id";
+
+    use abq_native_runner_simulation::{pack, Msg::*};
+    use abq_utils::net_protocol::runners::{
+        InitSuccessMessage, Manifest, ManifestMessage, Test, TestOrGroup,
+    };
+
+    let proto = ProtocolWitness::TEST;
+
+    let test = TestOrGroup::test(Test::new(proto, "test1", vec![], Default::default()));
+    let manifest = ManifestMessage::new(Manifest::new(vec![test], Default::default()));
+
+    // abq test ...
+    let test_args = |simfile_path: &Path| {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = simfile_path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker=0"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("-n=1"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+    let report_args = || {
+        let args = vec![
+            format!("report"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--color=never"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    // attempt 1 - complete with a failure, forcing a synthetic error to be produced.
+    {
+        let simulation = [
+            Connect,
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![
+                    OpaqueWrite(pack(&manifest)),
+                    // Finish
+                    Exit(0),
+                ],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    // Read first test, then bail
+                    OpaqueRead,
+                    Stdout(b"I failed catastrophically".to_vec()),
+                    Exit(1),
+                ],
+            },
+        ];
+
+        let packed = pack_msgs_to_disk(simulation);
+
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt1"))
+            .args(test_args(&packed.path))
+            .run();
+
+        assert_eq!(
+            exit_status.code().unwrap(),
+            101,
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        // ABQ report should exit with an internal error too.
+
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_report_attempt1"))
+            .args(report_args())
+            .run();
+
+        assert_eq!(
+            exit_status.code().unwrap(),
+            101,
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert_sum_of_run_tests([stdout.as_str()], 1);
+        assert_sum_of_run_test_failures([stdout.as_str()], 1);
+    }
+
+    // attempt 2 - complete with a success, any reference to the synthetic result should be
+    // dropped.
+    {
+        let simulation = [
+            Connect,
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![
+                    OpaqueWrite(pack(&manifest)),
+                    // Finish
+                    Exit(0),
+                ],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    //
+                    // Send result
+                    OpaqueRead,
+                    OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                ],
+            },
+            Exit(0),
+        ];
+
+        let packed = pack_msgs_to_disk(simulation);
+
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt2"))
+            .args(test_args(&packed.path))
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        // ABQ report should succeed this time.
+
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_report_attempt2"))
+            .args(report_args())
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert_sum_of_run_tests([stdout.as_str()], 1);
+    }
+
+    term(queue_proc);
 }

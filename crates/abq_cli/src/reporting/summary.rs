@@ -12,7 +12,7 @@ use abq_utils::{
     net_protocol::{
         entity::WorkerRunner,
         runners::{Status, TestId, TestResult, TestRuntime},
-        workers::INIT_RUN_NUMBER,
+        workers::{WorkId, INIT_RUN_NUMBER},
     },
 };
 
@@ -114,6 +114,17 @@ pub struct SuiteTracker {
 
     tests: HashMap<TestId, TestStatus>,
 
+    /// Keeps track of [Status::PrivateNativeRunnerError] results that have been seen.
+    /// These are synthetic results that are not produced by the underlying test framework, but
+    /// instead by the test runner if it observes a fault.
+    ///
+    /// We don't want to immediately report these as failures, because they may be followed-up by
+    /// out-of-process retries of [WorkId]s that do indeed succeed. Moreover, the [TestId] of each
+    /// [Status::PrivateNativeRunnerError] is synthetic, and does not correspond to the tests of
+    /// the underlying test framework. So, if we detect a retry of a [WorkId] associated here later
+    /// on, we drop the [Status::PrivateNativeRunnerError] result and report the retry on its own.
+    delayed_native_runner_errors: HashMap<WorkId, Vec<(TestId, TestStatus)>>,
+
     // (total_attempts, aggregated metrics)
     // Need to re-calculate every time the total attempts change.
     cached_aggregated_metric: Cell<Option<(u64, AggregatedMetrics)>>,
@@ -134,30 +145,58 @@ impl SuiteTracker {
             total_attempts: 0,
 
             tests: HashMap::new(),
+            delayed_native_runner_errors: HashMap::new(),
 
             cached_aggregated_metric: Cell::new(None),
         }
     }
 
-    pub fn account_result(&mut self, run_number: u32, test_result: &TestResult) {
+    /// Account a single test result.
+    /// Must be called in chronological order of test execution.
+    pub fn account_result(&mut self, run_number: u32, work_id: WorkId, test_result: &TestResult) {
         use StatusTag::*;
 
         self.total_attempts += 1;
 
+        let make_new_test_status = |tag| {
+            TestStatus::new(
+                OverallStatus::new(tag, false),
+                test_result.location.as_ref().map(|l| l.file.clone()),
+                test_result.source.runner,
+            )
+        };
+
+        if matches!(test_result.status, Status::PrivateNativeRunnerError) {
+            // We need to treat the synthetic [Status::PrivateNativeRunnerError] specially, as they
+            // may be retried and become material test results later on. As such, record them into
+            // the look-aside buffer for now.
+            let synthetic_results = self
+                .delayed_native_runner_errors
+                .entry(work_id)
+                .or_default();
+            synthetic_results.push((
+                test_result.id.clone(),
+                make_new_test_status(AlwaysFailed {
+                    internal_error: true,
+                }),
+            ));
+
+            return;
+        }
+
+        // This is a material result. Create a new entry for it if needed; otherwise update it.
+
         let mut is_new_result = false;
         if !self.tests.contains_key(&test_result.id) {
-            self.tests.insert(
-                test_result.id.clone(),
-                TestStatus::new(
-                    OverallStatus::new(NeverFailed, false),
-                    test_result.location.as_ref().map(|l| l.file.clone()),
-                    test_result.source.runner,
-                ),
-            );
+            self.tests
+                .insert(test_result.id.clone(), make_new_test_status(NeverFailed));
             is_new_result = true;
         };
 
-        let entry = self.tests.get_mut(&test_result.id).unwrap();
+        let entry = self
+            .tests
+            .get_mut(&test_result.id)
+            .expect("test entry was just created");
 
         let is_fail_like = test_result.status.is_fail_like();
 
@@ -167,17 +206,15 @@ impl SuiteTracker {
             NeverFailed if is_fail_like => {
                 if run_number == INIT_RUN_NUMBER {
                     entry.overall_status.tag = AlwaysFailed {
-                        internal_error: matches!(
-                            test_result.status,
-                            Status::PrivateNativeRunnerError
-                        ),
+                        // If this were an internal error, we would have processed
+                        // it in the early branch.
+                        internal_error: false,
                     };
                 } else {
                     entry.overall_status.tag = UltimatelyFailed;
                 }
             }
             AlwaysFailed { .. } if !is_fail_like => {
-                debug_assert!(run_number > INIT_RUN_NUMBER);
                 entry.overall_status.tag = UltimatelySucceeded;
             }
             _ => { /* no update */ }
@@ -188,14 +225,19 @@ impl SuiteTracker {
         // report aggregation - if a test suite is out-of-process retried, it may consist of many
         // results with the same INIT_RUN_NUMBER. But in fact, all of those are retries.
         entry.overall_status.retried = !is_new_result;
+
+        // If the material result is associated with the same WorkId as a synthetic result, then we
+        // should now drop the synthetic results, in favor of these real test executions.
+        self.delayed_native_runner_errors.remove(&work_id);
     }
 
     fn load_aggregated_metrics(&self) -> AggregatedMetrics {
         match self.cached_aggregated_metric.get() {
             Some((dirty_bit, metrics)) if dirty_bit == self.total_attempts => metrics,
             _ => {
-                let metric =
-                    AggregatedMetrics::new(self.tests.values().map(|ts| &ts.overall_status));
+                let statuses = self.iter_all_test_statuses().map(|ts| &ts.overall_status);
+                let metric = AggregatedMetrics::new(statuses);
+
                 self.cached_aggregated_metric
                     .set(Some((self.total_attempts, metric)));
                 metric
@@ -203,15 +245,24 @@ impl SuiteTracker {
         }
     }
 
+    fn iter_all_test_statuses(&self) -> impl Iterator<Item = &TestStatus> {
+        let material_tests = self.tests.values();
+        // If there are now any synthetic errors left over, they should be listed.
+        let leftover_synthetic_native_runner_errors = self
+            .delayed_native_runner_errors
+            .values()
+            .flatten()
+            .map(|r| &r.1);
+
+        material_tests.chain(leftover_synthetic_native_runner_errors)
+    }
+
     pub fn suite_result(&self) -> SuiteResult {
         let Self {
             start_time,
             test_time,
-            tests,
             ..
         } = self;
-
-        let count = tests.len() as _;
 
         let AggregatedMetrics {
             failed: failing,
@@ -221,7 +272,11 @@ impl SuiteTracker {
 
         let mut runner_summaries: BTreeMap<WorkerRunner, RunnerSummary> = BTreeMap::new();
 
-        for test in tests.values() {
+        let mut count = 0;
+
+        for test in self.iter_all_test_statuses() {
+            count += 1;
+
             let runner_summary =
                 runner_summaries
                     .entry(test.runner)
@@ -269,8 +324,9 @@ impl SuiteTracker {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, time::Duration};
+    use std::time::Duration;
 
+    use abq_test_utils::{wid, TestResultBuilder};
     use abq_utils::{
         exit::ExitCode,
         net_protocol::{
@@ -389,34 +445,24 @@ mod test {
         assert_eq!(exit_code, ExitCode::ABQ_ERROR);
     }
 
-    type IdToWorkId = HashMap<&'static str, WorkId>;
-
-    fn inject_results(
-        results: impl IntoIterator<Item = (&'static str, u32, Status)>,
-    ) -> (SuiteTracker, IdToWorkId) {
-        let mut id_to_work_id: IdToWorkId = HashMap::new();
+    fn inject_results<W: Into<WorkId>, T: Into<TestResult>>(
+        results: impl IntoIterator<Item = (u32, W, T)>,
+    ) -> SuiteTracker {
         let mut results_to_inject = vec![];
 
-        for (id, run_number, status) in results {
-            let work_id = id_to_work_id.entry(id).or_insert_with(WorkId::new);
+        for (run_number, work_id, test_result) in results {
+            let work_id = work_id.into();
+            let test_result = test_result.into();
 
-            let test_result = TestResult::new(
-                RunnerMeta::fake(),
-                TestResultSpec {
-                    id: id.to_string(),
-                    status,
-                    ..TestResultSpec::fake()
-                },
-            );
-            results_to_inject.push((*work_id, run_number, test_result));
+            results_to_inject.push((work_id, run_number, test_result));
         }
 
         let mut tracker = SuiteTracker::new();
 
-        for (_work_id, run_number, result) in results_to_inject {
-            tracker.account_result(run_number, &result);
+        for (work_id, run_number, result) in results_to_inject {
+            tracker.account_result(run_number, work_id, &result);
         }
-        (tracker, id_to_work_id)
+        tracker
     }
 
     macro_rules! test_suite_results {
@@ -426,7 +472,7 @@ mod test {
                 #[allow(unused)]
                 use Status::*;
 
-                let (tracker, _) = inject_results($statuses);
+                let tracker = inject_results($statuses);
 
                 let SuiteResult {
                     suggested_exit_code,
@@ -438,116 +484,154 @@ mod test {
                     runner_summaries: _,
                 } = tracker.suite_result();
 
-                assert_eq!(suggested_exit_code, $expect_exit);
-                assert_eq!(count, $count);
-                assert_eq!(count_failed, $failed);
-                assert_eq!(tests_retried, $retries);
+                assert_eq!(suggested_exit_code, $expect_exit, "exit code different");
+                assert_eq!(count, $count, "count different");
+                assert_eq!(count_failed, $failed, "failure different");
+                assert_eq!(tests_retried, $retries, "retries different");
             }
         )*};
     }
 
     test_suite_results! {
         success_if_no_errors, [
-            ("id1", INIT_RUN_NUMBER, Success),
-            ("id2", INIT_RUN_NUMBER, Pending),
-            ("id3", INIT_RUN_NUMBER, Skipped),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", Success)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", Pending)),
+            (INIT_RUN_NUMBER, wid(3), TestResultBuilder::new("id3", Skipped)),
         ], ExitCode::SUCCESS, total 3, failed 0, retries 0
 
         fail_if_success_then_error, [
-            ("id1", INIT_RUN_NUMBER, Success),
-            ("id2", INIT_RUN_NUMBER, ERROR)
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", Success)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", ERROR))
         ], ExitCode::FAILURE, total 2, failed 1, retries 0
 
         fail_if_error_then_success, [
-            ("id1", INIT_RUN_NUMBER, ERROR),
-            ("id2", INIT_RUN_NUMBER, Success)
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", ERROR)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", Success))
         ], ExitCode::FAILURE, total 2, failed 1, retries 0
 
         fail_if_success_then_failure, [
-            ("id1", INIT_RUN_NUMBER, Success),
-            ("id2", INIT_RUN_NUMBER, FAILURE)
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", Success)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", FAILURE))
         ], ExitCode::FAILURE, total 2, failed 1, retries 0
 
         fail_if_failure_then_success, [
-            ("id1", INIT_RUN_NUMBER, Failure { exception: None, backtrace: None }),
-            ("id2", INIT_RUN_NUMBER, Success)
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", FAILURE)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", Success))
         ], ExitCode::FAILURE, total 2, failed 1, retries 0
 
         error_if_success_then_internal_error, [
-            ("id1", INIT_RUN_NUMBER, Success),
-            ("id2", INIT_RUN_NUMBER, PrivateNativeRunnerError)
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", Success)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", PrivateNativeRunnerError))
         ], ExitCode::ABQ_ERROR, total 2, failed 1, retries 0
 
         error_if_internal_error_then_success, [
-            ("id1", INIT_RUN_NUMBER, PrivateNativeRunnerError),
-            ("id2", INIT_RUN_NUMBER, Success),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", PrivateNativeRunnerError)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", Success)),
         ], ExitCode::ABQ_ERROR, total 2, failed 1, retries 0
 
         error_if_error_then_internal_error, [
-            ("id1", INIT_RUN_NUMBER, ERROR),
-            ("id2", INIT_RUN_NUMBER, PrivateNativeRunnerError),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", ERROR)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", PrivateNativeRunnerError)),
         ], ExitCode::ABQ_ERROR, total 2, failed 2, retries 0
 
         error_if_internal_error_then_error, [
-            ("id1", INIT_RUN_NUMBER, PrivateNativeRunnerError),
-            ("id2", INIT_RUN_NUMBER, ERROR),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", PrivateNativeRunnerError)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", ERROR)),
         ], ExitCode::ABQ_ERROR, total 2, failed 2, retries 0
 
         error_if_failure_then_internal_error, [
-            ("id1", INIT_RUN_NUMBER, FAILURE),
-            ("id2", INIT_RUN_NUMBER, PrivateNativeRunnerError),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", FAILURE)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", PrivateNativeRunnerError)),
         ], ExitCode::ABQ_ERROR, total 2, failed 2, retries 0
 
         error_if_internal_error_then_failure, [
-            ("id1", INIT_RUN_NUMBER, PrivateNativeRunnerError),
-            ("id2", INIT_RUN_NUMBER, FAILURE),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", PrivateNativeRunnerError)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", FAILURE)),
         ], ExitCode::ABQ_ERROR, total 2, failed 2, retries 0
 
         retries_count_tests_not_attempts, [
-            ("id1", INIT_RUN_NUMBER, FAILURE),
-            ("id1", INIT_RUN_NUMBER + 1, FAILURE),
-            ("id1", INIT_RUN_NUMBER + 2, FAILURE),
-            ("id1", INIT_RUN_NUMBER + 3, FAILURE),
-            ("id1", INIT_RUN_NUMBER + 4, FAILURE),
+            (INIT_RUN_NUMBER    , wid(1), TestResultBuilder::new("id1", FAILURE)),
+            (INIT_RUN_NUMBER + 1, wid(1), TestResultBuilder::new("id1", FAILURE)),
+            (INIT_RUN_NUMBER + 2, wid(1), TestResultBuilder::new("id1", FAILURE)),
+            (INIT_RUN_NUMBER + 3, wid(1), TestResultBuilder::new("id1", FAILURE)),
+            (INIT_RUN_NUMBER + 4, wid(1), TestResultBuilder::new("id1", FAILURE)),
         ], ExitCode::FAILURE, total 1, failed 1, retries 1
 
         no_failures_after_retries, [
-            ("id1", INIT_RUN_NUMBER, Success),
-            ("id2", INIT_RUN_NUMBER, FAILURE),
-            ("id3", INIT_RUN_NUMBER, FAILURE),
-            ("id4", INIT_RUN_NUMBER, FAILURE),
-            ("id5", INIT_RUN_NUMBER, FAILURE),
-            ("id6", INIT_RUN_NUMBER, Success),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", Success)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", FAILURE)),
+            (INIT_RUN_NUMBER, wid(3), TestResultBuilder::new("id3", FAILURE)),
+            (INIT_RUN_NUMBER, wid(4), TestResultBuilder::new("id4", FAILURE)),
+            (INIT_RUN_NUMBER, wid(5), TestResultBuilder::new("id5", FAILURE)),
+            (INIT_RUN_NUMBER, wid(6), TestResultBuilder::new("id6", Success)),
             //
-            ("id2", INIT_RUN_NUMBER + 1, Success),
-            ("id3", INIT_RUN_NUMBER + 1, Success),
-            ("id4", INIT_RUN_NUMBER + 1, Success),
-            ("id5", INIT_RUN_NUMBER + 1, Success),
+            (INIT_RUN_NUMBER + 1, wid(2), TestResultBuilder::new("id2", Success)),
+            (INIT_RUN_NUMBER + 1, wid(3), TestResultBuilder::new("id3", Success)),
+            (INIT_RUN_NUMBER + 1, wid(4), TestResultBuilder::new("id4", Success)),
+            (INIT_RUN_NUMBER + 1, wid(5), TestResultBuilder::new("id5", Success)),
         ], ExitCode::SUCCESS, total 6, failed 0, retries 4
 
         failures_after_retries, [
-            ("id1", INIT_RUN_NUMBER, Success),
-            ("id2", INIT_RUN_NUMBER, FAILURE),
-            ("id3", INIT_RUN_NUMBER, FAILURE),
-            ("id4", INIT_RUN_NUMBER, FAILURE),
-            ("id5", INIT_RUN_NUMBER, FAILURE),
-            ("id6", INIT_RUN_NUMBER, Success),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("id1", Success)),
+            (INIT_RUN_NUMBER, wid(2), TestResultBuilder::new("id2", FAILURE)),
+            (INIT_RUN_NUMBER, wid(3), TestResultBuilder::new("id3", FAILURE)),
+            (INIT_RUN_NUMBER, wid(4), TestResultBuilder::new("id4", FAILURE)),
+            (INIT_RUN_NUMBER, wid(5), TestResultBuilder::new("id5", FAILURE)),
+            (INIT_RUN_NUMBER, wid(6), TestResultBuilder::new("id6", Success)),
             //
-            ("id2", INIT_RUN_NUMBER + 1, Success),
-            ("id3", INIT_RUN_NUMBER + 1, FAILURE),
-            ("id4", INIT_RUN_NUMBER + 1, Success),
-            ("id5", INIT_RUN_NUMBER + 1, FAILURE),
+            (INIT_RUN_NUMBER + 1, wid(2), TestResultBuilder::new("id2", Success)),
+            (INIT_RUN_NUMBER + 1, wid(3), TestResultBuilder::new("id3", FAILURE)),
+            (INIT_RUN_NUMBER + 1, wid(4), TestResultBuilder::new("id4", Success)),
+            (INIT_RUN_NUMBER + 1, wid(5), TestResultBuilder::new("id5", FAILURE)),
             //
-            ("id5", INIT_RUN_NUMBER + 2, FAILURE),
+            (INIT_RUN_NUMBER + 2, wid(5), TestResultBuilder::new("id5", FAILURE)),
         ], ExitCode::FAILURE, total 6, failed 2, retries 4
+
+        internal_error_followed_by_different_name_success, [
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("synthetic-1", PrivateNativeRunnerError)),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("real-1", Success)),
+        ], ExitCode::SUCCESS, total 1, failed 0, retries 0
+
+        internal_error_followed_by_different_name_failure, [
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("synthetic-1", PrivateNativeRunnerError)),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("real-1", FAILURE)),
+        ], ExitCode::FAILURE, total 1, failed 1, retries 0
+
+        internal_error_followed_by_different_name_failure_and_retry, [
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("synthetic-1", PrivateNativeRunnerError)),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("real-1", FAILURE)),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("real-1", Success)),
+        ], ExitCode::SUCCESS, total 1, failed 0, retries 1
+
+        internal_error_followed_by_success_followed_by_internal_error, [
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("synthetic-1", PrivateNativeRunnerError)),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("real-1", Success)),
+            (INIT_RUN_NUMBER, wid(1), TestResultBuilder::new("synthetic-1", PrivateNativeRunnerError)),
+            // TODO: the last synthetic error cannot be reliably molded into the previous success,
+            // since a work ID may have multiple associated tests.
+            // However, an alternative is to never display counts for synthetic errors to begin
+            // with, and only use them in accounting exit codes.
+        ], ExitCode::ABQ_ERROR, total 2, failed 1, retries 0
     }
 
     #[test]
     fn update_suite_result_on_change() {
-        let (mut tracker, _to_wid) = inject_results([
-            ("id1", INIT_RUN_NUMBER, Status::Success),
-            ("id2", INIT_RUN_NUMBER, FAILURE),
-            ("id3", INIT_RUN_NUMBER, ERROR),
+        let mut tracker = inject_results([
+            (
+                INIT_RUN_NUMBER,
+                wid(1),
+                TestResultBuilder::new("id1", Status::Success),
+            ),
+            (
+                INIT_RUN_NUMBER,
+                wid(2),
+                TestResultBuilder::new("id2", FAILURE),
+            ),
+            (
+                INIT_RUN_NUMBER,
+                wid(3),
+                TestResultBuilder::new("id3", ERROR),
+            ),
         ]);
 
         {
@@ -566,6 +650,7 @@ mod test {
 
         tracker.account_result(
             INIT_RUN_NUMBER + 1,
+            wid(2),
             &TestResult::new(
                 RunnerMeta::fake(),
                 TestResultSpec {
@@ -577,6 +662,7 @@ mod test {
         );
         tracker.account_result(
             INIT_RUN_NUMBER + 1,
+            wid(3),
             &TestResult::new(
                 RunnerMeta::fake(),
                 TestResultSpec {
@@ -615,7 +701,7 @@ mod test {
                     ..TestResultSpec::fake()
                 },
             );
-            tracker.account_result(INIT_RUN_NUMBER, &test_result);
+            tracker.account_result(INIT_RUN_NUMBER, WorkId::new(), &test_result);
         }
 
         let expected = Duration::from_secs(20);
