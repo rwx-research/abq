@@ -212,6 +212,7 @@ dependencies = [
 name = "abq_rwx_v1_json"
 version = "0.1.0"
 dependencies = [
+ "abq_test_utils",
  "abq_utils",
  "insta",
  "serde",

@@ -111,14 +111,14 @@ impl Default for Summary {
 }
 
 impl Summary {
-    fn account(&mut self, test: &TestSketch) {
+    fn account(&mut self, test: &Test) {
         self.tests += 1;
 
-        if !test.past_attempts.is_empty() {
+        if matches!(&test.past_attempts, Some(attempts) if !attempts.is_empty()) {
             self.retries += 1;
         }
 
-        match &test.latest_attempt.status {
+        match &test.attempt.status {
             AttemptStatus::Canceled => {
                 self.status = SummaryStatus::Failed;
                 self.canceled += 1;
@@ -150,6 +150,13 @@ impl Summary {
             AttemptStatus::Quarantined { original_status: _ } => {
                 self.quarantined += 1;
             }
+        }
+    }
+
+    fn account_native_runner_errors(&mut self, native_runner_errors: u64) {
+        self.other_errors += native_runner_errors;
+        if native_runner_errors > 0 {
+            self.status = SummaryStatus::Failed;
         }
     }
 }
@@ -234,8 +241,17 @@ pub struct Attempt {
     finished_at: Option<String>,
 }
 
+enum OptAttempt {
+    SyntheticNativeRunnerError,
+    Attempt {
+        attempt: Attempt,
+        past_attempts: Option<Vec<Attempt>>,
+        native_runner_errors: u64,
+    },
+}
+
 impl Attempt {
-    fn from(test_result: &TestResultSpec, runner_meta: RunnerMeta) -> (Self, Option<Vec<Attempt>>) {
+    fn from(test_result: &TestResultSpec, runner_meta: RunnerMeta) -> OptAttempt {
         let TestResultSpec {
             status,
             output,
@@ -264,11 +280,7 @@ impl Attempt {
                 message: output.clone(),
                 backtrace: backtrace.clone(),
             },
-            Status::PrivateNativeRunnerError => AttemptStatus::Failed {
-                exception: None,
-                message: output.clone(),
-                backtrace: None,
-            },
+            Status::PrivateNativeRunnerError => return OptAttempt::SyntheticNativeRunnerError,
             Status::Pending => AttemptStatus::Pended {
                 message: output.clone(),
             },
@@ -305,14 +317,26 @@ impl Attempt {
             meta
         };
 
+        let mut other_errors = 0;
         let past_attempts = past_attempts.as_ref().map(|attempts| {
             let mut all_past_attempts = Vec::with_capacity(attempts.len());
 
             for attempt in attempts.iter() {
-                let (attempt, extra_past_attempts) = Attempt::from(attempt, runner_meta);
-                all_past_attempts.push(attempt);
-                if let Some(extra) = extra_past_attempts {
-                    all_past_attempts.extend(extra);
+                match Attempt::from(attempt, runner_meta) {
+                    OptAttempt::SyntheticNativeRunnerError => {
+                        other_errors += 1;
+                    }
+                    OptAttempt::Attempt {
+                        attempt,
+                        past_attempts,
+                        native_runner_errors: past_other_errors,
+                    } => {
+                        all_past_attempts.push(attempt);
+                        if let Some(extra) = past_attempts {
+                            all_past_attempts.extend(extra);
+                        }
+                        other_errors += past_other_errors;
+                    }
                 }
             }
 
@@ -329,7 +353,11 @@ impl Attempt {
             finished_at: finished_at.as_ref().map(|t| t.0.clone()),
         };
 
-        (this_attempt, past_attempts)
+        OptAttempt::Attempt {
+            attempt: this_attempt,
+            past_attempts,
+            native_runner_errors: other_errors,
+        }
     }
 }
 
@@ -350,14 +378,13 @@ pub struct Test {
 
 /// A sketch of a test result we use to assemble results across retries.
 #[derive(Clone)]
-struct TestSketch {
-    id: String,
-    name: String,
-    lineage: Option<Vec<String>>,
-    location: Option<Location>,
-
-    latest_attempt: Attempt,
-    past_attempts: Vec<Attempt>,
+enum TestSketch {
+    /// A material test result.
+    Material {
+        test: Test,
+        native_runner_errors: u64,
+    },
+    SyntheticNativeRunnerError,
 }
 
 impl From<&TestResult> for TestSketch {
@@ -370,40 +397,22 @@ impl From<&TestResult> for TestSketch {
             ..
         } = &test_result.deref();
 
-        let (attempt, past_attempts) = Attempt::from(test_result.deref(), test_result.source);
-
-        TestSketch {
-            id: id.to_owned(),
-            name: display_name.clone(),
-            lineage: lineage.clone(),
-            location: location.as_ref().map(Into::into),
-            latest_attempt: attempt,
-            past_attempts: past_attempts.unwrap_or_default(),
-        }
-    }
-}
-
-impl From<TestSketch> for Test {
-    fn from(sketch: TestSketch) -> Self {
-        let TestSketch {
-            id,
-            name,
-            lineage,
-            location,
-            latest_attempt,
-            past_attempts,
-        } = sketch;
-
-        Test {
-            id: Some(id),
-            name,
-            lineage,
-            location,
-            attempt: latest_attempt,
-            past_attempts: if past_attempts.is_empty() {
-                None
-            } else {
-                Some(past_attempts)
+        match Attempt::from(test_result.deref(), test_result.source) {
+            OptAttempt::SyntheticNativeRunnerError => Self::SyntheticNativeRunnerError,
+            OptAttempt::Attempt {
+                attempt,
+                past_attempts,
+                native_runner_errors: other_errors,
+            } => TestSketch::Material {
+                test: Test {
+                    id: Some(id.to_owned()),
+                    name: display_name.clone(),
+                    lineage: lineage.clone(),
+                    location: location.as_ref().map(Into::into),
+                    attempt,
+                    past_attempts,
+                },
+                native_runner_errors: other_errors,
             },
         }
     }
@@ -423,33 +432,59 @@ pub struct TestResults {
 
 #[derive(Default, Clone)]
 pub struct Collector {
-    tests: HashMap<String, TestSketch>,
+    tests: HashMap<String, Test>,
+    native_runner_errors: u64,
 }
 
 impl Collector {
     #[inline(always)]
     pub fn push_result(&mut self, test_result: &TestResult) {
-        let sketch = match self.tests.get_mut(&test_result.id) {
-            Some(sketch) => sketch,
+        let test = match self.tests.get_mut(&test_result.id) {
+            Some(test) => test,
             None => {
                 // This will account for the first test result we saw; subsequent test results
                 // (due to retries) will trace the branch above.
-                self.tests
-                    .insert(test_result.id.clone(), test_result.into());
+                match TestSketch::from(test_result) {
+                    TestSketch::SyntheticNativeRunnerError => {
+                        self.native_runner_errors += 1;
+                    }
+                    TestSketch::Material {
+                        test,
+                        native_runner_errors: other_errors,
+                    } => {
+                        self.native_runner_errors += other_errors;
+                        self.tests.insert(test_result.id.clone(), test);
+                    }
+                }
                 return;
             }
         };
 
-        // This is a retry; add the attempt and push the old one back.
-        let (new_attempt, new_attempt_previous_attempts) =
-            Attempt::from(&test_result.result, test_result.source);
+        // This is a retry.
+        match Attempt::from(&test_result.result, test_result.source) {
+            OptAttempt::SyntheticNativeRunnerError => todo!(),
+            OptAttempt::Attempt {
+                attempt: new_attempt,
+                past_attempts: new_attempt_previous_attempts,
+                native_runner_errors: other_errors,
+            } => {
+                // Add the attempt and push the old one back.
+                let prev_latest_attempt = std::mem::replace(&mut test.attempt, new_attempt);
 
-        let prev_latest_attempt = std::mem::replace(&mut sketch.latest_attempt, new_attempt);
-        sketch.past_attempts.push(prev_latest_attempt);
+                let past_attempts = test.past_attempts.get_or_insert_with(|| {
+                    let new_past_attempts = new_attempt_previous_attempts.as_ref();
+                    Vec::with_capacity(1 + new_past_attempts.map(|a| a.len()).unwrap_or(0))
+                });
 
-        // Also add any additional attempts the latest attempt produced.
-        if let Some(new_attempt_previous_attempts) = new_attempt_previous_attempts {
-            sketch.past_attempts.extend(new_attempt_previous_attempts);
+                past_attempts.push(prev_latest_attempt);
+
+                // Also add any additional attempts the latest attempt produced.
+                if let Some(new_attempt_previous_attempts) = new_attempt_previous_attempts {
+                    past_attempts.extend(new_attempt_previous_attempts);
+                }
+
+                self.native_runner_errors += other_errors;
+            }
         }
     }
 
@@ -474,6 +509,8 @@ impl Collector {
     fn test_results(self, runner_specification: Option<&NativeRunnerSpecification>) -> TestResults {
         let mut summary = Summary::default();
         self.tests.values().for_each(|test| summary.account(test));
+
+        summary.account_native_runner_errors(self.native_runner_errors);
 
         let reified_schema_tests = if cfg!(test) {
             let mut ordered_tests: Vec<Test> = self.tests.into_values().map(Into::into).collect();
@@ -507,6 +544,7 @@ impl Collector {
 
 #[cfg(test)]
 mod test {
+    use abq_test_utils::TestResultBuilder;
     use abq_utils::net_protocol::{
         entity::{RunnerMeta, WorkerRunner},
         runners::{NativeRunnerSpecification, Status, TestResult, TestResultSpec, TestRuntime},
@@ -807,6 +845,22 @@ mod test {
                 ..TestResultSpec::fake()
             },
         ));
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
+            .expect("failed to write");
+
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
+    }
+
+    #[test]
+    fn native_runner_error_seen_as_other_error() {
+        let mut collector = Collector::default();
+
+        collector
+            .push_result(&TestResultBuilder::new("id1", Status::PrivateNativeRunnerError).build());
 
         let mut buf = vec![];
         collector
