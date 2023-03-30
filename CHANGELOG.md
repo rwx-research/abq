@@ -1,6 +1,19 @@
+## 1.3.2
+
+ABQ 1.3.2 includes bug fixes and improved output for `abq test` and `abq report`.
+
+- Failure detail is provided in `abq report` output.
+- Retried tests are listed in summary output.
+- Runner number is included in failed/retried test lists during `abq test`.
+- Worker number is included in failed/retried test lists during `abq report`.
+- Fix reporting of native runner failures that are later retried.
+- rwx-v1-json reporter counts native runner failures as `otherErrors`.
+- Manifest generation output suppressed when it's empty.
+- Document support for pytest.
+
 ## 1.3.1
 
-ABQ 1.3.1 is a patch release with several bugfixes.
+ABQ 1.3.1 is a patch release with several bug fixes.
 
 - ABQ now defaults to passing-through output from a test framework when `abq test` uses a single runner.
 - Retry banners are output when a native test runner is re-launched for ABQ
