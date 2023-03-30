@@ -33,7 +33,7 @@ test command.
 ABQ works locally and on all CI providers. It’s the best tool for splitting
 test suites into parallel jobs in CI.
 
-Get started with ABQ at XXX-TODO-ABQ-LANDING.
+Get started with ABQ at [rwx.com/abq][abq_homepage].
 
 Highlights of ABQ include:
 
@@ -57,11 +57,14 @@ Highlights of ABQ include:
 - ABQ is distributed as a standalone binary with all dependencies statically
   linked. All you need to run `abq test`, or self-host an ABQ queue, is to
   download the binary for your platform.
-- Seamless integration with [Captain][xxx-todo-captain-landing].
+- Seamless integration with [Captain][captain_homepage].
 
 This version of ABQ supports [ABQ native runner protocol 0.2][native_runner_protocol_0_2].
 1.3.0 is the first public release of ABQ.
 
-Learn more about using ABQ [at the docs](XXX-TODO-ABQ-DOCS).
+Learn more about using ABQ [at the docs][abq_docs].
 
+[abq_docs]: https://www.rwx.com/docs/abq
+[abq_homepage]: https://www.rwx.com/abq
+[captain_homepage]: https://www.rwx.com/captain
 [native_runner_protocol_0_2]: https://rwx.notion.site/ABQ-Native-Runner-Protocol-0-2-70b3ec70b2f64b84aa3253a558eba16f
