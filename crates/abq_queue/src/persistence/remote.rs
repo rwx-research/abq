@@ -14,6 +14,9 @@ mod s3;
 #[cfg(feature = "s3")]
 pub use s3::{S3Client, S3Persister};
 
+mod noop;
+pub use noop::NoopPersister;
+
 pub enum PersistenceKind {
     Manifest,
     Results,
