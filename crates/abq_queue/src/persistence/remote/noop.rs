@@ -23,7 +23,7 @@ impl RemotePersistence for NoopPersister {
     async fn store(
         &self,
         _kind: PersistenceKind,
-        _run_id: RunId,
+        _run_id: &RunId,
         _from_local_path: &Path,
     ) -> OpaqueResult<()> {
         Ok(())
@@ -32,13 +32,13 @@ impl RemotePersistence for NoopPersister {
     async fn load(
         &self,
         _kind: PersistenceKind,
-        _run_id: RunId,
+        _run_id: &RunId,
         _into_local_path: &Path,
     ) -> OpaqueResult<()> {
         Err("NoopPersister does not support loading.".located(here!()))
     }
 
-    fn boxed_clone(&self) -> Box<dyn RemotePersistence> {
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
         Box::new(self.clone())
     }
 }

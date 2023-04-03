@@ -82,8 +82,10 @@ enum Servers {
 impl Default for Servers {
     fn default() -> Self {
         let manifests_path = tempfile::tempdir().unwrap();
-        let persist_manifest =
-            persistence::manifest::FilesystemPersistor::new_shared(manifests_path.path());
+        let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
+            manifests_path.path(),
+            persistence::remote::NoopPersister,
+        );
 
         let results_path = tempfile::tempdir().unwrap();
         let persist_results =

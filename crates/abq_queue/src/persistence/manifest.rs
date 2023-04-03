@@ -19,7 +19,7 @@ use abq_utils::{
 use async_trait::async_trait;
 use serde_derive::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ManifestView {
     items: Vec<WorkerTest>,
     assigned_entities: Vec<Tag>,

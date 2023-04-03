@@ -11,21 +11,33 @@ use abq_utils::{
 use async_trait::async_trait;
 use tokio::fs;
 
+use crate::persistence::remote::{PersistenceKind, RemotePersister};
+
 use super::{ManifestView, PersistentManifest, Result, SharedPersistManifest};
 
 /// Persists manifests on a filesystem, encoding/decoding to JSON.
 #[derive(Clone)]
 pub struct FilesystemPersistor {
     root: PathBuf,
+    remote: RemotePersister,
 }
 
 impl FilesystemPersistor {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    pub fn new(root: impl Into<PathBuf>, remote: impl Into<RemotePersister>) -> Self {
+        Self {
+            root: root.into(),
+            remote: remote.into(),
+        }
     }
 
-    pub fn new_shared(root: impl Into<PathBuf>) -> SharedPersistManifest {
-        SharedPersistManifest(Box::new(Self { root: root.into() }))
+    pub fn new_shared(
+        root: impl Into<PathBuf>,
+        remote: impl Into<RemotePersister>,
+    ) -> SharedPersistManifest {
+        SharedPersistManifest(Box::new(Self {
+            root: root.into(),
+            remote: remote.into(),
+        }))
     }
 
     fn get_path(&self, run_id: &RunId) -> PathBuf {
@@ -42,7 +54,14 @@ impl PersistentManifest for FilesystemPersistor {
 
         let packed = serde_json::to_vec(&view).located(here!())?;
 
-        fs::write(path, packed).await.located(here!())?;
+        fs::write(&path, packed).await.located(here!())?;
+
+        // We must write to the remote only after the content has been written to disk, since the
+        // upload to remote will read from disk.
+        // TODO(PERF): write to remote in parallel by passing the in-memory bytes instead.
+        self.remote
+            .store(PersistenceKind::Manifest, run_id, &path)
+            .await?;
 
         Ok(())
     }
@@ -71,18 +90,25 @@ mod test {
     use std::path::PathBuf;
 
     use abq_test_utils::spec;
-    use abq_utils::net_protocol::{
-        entity::Tag,
-        workers::{RunId, WorkerTest, INIT_RUN_NUMBER},
+    use abq_utils::{
+        error::ErrorLocation,
+        here,
+        net_protocol::{
+            entity::Tag,
+            workers::{RunId, WorkerTest, INIT_RUN_NUMBER},
+        },
     };
 
-    use crate::persistence::manifest::{ManifestView, PersistentManifest};
+    use crate::persistence::{
+        manifest::{ManifestView, PersistentManifest},
+        remote::{FakePersister, NoopPersister, PersistenceKind},
+    };
 
     use super::FilesystemPersistor;
 
     #[test]
     fn get_path() {
-        let fs = FilesystemPersistor::new("/tmp");
+        let fs = FilesystemPersistor::new("/tmp", NoopPersister);
         let run_id = RunId("run1".to_owned());
         assert_eq!(
             fs.get_path(&run_id),
@@ -97,7 +123,7 @@ mod test {
             assigned_entities: vec![],
         };
 
-        let fs = FilesystemPersistor::new("__zzz_this_is_not_a_subdir__");
+        let fs = FilesystemPersistor::new("__zzz_this_is_not_a_subdir__", NoopPersister);
 
         let err = fs.dump(&RunId::unique(), view).await;
         assert!(err.is_err());
@@ -105,7 +131,7 @@ mod test {
 
     #[tokio::test]
     async fn load_from_nonexistent_file_is_error() {
-        let fs = FilesystemPersistor::new("__zzz_this_is_not_a_subdir__");
+        let fs = FilesystemPersistor::new("__zzz_this_is_not_a_subdir__", NoopPersister);
 
         let err = fs
             .get_partition_for_entity(&RunId::unique(), Tag::runner(1, 1))
@@ -146,7 +172,7 @@ mod test {
         };
 
         let tempdir = tempfile::tempdir().unwrap();
-        let fs = FilesystemPersistor::new(tempdir.path());
+        let fs = FilesystemPersistor::new(tempdir.path(), NoopPersister);
 
         let run_id = RunId::unique();
 
@@ -164,5 +190,74 @@ mod test {
             .await
             .unwrap();
         assert_eq!(man3, vec![]);
+    }
+
+    #[tokio::test]
+    async fn dump_includes_write_to_remote() {
+        let runner1 = Tag::runner(0, 1);
+        let runner2 = Tag::runner(0, 2);
+
+        let test1 = WorkerTest::new(spec(1), INIT_RUN_NUMBER);
+        let test2 = WorkerTest::new(spec(2), INIT_RUN_NUMBER);
+
+        let items = vec![test1.clone(), test2.clone()];
+        let assigned_entities = vec![runner1, runner2];
+
+        let view = ManifestView {
+            items,
+            assigned_entities,
+        };
+
+        let run_id = RunId("run-id".to_string());
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let temppath = tempdir.path().to_owned();
+
+        let fs = FilesystemPersistor::new(
+            tempdir.path(),
+            FakePersister::new(
+                {
+                    let view = view.clone();
+                    move |kind, run_id, path| {
+                        assert_eq!(kind, PersistenceKind::Manifest);
+                        assert_eq!(run_id.0, "run-id");
+                        assert_eq!(path, temppath.join("run-id.manifest.json"));
+                        let fi = std::fs::read(path).unwrap();
+                        let loaded_view = serde_json::from_slice(&fi).unwrap();
+                        assert_eq!(view, loaded_view);
+                        Ok(())
+                    }
+                },
+                |_, _, _| unreachable!(),
+            ),
+        );
+
+        let res = fs.dump(&run_id, view).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failure_to_remote_write_is_error() {
+        let view = ManifestView {
+            items: vec![],
+            assigned_entities: vec![],
+        };
+
+        let run_id = RunId("run-id".to_string());
+
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let fs = FilesystemPersistor::new(
+            tempdir.path(),
+            FakePersister::new(
+                |_, _, _| Err("i failed".located(here!())),
+                |_, _, _| unreachable!(),
+            ),
+        );
+
+        let res = fs.dump(&run_id, view).await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("i failed"));
     }
 }

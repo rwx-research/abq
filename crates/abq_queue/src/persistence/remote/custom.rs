@@ -50,7 +50,7 @@ impl CustomPersister {
         &self,
         action: Action,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         path: &Path,
     ) -> OpaqueResult<()> {
         let action = match action {
@@ -90,15 +90,15 @@ impl CustomPersister {
 
 #[async_trait]
 impl RemotePersistence for CustomPersister {
-    async fn load(&self, kind: PersistenceKind, run_id: RunId, path: &Path) -> OpaqueResult<()> {
+    async fn load(&self, kind: PersistenceKind, run_id: &RunId, path: &Path) -> OpaqueResult<()> {
         self.call(Action::Load, kind, run_id, path).await
     }
 
-    async fn store(&self, kind: PersistenceKind, run_id: RunId, path: &Path) -> OpaqueResult<()> {
+    async fn store(&self, kind: PersistenceKind, run_id: &RunId, path: &Path) -> OpaqueResult<()> {
         self.call(Action::Store, kind, run_id, path).await
     }
 
-    fn boxed_clone(&self) -> Box<dyn RemotePersistence> {
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
         Box::new(self.clone())
     }
 }
@@ -135,7 +135,7 @@ mod test {
         persister
             .load(
                 super::PersistenceKind::Manifest,
-                RunId("run-id".to_string()),
+                &RunId("run-id".to_string()),
                 Path::new("/tmp/foo"),
             )
             .await
@@ -156,7 +156,7 @@ mod test {
         let err = persister
             .load(
                 super::PersistenceKind::Manifest,
-                RunId("run-id".to_string()),
+                &RunId("run-id".to_string()),
                 Path::new("/tmp/foo"),
             )
             .await
@@ -181,7 +181,7 @@ mod test {
         persister
             .store(
                 super::PersistenceKind::Manifest,
-                RunId("run-id".to_string()),
+                &RunId("run-id".to_string()),
                 Path::new("/tmp/foo"),
             )
             .await
@@ -202,7 +202,7 @@ mod test {
         let err = persister
             .store(
                 super::PersistenceKind::Manifest,
-                RunId("run-id".to_string()),
+                &RunId("run-id".to_string()),
                 Path::new("/tmp/foo"),
             )
             .await
