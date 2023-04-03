@@ -1,6 +1,7 @@
 use abq_queue::persistence;
 use abq_queue::queue::{Abq, QueueConfig};
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
+use abq_utils::exit::ExitCode;
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::Entity;
 use abq_utils::net_protocol::meta::DeprecationRecord;
@@ -17,6 +18,10 @@ use tempfile::TempDir;
 use thiserror::Error;
 use tokio::select;
 
+use self::remote_persistence::RemotePersistenceConfig;
+
+pub mod remote_persistence;
+
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 type ClientAuthStrategy = abq_utils::auth::ClientAuthStrategy<abq_utils::auth::User>;
 
@@ -32,9 +37,13 @@ pub async fn start_abq_forever(
     work_port: u16,
     negotiator_port: u16,
     server_options: ServerOptions,
-) -> ! {
+    remote_persistence_config: RemotePersistenceConfig,
+) -> Result<ExitCode, clap::Error> {
     // Public IP defaults to the binding IP.
     let public_ip = public_ip.unwrap_or(bind_ip);
+
+    #[allow(unused)] // for now
+    let remote_persistence = remote_persistence_config.resolve().await?;
 
     let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
     let persist_manifest =
@@ -113,7 +122,7 @@ pub async fn start_abq_forever(
     tracing::debug!("shut down queue");
     abq.shutdown().await.unwrap();
 
-    std::process::exit(0);
+    Ok(ExitCode::SUCCESS)
 }
 
 pub(crate) struct AbqInstance {

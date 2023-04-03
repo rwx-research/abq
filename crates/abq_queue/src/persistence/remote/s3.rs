@@ -25,6 +25,13 @@ use super::{PersistenceKind, RemotePersistence};
 #[derive(Clone)]
 pub struct S3Client(s3::Client);
 
+impl S3Client {
+    pub async fn new_from_env() -> Self {
+        let sdk_config = aws_config::load_from_env().await;
+        Self(s3::Client::new(&sdk_config))
+    }
+}
+
 type PutResult = Result<PutObjectOutput, SdkError<PutObjectError>>;
 type GetResult = Result<GetObjectOutput, SdkError<GetObjectError>>;
 
@@ -44,11 +51,7 @@ pub struct S3Persister {
 
 impl S3Persister {
     /// Initializes a new
-    pub async fn new(
-        client: S3Client,
-        bucket: impl Into<String>,
-        key_prefix: impl Into<String>,
-    ) -> Self {
+    pub fn new(client: S3Client, bucket: impl Into<String>, key_prefix: impl Into<String>) -> Self {
         Self {
             client: client.0,
             bucket: bucket.into(),
@@ -100,7 +103,7 @@ fn build_key(prefix: &str, kind: PersistenceKind, run_id: RunId) -> impl Into<St
 #[async_trait]
 impl<T> RemotePersistence for T
 where
-    T: S3Impl + Send + Sync,
+    T: S3Impl + Clone + Send + Sync + 'static,
 {
     async fn store(
         &self,
@@ -137,6 +140,10 @@ where
 
         Ok(())
     }
+
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence> {
+        Box::new(self.clone())
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +155,7 @@ mod fake {
 
     use super::{GetResult, PutResult, S3Impl};
 
+    #[derive(Clone)]
     pub struct S3Fake<OnPut, OnGet> {
         key_prefix: String,
         on_put: OnPut,

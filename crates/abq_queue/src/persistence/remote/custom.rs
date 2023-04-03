@@ -23,6 +23,7 @@ use super::{PersistenceKind, RemotePersistence};
 ///
 /// If the process exits with a non-zero exit code, the error message will be the contents of the
 /// process's standard error.
+#[derive(Clone)]
 pub struct CustomPersister {
     command: String,
     head_args: Vec<String>,
@@ -95,6 +96,10 @@ impl RemotePersistence for CustomPersister {
 
     async fn store(&self, kind: PersistenceKind, run_id: RunId, path: &Path) -> OpaqueResult<()> {
         self.call(Action::Store, kind, run_id, path).await
+    }
+
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence> {
+        Box::new(self.clone())
     }
 }
 

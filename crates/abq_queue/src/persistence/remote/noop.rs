@@ -9,6 +9,7 @@ use async_trait::async_trait;
 
 use super::{PersistenceKind, RemotePersistence};
 
+#[derive(Clone, Default)]
 pub struct NoopPersister;
 
 impl NoopPersister {
@@ -35,5 +36,9 @@ impl RemotePersistence for NoopPersister {
         _into_local_path: &Path,
     ) -> OpaqueResult<()> {
         Err("NoopPersister does not support loading.".located(here!()))
+    }
+
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence> {
+        Box::new(self.clone())
     }
 }
