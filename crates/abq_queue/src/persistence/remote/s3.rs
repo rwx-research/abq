@@ -94,7 +94,7 @@ fn build_key(prefix: &str, kind: PersistenceKind, run_id: RunId) -> impl Into<St
         PersistenceKind::Manifest => "manifest",
         PersistenceKind::Results => "results",
     };
-    [&prefix, run_id.0.as_str(), kind_str].join("/")
+    [prefix, run_id.0.as_str(), kind_str].join("/")
 }
 
 #[async_trait]
@@ -124,7 +124,7 @@ where
         run_id: RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
-        let key = build_key(&self.key_prefix(), kind, run_id);
+        let key = build_key(self.key_prefix(), kind, run_id);
         let get_object = self.get(key).await.located(here!())?;
 
         let mut body = get_object.body.into_async_read();
@@ -199,6 +199,7 @@ mod test {
     use super::{build_key, PersistenceKind};
     use crate::persistence::remote::RemotePersistence;
     use abq_utils::net_protocol::workers::RunId;
+    use aws_sdk_s3::error::SdkError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::primitives::ByteStream;
@@ -275,5 +276,57 @@ mod test {
         io::Read::read_to_end(&mut io::BufReader::new(manifest), &mut buf).unwrap();
 
         assert_eq!(buf, b"manifest-body");
+    }
+
+    #[tokio::test]
+    async fn store_error() {
+        let s3 = S3Fake::new(
+            "bucket-prefix",
+            |key, body| {
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                assert_eq!(body, b"manifest-body");
+                Err(SdkError::timeout_error("timed out"))
+            },
+            |_| unreachable!(),
+        );
+
+        let mut manifest = NamedTempFile::new().unwrap();
+        io::Write::write_all(&mut manifest, b"manifest-body").unwrap();
+
+        let err = s3
+            .store(
+                PersistenceKind::Manifest,
+                RunId("test-run-id".to_owned()),
+                manifest.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn load_error() {
+        let s3 = S3Fake::new(
+            "bucket-prefix",
+            |_key, _body| unreachable!(),
+            |key| {
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                Err(SdkError::timeout_error("timed out"))
+            },
+        );
+
+        let manifest = NamedTempFile::new().unwrap();
+
+        let err = s3
+            .load(
+                PersistenceKind::Manifest,
+                RunId("test-run-id".to_owned()),
+                manifest.path(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
     }
 }
