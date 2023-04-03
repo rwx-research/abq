@@ -74,7 +74,7 @@ derive_more = "0.99.17"
 
 # --- Development ---
 
-insta = { version = "1.29.0", features = ["json"] }
+insta = { version = "1.29.0", features = ["json", "redactions"] }
 paste = "1.0.12"
 
 fs4 = "0.6.3"

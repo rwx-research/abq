@@ -1,10 +1,12 @@
 use std::{fmt::Display, str::FromStr};
 
-use abq_queue::persistence::remote::{
-    CustomPersister, NoopPersister, RemotePersister, S3Client, S3Persister,
-};
+use abq_queue::persistence::remote::{CustomPersister, NoopPersister, RemotePersister};
+#[cfg(feature = "s3")]
+use abq_queue::persistence::remote::{S3Client, S3Persister};
 
 use crate::args::Cli;
+
+use clap::{error::ErrorKind, CommandFactory};
 
 pub const ENV_REMOTE_PERSISTENCE_STRATEGY: &str = "ABQ_REMOTE_PERSISTENCE_STRATEGY";
 pub const ENV_REMOTE_PERSISTENCE_COMMAND: &str = "ABQ_REMOTE_PERSISTENCE_COMMAND";
@@ -78,11 +80,23 @@ impl RemotePersistenceConfig {
         use RemotePersistenceStrategy::*;
         match strategy {
             S3 => {
-                build_s3_strategy(
-                    remote_persistence_s3_bucket,
-                    remote_persistence_s3_key_prefix,
-                )
-                .await
+                #[cfg(feature = "s3")]
+                {
+                    build_s3_strategy(
+                        remote_persistence_s3_bucket,
+                        remote_persistence_s3_key_prefix,
+                    )
+                    .await
+                }
+
+                #[cfg(not(feature = "s3"))]
+                {
+                    let mut cmd = Cli::command();
+                    Err(cmd.error(
+                        ErrorKind::InvalidValue,
+                        format!(r#"Persistence to S3 is only available when compiled with the "s3" feature"#),
+                    ))
+                }
             }
             Custom => build_custom_strategy(remote_persistence_command),
         }
@@ -90,7 +104,6 @@ impl RemotePersistenceConfig {
 }
 
 fn missing_arg_for(arg: &str, strategy: RemotePersistenceStrategy) -> clap::Error {
-    use clap::{error::ErrorKind, CommandFactory};
     let mut cmd = Cli::command();
     cmd.error(
         ErrorKind::MissingRequiredArgument,
@@ -98,6 +111,7 @@ fn missing_arg_for(arg: &str, strategy: RemotePersistenceStrategy) -> clap::Erro
     )
 }
 
+#[cfg(feature = "s3")]
 async fn build_s3_strategy(
     remote_persistence_s3_bucket: Option<String>,
     remote_persistence_s3_key_prefix: Option<String>,
