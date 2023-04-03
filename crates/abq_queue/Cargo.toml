@@ -25,6 +25,15 @@ async-trait.workspace = true
 
 anyhow.workspace = true
 
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+
+[features]
+s3 = [
+  "dep:aws-config",
+  "dep:aws-sdk-s3",
+]
+
 [dev-dependencies]
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 abq_test_utils = { path = "../abq_test_support/abq_test_utils" }
