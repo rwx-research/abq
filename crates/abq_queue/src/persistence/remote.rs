@@ -33,8 +33,10 @@ pub enum PersistenceKind {
 
 #[async_trait]
 pub trait RemotePersistence {
+    async fn store(&self, kind: PersistenceKind, run_id: RunId, data: Vec<u8>) -> OpaqueResult<()>;
+
     /// Stores a file from the local filesystem to the remote persistence.
-    async fn store(
+    async fn store_from_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
