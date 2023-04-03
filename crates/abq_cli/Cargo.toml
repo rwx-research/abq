@@ -64,3 +64,4 @@ regex.workspace = true
 
 [features]
 test-abq-jest = []
+s3 = [ "abq_queue/s3" ]

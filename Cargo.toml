@@ -87,6 +87,10 @@ nix = "0.26.2"
 
 regex = "1.7.3"
 
+# Enabled with the "s3" feature.
+aws-config = "0.55.0"
+aws-sdk-s3 = "0.25.0"
+
 [workspace.dependencies.uuid]
 version = "1.3.0"
 features = [
