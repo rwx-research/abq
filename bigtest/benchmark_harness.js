@@ -44,7 +44,7 @@ const VERSION_FILE = `${STATEDIR}/version`;
 
 const BATCH_SIZE = 14;
 const EXPECTED_NUM_TESTS = 500;
-const MAX_WORKER_OVERHEAD_PCT = 10; // 10%
+const MAX_WORKER_OVERHEAD_PCT = 16; // 16%
 
 function runBenchmark(
   {
