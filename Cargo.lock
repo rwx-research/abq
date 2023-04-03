@@ -162,6 +162,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "futures",
+ "indoc",
  "insta",
  "moka",
  "ntest",

@@ -17,6 +17,9 @@ pub use s3::{S3Client, S3Persister};
 mod noop;
 pub use noop::NoopPersister;
 
+mod custom;
+pub use custom::CustomPersister;
+
 pub enum PersistenceKind {
     Manifest,
     Results,
