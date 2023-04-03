@@ -23,7 +23,7 @@ jobs:
   release:
     name: Build, Upload, Release ABQ
     # We only need x86-64 statically-linked binaries for development testing.
-    runs-on: rwx-ubuntu-latest
+    runs-on: ubuntu-latest
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
     env:

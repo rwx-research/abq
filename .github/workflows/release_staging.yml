@@ -20,7 +20,7 @@ on:
 jobs:
   release:
     name: Release ABQ
-    runs-on: rwx-ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Register a new release with the abq api to a release channel
         if: inputs.release_channel != ''
