@@ -60,6 +60,22 @@ impl<T> WorkerSet<T> {
     pub fn iter(&self) -> impl Iterator<Item = &(Entity, T)> {
         self.0.iter()
     }
+
+    /// Get the number of unique workers.
+    ///
+    /// Multiple runners for the same worker are only counted once.
+    pub fn worker_count(&self) -> usize {
+        let mut workers = self
+            .iter()
+            .filter_map(|(k, _)| match k.tag {
+                Tag::Runner(wr) => Some(wr.worker()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        workers.sort_unstable();
+        workers.dedup();
+        workers.len()
+    }
 }
 
 impl<V> IntoIterator for WorkerSet<V> {

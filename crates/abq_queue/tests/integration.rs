@@ -13,7 +13,7 @@ use abq_queue::{
     persistence,
     queue::{Abq, QueueConfig},
 };
-use abq_test_utils::{artifacts_dir, s};
+use abq_test_utils::{artifacts_dir, assert_scoped_log, s};
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
     exit::ExitCode,
@@ -569,9 +569,9 @@ async fn run_test(servers: Servers, steps: Steps<'_>) {
 }
 
 #[tokio::test]
+#[traced_test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
-#[traced_test]
 async fn multiple_jobs_complete() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
@@ -629,6 +629,107 @@ async fn multiple_jobs_complete() {
 }
 
 #[tokio::test]
+#[traced_test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 second
+async fn multiple_worker_count() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            echo_test(proto, "echo1".to_string()),
+            echo_test(proto, "echo2".to_string()),
+            echo_test(proto, "echo3".to_string()),
+            echo_test(proto, "echo4".to_string()),
+            echo_test(proto, "echo5".to_string()),
+        ],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    let start_worker = |n| {
+        StartWorkers(
+            Run(73495),
+            Wid(n),
+            WorkersConfigBuilder::new(n as u32, runner.clone())
+                .with_num_workers(NonZeroUsize::new(1).unwrap()),
+        )
+    };
+
+    TestBuilder::default()
+        .act([start_worker(4), start_worker(5), start_worker(6)])
+        .step(
+            [
+                StopWorkers(Wid(4)),
+                StopWorkers(Wid(6)),
+                StopWorkers(Wid(5)),
+                WaitForCompletedRun(Run(73495)),
+                WaitForNoPendingResults(Run(73495)),
+            ],
+            [
+                WorkerTestResults(
+                    Run(73495),
+                    Box::new(|results| {
+                        let mut results = results.to_vec();
+                        let results = sort_results(&mut results);
+                        results
+                            == [
+                                (1, "echo1"),
+                                (1, "echo2"),
+                                (1, "echo3"),
+                                (1, "echo4"),
+                                (1, "echo5"),
+                            ]
+                    }),
+                ),
+                WorkerExitStatus(
+                    Wid(4),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                WorkerExitStatus(
+                    Wid(6),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                WorkerExitStatus(
+                    Wid(5),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(73495),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results {
+                            chunk,
+                            final_chunk: true,
+                        } => {
+                            let (results, summary) = flatten_queue_results(chunk);
+                            assert_eq!(
+                                results,
+                                vec![
+                                    (1, s!("echo1")),
+                                    (1, s!("echo2")),
+                                    (1, s!("echo3")),
+                                    (1, s!("echo4")),
+                                    (1, s!("echo5"))
+                                ]
+                            );
+                            assert_eq!(summary.manifest_size_nonce, 5);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
+        )
+        .test()
+        .await;
+
+    let log_message = format!(
+        "marking end of manifest run_id={} worker_count={}",
+        73495, 3
+    );
+    assert_scoped_log("abq_queue::queue", &log_message);
+}
+
+#[tokio::test]
+#[traced_test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
 async fn multiple_invokers() {
@@ -1018,8 +1119,8 @@ async fn get_init_context_from_work_server_active() {
 }
 
 #[tokio::test]
-#[with_protocol_version]
 #[traced_test]
+#[with_protocol_version]
 async fn get_init_context_after_run_already_completed() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
