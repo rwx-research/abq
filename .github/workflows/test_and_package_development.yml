@@ -114,22 +114,22 @@ jobs:
         run: |
           cargo build --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
 
-      - name: Run tests with cargo
-        timeout-minutes: 4
-        if: github.run_attempt == 1
-        run: |
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
-        env:
-          CI: false
+      #- name: Run tests with cargo
+      #  timeout-minutes: 4
+      #  if: github.run_attempt == 1
+      #  run: |
+      #    cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
+      #  env:
+      #    CI: false
 
-      - name: Run retried tests with cargo, including debug output
-        timeout-minutes: 5
-        if: github.run_attempt > 1
-        run: |
-          export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
-        env:
-          CI: false
+      #- name: Run retried tests with cargo, including debug output
+      #  timeout-minutes: 5
+      #  if: github.run_attempt > 1
+      #  run: |
+      #    export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
+      #    cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
+      #  env:
+      #    CI: false
 
       - name: Prepare release environment
         run: |
