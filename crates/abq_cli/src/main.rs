@@ -39,9 +39,9 @@ use crate::{
     reporting::StdoutPreferences,
 };
 
-//#[cfg(all(target_arch = "x86_64", target_env = "musl"))]
-//#[global_allocator]
-//static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(all(target_arch = "x86_64", target_env = "musl"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
