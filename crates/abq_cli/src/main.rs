@@ -34,7 +34,10 @@ use instance::AbqInstance;
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
-use crate::{args::Token, health::HealthCheckKind, reporting::StdoutPreferences};
+use crate::{
+    args::Token, health::HealthCheckKind, instance::remote_persistence::RemotePersistenceConfig,
+    reporting::StdoutPreferences,
+};
 
 #[cfg(all(target_arch = "x86_64", target_env = "musl"))]
 #[global_allocator]
@@ -231,6 +234,10 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             admin_token,
             tls_cert,
             tls_key,
+            remote_persistence_strategy,
+            remote_persistence_command,
+            remote_persistence_s3_bucket,
+            remote_persistence_s3_key_prefix,
         } => {
             let server_auth = match (user_token, admin_token) {
                 (Some(user), Some(admin)) => {
@@ -254,15 +261,24 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 _ => unreachable!("Mutual dependency of TLS config should have been caught by clap during arg parsing!"),
             };
 
-            instance::start_abq_forever(
+            let remote_persistence_config = RemotePersistenceConfig::new(
+                remote_persistence_strategy,
+                remote_persistence_command,
+                remote_persistence_s3_bucket,
+                remote_persistence_s3_key_prefix,
+            );
+
+            let code = instance::start_abq_forever(
                 public_ip,
                 bind_ip,
                 server_port,
                 work_port,
                 negotiator_port,
                 ServerOptions::new(server_auth, server_tls),
+                remote_persistence_config,
             )
-            .await
+            .await?;
+            Ok(code)
         }
         Command::Test {
             worker,
@@ -398,7 +414,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             )
             .await?;
 
-            report::report_results(
+            let code = report::report_results(
                 abq,
                 entity,
                 run_id,
@@ -406,7 +422,8 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 stdout_preferences,
                 Duration::from_secs(timeout_seconds),
             )
-            .await
+            .await?;
+            Ok(code)
         }
         Command::Health {
             queue,

@@ -14,6 +14,12 @@ mod s3;
 #[cfg(feature = "s3")]
 pub use s3::{S3Client, S3Persister};
 
+mod noop;
+pub use noop::NoopPersister;
+
+mod custom;
+pub use custom::CustomPersister;
+
 pub enum PersistenceKind {
     Manifest,
     Results,
@@ -37,4 +43,39 @@ pub trait RemotePersistence {
         run_id: RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()>;
+
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence>;
+}
+
+#[repr(transparent)]
+pub struct RemotePersister(Box<dyn RemotePersistence>);
+
+impl RemotePersister {
+    pub fn new(persister: impl RemotePersistence + 'static) -> RemotePersister {
+        RemotePersister(Box::new(persister))
+    }
+
+    pub async fn store(
+        &self,
+        kind: PersistenceKind,
+        run_id: RunId,
+        from_local_path: &Path,
+    ) -> OpaqueResult<()> {
+        self.0.store(kind, run_id, from_local_path).await
+    }
+
+    pub async fn load(
+        &self,
+        kind: PersistenceKind,
+        run_id: RunId,
+        into_local_path: &Path,
+    ) -> OpaqueResult<()> {
+        self.0.load(kind, run_id, into_local_path).await
+    }
+}
+
+impl Clone for RemotePersister {
+    fn clone(&self) -> Self {
+        Self(self.0.boxed_clone())
+    }
 }

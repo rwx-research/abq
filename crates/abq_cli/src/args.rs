@@ -12,7 +12,14 @@ use abq_utils::{
 
 use clap::{ArgGroup, Parser, Subcommand};
 
-use crate::reporting::{ColorPreference, ReporterKind};
+use crate::{
+    instance::remote_persistence::{
+        RemotePersistenceStrategy, ENV_REMOTE_PERSISTENCE_COMMAND,
+        ENV_REMOTE_PERSISTENCE_S3_BUCKET, ENV_REMOTE_PERSISTENCE_S3_KEY_PREFIX,
+        ENV_REMOTE_PERSISTENCE_STRATEGY,
+    },
+    reporting::{ColorPreference, ReporterKind},
+};
 
 #[derive(Clone)]
 pub enum NumWorkers {
@@ -46,7 +53,6 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-
 pub enum Command {
     /// Starts the "abq" ephemeral queue.
     Start {
@@ -115,6 +121,50 @@ pub enum Command {
         /// If provided, must also provide `--tls-cert`.
         #[clap(long, requires("tls_cert"))]
         tls_key: Option<PathBuf>,
+
+        /// How files should be persisted to a remote location, if at all.{n}
+        /// The default is that no remote persistence is performed, and instead results and
+        /// manifest files are only persisted locally.{n}
+        ///
+        /// The remote persistence options are:{n}
+        ///  - s3: files are remotely persisted to an S3 bucket. Requires `ABQ_REMOTE_PERISTENCE_S3_BUCKET`
+        ///  and `ABQ_REMOTE_PERSISTENCE_S3_KEY_PREFIX` to be set as well. AWS credentials and region
+        ///  information are read from the environment, using the standard AWS environment variable
+        ///  support (https://docs.aws.amazon.com/sdkref/latest/guide/environment-variables.html).{n}
+        ///
+        ///  - custom: files are remotely persisted by calling a provided executable. See
+        ///  `--remote-persistence-command` for more information.{n}
+        #[clap(long, required = false, env(ENV_REMOTE_PERSISTENCE_STRATEGY))]
+        remote_persistence_strategy: Option<RemotePersistenceStrategy>,
+
+        /// The command that should be run to persist files to a remote location, if at all.{n}
+        /// Only relevant if `--remote-persistence-strategy` is set to `custom`.{n}
+        ///
+        /// The command should be specified as a comma-delimited string of the executable and its
+        /// arguments. The executable will be called in the following form:{n}
+        ///
+        /// <executable> <...arguments> <mode> <file-type> <run-id> <local-path>{n}
+        ///
+        /// Where{n}
+        ///   - <mode> is either "store" or "load", depending on whether the file should be stored
+        ///   into the remote location, or loaded from the remote location.{n}
+        ///   - <file-type> is either "manifest" or "results".{n}
+        ///   - <run-id> is the run ID of the test suite run.{n}
+        ///   - <local-path> is the path to the file on the local filesystem. If the mode is "store",
+        ///   the content to upload should be read from this path. If the mode is "load", the
+        ///   downloaded content should be written to this path.{n}
+        #[clap(long, required = false, env(ENV_REMOTE_PERSISTENCE_COMMAND))]
+        remote_persistence_command: Option<String>,
+
+        /// The name of the S3 bucket to use for remote persistence.{n}
+        /// Only relevant if `--remote-persistence-strategy` is set to `s3`.{n}
+        #[clap(long, required = false, env(ENV_REMOTE_PERSISTENCE_S3_BUCKET))]
+        remote_persistence_s3_bucket: Option<String>,
+
+        /// The prefix to use for keys in the S3 bucket used for remote persistence.{n}
+        /// Only relevant if `--remote-persistence-strategy` is set to `s3`.{n}
+        #[clap(long, required = false, env(ENV_REMOTE_PERSISTENCE_S3_KEY_PREFIX))]
+        remote_persistence_s3_key_prefix: Option<String>,
     },
     /// Starts an instance of an ABQ test suite run, or connects a worker to a test suite run.
     ///
