@@ -111,9 +111,5 @@ codegen-units = 1 # disables parallelism during the build, making the code faste
 # This is the profile built in CI during non-release cycles.
 # Keeps debug assertions around, and prefers faster compilation times.
 [profile.release-unstable]
-inherits = "dev"
-opt-level = 0
-# Geometric mean between default of incremental=false=>16 units and incremental=true=>256 units
-# https://doc.rust-lang.org/cargo/reference/profiles.html#codegen-units
-incremental = true
-codegen-units = 256
+inherits = "release"
+debug = true
