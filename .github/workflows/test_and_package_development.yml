@@ -82,23 +82,6 @@ jobs:
         run: |
           cargo build --bins --profile=release --all-features --target="$RUST_TARGET"
 
-      #- name: Run tests with cargo
-      #  timeout-minutes: 4
-      #  if: github.run_attempt == 1
-      #  run: |
-      #    cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
-      #  env:
-      #    CI: false
-
-      #- name: Run retried tests with cargo, including debug output
-      #  timeout-minutes: 5
-      #  if: github.run_attempt > 1
-      #  run: |
-      #    export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-      #    cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
-      #  env:
-      #    CI: false
-
       - name: Prepare release environment
         run: |
           ABQ_VERSION="$(cat build_artifact/abq_version.txt)"
@@ -122,8 +105,8 @@ jobs:
         id: prepare_release
         run: |
           mkdir "${RELEASE_DIR}"
-          cp "target/$RUST_TARGET/release-unstable/abq" "${RELEASE_DIR}"
-          cp "target/$RUST_TARGET/release-unstable/abq_tester_harness" "${RELEASE_DIR}"
+          cp "target/$RUST_TARGET/release/abq" "${RELEASE_DIR}"
+          cp "target/$RUST_TARGET/release/abq_tester_harness" "${RELEASE_DIR}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
 
       - name: Push release to staging S3
