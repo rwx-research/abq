@@ -921,8 +921,6 @@ impl AllRuns {
             }
         };
 
-        tracing::info!(?run_id, "marking end of manifest");
-
         let mut seen_workers = WorkerSet::default();
 
         for (worker, opt_completed) in active_worker_timings {
@@ -930,6 +928,8 @@ impl AllRuns {
             let is_active = opt_completed.is_none();
             seen_workers.insert_by_tag(worker, is_active);
         }
+
+        tracing::info!(?run_id, worker_count=?seen_workers.worker_count(), "marking end of manifest");
 
         // Build the plan to persist the manifest.
         let view = queue.into_manifest_view();
