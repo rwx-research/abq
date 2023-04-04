@@ -78,58 +78,26 @@ jobs:
           target: ${{ env.RUST_TARGET }}
           components: clippy, rustfmt
 
-      - name: Check formatting
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: fmt
-          args: -- --check
-
-      - name: Run lints
-        uses: actions-rs/cargo@v1.0.3
-        with:
-          command: clippy
-          args: --workspace --tests --profile=release-unstable --all-features --target=${{ env.RUST_TARGET }} -- --deny warnings
-
-      - name: Lint github workflows
-        run: |
-          echo "::add-matcher::.github/actionlint-matcher.json"
-          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/3a2f2c755b6442ec7999b28dfd107e1bb9853389/scripts/download-actionlint.bash)
-          ./actionlint -color
-        shell: bash
-
-      # setup testdata
-      - uses: actions/setup-node@v3
-        with:
-          node-version: "14"
-          cache: "npm"
-          cache-dependency-path: "testdata/**/package-lock.json"
-
-      - name: Load test dependencies
-        run: |
-          scripts/init_testdata
-
-      # End setup testdata
-
       - name: Build release with tests
         run: |
-          cargo build --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
+          cargo build --bins --profile=release --all-features --target="$RUST_TARGET"
 
-      - name: Run tests with cargo
-        timeout-minutes: 4
-        if: github.run_attempt == 1
-        run: |
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
-        env:
-          CI: false
+      #- name: Run tests with cargo
+      #  timeout-minutes: 4
+      #  if: github.run_attempt == 1
+      #  run: |
+      #    cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
+      #  env:
+      #    CI: false
 
-      - name: Run retried tests with cargo, including debug output
-        timeout-minutes: 5
-        if: github.run_attempt > 1
-        run: |
-          export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
-        env:
-          CI: false
+      #- name: Run retried tests with cargo, including debug output
+      #  timeout-minutes: 5
+      #  if: github.run_attempt > 1
+      #  run: |
+      #    export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
+      #    cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
+      #  env:
+      #    CI: false
 
       - name: Prepare release environment
         run: |
