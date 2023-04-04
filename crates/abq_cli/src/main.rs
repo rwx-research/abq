@@ -6,6 +6,7 @@ mod reporting;
 mod statefile;
 mod workers;
 
+use jemallocator::Jemalloc;
 use std::{
     collections::HashMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration,
 };
@@ -39,9 +40,8 @@ use crate::{
     reporting::StdoutPreferences,
 };
 
-//#[cfg(all(target_arch = "x86_64", target_env = "musl"))]
-//#[global_allocator]
-//static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
