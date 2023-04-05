@@ -3421,7 +3421,7 @@ mod test {
                 newly_observed_test_index: 1,
             } => {
                 assert_eq!(work_bundle.work.len(), 1);
-                assert!(work_bundle.eow);
+                assert!(!work_bundle.eow);
                 assert_eq!(work_status, PulledTestsStatus::MoreTestsRemaining);
                 assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
             }

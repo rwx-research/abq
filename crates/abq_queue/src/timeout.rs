@@ -5,8 +5,9 @@ use std::{
     time::Duration,
 };
 
-use abq_utils::net_protocol::{queue::CancelReason, workers::RunId};
+use abq_utils::net_protocol::workers::RunId;
 use futures::{stream::FuturesUnordered, StreamExt};
+use pin_project_lite::pin_project;
 use std::future::Future;
 use tokio::sync::RwLock;
 
@@ -92,15 +93,27 @@ pub(crate) struct FiredTimeout {
     pub reason: TimeoutReason,
 }
 
-struct TimeoutCell {
-    timeout: Pin<Box<dyn Future<Output = FiredTimeout> + Send + Sync + 'static>>,
+pin_project! {
+    struct TimeoutCell {
+        #[pin]
+        sleep: tokio::time::Sleep,
+        fired_timeout: Option<FiredTimeout>,
+    }
 }
 
 impl Future for TimeoutCell {
     type Output = FiredTimeout;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.timeout).poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.project();
+        match me.sleep.poll(cx) {
+            Poll::Ready(()) => Poll::Ready(
+                me.fired_timeout
+                    .take()
+                    .expect("ready futures are never re-polled."),
+            ),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -130,15 +143,14 @@ impl RunTimeoutManager {
     pub async fn insert(&self, run_id: RunId, timeout_spec: TimeoutSpec) {
         let TimeoutSpec { duration, reason } = timeout_spec;
         let runs = self.0.timeouts.read().await;
-        let fut = Box::pin(async move {
-            tokio::time::sleep(duration).await;
-            FiredTimeout {
+        let timeout_cell = TimeoutCell {
+            sleep: tokio::time::sleep(duration),
+            fired_timeout: Some(FiredTimeout {
                 run_id,
                 after: duration,
                 reason,
-            }
-        });
-        let timeout_cell = TimeoutCell { timeout: fut };
+            }),
+        };
 
         // NB: We should attempt to minimize memory leaks by dropping timeout
         // cells that are no longer active, or reusing their memory. The latter
