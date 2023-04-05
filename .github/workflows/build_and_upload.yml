@@ -56,6 +56,7 @@ jobs:
       # in the future we'll want to release against different architectures
       matrix:
         include:
+          # Linux x86, statically compiled with musl
           - runs-on: ubuntu-latest
             # todo: deprecate plaform key when we move to RFC 20 style abq uploads
             deprecated-platform: linux_x86-64
@@ -63,6 +64,17 @@ jobs:
             architecture: x86_64
             cross-target: 'x86_64-unknown-linux-musl'
             install-musl-tools: true
+          # Linux x86, dynamically compiled against glibc. Manylinux 2014
+          # provides a sufficiently-old glibc suitable for later linking in
+          # either EC2 or GHA.
+          - runs-on: ubuntu-latest
+            # todo: deprecate plaform key when we move to RFC 20 style abq uploads
+            deprecated-platform: linux_x86-64_glibc
+            os: linux
+            architecture: x86_64_glibc
+            cross-target: ''
+            install-musl-tools: false
+            container: quay.io/pypa/manylinux2014_x86_64
           - runs-on: ubuntu-latest
             deprecated-platform: linux_aarch64
             os: linux
