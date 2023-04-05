@@ -166,6 +166,7 @@ dependencies = [
  "moka",
  "ntest",
  "parking_lot",
+ "pin-project-lite",
  "serde",
  "serde_derive",
  "serde_json",

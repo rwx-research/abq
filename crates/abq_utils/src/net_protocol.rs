@@ -324,6 +324,8 @@ pub mod workers {
         FailOnTestName(String),
         /// A worker that errors before generating a manifest.
         NeverReturnManifest,
+        /// A worker that hangs when the test run starts.
+        HangOnTestStart,
         /// A worker that errors when a test of a name is received, never returning a result.
         NeverReturnOnTest(String),
         /// A worker that panics in a section of ABQ code.
@@ -559,8 +561,8 @@ pub mod queue {
     pub enum CancelReason {
         /// The test run was cancelled on a worker
         User,
-        /// Timed out waiting for the last test result in a test run.
-        TimeoutOnTestResult,
+        /// Timed out because no progress was made popping items off the manifest.
+        ManifestHadNoProgress,
     }
 
     /// A request sent to the queue.

@@ -17,6 +17,7 @@ use crate::{
     negotiate,
     runner_strategy::RunnerStrategyGenerator,
     workers::{WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus},
+    AssignedRun, AssignedRunStatus, GetAssignedRun,
 };
 use abq_utils::{
     auth::User,
@@ -382,28 +383,6 @@ pub enum QueueNegotiateError {
     BadWorkersMessage,
 }
 
-/// The test run a worker should ask for work on.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub enum AssignedRun {
-    /// This worker is connecting for a fresh run, and should fetch tests online.
-    Fresh { should_generate_manifest: bool },
-    /// This worker is connecting for a retry, and should fetch its manifest from the queue once.
-    Retry,
-}
-
-/// A marker that a test run should work on has already completed by the time the worker started
-/// up, and so the worker can exit immediately.
-pub struct AssignedRunCompeleted {
-    pub success: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum AssignedRunStatus {
-    RunUnknown,
-    Run(AssignedRun),
-    AlreadyDone { exit_code: ExitCode },
-}
-
 /// An error that happens in the construction or execution of the queue negotiation server.
 ///
 /// Does not include errors in the handling of requests to the server, but does include errors in
@@ -419,20 +398,20 @@ pub enum QueueNegotiatorServerError {
     Other(#[from] Box<dyn Error + Send + Sync>),
 }
 
-struct QueueNegotiatorCtx<GetAssignedRun>
+struct QueueNegotiatorCtx<GA>
 where
-    GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+    GA: GetAssignedRun + Send + Sync,
 {
     /// Fetches the status of an assigned run, and yields immediately.
-    get_assigned_run: Arc<GetAssignedRun>,
+    get_assigned_run: Arc<GA>,
     advertised_queue_work_scheduler_addr: SocketAddr,
     advertised_queue_results_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
-impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
+impl<GA> QueueNegotiatorCtx<GA>
 where
-    GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+    GA: GetAssignedRun + Send + Sync,
 {
     fn clone(&self) -> Self {
         Self {
@@ -448,16 +427,16 @@ impl QueueNegotiator {
     /// Starts a queue negotiator on an async executor.
     ///
     /// * `get_assigned_run` - should fetch the status of an assigned run and yield immediately.
-    pub async fn start<GetAssignedRun>(
+    pub async fn start<GA>(
         public_ip: IpAddr,
         listener: Box<dyn net_async::ServerListener>,
         mut shutdown_rx: ShutdownReceiver,
         queue_work_scheduler_addr: SocketAddr,
         queue_results_addr: SocketAddr,
-        get_assigned_run: GetAssignedRun,
+        get_assigned_run: GA,
     ) -> Self
     where
-        GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+        GA: GetAssignedRun + Send + Sync + 'static,
     {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -516,12 +495,12 @@ impl QueueNegotiator {
         }
     }
 
-    async fn handle_conn<GetAssignedRun>(
-        ctx: QueueNegotiatorCtx<GetAssignedRun>,
+    async fn handle_conn<GA>(
+        ctx: QueueNegotiatorCtx<GA>,
         stream: net_async::UnverifiedServerStream,
     ) -> Result<(), EntityfulError>
     where
-        GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+        GA: GetAssignedRun + Send + Sync + 'static,
     {
         let mut stream = ctx
             .handshake_ctx
@@ -551,7 +530,10 @@ impl QueueNegotiator {
 
                 tracing::debug!(run_id=?run_id, "New worker set negotiating");
 
-                let assigned_run_result = (ctx.get_assigned_run)(entity, &invoke_data);
+                let assigned_run_result = ctx
+                    .get_assigned_run
+                    .get_assigned_run(entity, &invoke_data)
+                    .await;
 
                 use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
@@ -599,10 +581,11 @@ mod test {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
+    use super::{MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
+    use crate::assigned_run::fake::MockGetAssignedRun;
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExitStatus};
-    use crate::DEFAULT_RUNNER_TEST_TIMEOUT;
+    use crate::{AssignedRun, DEFAULT_RUNNER_TEST_TIMEOUT};
     use abq_generic_test_runner::DEFAULT_PROTOCOL_VERSION_TIMEOUT;
     use abq_test_utils::one_nonzero;
     use abq_utils::auth::{
@@ -871,11 +854,11 @@ mod test {
             Default::default(),
         ));
 
-        let get_assigned_run = move |_entity, _data: &InvokeWork| {
+        let get_assigned_run = MockGetAssignedRun::new(|| {
             AssignedRunStatus::Run(AssignedRun::Fresh {
                 should_generate_manifest: true,
             })
-        };
+        });
 
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let listener =
@@ -962,11 +945,11 @@ mod test {
             // Below parameters are faux because they are unnecessary for healthchecks.
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
-            move |_, _| {
+            MockGetAssignedRun::new(|| {
                 AssignedRunStatus::Run(AssignedRun::Fresh {
                     should_generate_manifest: true,
                 })
-            },
+            }),
         )
         .await;
 
