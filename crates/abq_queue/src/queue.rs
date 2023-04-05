@@ -1627,9 +1627,12 @@ impl QueueServer {
                     });
                 }
                 HandleTimeout(fired_timeout) => {
-                    let ctx = ctx.clone();
+                    let queues = ctx.queues.clone();
+                    let timeout_manager = ctx.timeout_manager.clone();
                     tokio::spawn(async move {
-                        let result = Self::handle_timeout(ctx, fired_timeout).await.no_entity();
+                        let result = Self::handle_timeout(queues, timeout_manager, fired_timeout)
+                            .await
+                            .no_entity();
                         if let Err(error) = result {
                             log_entityful_error!(error, "error handling timeout: {}")
                         }
@@ -2182,7 +2185,11 @@ impl QueueServer {
     ///   has been made in popping the manifest for a run.
     ///   If no progress has been made, the run is considered to be stuck and is cancelled.
     ///   If progress has been made but the manifest is still active, the timeout is re-enqueued.
-    async fn handle_timeout(ctx: QueueServerCtx, timeout: FiredTimeout) -> OpaqueResult<()> {
+    async fn handle_timeout(
+        queues: SharedRuns,
+        timeout_manager: RunTimeoutManager,
+        timeout: FiredTimeout,
+    ) -> OpaqueResult<()> {
         let FiredTimeout {
             run_id,
             reason,
@@ -2193,9 +2200,7 @@ impl QueueServer {
             last_observed_test_index,
         } = reason;
 
-        let opt_result = ctx
-            .queues
-            .handle_manifest_progress_timeout(&run_id, last_observed_test_index);
+        let opt_result = queues.handle_manifest_progress_timeout(&run_id, last_observed_test_index);
 
         match opt_result {
             Some(result) => match result {
@@ -2217,11 +2222,10 @@ impl QueueServer {
                 } => {
                     // Enqueue a new wait-for-manifest-progress timeout with the newly-observed
                     // progress.
-                    let timeout_spec = ctx
-                        .timeout_manager
+                    let timeout_spec = timeout_manager
                         .strategy()
                         .wait_for_manifest_progress_duration(newly_observed_test_index);
-                    ctx.timeout_manager.insert(run_id, timeout_spec).await;
+                    timeout_manager.insert(run_id, timeout_spec).await;
 
                     Ok(())
                 }
