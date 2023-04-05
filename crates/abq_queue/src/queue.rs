@@ -50,6 +50,7 @@ use crate::persistence::manifest::{
 };
 use crate::persistence::results::{ResultsPersistedCell, SharedPersistResults};
 use crate::prelude::*;
+use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy};
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
 
@@ -1246,6 +1247,8 @@ pub struct QueueConfig {
     pub persist_manifest: SharedPersistManifest,
     /// How results should be persisted.
     pub persist_results: SharedPersistResults,
+    /// How timeouts should be configured.
+    pub run_timeout_strategy: RunTimeoutStrategy,
 }
 
 impl QueueConfig {
@@ -1267,6 +1270,7 @@ impl QueueConfig {
             ),
             persist_manifest,
             persist_results,
+            run_timeout_strategy: RunTimeoutStrategy::RUN_BASED,
         }
     }
 }
@@ -1284,9 +1288,12 @@ async fn start_queue(config: QueueConfig) -> Abq {
         server_options,
         persist_manifest,
         persist_results,
+        run_timeout_strategy,
     } = config;
 
     let mut shutdown_manager = ShutdownManager::default();
+
+    let timeout_manager = RunTimeoutManager::new(run_timeout_strategy);
 
     let queues: SharedRuns = Default::default();
 
@@ -1308,7 +1315,12 @@ async fn start_queue(config: QueueConfig) -> Abq {
     let server_shutdown_rx = shutdown_manager.add_receiver();
     let server_handle = tokio::spawn({
         let queues = queues.clone();
-        let queue_server = QueueServer::new(queues, public_negotiator_addr, persist_results);
+        let queue_server = QueueServer::new(
+            queues,
+            public_negotiator_addr,
+            persist_results,
+            timeout_manager,
+        );
         queue_server.start(server_listener, server_shutdown_rx)
     });
 
@@ -1383,6 +1395,7 @@ async fn start_queue(config: QueueConfig) -> Abq {
 struct QueueServer {
     queues: SharedRuns,
     persist_results: SharedPersistResults,
+    timeout_manager: RunTimeoutManager,
     public_negotiator_addr: SocketAddr,
 }
 
@@ -1407,6 +1420,7 @@ struct QueueServerCtx {
     public_negotiator_addr: SocketAddr,
     persist_results: SharedPersistResults,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
+    timeout_manager: RunTimeoutManager,
 }
 
 impl QueueServer {
@@ -1414,10 +1428,12 @@ impl QueueServer {
         queues: SharedRuns,
         public_negotiator_addr: SocketAddr,
         persist_results: SharedPersistResults,
+        timeout_manager: RunTimeoutManager,
     ) -> Self {
         Self {
             queues,
             persist_results,
+            timeout_manager,
             public_negotiator_addr,
         }
     }
@@ -1430,6 +1446,7 @@ impl QueueServer {
         let Self {
             queues,
             persist_results,
+            timeout_manager,
             public_negotiator_addr,
         } = self;
 
@@ -1438,6 +1455,7 @@ impl QueueServer {
             public_negotiator_addr,
             persist_results,
             handshake_ctx: Arc::new(server_listener.handshake_ctx()),
+            timeout_manager,
         };
 
         enum Task {
@@ -2309,6 +2327,7 @@ mod test {
     use crate::{
         persistence::{self, manifest::InMemoryPersistor},
         queue::{AddedManifest, CancelReason, QueueServer, RunStatus, SharedRuns, WorkScheduler},
+        timeout::RunTimeoutManager,
     };
     use abq_run_n_times::n_times;
     use abq_test_utils::{
@@ -2336,14 +2355,19 @@ mod test {
     use abq_workers::negotiate::{AssignedRun, AssignedRunStatus};
     use tracing_test::traced_test;
 
-    #[tokio::test]
-    #[traced_test]
-    async fn bad_message_doesnt_take_down_server() {
-        let server = QueueServer::new(
+    fn test_queue() -> QueueServer {
+        QueueServer::new(
             Default::default(),
             "0.0.0.0:0".parse().unwrap(),
             persistence::results::InMemoryPersistor::new_shared(),
-        );
+            RunTimeoutManager::default(),
+        )
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn bad_message_doesnt_take_down_server() {
+        let server = test_queue();
 
         let server_opts =
             ServerOptions::new(ServerAuthStrategy::no_auth(), ServerTlsStrategy::no_tls());
@@ -2381,11 +2405,7 @@ mod test {
 
         let (mut server_shutdown_tx, server_shutdown_rx) = ShutdownManager::new_pair();
 
-        let queue_server = QueueServer {
-            queues: Default::default(),
-            public_negotiator_addr: "0.0.0.0:0".parse().unwrap(),
-            persist_results: persistence::results::InMemoryPersistor::new_shared(),
-        };
+        let queue_server = test_queue();
         let queue_handle = tokio::spawn(queue_server.start(server, server_shutdown_rx));
 
         let client = client_opts.build_async().unwrap();
@@ -2479,12 +2499,8 @@ mod test {
     #[tokio::test]
     #[traced_test]
     async fn connecting_to_queue_server_with_auth_okay() {
-        let negotiator_addr = "0.0.0.0:0".parse().unwrap();
-        let server = QueueServer::new(
-            Default::default(),
-            negotiator_addr,
-            persistence::results::InMemoryPersistor::new_shared(),
-        );
+        let server = test_queue();
+        let negotiator_addr = server.public_negotiator_addr;
 
         let (server_auth, client_auth, _) =
             build_strategies(UserToken::new_random(), AdminToken::new_random());
@@ -2525,12 +2541,7 @@ mod test {
     #[tokio::test]
     #[traced_test]
     async fn connecting_to_queue_server_with_no_auth_fails() {
-        let negotiator_addr = "0.0.0.0:0".parse().unwrap();
-        let server = QueueServer::new(
-            Default::default(),
-            negotiator_addr,
-            persistence::results::InMemoryPersistor::new_shared(),
-        );
+        let server = test_queue();
 
         let (server_auth, _, _) = build_random_strategies();
 

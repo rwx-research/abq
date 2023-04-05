@@ -110,6 +110,12 @@ impl Future for TimeoutCell {
     }
 }
 
+impl Default for RunTimeoutManager {
+    fn default() -> Self {
+        Self::new(RunTimeoutStrategy::default())
+    }
+}
+
 impl RunTimeoutManager {
     const MAX_TIMEOUT_WAIT_TIME: Duration = Duration::from_micros(10);
 
