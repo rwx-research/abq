@@ -191,7 +191,7 @@ enum InitMetadata {
 }
 
 /// What is the state of the queue of tests for a run after some bundle of tests have been pulled?
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PulledTestsStatus {
     /// There are additional tests remaining.
     MoreTestsRemaining,
@@ -2501,7 +2501,7 @@ mod test {
         persistence::{self, manifest::InMemoryPersistor},
         queue::{
             AddedManifest, CancelReason, ManifestProgressCancelReason, ManifestProgressResult,
-            QueueServer, RunStatus, SharedRuns, WorkScheduler,
+            PulledTestsStatus, QueueServer, RunStatus, SharedRuns, WorkScheduler,
         },
         timeout::RunTimeoutManager,
     };
@@ -3360,6 +3360,76 @@ mod test {
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
         assert_eq!(result, None);
+    }
+
+    #[n_times(1_000)]
+    #[test]
+    fn handle_manifest_progress_timeout_while_run_is_active_races() {
+        let queues = SharedRuns::default();
+        let run_id = RunId::unique();
+
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
+        let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
+
+        // Race popping an item off the manifest, and handling the no-progress timeout.
+        // If the no-progress handler wins, the run should be cancelled and getting next work
+        // should return nothing.
+        // If the next-work handler wins, the run should be marked as progressed and the no-progress
+        // handler should return RunComplete.
+
+        let manifest_progress_handler = {
+            let queues = queues.clone();
+            let run_id = run_id.clone();
+            move || {
+                let result = queues.handle_manifest_progress_timeout(&run_id, 0);
+                result.unwrap()
+            }
+        };
+
+        let next_work_handler = {
+            let queues = queues.clone();
+            let run_id = run_id.clone();
+            move || {
+                let result = queues.next_work(Entity::runner(0, 1), &run_id);
+                (result.bundle, result.status)
+            }
+        };
+
+        let manifest_progress_thread;
+        let next_work_thread;
+        if i % 2 == 0 {
+            manifest_progress_thread = std::thread::spawn(manifest_progress_handler);
+            next_work_thread = std::thread::spawn(next_work_handler);
+        } else {
+            next_work_thread = std::thread::spawn(next_work_handler);
+            manifest_progress_thread = std::thread::spawn(manifest_progress_handler);
+        }
+
+        let (manifest_progress_result, (work_bundle, work_status)) = (
+            manifest_progress_thread.join().unwrap(),
+            next_work_thread.join().unwrap(),
+        );
+
+        match manifest_progress_result {
+            ManifestProgressResult::Cancelled(ManifestProgressCancelReason::NoTestProgress) => {
+                assert_eq!(work_bundle.work, []);
+                assert!(work_bundle.eow);
+                assert_eq!(work_status, PulledTestsStatus::QueueWasEmpty);
+                assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Cancelled));
+            }
+            ManifestProgressResult::NewProgress {
+                newly_observed_test_index: 1,
+            } => {
+                assert_eq!(work_bundle.work.len(), 1);
+                assert!(work_bundle.eow);
+                assert_eq!(work_status, PulledTestsStatus::MoreTestsRemaining);
+                assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
+            }
+            result => unreachable!(
+                "invalid combination: {:?}",
+                (result, work_bundle, work_status)
+            ),
+        }
     }
 }
 
