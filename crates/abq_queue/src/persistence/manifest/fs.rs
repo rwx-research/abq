@@ -54,14 +54,13 @@ impl PersistentManifest for FilesystemPersistor {
 
         let packed = serde_json::to_vec(&view).located(here!())?;
 
-        fs::write(&path, packed).await.located(here!())?;
+        let (local_result, remote_result) = tokio::join!(
+            fs::write(&path, packed.clone()),
+            self.remote.store(PersistenceKind::Manifest, run_id, packed),
+        );
 
-        // We must write to the remote only after the content has been written to disk, since the
-        // upload to remote will read from disk.
-        // TODO(PERF): write to remote in parallel by passing the in-memory bytes instead.
-        self.remote
-            .store(PersistenceKind::Manifest, run_id, &path)
-            .await?;
+        local_result.located(here!())?;
+        remote_result?;
 
         Ok(())
     }
@@ -211,23 +210,21 @@ mod test {
         let run_id = RunId("run-id".to_string());
 
         let tempdir = tempfile::tempdir().unwrap();
-        let temppath = tempdir.path().to_owned();
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
             FakePersister::new(
                 {
                     let view = view.clone();
-                    move |kind, run_id, path| {
+                    move |kind, run_id, data| {
                         assert_eq!(kind, PersistenceKind::Manifest);
                         assert_eq!(run_id.0, "run-id");
-                        assert_eq!(path, temppath.join("run-id.manifest.json"));
-                        let fi = std::fs::read(path).unwrap();
-                        let loaded_view = serde_json::from_slice(&fi).unwrap();
+                        let loaded_view = serde_json::from_slice(&data).unwrap();
                         assert_eq!(view, loaded_view);
                         Ok(())
                     }
                 },
+                |_, _, _| unreachable!(),
                 |_, _, _| unreachable!(),
             ),
         );
@@ -251,6 +248,7 @@ mod test {
             tempdir.path(),
             FakePersister::new(
                 |_, _, _| Err("i failed".located(here!())),
+                |_, _, _| unreachable!(),
                 |_, _, _| unreachable!(),
             ),
         );
