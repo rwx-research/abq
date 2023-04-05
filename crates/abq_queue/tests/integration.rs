@@ -2383,6 +2383,7 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
 
 #[tokio::test]
 #[with_protocol_version]
+#[traced_test]
 async fn cancel_test_run_if_no_manifest_progress() {
     let manifest = ManifestMessage::new(Manifest::new(
         [echo_test(proto, "echo1".to_string())],
@@ -2427,4 +2428,9 @@ async fn cancel_test_run_if_no_manifest_progress() {
         )
         .test()
         .await;
+
+    assert_scoped_log(
+        "abq_queue::queue",
+        "run cancelled because manifest made no progress",
+    );
 }
