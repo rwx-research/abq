@@ -26,6 +26,9 @@ trait PersistResults: Send + Sync {
     /// Dumps a summary line.
     async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()>;
 
+    /// Dumps the persisted results to a remote, if any is configured.
+    async fn dump_to_remote(&self, run_id: &RunId) -> ArcResult<()>;
+
     /// Load a set of test results as [OpaqueLazyAssociatedTestResults].
     async fn get_results(&self, run_id: &RunId) -> ArcResult<OpaqueLazyAssociatedTestResults>;
 
@@ -67,6 +70,17 @@ struct CellInner {
     processing: AtomicU64,
 }
 
+/// Whether the results persistence is eligible for persistence to the remote, if any.
+///
+/// This is a hint as to whether or not the remote can be hit. The remote will only actually be
+/// persisted to if there are no additional pending local persistence operations after a local
+/// persistence operation completes.
+#[derive(PartialEq, Eq, Debug)]
+pub enum EligibleForRemoteDump {
+    Yes,
+    No,
+}
+
 impl ResultsPersistedCell {
     pub fn new(run_id: RunId) -> Self {
         Self(Arc::new(CellInner {
@@ -86,6 +100,7 @@ impl ResultsPersistedCell {
         &'a self,
         persistence: &'a SharedPersistResults,
         results: Vec<AssociatedTestResults>,
+        eligible_for_remote_dump: EligibleForRemoteDump,
     ) -> PersistencePlan<'a> {
         self.0.processing.fetch_add(1, atomic::ORDERING);
 
@@ -93,6 +108,7 @@ impl ResultsPersistedCell {
             persist_results: &*persistence.0,
             cell: &self.0,
             line: ResultsLine::Results(results),
+            eligible_for_remote_dump,
         }
     }
 
@@ -102,6 +118,7 @@ impl ResultsPersistedCell {
         &'a self,
         persistence: &'a SharedPersistResults,
         summary: Summary,
+        eligible_for_remote_dump: EligibleForRemoteDump,
     ) -> PersistencePlan<'a> {
         self.0.processing.fetch_add(1, atomic::ORDERING);
 
@@ -109,6 +126,7 @@ impl ResultsPersistedCell {
             persist_results: &*persistence.0,
             cell: &self.0,
             line: ResultsLine::Summary(summary),
+            eligible_for_remote_dump,
         }
     }
 
@@ -129,6 +147,7 @@ pub struct PersistencePlan<'a> {
     persist_results: &'a dyn PersistResults,
     cell: &'a CellInner,
     line: ResultsLine,
+    eligible_for_remote_dump: EligibleForRemoteDump,
 }
 
 impl<'a> PersistencePlan<'a> {
@@ -137,7 +156,18 @@ impl<'a> PersistencePlan<'a> {
             .persist_results
             .dump(&self.cell.run_id, self.line)
             .await;
-        self.cell.processing.fetch_sub(1, atomic::ORDERING);
+        let additional_persistence_tasks = self.cell.processing.fetch_sub(1, atomic::ORDERING);
+
+        if additional_persistence_tasks == 1
+            && self.eligible_for_remote_dump == EligibleForRemoteDump::Yes
+        {
+            // The last local persistence task was just completed by us; we can now dump to the
+            // remote.
+            self.persist_results
+                .dump_to_remote(&self.cell.run_id)
+                .await?;
+        }
+
         result
     }
 }
@@ -154,6 +184,8 @@ mod test {
             queue::AssociatedTestResults, results::ResultsLine, runners::TestResult, workers::RunId,
         },
     };
+
+    use crate::persistence::results::EligibleForRemoteDump;
 
     use super::{fs::FilesystemPersistor, ResultsPersistedCell};
 
@@ -197,7 +229,11 @@ mod test {
             AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
         ];
 
-        let plan = cell.build_persist_results_plan(&persistence, results1.clone());
+        let plan = cell.build_persist_results_plan(
+            &persistence,
+            results1.clone(),
+            EligibleForRemoteDump::No,
+        );
         plan.execute().await.unwrap();
 
         // Due to our listed constraints, retrieval may finish before persistence of results2 does.
@@ -213,7 +249,11 @@ mod test {
             }
         };
         let persist_task = async {
-            let plan = cell.build_persist_results_plan(&persistence, results2.clone());
+            let plan = cell.build_persist_results_plan(
+                &persistence,
+                results2.clone(),
+                EligibleForRemoteDump::No,
+            );
             plan.execute().await.unwrap();
         };
         let ((), retrieve_result) = tokio::join!(persist_task, retrieve_task);

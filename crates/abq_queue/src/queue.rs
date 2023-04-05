@@ -47,7 +47,9 @@ use crate::job_queue::JobQueue;
 use crate::persistence::manifest::{
     self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
 };
-use crate::persistence::results::{ResultsPersistedCell, SharedPersistResults};
+use crate::persistence::results::{
+    EligibleForRemoteDump, ResultsPersistedCell, SharedPersistResults,
+};
 use crate::prelude::*;
 use crate::timeout::{FiredTimeout, RunTimeoutManager, RunTimeoutStrategy, TimeoutReason};
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
@@ -1913,10 +1915,12 @@ impl QueueServer {
                     manifest_size_nonce,
                     native_runner_info,
                 };
+                let eligible_for_remote_dump = EligibleForRemoteDump::No;
                 run_summary_persistence_task(
                     entity,
                     &persist_results,
                     results_persistence,
+                    eligible_for_remote_dump,
                     summary,
                 )
                 .await?;
@@ -1976,10 +1980,12 @@ impl QueueServer {
                         native_runner_info,
                         manifest_size_nonce: 0,
                     };
+                    let eligible_for_remote_dump = EligibleForRemoteDump::No;
                     run_summary_persistence_task(
                         entity,
                         &persist_results,
                         results_persistence,
+                        eligible_for_remote_dump,
                         summary,
                     )
                     .await?
@@ -2022,8 +2028,13 @@ impl QueueServer {
         // tasks, then send the ACK, since we don't want to block the workers on the actual
         // persistence.
         let cell_result = queues.get_write_results_cell(&run_id).located(here!());
+        let eligible_for_remote_dump = EligibleForRemoteDump::No;
         let plan_result = match cell_result.as_ref() {
-            Ok(cell) => Ok(cell.build_persist_results_plan(&persist_results, results)),
+            Ok(cell) => Ok(cell.build_persist_results_plan(
+                &persist_results,
+                results,
+                eligible_for_remote_dump,
+            )),
             Err(e) => Err(e),
         };
 
@@ -2466,9 +2477,14 @@ async fn run_summary_persistence_task(
     entity: Entity,
     persist_results: &SharedPersistResults,
     results_persistence: ResultsPersistedCell,
+    eligible_for_remote_dump: EligibleForRemoteDump,
     summary: results::Summary,
 ) -> OpaqueResult<()> {
-    let task = results_persistence.build_persist_summary_plan(persist_results, summary);
+    let task = results_persistence.build_persist_summary_plan(
+        persist_results,
+        summary,
+        eligible_for_remote_dump,
+    );
 
     task.execute().await.map_err(dearc_located)
 }

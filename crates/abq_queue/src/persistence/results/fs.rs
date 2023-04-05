@@ -99,6 +99,10 @@ impl PersistResults for FilesystemPersistor {
         Ok(())
     }
 
+    async fn dump_to_remote(&self, _run_id: &RunId) -> ArcResult<()> {
+        Ok(())
+    }
+
     async fn get_results(&self, run_id: &RunId) -> ArcResult<OpaqueLazyAssociatedTestResults> {
         let path = self.get_path(run_id);
 
