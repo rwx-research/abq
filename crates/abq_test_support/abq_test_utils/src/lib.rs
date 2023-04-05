@@ -28,6 +28,7 @@ pub const WORKSPACE: &str = env!("ABQ_WORKSPACE_DIR");
 
 pub fn artifacts_dir() -> PathBuf {
     let path = if cfg!(all(target_arch = "x86_64")) {
+        // GHA x86 linux.
         if cfg!(debug_assertions) {
             // GHA x86 with debug assertions targets the release-unstable profile.
             "target/release-unstable"
