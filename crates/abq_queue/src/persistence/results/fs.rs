@@ -20,6 +20,12 @@ use crate::persistence::remote::{PersistenceKind, RemotePersister};
 use super::{ArcResult, PersistResults, SharedPersistResults};
 
 /// A concurrent LRU cache of open file descriptors.
+//
+// TODO: reading and writing to results files asynchronously may be an expensive task,
+// given that results file may be quite large. Would it be better to use [std::fs::File]
+// and spawn off a blocking tasks instead?
+//
+//     https://docs.rs/tokio/latest/tokio/fs/index.html#usage
 #[derive(Clone)]
 struct FdCache(moka::future::Cache<PathBuf, Arc<Mutex<File>>>);
 
