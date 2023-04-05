@@ -64,13 +64,17 @@ impl TimeoutSpec {
     }
 }
 
+struct RunTimeoutManagerInner {
+    strategy: RunTimeoutStrategy,
+    timeouts: RwLock<FuturesUnordered<TimeoutCell>>,
+}
+
 /// Records runs that should timeout after a certain amount of time.
 /// Fires [RunTimeoutManager::next_timeout] when a timeout is reached.
+///
+/// Clones of the manager are cheap.
 #[derive(Clone)]
-pub(crate) struct RunTimeoutManager {
-    strategy: RunTimeoutStrategy,
-    timeouts: Arc<RwLock<FuturesUnordered<TimeoutCell>>>,
-}
+pub(crate) struct RunTimeoutManager(Arc<RunTimeoutManagerInner>);
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TimeoutReason {
@@ -110,14 +114,14 @@ impl RunTimeoutManager {
     const MAX_TIMEOUT_WAIT_TIME: Duration = Duration::from_micros(10);
 
     pub fn new(strategy: RunTimeoutStrategy) -> Self {
-        Self {
+        Self(Arc::new(RunTimeoutManagerInner {
             strategy,
             timeouts: Default::default(),
-        }
+        }))
     }
 
     pub fn strategy(&self) -> RunTimeoutStrategy {
-        self.strategy
+        self.0.strategy
     }
 
     /// Inserts a new timeout for a given run ID.
@@ -125,7 +129,7 @@ impl RunTimeoutManager {
     /// cheap across threads, while waiting for timeouts requires exclusive access.
     pub async fn insert_run(&self, run_id: RunId, timeout_spec: TimeoutSpec) {
         let TimeoutSpec { duration, reason } = timeout_spec;
-        let runs = self.timeouts.read().await;
+        let runs = self.0.timeouts.read().await;
         let fut = Box::pin(async move {
             tokio::time::sleep(duration).await;
             TimedOutRun {
@@ -152,7 +156,7 @@ impl RunTimeoutManager {
     /// timeout is inserted.
     pub async fn next_timeout(&self) -> TimedOutRun {
         loop {
-            let mut runs = self.timeouts.write().await;
+            let mut runs = self.0.timeouts.write().await;
             // TODO: consider using futures::select_biased, since the max-wait path
             // is far more likely to fire.
             tokio::select! {
