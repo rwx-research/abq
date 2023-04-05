@@ -13,17 +13,20 @@ use abq_utils::net_protocol::runners::{
     NativeRunnerSpecification, ProtocolWitness, RawNativeRunnerSpawnedMessage,
 };
 use abq_with_protocol_version::with_protocol_version;
+use indoc::formatdoc;
 use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
 use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
+use std::thread;
 use std::time::Duration;
 use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
+use tempfile::NamedTempFile;
 
 use abq_utils::net_protocol::workers::RunId;
 
@@ -351,7 +354,10 @@ fn wait_for_worker_executing(worker_stderr: &mut ChildStderr) {
 }
 
 macro_rules! setup_queue {
-    ($name:expr, $conf:expr) => {{
+    ($name:expr, $conf:expr) => {
+        setup_queue!($name, $conf, env: Vec::<(String, String)>::new())
+    };
+    ($name:expr, $conf:expr, env:$env:expr) => {{
         let server_port = find_free_port();
         let worker_port = find_free_port();
         let negotiator_port = find_free_port();
@@ -366,6 +372,7 @@ macro_rules! setup_queue {
                 format!("--work-port={worker_port}"),
                 format!("--negotiator-port={negotiator_port}"),
             ]))
+            .env($env)
             .spawn();
 
         let queue_stdout = queue_proc.stdout.as_mut().unwrap();
@@ -2982,6 +2989,156 @@ fn native_runner_fault_followed_by_success_results_in_report_success() {
         );
         assert_sum_of_run_tests([stdout.as_str()], 1);
     }
+
+    term(queue_proc);
+}
+
+fn write_to_temp(content: &str) -> NamedTempFile {
+    use std::io::Write;
+    let mut fi = NamedTempFile::new().unwrap();
+    fi.write_all(content.as_bytes()).unwrap();
+    fi
+}
+
+#[test]
+#[serial]
+fn custom_remote_persistence() {
+    let name = "custom_remote_persistence";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let custom_persisted_path = tempfile::tempdir().unwrap().into_path();
+    let custom_script = write_to_temp(&formatdoc! {
+        "
+        const fs = require(`fs`);
+
+        const dir = `{persist_dir}`;
+
+        const action = process.argv[2];
+        const kind = process.argv[3];
+        const runId = process.argv[4];
+        const readFrom = process.argv[5];
+        const writeTo = `${{dir}}/${{action}}-${{kind}}-${{runId}}`
+
+        const data = fs.readFileSync(readFrom, `utf8`);
+        fs.writeFileSync(writeTo, data);
+        ",
+        persist_dir = custom_persisted_path.display(),
+    });
+    let custom_command = format!("node,{}", custom_script.path().to_str().unwrap());
+
+    let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
+        ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
+        ("ABQ_REMOTE_PERSISTENCE_COMMAND", &custom_command),
+    ]);
+
+    let run_id = "test-run-id";
+
+    use abq_native_runner_simulation::{pack, Msg::*};
+    use abq_utils::net_protocol::runners::{
+        InitSuccessMessage, Manifest, ManifestMessage, Test, TestOrGroup,
+    };
+
+    let proto = ProtocolWitness::TEST;
+
+    let test = TestOrGroup::test(Test::new(proto, "test1", vec![], Default::default()));
+    let manifest = ManifestMessage::new(Manifest::new(vec![test], Default::default()));
+
+    // Run `abq test`
+    {
+        let simulation = [
+            Connect,
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![
+                    OpaqueWrite(pack(&manifest)),
+                    // Finish
+                    Exit(0),
+                ],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    // Read first test, write okay
+                    OpaqueRead,
+                    OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                ],
+            },
+            Exit(0),
+        ];
+
+        let packed = pack_msgs_to_disk(simulation);
+
+        // abq test ...
+        let test_args = {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = packed.path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker=0"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        };
+
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt1"))
+            .args(test_args)
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+
+    let custom_persisted_manifest_path = custom_persisted_path.join("store-manifest-test-run-id");
+    while !custom_persisted_manifest_path.exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let manifest = std::fs::read_to_string(&custom_persisted_manifest_path)
+        .unwrap_or_else(|_| panic!("Nothing at {:?}", custom_persisted_manifest_path));
+
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    insta::assert_json_snapshot!(manifest, {
+        ".items[0].spec.work_id" => "[redacted]",
+    }, @r###"
+    {
+      "assigned_entities": [
+        {
+          "Runner": [
+            0,
+            1
+          ]
+        }
+      ],
+      "items": [
+        {
+          "run_number": 1,
+          "spec": {
+            "test_case": {
+              "id": "test1",
+              "meta": {}
+            },
+            "work_id": "[redacted]"
+          }
+        }
+      ]
+    }
+    "###);
 
     term(queue_proc);
 }

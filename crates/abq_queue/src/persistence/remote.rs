@@ -20,6 +20,12 @@ pub use noop::NoopPersister;
 mod custom;
 pub use custom::CustomPersister;
 
+#[cfg(test)]
+mod fake;
+#[cfg(test)]
+pub use fake::FakePersister;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PersistenceKind {
     Manifest,
     Results,
@@ -31,7 +37,7 @@ pub trait RemotePersistence {
     async fn store(
         &self,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         from_local_path: &Path,
     ) -> OpaqueResult<()>;
 
@@ -40,25 +46,34 @@ pub trait RemotePersistence {
     async fn load(
         &self,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()>;
 
-    fn boxed_clone(&self) -> Box<dyn RemotePersistence>;
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync>;
 }
 
 #[repr(transparent)]
-pub struct RemotePersister(Box<dyn RemotePersistence>);
+pub struct RemotePersister(Box<dyn RemotePersistence + Send + Sync>);
+
+impl<T> From<T> for RemotePersister
+where
+    T: RemotePersistence + Send + Sync + 'static,
+{
+    fn from(persister: T) -> Self {
+        Self::new(persister)
+    }
+}
 
 impl RemotePersister {
-    pub fn new(persister: impl RemotePersistence + 'static) -> RemotePersister {
+    pub fn new(persister: impl RemotePersistence + Send + Sync + 'static) -> RemotePersister {
         RemotePersister(Box::new(persister))
     }
 
     pub async fn store(
         &self,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         from_local_path: &Path,
     ) -> OpaqueResult<()> {
         self.0.store(kind, run_id, from_local_path).await
@@ -67,7 +82,7 @@ impl RemotePersister {
     pub async fn load(
         &self,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
         self.0.load(kind, run_id, into_local_path).await

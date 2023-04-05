@@ -92,7 +92,7 @@ impl S3Impl for S3Persister {
 /// <prefix>/<run_id>/<kind>
 /// ```
 #[inline]
-fn build_key(prefix: &str, kind: PersistenceKind, run_id: RunId) -> impl Into<String> {
+fn build_key(prefix: &str, kind: PersistenceKind, run_id: &RunId) -> impl Into<String> {
     let kind_str = match kind {
         PersistenceKind::Manifest => "manifest",
         PersistenceKind::Results => "results",
@@ -108,7 +108,7 @@ where
     async fn store(
         &self,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         from_local_path: &Path,
     ) -> OpaqueResult<()> {
         let key = build_key(self.key_prefix(), kind, run_id);
@@ -124,7 +124,7 @@ where
     async fn load(
         &self,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
         let key = build_key(self.key_prefix(), kind, run_id);
@@ -141,14 +141,13 @@ where
         Ok(())
     }
 
-    fn boxed_clone(&self) -> Box<dyn RemotePersistence> {
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
         Box::new(self.clone())
     }
 }
 
 #[cfg(test)]
 mod fake {
-
     use async_trait::async_trait;
     use aws_sdk_s3::primitives::ByteStream;
     use tokio::io::AsyncReadExt;
@@ -219,7 +218,7 @@ mod test {
         let kind = PersistenceKind::Results;
         let prefix = "test-prefix";
 
-        let key = build_key(prefix, kind, run_id);
+        let key = build_key(prefix, kind, &run_id);
         assert_eq!(key.into(), "test-prefix/test-run-id/results");
     }
 
@@ -229,7 +228,7 @@ mod test {
         let kind = PersistenceKind::Manifest;
         let prefix = "test-prefix";
 
-        let key = build_key(prefix, kind, run_id);
+        let key = build_key(prefix, kind, &run_id);
         assert_eq!(key.into(), "test-prefix/test-run-id/manifest");
     }
 
@@ -250,7 +249,7 @@ mod test {
 
         s3.store(
             PersistenceKind::Manifest,
-            RunId("test-run-id".to_owned()),
+            &RunId("test-run-id".to_owned()),
             manifest.path(),
         )
         .await
@@ -274,7 +273,7 @@ mod test {
 
         s3.load(
             PersistenceKind::Manifest,
-            RunId("test-run-id".to_owned()),
+            &RunId("test-run-id".to_owned()),
             manifest.path(),
         )
         .await
@@ -304,7 +303,7 @@ mod test {
         let err = s3
             .store(
                 PersistenceKind::Manifest,
-                RunId("test-run-id".to_owned()),
+                &RunId("test-run-id".to_owned()),
                 manifest.path(),
             )
             .await
@@ -329,7 +328,7 @@ mod test {
         let err = s3
             .load(
                 PersistenceKind::Manifest,
-                RunId("test-run-id".to_owned()),
+                &RunId("test-run-id".to_owned()),
                 manifest.path(),
             )
             .await

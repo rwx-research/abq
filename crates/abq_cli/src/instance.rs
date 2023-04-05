@@ -1,4 +1,5 @@
 use abq_queue::persistence;
+use abq_queue::persistence::remote::NoopPersister;
 use abq_queue::queue::{Abq, QueueConfig};
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::exit::ExitCode;
@@ -42,12 +43,13 @@ pub async fn start_abq_forever(
     // Public IP defaults to the binding IP.
     let public_ip = public_ip.unwrap_or(bind_ip);
 
-    #[allow(unused)] // for now
     let remote_persistence = remote_persistence_config.resolve().await?;
 
     let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
-    let persist_manifest =
-        persistence::manifest::FilesystemPersistor::new_shared(manifests_path.path());
+    let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
+        manifests_path.path(),
+        remote_persistence,
+    );
 
     let results_path = tempfile::tempdir().expect("unable to create a temporary file");
     let persist_results = persistence::results::FilesystemPersistor::new_shared(
@@ -196,8 +198,10 @@ impl AbqInstance {
         };
 
         let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
-        let persist_manifest =
-            persistence::manifest::FilesystemPersistor::new_shared(manifests_path.path());
+        let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
+            manifests_path.path(),
+            NoopPersister,
+        );
 
         let results_path = tempfile::tempdir().expect("unable to create a temporary file");
         let persist_results =
