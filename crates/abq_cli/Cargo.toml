@@ -43,9 +43,6 @@ tracing-appender.workspace = true
 
 indoc.workspace = true
 
-[target.x86_64-unknown-linux-musl.dependencies]
-mimalloc = "0.1.34"
-
 [dev-dependencies]
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 abq_test_utils = { path = "../abq_test_support/abq_test_utils" }
