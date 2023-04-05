@@ -33,10 +33,8 @@ use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::vec_map::VecMap;
 use abq_utils::{atomic, illegal_state, log_assert};
-use abq_workers::negotiate::{
-    AssignedRun, AssignedRunStatus, GetAssignedRun, QueueNegotiator, QueueNegotiatorHandle,
-    QueueNegotiatorServerError,
-};
+use abq_workers::negotiate::{QueueNegotiator, QueueNegotiatorHandle, QueueNegotiatorServerError};
+use abq_workers::{AssignedRun, AssignedRunStatus, GetAssignedRun};
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
@@ -2561,7 +2559,7 @@ mod test {
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;
-    use abq_workers::negotiate::{AssignedRun, AssignedRunStatus};
+    use abq_workers::{AssignedRun, AssignedRunStatus};
     use tracing_test::traced_test;
 
     fn test_queue() -> QueueServer {
@@ -3588,7 +3586,7 @@ mod retry_manifest {
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;
-    use abq_workers::negotiate::{AssignedRun, AssignedRunStatus};
+    use abq_workers::{AssignedRun, AssignedRunStatus};
     use ntest::timeout;
     use tokio::task::JoinHandle;
 

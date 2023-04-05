@@ -1,6 +1,5 @@
 //! Module negotiate helps worker pools attach to queues.
 
-use async_trait::async_trait;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -18,6 +17,7 @@ use crate::{
     negotiate,
     runner_strategy::RunnerStrategyGenerator,
     workers::{WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus},
+    AssignedRun, AssignedRunStatus, GetAssignedRun,
 };
 use abq_utils::{
     auth::User,
@@ -383,46 +383,6 @@ pub enum QueueNegotiateError {
     BadWorkersMessage,
 }
 
-/// The test run a worker should ask for work on.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub enum AssignedRun {
-    /// This worker is connecting for a fresh run, and should fetch tests online.
-    Fresh { should_generate_manifest: bool },
-    /// This worker is connecting for a retry, and should fetch its manifest from the queue once.
-    Retry,
-}
-
-/// A marker that a test run should work on has already completed by the time the worker started
-/// up, and so the worker can exit immediately.
-pub struct AssignedRunCompeleted {
-    pub success: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum AssignedRunStatus {
-    RunUnknown,
-    Run(AssignedRun),
-    AlreadyDone { exit_code: ExitCode },
-}
-
-impl AssignedRunStatus {
-    /// Returns true iff this is the first time the run was ever introduced.
-    pub fn freshly_created(&self) -> bool {
-        matches!(
-            self,
-            AssignedRunStatus::Run(AssignedRun::Fresh {
-                should_generate_manifest: true
-            })
-        )
-    }
-}
-
-#[async_trait]
-pub trait GetAssignedRun {
-    async fn get_assigned_run(&self, entity: Entity, invoke_work: &InvokeWork)
-        -> AssignedRunStatus;
-}
-
 /// An error that happens in the construction or execution of the queue negotiation server.
 ///
 /// Does not include errors in the handling of requests to the server, but does include errors in
@@ -621,12 +581,11 @@ mod test {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{
-        AssignedRun, GetAssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator,
-    };
+    use super::{MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
+    use crate::assigned_run::fake::MockGetAssignedRun;
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExitStatus};
-    use crate::DEFAULT_RUNNER_TEST_TIMEOUT;
+    use crate::{AssignedRun, DEFAULT_RUNNER_TEST_TIMEOUT};
     use abq_generic_test_runner::DEFAULT_PROTOCOL_VERSION_TIMEOUT;
     use abq_test_utils::one_nonzero;
     use abq_utils::auth::{
@@ -652,7 +611,6 @@ mod test {
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{net_async, net_protocol};
     use abq_with_protocol_version::with_protocol_version;
-    use async_trait::async_trait;
     use parking_lot::Mutex;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
@@ -878,30 +836,6 @@ mod test {
 
     fn echo_test(protocol: ProtocolWitness, echo_msg: String) -> TestOrGroup {
         TestOrGroup::test(Test::new(protocol, echo_msg, [], Default::default()))
-    }
-
-    struct MockGetAssignedRun<F> {
-        status: F,
-    }
-
-    impl<F> MockGetAssignedRun<F> {
-        fn new(status: F) -> Self {
-            Self { status }
-        }
-    }
-
-    #[async_trait]
-    impl<F> GetAssignedRun for MockGetAssignedRun<F>
-    where
-        F: Fn() -> AssignedRunStatus + Send + Sync,
-    {
-        async fn get_assigned_run(
-            &self,
-            _entity: Entity,
-            _invoke_work: &InvokeWork,
-        ) -> AssignedRunStatus {
-            (self.status)()
-        }
     }
 
     #[tokio::test]

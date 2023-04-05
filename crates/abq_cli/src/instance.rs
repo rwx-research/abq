@@ -1,6 +1,7 @@
 use abq_queue::persistence;
 use abq_queue::persistence::remote::NoopPersister;
 use abq_queue::queue::{Abq, QueueConfig};
+use abq_queue::{persistence, RunTimeoutStrategy};
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_opt::ServerOptions;
@@ -57,6 +58,8 @@ pub async fn start_abq_forever(
         RESULTS_PERSISTENCE_LRU_CAPACITY,
     );
 
+    let run_timeout_strategy = RunTimeoutStrategy::RUN_BASED;
+
     let queue_config = QueueConfig {
         public_ip,
         bind_ip,
@@ -66,6 +69,7 @@ pub async fn start_abq_forever(
         server_options,
         persist_manifest,
         persist_results,
+        run_timeout_strategy,
     };
     let mut abq = Abq::start(queue_config).await;
 

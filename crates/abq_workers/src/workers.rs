@@ -877,6 +877,7 @@ mod test {
         GetNextTests, InitContextResult, NotifyManifest, NotifyMaterialTestsAllRun, TestsFetcher,
         WorkerContext, WorkerPool,
     };
+    use crate::assigned_run::fake::MockGetAssignedRun;
     use crate::negotiate::QueueNegotiator;
     use crate::runner_strategy::{self, RunnerStrategy};
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
@@ -1366,7 +1367,7 @@ mod test {
             shutdown_rx,
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
-            |_, _| panic!("should not ask for assigned run in this test"),
+            MockGetAssignedRun::new(|| panic!("should not ask for assigned run in this test")),
         )
         .await;
 
