@@ -1,7 +1,7 @@
 use abq_queue::persistence;
 use abq_queue::persistence::remote::NoopPersister;
 use abq_queue::queue::{Abq, QueueConfig};
-use abq_queue::{persistence, RunTimeoutStrategy};
+use abq_queue::RunTimeoutStrategy;
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_opt::ServerOptions;
