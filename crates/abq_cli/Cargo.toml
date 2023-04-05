@@ -43,6 +43,8 @@ tracing-appender.workspace = true
 
 indoc.workspace = true
 
+jemallocator = "0.5.0"
+
 [dev-dependencies]
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 abq_test_utils = { path = "../abq_test_support/abq_test_utils" }

@@ -39,6 +39,9 @@ use crate::{
     reporting::StdoutPreferences,
 };
 
+#[global_allocator]
+static GLOBAL: Jemalloc = jemallocator::Jemalloc;
+
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
     std::process::exit(exit_code.get());
