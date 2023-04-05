@@ -424,7 +424,7 @@ impl AllRuns {
                     tracing::info!(
                         ?run_id,
                         ?entity,
-                        "worker reconnecting for out-of-process retry manifest during active run"
+                        "worker reconnecting for out-of-process retry manifest afer initial run"
                     );
                     AssignedRunStatus::Run(AssignedRun::Retry)
                 } else {
@@ -563,6 +563,7 @@ impl AllRuns {
                         ?entity,
                         "assigning init metadata to out-of-process retry"
                     );
+                    seen_workers.write().insert_by_tag(entity, true);
                     // This worker was already involved in this run; assume it's connecting for an
                     // out-of-process retry.
                     InitMetadata::Metadata(init_metadata.clone())
