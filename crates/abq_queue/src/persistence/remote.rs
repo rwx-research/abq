@@ -31,6 +31,22 @@ pub enum PersistenceKind {
     Results,
 }
 
+impl PersistenceKind {
+    fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Manifest => "manifest",
+            Self::Results => "results",
+        }
+    }
+
+    fn file_extension(&self) -> &'static str {
+        match self {
+            Self::Manifest => "json",
+            Self::Results => "jsonl",
+        }
+    }
+}
+
 #[async_trait]
 pub trait RemotePersistence {
     async fn store(&self, kind: PersistenceKind, run_id: &RunId, data: Vec<u8>)
