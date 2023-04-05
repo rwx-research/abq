@@ -21,10 +21,10 @@ use futures::FutureExt;
 use tracing::instrument;
 
 use crate::{
-    negotiate::AssignedRun,
     results_handler::{MultiplexingResultsHandler, QueueResultsSender},
     test_fetching,
     workers::{GetInitContext, InitContextResult, NotifyManifest, NotifyMaterialTestsAllRun},
+    AssignedRun,
 };
 
 pub struct RunnerStrategy {

@@ -120,6 +120,11 @@ impl JobQueue {
 
         persistence::manifest::ManifestView::new(queue, assigned_entities)
     }
+
+    /// Reads the current index at a given point in time. Not atomic.
+    pub fn read_index(&self) -> usize {
+        self.ptr.load(atomic::ORDERING)
+    }
 }
 
 #[cfg(test)]
