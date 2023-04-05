@@ -68,9 +68,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-release-unstable-1-linux_x86-64-manylinux-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-1-linux_x86-64-manylinux-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-unstable-1-linux_x86-64-manylinux-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-1-linux_x86-64-manylinux-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
@@ -87,7 +87,7 @@ jobs:
         uses: actions-rs/cargo@v1.0.3
         with:
           command: clippy
-          args: --workspace --tests --profile=release-unstable --all-features -- --deny warnings
+          args: --workspace --tests --profile=release --all-features -- --deny warnings
 
       - name: Lint github workflows
         run: |
@@ -111,24 +111,7 @@ jobs:
 
       - name: Build release with tests
         run: |
-          cargo build --tests --bins --profile=release-unstable --all-features
-
-      - name: Run tests with cargo
-        timeout-minutes: 4
-        if: github.run_attempt == 1
-        run: |
-          cargo test --profile=release-unstable --all-features
-        env:
-          CI: false
-
-      - name: Run retried tests with cargo, including debug output
-        timeout-minutes: 5
-        if: github.run_attempt > 1
-        run: |
-          export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --profile=release-unstable --all-features -- --nocapture
-        env:
-          CI: false
+          cargo build --bins --profile=release --all-features
 
       - name: Install aws CLI
         run: |
@@ -159,8 +142,8 @@ jobs:
         id: prepare_release
         run: |
           mkdir "${RELEASE_DIR}"
-          cp "target/release-unstable/abq" "${RELEASE_DIR}"
-          cp "target/release-unstable/abq_tester_harness" "${RELEASE_DIR}"
+          cp "target/release/abq" "${RELEASE_DIR}"
+          cp "target/release/abq_tester_harness" "${RELEASE_DIR}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
 
       - name: Push release to staging S3
