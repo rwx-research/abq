@@ -185,14 +185,14 @@ mod test {
         },
     };
 
-    use crate::persistence::results::EligibleForRemoteDump;
+    use crate::persistence::{remote, results::EligibleForRemoteDump};
 
     use super::{fs::FilesystemPersistor, ResultsPersistedCell};
 
     #[tokio::test]
     async fn retrieve_is_none_while_pending() {
         let tempdir = tempfile::tempdir().unwrap();
-        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1);
+        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote::NoopPersister);
 
         let cell = ResultsPersistedCell::new(RunId::unique());
         cell.0.processing.fetch_add(1, atomic::ORDERING);
@@ -203,7 +203,7 @@ mod test {
     #[tokio::test]
     async fn retrieve_is_some_when_no_pending() {
         let tempdir = tempfile::tempdir().unwrap();
-        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1);
+        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote::NoopPersister);
 
         let cell = ResultsPersistedCell::new(RunId::unique());
 
@@ -216,7 +216,7 @@ mod test {
     #[tokio::test]
     async fn retrieve_is_linearized() {
         let tempdir = tempfile::tempdir().unwrap();
-        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1);
+        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote::NoopPersister);
 
         let cell = ResultsPersistedCell::new(RunId::unique());
 

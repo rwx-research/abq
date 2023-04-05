@@ -89,8 +89,11 @@ impl Default for Server {
         );
 
         let results_path = tempfile::tempdir().unwrap();
-        let persist_results =
-            persistence::results::FilesystemPersistor::new_shared(results_path.path(), 10);
+        let persist_results = persistence::results::FilesystemPersistor::new_shared(
+            results_path.path(),
+            10,
+            persistence::remote::NoopPersister,
+        );
 
         let config = QueueConfig::new(persist_manifest, persist_results);
         let deps = QueueExtDeps {
