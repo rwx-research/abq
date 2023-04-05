@@ -424,7 +424,7 @@ impl AllRuns {
                     tracing::info!(
                         ?run_id,
                         ?entity,
-                        "worker reconnecting for out-of-process retry manifest afer initial run"
+                        "worker reconnecting for out-of-process retry manifest after initial run"
                     );
                     AssignedRunStatus::Run(AssignedRun::Retry)
                 } else {
