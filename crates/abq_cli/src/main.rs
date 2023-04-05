@@ -40,7 +40,7 @@ use crate::{
 };
 
 #[global_allocator]
-static GLOBAL: Jemalloc = jemallocator::Jemalloc;
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
