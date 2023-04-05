@@ -52,15 +52,22 @@ impl PersistentManifest for FilesystemPersistor {
     async fn dump(&self, run_id: &RunId, view: ManifestView) -> Result<()> {
         let path = self.get_path(run_id);
 
-        let packed = serde_json::to_vec(&view).located(here!())?;
+        let write_task = {
+            let path = path.clone();
+            move || {
+                let fd = std::fs::File::create(path).located(here!())?;
+                serde_json::to_writer(fd, &view).located(here!())?;
+                Ok(())
+            }
+        };
 
-        let (local_result, remote_result) = tokio::join!(
-            fs::write(&path, packed.clone()),
-            self.remote.store(PersistenceKind::Manifest, run_id, packed),
-        );
+        tokio::task::spawn_blocking(write_task)
+            .await
+            .located(here!())??;
 
-        local_result.located(here!())?;
-        remote_result?;
+        self.remote
+            .store_from_disk(PersistenceKind::Manifest, run_id, &path)
+            .await?;
 
         Ok(())
     }
@@ -210,21 +217,24 @@ mod test {
         let run_id = RunId("run-id".to_string());
 
         let tempdir = tempfile::tempdir().unwrap();
+        let tempdir_path = tempdir.path().to_owned();
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
             FakePersister::new(
+                |_, _, _| unreachable!(),
                 {
                     let view = view.clone();
-                    move |kind, run_id, data| {
+                    move |kind, run_id, path| {
                         assert_eq!(kind, PersistenceKind::Manifest);
                         assert_eq!(run_id.0, "run-id");
-                        let loaded_view = serde_json::from_slice(&data).unwrap();
+                        assert_eq!(path, tempdir_path.join("run-id.manifest.json"));
+                        let buf = std::fs::read_to_string(path).unwrap();
+                        let loaded_view = serde_json::from_slice(&buf.as_bytes()).unwrap();
                         assert_eq!(view, loaded_view);
                         Ok(())
                     }
                 },
-                |_, _, _| unreachable!(),
                 |_, _, _| unreachable!(),
             ),
         );
@@ -247,8 +257,8 @@ mod test {
         let fs = FilesystemPersistor::new(
             tempdir.path(),
             FakePersister::new(
-                |_, _, _| Err("i failed".located(here!())),
                 |_, _, _| unreachable!(),
+                |_, _, _| Err("i failed".located(here!())),
                 |_, _, _| unreachable!(),
             ),
         );
