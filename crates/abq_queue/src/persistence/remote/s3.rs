@@ -88,7 +88,7 @@ impl S3Impl for S3Persister {
 
 /// Builds a key for an S3 bucket of form
 ///
-/// ```
+/// ```text
 /// <prefix>/<run_id>/<kind>
 /// ```
 #[inline]
