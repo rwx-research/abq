@@ -112,7 +112,7 @@ jobs:
 
       - name: Build release with tests
         run: |
-          cargo build --bins --profile=release --all-features
+          cargo build --bins --profile=release --all-features --target="$RUST_TARGET"
 
       - name: Prepare release environment
         run: |
