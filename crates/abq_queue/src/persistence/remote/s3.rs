@@ -105,7 +105,12 @@ impl<T> RemotePersistence for T
 where
     T: S3Impl + Clone + Send + Sync + 'static,
 {
-    async fn store(&self, kind: PersistenceKind, run_id: RunId, data: Vec<u8>) -> OpaqueResult<()> {
+    async fn store(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        data: Vec<u8>,
+    ) -> OpaqueResult<()> {
         let key = build_key(self.key_prefix(), kind, run_id);
         let body = ByteStream::from(data);
 
@@ -255,7 +260,7 @@ mod test {
 
         s3.store(
             PersistenceKind::Manifest,
-            RunId("test-run-id".to_owned()),
+            &RunId("test-run-id".to_owned()),
             b"manifest-body".to_vec(),
         )
         .await
@@ -330,7 +335,7 @@ mod test {
         let err = s3
             .store(
                 PersistenceKind::Manifest,
-                RunId("test-run-id".to_owned()),
+                &RunId("test-run-id".to_owned()),
                 b"manifest-body".to_vec(),
             )
             .await

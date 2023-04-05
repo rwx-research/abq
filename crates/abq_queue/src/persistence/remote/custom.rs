@@ -96,7 +96,12 @@ impl RemotePersistence for CustomPersister {
 
     /// Stores the bytes to a temporary path, then calls [Self::store_from_disk].
     /// If possible, prefer to use [Self::store_from_disk] directly.
-    async fn store(&self, kind: PersistenceKind, run_id: &RunId, path: &Path) -> OpaqueResult<()> {
+    async fn store(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        data: Vec<u8>,
+    ) -> OpaqueResult<()> {
         let tempfile = tokio::task::spawn_blocking(tempfile::NamedTempFile::new)
             .await
             .located(here!())?
@@ -118,7 +123,7 @@ impl RemotePersistence for CustomPersister {
     async fn store_from_disk(
         &self,
         kind: PersistenceKind,
-        run_id: RunId,
+        run_id: &RunId,
         path: &Path,
     ) -> OpaqueResult<()> {
         self.call(Action::Store, kind, run_id, path).await
