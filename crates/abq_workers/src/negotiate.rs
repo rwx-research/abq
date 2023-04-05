@@ -1,5 +1,6 @@
 //! Module negotiate helps worker pools attach to queues.
 
+use async_trait::async_trait;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -404,6 +405,24 @@ pub enum AssignedRunStatus {
     AlreadyDone { exit_code: ExitCode },
 }
 
+impl AssignedRunStatus {
+    /// Returns true iff this is the first time the run was ever introduced.
+    pub fn freshly_created(&self) -> bool {
+        matches!(
+            self,
+            AssignedRunStatus::Run(AssignedRun::Fresh {
+                should_generate_manifest: true
+            })
+        )
+    }
+}
+
+#[async_trait]
+pub trait GetAssignedRun {
+    async fn get_assigned_run(&self, entity: Entity, invoke_work: &InvokeWork)
+        -> AssignedRunStatus;
+}
+
 /// An error that happens in the construction or execution of the queue negotiation server.
 ///
 /// Does not include errors in the handling of requests to the server, but does include errors in
@@ -419,20 +438,20 @@ pub enum QueueNegotiatorServerError {
     Other(#[from] Box<dyn Error + Send + Sync>),
 }
 
-struct QueueNegotiatorCtx<GetAssignedRun>
+struct QueueNegotiatorCtx<GA>
 where
-    GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+    GA: GetAssignedRun + Send + Sync,
 {
     /// Fetches the status of an assigned run, and yields immediately.
-    get_assigned_run: Arc<GetAssignedRun>,
+    get_assigned_run: Arc<GA>,
     advertised_queue_work_scheduler_addr: SocketAddr,
     advertised_queue_results_addr: SocketAddr,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
 }
 
-impl<GetAssignedRun> QueueNegotiatorCtx<GetAssignedRun>
+impl<GA> QueueNegotiatorCtx<GA>
 where
-    GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+    GA: GetAssignedRun + Send + Sync,
 {
     fn clone(&self) -> Self {
         Self {
@@ -448,16 +467,16 @@ impl QueueNegotiator {
     /// Starts a queue negotiator on an async executor.
     ///
     /// * `get_assigned_run` - should fetch the status of an assigned run and yield immediately.
-    pub async fn start<GetAssignedRun>(
+    pub async fn start<GA>(
         public_ip: IpAddr,
         listener: Box<dyn net_async::ServerListener>,
         mut shutdown_rx: ShutdownReceiver,
         queue_work_scheduler_addr: SocketAddr,
         queue_results_addr: SocketAddr,
-        get_assigned_run: GetAssignedRun,
+        get_assigned_run: GA,
     ) -> Self
     where
-        GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+        GA: GetAssignedRun + Send + Sync + 'static,
     {
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -516,12 +535,12 @@ impl QueueNegotiator {
         }
     }
 
-    async fn handle_conn<GetAssignedRun>(
-        ctx: QueueNegotiatorCtx<GetAssignedRun>,
+    async fn handle_conn<GA>(
+        ctx: QueueNegotiatorCtx<GA>,
         stream: net_async::UnverifiedServerStream,
     ) -> Result<(), EntityfulError>
     where
-        GetAssignedRun: Fn(Entity, &InvokeWork) -> AssignedRunStatus + Send + Sync + 'static,
+        GA: GetAssignedRun + Send + Sync + 'static,
     {
         let mut stream = ctx
             .handshake_ctx
@@ -551,7 +570,10 @@ impl QueueNegotiator {
 
                 tracing::debug!(run_id=?run_id, "New worker set negotiating");
 
-                let assigned_run_result = (ctx.get_assigned_run)(entity, &invoke_data);
+                let assigned_run_result = ctx
+                    .get_assigned_run
+                    .get_assigned_run(entity, &invoke_data)
+                    .await;
 
                 use AssignedRunStatus::*;
                 let msg = match assigned_run_result {
@@ -599,7 +621,9 @@ mod test {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use super::{AssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
+    use super::{
+        AssignedRun, GetAssignedRun, MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator,
+    };
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExitStatus};
     use crate::DEFAULT_RUNNER_TEST_TIMEOUT;
@@ -628,6 +652,7 @@ mod test {
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{net_async, net_protocol};
     use abq_with_protocol_version::with_protocol_version;
+    use async_trait::async_trait;
     use parking_lot::Mutex;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
@@ -855,6 +880,30 @@ mod test {
         TestOrGroup::test(Test::new(protocol, echo_msg, [], Default::default()))
     }
 
+    struct MockGetAssignedRun<F> {
+        status: F,
+    }
+
+    impl<F> MockGetAssignedRun<F> {
+        fn new(status: F) -> Self {
+            Self { status }
+        }
+    }
+
+    #[async_trait]
+    impl<F> GetAssignedRun for MockGetAssignedRun<F>
+    where
+        F: Fn() -> AssignedRunStatus + Send + Sync,
+    {
+        async fn get_assigned_run(
+            &self,
+            _entity: Entity,
+            _invoke_work: &InvokeWork,
+        ) -> AssignedRunStatus {
+            (self.status)()
+        }
+    }
+
     #[tokio::test]
     #[with_protocol_version]
     async fn queue_and_workers_lifecycle() {
@@ -871,11 +920,11 @@ mod test {
             Default::default(),
         ));
 
-        let get_assigned_run = move |_entity, _data: &InvokeWork| {
+        let get_assigned_run = MockGetAssignedRun::new(|| {
             AssignedRunStatus::Run(AssignedRun::Fresh {
                 should_generate_manifest: true,
             })
-        };
+        });
 
         let (mut shutdown_tx, shutdown_rx) = ShutdownManager::new_pair();
         let listener =
@@ -962,11 +1011,11 @@ mod test {
             // Below parameters are faux because they are unnecessary for healthchecks.
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
-            move |_, _| {
+            MockGetAssignedRun::new(|| {
                 AssignedRunStatus::Run(AssignedRun::Fresh {
                     should_generate_manifest: true,
                 })
-            },
+            }),
         )
         .await;
 

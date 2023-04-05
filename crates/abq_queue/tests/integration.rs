@@ -12,6 +12,7 @@ use abq_native_runner_simulation::{legal_spawned_message, pack, pack_msgs_to_dis
 use abq_queue::{
     persistence,
     queue::{Abq, QueueConfig},
+    RunTimeoutStrategy, TimeoutReason,
 };
 use abq_test_utils::{artifacts_dir, assert_scoped_log, s};
 use abq_utils::{
@@ -52,7 +53,6 @@ use tempfile::TempDir;
 use tracing_test::traced_test;
 use Action::*;
 use Assert::*;
-use Servers::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Run(usize);
@@ -75,11 +75,12 @@ struct QueueExtDeps {
     _results_path: TempDir,
 }
 
-enum Servers {
-    Unified(QueueConfig, QueueExtDeps),
+struct Server {
+    config: QueueConfig,
+    deps: QueueExtDeps,
 }
 
-impl Default for Servers {
+impl Default for Server {
     fn default() -> Self {
         let manifests_path = tempfile::tempdir().unwrap();
         let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
@@ -96,7 +97,14 @@ impl Default for Servers {
             _manifests_path: manifests_path,
             _results_path: results_path,
         };
-        Self::Unified(config, deps)
+        Self { config, deps }
+    }
+}
+
+impl Server {
+    fn with_timeout_strategy(mut self, run_timeout_strategy: RunTimeoutStrategy) -> Self {
+        self.config.run_timeout_strategy = run_timeout_strategy;
+        self
     }
 }
 
@@ -243,11 +251,18 @@ type Steps<'a> = Vec<(Vec<Action>, Vec<Assert<'a>>)>;
 
 #[derive(Default)]
 struct TestBuilder<'a> {
-    servers: Servers,
+    server: Server,
     steps: Steps<'a>,
 }
 
 impl<'a> TestBuilder<'a> {
+    fn new(server: Server) -> Self {
+        Self {
+            server,
+            ..Default::default()
+        }
+    }
+
     fn step(
         mut self,
         actions: impl IntoIterator<Item = Action>,
@@ -264,7 +279,7 @@ impl<'a> TestBuilder<'a> {
     }
 
     async fn test(self) {
-        run_test(self.servers, self.steps).await
+        run_test(self.server, self.steps).await
     }
 }
 
@@ -469,10 +484,12 @@ fn action_to_fut(
     }
 }
 
-async fn run_test(servers: Servers, steps: Steps<'_>) {
-    let (mut queue, _deps) = match servers {
-        Unified(config, deps) => (Abq::start(config).await, deps),
-    };
+async fn run_test(server: Server, steps: Steps<'_>) {
+    let Server {
+        config,
+        deps: _deps,
+    } = server;
+    let mut queue = Abq::start(config).await;
 
     let client_opts =
         ClientOptions::new(ClientAuthStrategy::no_auth(), ClientTlsStrategy::no_tls());
@@ -2359,6 +2376,54 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
                     }),
                 ),
             ],
+        )
+        .test()
+        .await;
+}
+
+#[tokio::test]
+#[with_protocol_version]
+async fn cancel_test_run_if_no_manifest_progress() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [echo_test(proto, "echo1".to_string())],
+        Default::default(),
+    ));
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::HangOnTestStart, Box::new(manifest));
+
+    let server = {
+        fn timeout_zero(_reason: TimeoutReason) -> Duration {
+            Duration::ZERO
+        }
+        Server::default().with_timeout_strategy(RunTimeoutStrategy::constant(timeout_zero))
+    };
+
+    TestBuilder::new(server)
+        // First workers - let them go, the queue should cancel the run soon.
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner.clone()).with_num_workers(one_nonzero_usize()),
+        )])
+        .act([
+            // Run should be seen as completed (cancelled) soon.
+            WaitForCompletedRun(Run(1)),
+        ])
+        // If we start another set of workers, they should exit as cancelled immediately.
+        .act([StartWorkers(
+            Run(1),
+            Wid(2),
+            WorkersConfigBuilder::new(1, runner),
+        )])
+        .step(
+            [
+                StopWorkers(Wid(2)),
+                // Run should still be seen as completed
+                WaitForCompletedRun(Run(1)),
+            ],
+            [WorkerExitStatus(
+                Wid(2),
+                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+            )],
         )
         .test()
         .await;

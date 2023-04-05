@@ -34,10 +34,11 @@ use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::vec_map::VecMap;
 use abq_utils::{atomic, illegal_state, log_assert};
 use abq_workers::negotiate::{
-    AssignedRun, AssignedRunStatus, QueueNegotiator, QueueNegotiatorHandle,
+    AssignedRun, AssignedRunStatus, GetAssignedRun, QueueNegotiator, QueueNegotiatorHandle,
     QueueNegotiatorServerError,
 };
 
+use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -1418,7 +1419,7 @@ async fn start_queue(config: QueueConfig) -> Abq {
             queues,
             public_negotiator_addr,
             persist_results,
-            timeout_manager,
+            timeout_manager.clone(),
         );
         queue_server.start(server_listener, server_shutdown_rx)
     });
@@ -1442,25 +1443,9 @@ async fn start_queue(config: QueueConfig) -> Abq {
     // Provide the execution context a set of workers should attach with, if it is known at the
     // time of polling. We must not to block here, since that can take a lock over the shared
     // queues indefinitely.
-    let choose_run_for_worker = {
-        let queues = queues.clone();
-        move |entity: Entity, invoke_work: &InvokeWork| {
-            let InvokeWork {
-                run_id,
-                batch_size_hint,
-            } = invoke_work;
-
-            let batch_size_hint = if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
-                MAX_BATCH_SIZE
-            } else {
-                NonZeroUsize::new(batch_size_hint.get().try_into().expect(
-                    "u64 batch size must fit into a usize batch size less than MAX_BATCH_SIZE",
-                ))
-                .unwrap()
-            };
-
-            queues.find_or_create_run(run_id, batch_size_hint, entity)
-        }
+    let choose_run_for_worker = ChooseRunForWorker {
+        queues: queues.clone(),
+        timeout_manager,
     };
 
     let negotiator_shutdown_rx = shutdown_manager.add_receiver();
@@ -1487,6 +1472,54 @@ async fn start_queue(config: QueueConfig) -> Abq {
         negotiator,
 
         active: true,
+    }
+}
+
+struct ChooseRunForWorker {
+    queues: SharedRuns,
+    timeout_manager: RunTimeoutManager,
+}
+
+#[async_trait]
+impl GetAssignedRun for ChooseRunForWorker {
+    async fn get_assigned_run(
+        &self,
+        entity: Entity,
+        invoke_work: &InvokeWork,
+    ) -> AssignedRunStatus {
+        let InvokeWork {
+            run_id,
+            batch_size_hint,
+        } = invoke_work;
+
+        let batch_size_hint =
+            if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
+                MAX_BATCH_SIZE
+            } else {
+                NonZeroUsize::new(batch_size_hint.get().try_into().expect(
+                    "u64 batch size must fit into a usize batch size less than MAX_BATCH_SIZE",
+                ))
+                .unwrap()
+            };
+
+        let assigned_run = self
+            .queues
+            .find_or_create_run(run_id, batch_size_hint, entity);
+
+        // Now that we've found a run for this ID, if the run is fresh, enqueue a job to check
+        // whether any progress has been made for it later.
+        if assigned_run.freshly_created() {
+            let timeout_spec = self
+                .timeout_manager
+                .strategy()
+                .wait_for_manifest_progress_duration(0);
+
+            self.timeout_manager
+                .insert(run_id.clone(), timeout_spec)
+                .await;
+        }
+
+        assigned_run
     }
 }
 

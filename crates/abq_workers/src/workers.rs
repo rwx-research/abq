@@ -644,6 +644,11 @@ async fn test_like_runner_exec_loop(
     runner_meta: RunnerMeta,
     mut results_handler: ResultsHandler,
 ) -> Option<Result<TestRunnerExit, GenericRunnerError>> {
+    if matches!(&runner, TestLikeRunner::HangOnTestStart) {
+        tokio::time::sleep(Duration::from_secs(60 * 60 * 24)).await;
+        unreachable!();
+    }
+
     'tests_done: loop {
         let NextWorkBundle { work, eow } = match tests_fetcher.get_next_tests().await {
             Ok(bundle) => bundle,
