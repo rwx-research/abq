@@ -559,8 +559,8 @@ pub mod queue {
     pub enum CancelReason {
         /// The test run was cancelled on a worker
         User,
-        /// Timed out waiting for the last test result in a test run.
-        TimeoutOnTestResult,
+        /// Timed out because no progress was made popping items off the manifest.
+        ManifestHadNoProgress,
     }
 
     /// A request sent to the queue.
