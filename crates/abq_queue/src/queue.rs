@@ -50,7 +50,7 @@ use crate::persistence::manifest::{
 };
 use crate::persistence::results::{ResultsPersistedCell, SharedPersistResults};
 use crate::prelude::*;
-use crate::timeout::{RunTimeoutManager, RunTimeoutStrategy};
+use crate::timeout::{FiredTimeout, RunTimeoutManager, RunTimeoutStrategy, TimeoutReason};
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
 
@@ -282,6 +282,24 @@ enum ReadResultsState {
     ReadFromCell(ResultsPersistedCell),
     /// The given workers are still active.
     OutstandingRunners(Vec<Tag>),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestProgressCancelReason {
+    /// The run was cancelled because no progress was made in receiving the manifest.
+    ManifestNotReceived,
+    /// The run was cancelled because no progress was made in popping tests off the manifest.
+    NoTestProgress,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestProgressResult {
+    /// The run was cancelled.
+    Cancelled(ManifestProgressCancelReason),
+    /// The run was not cancelled because the run is already complete.
+    RunComplete,
+    /// Progress was made in the manifest.
+    NewProgress { newly_observed_test_index: usize },
 }
 
 impl AllRuns {
@@ -1057,10 +1075,14 @@ impl AllRuns {
             }
         }
 
-        run.state = RunState::Cancelled { reason };
+        Self::mark_cancelled_help(&mut run.state, &self.num_active, reason)
+    }
+
+    fn mark_cancelled_help(run_state: &mut RunState, num_active: &AtomicU64, reason: CancelReason) {
+        *run_state = RunState::Cancelled { reason };
 
         // NB: Always sub last for conversative estimation.
-        self.num_active.fetch_sub(1, atomic::ORDERING);
+        num_active.fetch_sub(1, atomic::ORDERING);
     }
 
     fn get_run_status(&self, run_id: &RunId) -> Option<RunStatus> {
@@ -1082,6 +1104,83 @@ impl AllRuns {
                 })
             }
             RunState::Cancelled { .. } => Some(RunStatus::Cancelled),
+        }
+    }
+
+    /// Cancels a test run if no progress in the manifest since `last_observed_test_index` has been
+    /// made; otherwise, does nothing.
+    ///
+    /// Returns `None` if the run does not exist.
+    pub fn handle_manifest_progress_timeout(
+        &self,
+        run_id: &RunId,
+        last_observed_test_index: usize,
+    ) -> Option<ManifestProgressResult> {
+        let runs = self.runs.read();
+
+        let run = runs.get(run_id)?;
+        {
+            let run = run.read();
+            match Self::query_manifest_progress_status(&run.state, run_id, last_observed_test_index)
+            {
+                Ok(ok_result) => return Some(ok_result),
+                Err(_cancel_reason) => {
+                    // This is eligible for cancellation, fall through.
+                }
+            }
+        }
+
+        // This run is eligible for cancellation. We must now check its state again to avoid TOCTOU
+        // races; if it is indeed still in a state eligible for cancellation, perform the
+        // cancellation.
+        let mut run = run.write();
+        match Self::query_manifest_progress_status(&run.state, run_id, last_observed_test_index) {
+            Ok(ok_result) => Some(ok_result),
+            Err(cancel_reason) => {
+                Self::mark_cancelled_help(
+                    &mut run.state,
+                    &self.num_active,
+                    CancelReason::ManifestHadNoProgress,
+                );
+                Some(ManifestProgressResult::Cancelled(cancel_reason))
+            }
+        }
+    }
+
+    /// Checks the status of a manifest's progress. If progress has been made, an appropriate
+    /// [ManifestProgressResult] is returned; otherwise, an `Err` value indicates why the run
+    /// should be cancelled.
+    fn query_manifest_progress_status(
+        run_state: &RunState,
+        run_id: &RunId,
+        last_observed_test_index: usize,
+    ) -> Result<ManifestProgressResult, ManifestProgressCancelReason> {
+        match run_state {
+            RunState::WaitingForManifest { .. } => {
+                Err(ManifestProgressCancelReason::ManifestNotReceived)
+            }
+            RunState::HasWork { queue, .. } => {
+                let newly_observed_test_index = queue.read_index();
+
+                log_assert!(
+                    newly_observed_test_index >= last_observed_test_index,
+                    ?run_id,
+                    ?last_observed_test_index,
+                    ?newly_observed_test_index,
+                    "test index went backwards"
+                );
+
+                if newly_observed_test_index > last_observed_test_index {
+                    Ok(ManifestProgressResult::NewProgress {
+                        newly_observed_test_index,
+                    })
+                } else {
+                    Err(ManifestProgressCancelReason::NoTestProgress)
+                }
+            }
+            RunState::InitialManifestDone { .. } | RunState::Cancelled { .. } => {
+                Ok(ManifestProgressResult::RunComplete)
+            }
         }
     }
 
@@ -1455,11 +1554,12 @@ impl QueueServer {
             public_negotiator_addr,
             persist_results,
             handshake_ctx: Arc::new(server_listener.handshake_ctx()),
-            timeout_manager,
+            timeout_manager: timeout_manager.clone(),
         };
 
         enum Task {
             HandleConn(UnverifiedServerStream),
+            HandleTimeout(FiredTimeout),
         }
         use Task::*;
 
@@ -1474,6 +1574,9 @@ impl QueueServer {
                         }
                     }
                 }
+                fired_timeout = timeout_manager.next_timeout() => {
+                    HandleTimeout(fired_timeout)
+                }
                 _ = shutdown.recv_shutdown_immediately() => {
                     break;
                 }
@@ -1486,6 +1589,15 @@ impl QueueServer {
                         let result = Self::handle(ctx, client).await;
                         if let Err(error) = result {
                             log_entityful_error!(error, "error handling connection to queue: {}")
+                        }
+                    });
+                }
+                HandleTimeout(fired_timeout) => {
+                    let ctx = ctx.clone();
+                    tokio::spawn(async move {
+                        let result = Self::handle_timeout(ctx, fired_timeout).await.no_entity();
+                        if let Err(error) = result {
+                            log_entityful_error!(error, "error handling timeout: {}")
                         }
                     });
                 }
@@ -2019,6 +2131,67 @@ impl QueueServer {
 
         Ok(())
     }
+
+    /// Handles fired timeouts for test results, instuted by a [RunTimeoutManager].
+    /// There is one class of timeout, always fired for a queue:
+    ///
+    /// - [TimeoutReason::WaitForManifestProgress] - fired on an interval to check whether progress
+    ///   has been made in popping the manifest for a run.
+    ///   If no progress has been made, the run is considered to be stuck and is cancelled.
+    ///   If progress has been made but the manifest is still active, the timeout is re-enqueued.
+    async fn handle_timeout(ctx: QueueServerCtx, timeout: FiredTimeout) -> OpaqueResult<()> {
+        let FiredTimeout {
+            run_id,
+            reason,
+            after,
+        } = timeout;
+
+        let TimeoutReason::WaitForManifestProgress {
+            last_observed_test_index,
+        } = reason;
+
+        let opt_result = ctx
+            .queues
+            .handle_manifest_progress_timeout(&run_id, last_observed_test_index);
+
+        match opt_result {
+            Some(result) => match result {
+                ManifestProgressResult::Cancelled(reason) => {
+                    tracing::warn!(
+                        ?run_id,
+                        ?reason,
+                        ?after,
+                        "run cancelled because manifest made no progress"
+                    );
+                    Ok(())
+                }
+                ManifestProgressResult::RunComplete => {
+                    // The run is complete, nothing more to do.
+                    Ok(())
+                }
+                ManifestProgressResult::NewProgress {
+                    newly_observed_test_index,
+                } => {
+                    // Enqueue a new wait-for-manifest-progress timeout with the newly-observed
+                    // progress.
+                    let timeout_spec = ctx
+                        .timeout_manager
+                        .strategy()
+                        .wait_for_manifest_progress_duration(newly_observed_test_index);
+                    ctx.timeout_manager.insert(run_id, timeout_spec).await;
+
+                    Ok(())
+                }
+            },
+            None => {
+                illegal_state!(
+                    "Invalid state: timeout fired for non-existent run ID",
+                    ?run_id
+                );
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Unwrap the Arc from a [LocatedError]. Needed sometimes when the return type expects a
@@ -2326,13 +2499,16 @@ mod test {
 
     use crate::{
         persistence::{self, manifest::InMemoryPersistor},
-        queue::{AddedManifest, CancelReason, QueueServer, RunStatus, SharedRuns, WorkScheduler},
+        queue::{
+            AddedManifest, CancelReason, ManifestProgressCancelReason, ManifestProgressResult,
+            QueueServer, RunStatus, SharedRuns, WorkScheduler,
+        },
         timeout::RunTimeoutManager,
     };
     use abq_run_n_times::n_times;
     use abq_test_utils::{
         accept_handshake, assert_scoped_log, build_fake_connection, build_random_strategies,
-        one_nonzero_usize,
+        one_nonzero_usize, spec,
     };
     use abq_utils::{
         auth::{build_strategies, AdminToken, ClientAuthStrategy, ServerAuthStrategy, UserToken},
@@ -3087,6 +3263,103 @@ mod test {
             queues.get_run_status(&run_id).unwrap(),
             RunStatus::Cancelled {}
         ));
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn handle_manifest_progress_timeout_while_waiting_for_manifest() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
+
+        let result = queues.handle_manifest_progress_timeout(&run_id, 0);
+        assert_eq!(
+            result,
+            Some(ManifestProgressResult::Cancelled(
+                ManifestProgressCancelReason::ManifestNotReceived
+            ))
+        );
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn handle_manifest_progress_timeout_while_manifest_exists() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
+        let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
+
+        let result = queues.handle_manifest_progress_timeout(&run_id, 0);
+        assert_eq!(
+            result,
+            Some(ManifestProgressResult::Cancelled(
+                ManifestProgressCancelReason::NoTestProgress
+            ))
+        );
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn handle_manifest_progress_timeout_when_manifest_progress_made() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
+        let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
+        let _ = queues.next_work(Entity::runner(0, 1), &run_id);
+
+        let result = queues.handle_manifest_progress_timeout(&run_id, 0);
+        assert_eq!(
+            result,
+            Some(ManifestProgressResult::NewProgress {
+                newly_observed_test_index: 1
+            })
+        );
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn handle_manifest_progress_timeout_when_manifest_completed() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
+        let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
+        let _ = queues.next_work(Entity::runner(0, 1), &run_id);
+
+        let result = queues.handle_manifest_progress_timeout(&run_id, 0);
+        assert_eq!(result, Some(ManifestProgressResult::RunComplete));
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn handle_manifest_progress_timeout_when_cancelled() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1));
+        queues.mark_cancelled(&run_id, Entity::runner(0, 1), CancelReason::User);
+
+        let result = queues.handle_manifest_progress_timeout(&run_id, 0);
+        assert_eq!(result, Some(ManifestProgressResult::RunComplete));
+    }
+
+    #[test]
+    #[with_protocol_version]
+    fn handle_manifest_progress_timeout_when_does_not_exist() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let result = queues.handle_manifest_progress_timeout(&run_id, 0);
+        assert_eq!(result, None);
     }
 }
 

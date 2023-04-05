@@ -42,8 +42,13 @@ const WAIT_FOR_MANIFEST_PROGRESS_DURATION: Duration = Duration::from_secs(60 * 6
 impl RunTimeoutStrategy {
     /// Determine a duration for how long to wait before a manifest must make progress, or
     /// else its associated run is timed-out.
-    pub(crate) fn wait_for_manifest_progress_duration(&self) -> TimeoutSpec {
-        let reason = TimeoutReason::WaitForManifestProgress;
+    pub(crate) fn wait_for_manifest_progress_duration(
+        &self,
+        current_manifest_index: usize,
+    ) -> TimeoutSpec {
+        let reason = TimeoutReason::WaitForManifestProgress {
+            last_observed_test_index: current_manifest_index,
+        };
         let duration = match self.0 {
             RunTimeoutStrategyPriv::RunBased => WAIT_FOR_MANIFEST_PROGRESS_DURATION,
             RunTimeoutStrategyPriv::Constant(timeout) => timeout(reason),
@@ -56,12 +61,6 @@ impl RunTimeoutStrategy {
 pub(crate) struct TimeoutSpec {
     duration: Duration,
     reason: TimeoutReason,
-}
-
-impl TimeoutSpec {
-    pub fn duration(&self) -> Duration {
-        self.duration
-    }
 }
 
 struct RunTimeoutManagerInner {
@@ -80,30 +79,25 @@ pub(crate) struct RunTimeoutManager(Arc<RunTimeoutManagerInner>);
 pub enum TimeoutReason {
     /// A test run was timed-out because no progress was made in popping tests off the manifest in
     /// time.
-    WaitForManifestProgress,
-}
-
-impl From<TimeoutReason> for CancelReason {
-    fn from(reason: TimeoutReason) -> Self {
-        match reason {
-            TimeoutReason::WaitForManifestProgress => CancelReason::ManifestHadNoProgress,
-        }
-    }
+    WaitForManifestProgress {
+        /// Where in the manifest we were when the timeout was started.
+        last_observed_test_index: usize,
+    },
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct TimedOutRun {
+pub(crate) struct FiredTimeout {
     pub run_id: RunId,
     pub after: Duration,
     pub reason: TimeoutReason,
 }
 
 struct TimeoutCell {
-    timeout: Pin<Box<dyn Future<Output = TimedOutRun> + Send + Sync + 'static>>,
+    timeout: Pin<Box<dyn Future<Output = FiredTimeout> + Send + Sync + 'static>>,
 }
 
 impl Future for TimeoutCell {
-    type Output = TimedOutRun;
+    type Output = FiredTimeout;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Pin::new(&mut self.timeout).poll(cx)
@@ -130,15 +124,15 @@ impl RunTimeoutManager {
         self.0.strategy
     }
 
-    /// Inserts a new timeout for a given run ID.
+    /// Inserts a new timeout.
     /// Thread safe and takes only a read over a read/write lock; this makes insertions relatively
     /// cheap across threads, while waiting for timeouts requires exclusive access.
-    pub async fn insert_run(&self, run_id: RunId, timeout_spec: TimeoutSpec) {
+    pub async fn insert(&self, run_id: RunId, timeout_spec: TimeoutSpec) {
         let TimeoutSpec { duration, reason } = timeout_spec;
         let runs = self.0.timeouts.read().await;
         let fut = Box::pin(async move {
             tokio::time::sleep(duration).await;
-            TimedOutRun {
+            FiredTimeout {
                 run_id,
                 after: duration,
                 reason,
@@ -160,7 +154,7 @@ impl RunTimeoutManager {
     /// but will yield at regular intervals for [new runs][Self::insert_run].
     /// If there are no timeouts, this call will not return, or will only return after a new
     /// timeout is inserted.
-    pub async fn next_timeout(&self) -> TimedOutRun {
+    pub async fn next_timeout(&self) -> FiredTimeout {
         loop {
             let mut runs = self.0.timeouts.write().await;
             // TODO: consider using futures::select_biased, since the max-wait path
@@ -183,7 +177,7 @@ mod test {
 
     use abq_utils::net_protocol::workers::RunId;
 
-    use crate::timeout::{RunTimeoutStrategy, TimedOutRun, TimeoutReason, TimeoutSpec};
+    use crate::timeout::{FiredTimeout, RunTimeoutStrategy, TimeoutReason, TimeoutSpec};
 
     use super::RunTimeoutManager;
 
@@ -197,15 +191,17 @@ mod test {
 
         let run_id = RunId::unique();
 
-        let spec = manager.strategy().wait_for_manifest_progress_duration();
+        let spec = manager.strategy().wait_for_manifest_progress_duration(0);
 
-        manager.insert_run(run_id.clone(), spec).await;
+        manager.insert(run_id.clone(), spec).await;
         assert_eq!(
             manager.next_timeout().await,
-            TimedOutRun {
+            FiredTimeout {
                 run_id,
                 after: Duration::ZERO,
-                reason: TimeoutReason::WaitForManifestProgress,
+                reason: TimeoutReason::WaitForManifestProgress {
+                    last_observed_test_index: 0
+                },
             }
         );
     }
@@ -220,18 +216,20 @@ mod test {
 
         let spec = TimeoutSpec {
             duration: Duration::ZERO,
-            reason: TimeoutReason::WaitForManifestProgress,
+            reason: TimeoutReason::WaitForManifestProgress {
+                last_observed_test_index: 0,
+            },
         };
 
-        manager.insert_run(run_id1.clone(), spec).await;
-        manager.insert_run(run_id2.clone(), spec).await;
-        manager.insert_run(run_id3.clone(), spec).await;
+        manager.insert(run_id1.clone(), spec).await;
+        manager.insert(run_id2.clone(), spec).await;
+        manager.insert(run_id3.clone(), spec).await;
 
         let mut timed_out = HashSet::new();
         let mut afters = HashSet::new();
 
         for _ in 0..3 {
-            let TimedOutRun {
+            let FiredTimeout {
                 run_id,
                 after,
                 reason: _,
@@ -261,7 +259,9 @@ mod test {
 
         let old_spec = TimeoutSpec {
             duration: old_timeout,
-            reason: TimeoutReason::WaitForManifestProgress,
+            reason: TimeoutReason::WaitForManifestProgress {
+                last_observed_test_index: 0,
+            },
         };
 
         let young_timeout = Duration::from_micros(10);
@@ -269,22 +269,26 @@ mod test {
 
         let young_spec = TimeoutSpec {
             duration: young_timeout,
-            reason: TimeoutReason::WaitForManifestProgress,
+            reason: TimeoutReason::WaitForManifestProgress {
+                last_observed_test_index: 0,
+            },
         };
 
-        manager.insert_run(old_run_id, old_spec).await;
+        manager.insert(old_run_id, old_spec).await;
 
         tokio::select! {
-            _insert_young = manager.insert_run(young_run_id.clone(), young_spec) => (),
+            _insert_young = manager.insert(young_run_id.clone(), young_spec) => (),
             _wait_for_old = manager.next_timeout() => unreachable!(),
         };
 
         assert_eq!(
             manager.next_timeout().await,
-            TimedOutRun {
+            FiredTimeout {
                 run_id: young_run_id,
                 after: young_timeout,
-                reason: TimeoutReason::WaitForManifestProgress,
+                reason: TimeoutReason::WaitForManifestProgress {
+                    last_observed_test_index: 0
+                },
             }
         )
     }
