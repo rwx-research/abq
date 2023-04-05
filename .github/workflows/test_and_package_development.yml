@@ -50,12 +50,12 @@ jobs:
       - name: re-fetch overwritten tag
         run: git fetch --tags --force
 
-      - name: check for typos
-        uses: crate-ci/typos@master
-
       - name: Install build + deploy deps
         run: |
-          yum install sudo jq -y
+          yum install wget sudo jq -y
+
+      - name: check for typos
+        uses: crate-ci/typos@master
 
       - name: Restore cargo cache
         uses: actions/cache@v3.3.1
