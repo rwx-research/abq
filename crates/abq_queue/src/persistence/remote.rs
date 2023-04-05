@@ -3,7 +3,7 @@
 //! [results]: super::results
 //! [manifest]: super::manifest
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use abq_utils::{error::OpaqueResult, net_protocol::workers::RunId};
 use async_trait::async_trait;
@@ -72,8 +72,9 @@ pub trait RemotePersistence {
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync>;
 }
 
+#[derive(Clone)]
 #[repr(transparent)]
-pub struct RemotePersister(Box<dyn RemotePersistence + Send + Sync>);
+pub struct RemotePersister(Arc<Box<dyn RemotePersistence + Send + Sync>>);
 
 impl<T> From<T> for RemotePersister
 where
@@ -86,7 +87,7 @@ where
 
 impl RemotePersister {
     pub fn new(persister: impl RemotePersistence + Send + Sync + 'static) -> RemotePersister {
-        RemotePersister(Box::new(persister))
+        RemotePersister(Arc::new(Box::new(persister)))
     }
 
     pub async fn store(
@@ -114,11 +115,5 @@ impl RemotePersister {
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
         self.0.load(kind, run_id, into_local_path).await
-    }
-}
-
-impl Clone for RemotePersister {
-    fn clone(&self) -> Self {
-        Self(self.0.boxed_clone())
     }
 }
