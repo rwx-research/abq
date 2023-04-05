@@ -75,7 +75,7 @@ struct CellInner {
 /// This is a hint as to whether or not the remote can be hit. The remote will only actually be
 /// persisted to if there are no additional pending local persistence operations after a local
 /// persistence operation completes.
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub enum EligibleForRemoteDump {
     Yes,
     No,

@@ -693,7 +693,7 @@ impl AllRuns {
     pub fn get_write_results_cell(
         &self,
         run_id: &RunId,
-    ) -> Result<ResultsPersistedCell, WriteResultsError> {
+    ) -> Result<(ResultsPersistedCell, EligibleForRemoteDump), WriteResultsError> {
         use WriteResultsError::*;
 
         let runs = self.runs.read();
@@ -707,12 +707,21 @@ impl AllRuns {
             RunState::HasWork {
                 results_persistence,
                 ..
-            } => Ok(results_persistence.clone()),
+            } => {
+                // Since there are still tests in the manifest, we're not yet eligible for a dump
+                // to the remote. We will be once the manifest is emptied, at which point we'll be
+                // receiving the test results that live at the tail of the manifest.
+                let elibible_for_remote_dump = EligibleForRemoteDump::No;
+
+                Ok((results_persistence.clone(), elibible_for_remote_dump))
+            }
             RunState::InitialManifestDone {
                 results_persistence,
                 ..
             } => match results_persistence {
-                ResultsPersistence::Persisted(cell) => Ok(cell.clone()),
+                ResultsPersistence::Persisted(cell) => {
+                    Ok((cell.clone(), EligibleForRemoteDump::Yes))
+                }
                 ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
             },
             RunState::Cancelled { .. } => Err(RunCancelled),
@@ -1918,6 +1927,9 @@ impl QueueServer {
                     manifest_size_nonce,
                     native_runner_info,
                 };
+
+                // The manifest was only just added; don't dump to the remote, as that will happen
+                // after all results come in.
                 let eligible_for_remote_dump = EligibleForRemoteDump::No;
                 run_summary_persistence_task(
                     entity,
@@ -1983,7 +1995,10 @@ impl QueueServer {
                         native_runner_info,
                         manifest_size_nonce: 0,
                     };
-                    let eligible_for_remote_dump = EligibleForRemoteDump::No;
+
+                    // Since this is the empty manifest and there will be no continuation of the
+                    // run, we can go ahead and offload the summary to the remote now.
+                    let eligible_for_remote_dump = EligibleForRemoteDump::Yes;
                     run_summary_persistence_task(
                         entity,
                         &persist_results,
@@ -2031,12 +2046,12 @@ impl QueueServer {
         // tasks, then send the ACK, since we don't want to block the workers on the actual
         // persistence.
         let cell_result = queues.get_write_results_cell(&run_id).located(here!());
-        let eligible_for_remote_dump = EligibleForRemoteDump::No;
+
         let plan_result = match cell_result.as_ref() {
-            Ok(cell) => Ok(cell.build_persist_results_plan(
+            Ok((cell, eligible_for_remote_dump)) => Ok(cell.build_persist_results_plan(
                 &persist_results,
                 results,
-                eligible_for_remote_dump,
+                *eligible_for_remote_dump,
             )),
             Err(e) => Err(e),
         };

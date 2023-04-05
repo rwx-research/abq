@@ -3,6 +3,7 @@ use std::{
     future::Future,
     num::{NonZeroU64, NonZeroUsize},
     panic,
+    path::Path,
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -10,13 +11,18 @@ use std::{
 
 use abq_native_runner_simulation::{legal_spawned_message, pack, pack_msgs_to_disk};
 use abq_queue::{
-    persistence,
+    persistence::{
+        self,
+        manifest::ManifestView,
+        remote::{PersistenceKind, RemotePersistence},
+    },
     queue::{Abq, QueueConfig},
     RunTimeoutStrategy, TimeoutReason,
 };
 use abq_test_utils::{artifacts_dir, assert_scoped_log, s};
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
+    error::OpaqueResult,
     exit::ExitCode,
     net_async::{ClientStream, ConfiguredClient},
     net_opt::ClientOptions,
@@ -45,6 +51,7 @@ use abq_workers::{
     workers::{WorkerContext, WorkersExit, WorkersExitStatus},
     DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
 };
+use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt};
 use ntest::timeout;
 use parking_lot::Mutex;
@@ -78,21 +85,24 @@ struct QueueExtDeps {
 struct Server {
     config: QueueConfig,
     deps: QueueExtDeps,
+    remote: InMemoryRemote,
 }
 
 impl Default for Server {
     fn default() -> Self {
+        let remote = InMemoryRemote::default();
+
         let manifests_path = tempfile::tempdir().unwrap();
         let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
             manifests_path.path(),
-            persistence::remote::NoopPersister,
+            remote.clone(),
         );
 
         let results_path = tempfile::tempdir().unwrap();
         let persist_results = persistence::results::FilesystemPersistor::new_shared(
             results_path.path(),
             10,
-            persistence::remote::NoopPersister,
+            remote.clone(),
         );
 
         let config = QueueConfig::new(persist_manifest, persist_results);
@@ -100,7 +110,11 @@ impl Default for Server {
             _manifests_path: manifests_path,
             _results_path: results_path,
         };
-        Self { config, deps }
+        Self {
+            config,
+            deps,
+            remote,
+        }
     }
 }
 
@@ -108,6 +122,81 @@ impl Server {
     fn with_timeout_strategy(mut self, run_timeout_strategy: RunTimeoutStrategy) -> Self {
         self.config.run_timeout_strategy = run_timeout_strategy;
         self
+    }
+}
+
+#[derive(Default)]
+struct InMemoryRemoteInner {
+    manifests: HashMap<RunId, ManifestView>,
+    results: HashMap<RunId, OpaqueLazyAssociatedTestResults>,
+}
+
+#[derive(Default, Clone)]
+struct InMemoryRemote(Arc<Mutex<InMemoryRemoteInner>>);
+
+#[async_trait]
+impl RemotePersistence for InMemoryRemote {
+    async fn store(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        data: Vec<u8>,
+    ) -> OpaqueResult<()> {
+        let mut inner = self.0.lock();
+        match kind {
+            PersistenceKind::Manifest => {
+                let manifest: ManifestView = serde_json::from_slice(&data).unwrap();
+                inner.manifests.insert(run_id.clone(), manifest);
+            }
+            PersistenceKind::Results => {
+                let results: OpaqueLazyAssociatedTestResults =
+                    serde_json::from_slice(&data).unwrap();
+                inner.results.insert(run_id.clone(), results);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores a file from the local filesystem to the remote persistence.
+    async fn store_from_disk(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        from_local_path: &Path,
+    ) -> OpaqueResult<()> {
+        let data = tokio::fs::read(from_local_path).await.unwrap();
+        self.store(kind, run_id, data).await
+    }
+
+    /// Loads a file from the remote persistence to the local filesystem.
+    /// The given local path must have all intermediate directories already created.
+    async fn load(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        into_local_path: &Path,
+    ) -> OpaqueResult<()> {
+        let data = {
+            let inner = self.0.lock();
+            match kind {
+                PersistenceKind::Manifest => {
+                    let manifest = inner.manifests.get(run_id).unwrap();
+                    serde_json::to_vec(manifest).unwrap()
+                }
+                PersistenceKind::Results => {
+                    let results = inner.results.get(run_id).unwrap();
+                    serde_json::to_vec(results).unwrap()
+                }
+            }
+        };
+
+        tokio::fs::write(into_local_path, data).await.unwrap();
+
+        Ok(())
+    }
+
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
+        Box::new(self.clone())
     }
 }
 
@@ -248,6 +337,11 @@ enum Assert<'a> {
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, Box<dyn Fn(&WorkersExitStatus)>),
     WorkerResultStatus(Wid, &'a dyn Fn(&WorkersExitKind)),
+
+    #[allow(unused)]
+    RemoteManifest(Run, Box<dyn Fn(&ManifestView)>),
+    #[allow(unused)]
+    RemoteResults(Run, Box<dyn Fn(&OpaqueLazyAssociatedTestResults)>),
 }
 
 type Steps<'a> = Vec<(Vec<Action>, Vec<Assert<'a>>)>;
@@ -491,6 +585,7 @@ async fn run_test(server: Server, steps: Steps<'_>) {
     let Server {
         config,
         deps: _deps,
+        remote,
     } = server;
     let mut queue = Abq::start(config).await;
 
@@ -582,6 +677,20 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                     let results = worker_exit_kinds.lock();
                     let real_result = results.get(&n).expect("workers result not found");
                     workers_result(real_result)
+                }
+
+                RemoteManifest(n, check) => {
+                    let run_id = run_ids.get(&n).unwrap().clone();
+                    let remote = remote.0.lock();
+                    let manifest = remote.manifests.get(&run_id).unwrap();
+                    check(manifest)
+                }
+
+                RemoteResults(n, check) => {
+                    let run_id = run_ids.get(&n).unwrap().clone();
+                    let remote = remote.0.lock();
+                    let results = remote.results.get(&run_id).unwrap();
+                    check(results)
                 }
             }
         }
