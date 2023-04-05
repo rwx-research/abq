@@ -57,10 +57,6 @@ impl CustomPersister {
             Action::Load => "load",
             Action::Store => "store",
         };
-        let kind = match kind {
-            PersistenceKind::Manifest => "manifest",
-            PersistenceKind::Results => "results",
-        };
 
         let std::process::Output {
             status,
@@ -69,7 +65,7 @@ impl CustomPersister {
         } = tokio::process::Command::new(&self.command)
             .args(&self.head_args)
             .arg(action)
-            .arg(kind)
+            .arg(kind.kind_str())
             .arg(run_id.to_string())
             .arg(path)
             .output()

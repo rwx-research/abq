@@ -92,12 +92,11 @@ impl S3Impl for S3Persister {
 /// <prefix>/<run_id>/<kind>
 /// ```
 #[inline]
-fn build_key(prefix: &str, kind: PersistenceKind, run_id: &RunId) -> impl Into<String> {
-    let kind_str = match kind {
-        PersistenceKind::Manifest => "manifest",
-        PersistenceKind::Results => "results",
-    };
-    [prefix, run_id.0.as_str(), kind_str].join("/")
+fn build_key(prefix: &str, persistence_kind: PersistenceKind, run_id: &RunId) -> String {
+    let kind = persistence_kind.kind_str();
+    let run_id = &run_id.0;
+    let ext = persistence_kind.file_extension();
+    format!("{prefix}/{run_id}/{kind}.{ext}")
 }
 
 #[async_trait]
@@ -233,7 +232,7 @@ mod test {
         let prefix = "test-prefix";
 
         let key = build_key(prefix, kind, &run_id);
-        assert_eq!(key.into(), "test-prefix/test-run-id/results");
+        assert_eq!(key, "test-prefix/test-run-id/results.jsonl");
     }
 
     #[test]
@@ -243,7 +242,7 @@ mod test {
         let prefix = "test-prefix";
 
         let key = build_key(prefix, kind, &run_id);
-        assert_eq!(key.into(), "test-prefix/test-run-id/manifest");
+        assert_eq!(key, "test-prefix/test-run-id/manifest.json");
     }
 
     #[tokio::test]
@@ -251,7 +250,7 @@ mod test {
         let s3 = S3Fake::new(
             "bucket-prefix",
             |key, body| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
                 assert_eq!(body, b"manifest-body");
                 Ok(PutObjectOutput::builder().build())
             },
@@ -272,7 +271,7 @@ mod test {
         let s3 = S3Fake::new(
             "bucket-prefix",
             |key, body| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
                 assert_eq!(body, b"manifest-body");
                 Ok(PutObjectOutput::builder().build())
             },
@@ -297,7 +296,7 @@ mod test {
             "bucket-prefix",
             |_key, _body| unreachable!(),
             |key| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
                 Ok(GetObjectOutput::builder()
                     .body(ByteStream::from(b"manifest-body".to_vec()))
                     .build())
@@ -325,7 +324,7 @@ mod test {
         let s3 = S3Fake::new(
             "bucket-prefix",
             |key, body| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
                 assert_eq!(body, b"manifest-body");
                 Err(SdkError::timeout_error("timed out"))
             },
@@ -349,7 +348,7 @@ mod test {
         let s3 = S3Fake::new(
             "bucket-prefix",
             |key, body| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
                 assert_eq!(body, b"manifest-body");
                 Err(SdkError::timeout_error("timed out"))
             },
@@ -377,7 +376,7 @@ mod test {
             "bucket-prefix",
             |_key, _body| unreachable!(),
             |key| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest");
+                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
                 Err(SdkError::timeout_error("timed out"))
             },
         );
