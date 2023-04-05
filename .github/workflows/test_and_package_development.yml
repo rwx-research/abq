@@ -22,14 +22,14 @@ on:
 jobs:
   release:
     name: Build, Upload, Release ABQ
-    # We only need x86-64 statically-linked binaries for development testing.
+    # We only need x86-64 many-glibc binaries for development testing.
     runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux2014_x86_64
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
-      RUST_TARGET: x86_64-unknown-linux-musl
       ABQ_DEVELOPMENT_BUILD: 1
       ABQ_NO_REBUILD: true
     steps:
@@ -53,9 +53,9 @@ jobs:
       - name: check for typos
         uses: crate-ci/typos@master
 
-      - name: Install musl libc tools
+      - name: Install build + deploy deps
         run: |
-          sudo apt-get install -y musl-tools
+          yum install sudo jq -y
 
       - name: Restore cargo cache
         uses: actions/cache@v3.3.1
@@ -68,14 +68,13 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: cargo-release-unstable-1-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-release-unstable-1-linux_x86-64-manylinux-${{ hashFiles('rust-toolchain.toml')}}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-release-unstable-1-linux_x86-64-musl-${{ hashFiles('rust-toolchain.toml')}}-
+            cargo-release-unstable-1-linux_x86-64-manylinux-${{ hashFiles('rust-toolchain.toml')}}-
       - name: Install Rust toolchain
         uses: rwx-research/rust-toolchain@abq
         with:
           toolchain: 1.65.0
-          target: ${{ env.RUST_TARGET }}
           components: clippy, rustfmt
 
       - name: Check formatting
@@ -88,7 +87,7 @@ jobs:
         uses: actions-rs/cargo@v1.0.3
         with:
           command: clippy
-          args: --workspace --tests --profile=release-unstable --all-features --target=${{ env.RUST_TARGET }} -- --deny warnings
+          args: --workspace --tests --profile=release-unstable --all-features -- --deny warnings
 
       - name: Lint github workflows
         run: |
@@ -112,13 +111,13 @@ jobs:
 
       - name: Build release with tests
         run: |
-          cargo build --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
+          cargo build --tests --bins --profile=release-unstable --all-features
 
       - name: Run tests with cargo
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
+          cargo test --profile=release-unstable --all-features
         env:
           CI: false
 
@@ -127,9 +126,15 @@ jobs:
         if: github.run_attempt > 1
         run: |
           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
+          cargo test --profile=release-unstable --all-features -- --nocapture
         env:
           CI: false
+
+      - name: Install aws CLI
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
 
       - name: Prepare release environment
         run: |
@@ -154,8 +159,8 @@ jobs:
         id: prepare_release
         run: |
           mkdir "${RELEASE_DIR}"
-          cp "target/$RUST_TARGET/release-unstable/abq" "${RELEASE_DIR}"
-          cp "target/$RUST_TARGET/release-unstable/abq_tester_harness" "${RELEASE_DIR}"
+          cp "target/release-unstable/abq" "${RELEASE_DIR}"
+          cp "target/release-unstable/abq_tester_harness" "${RELEASE_DIR}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
 
       - name: Push release to staging S3
