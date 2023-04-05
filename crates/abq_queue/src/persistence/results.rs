@@ -174,7 +174,10 @@ impl<'a> PersistencePlan<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::{
+        sync::{atomic::AtomicBool, Arc},
+        time::Duration,
+    };
 
     use abq_run_n_times::n_times;
     use abq_test_utils::wid;
@@ -185,7 +188,10 @@ mod test {
         },
     };
 
-    use crate::persistence::{remote, results::EligibleForRemoteDump};
+    use crate::persistence::{
+        remote::{self, PersistenceKind},
+        results::EligibleForRemoteDump,
+    };
 
     use super::{fs::FilesystemPersistor, ResultsPersistedCell};
 
@@ -267,5 +273,134 @@ mod test {
             2 => assert_eq!(results, vec![Results(results1), Results(results2)]),
             _ => unreachable!("{results:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn execute_not_eligible_for_persistence_is_last() {
+        let remote = remote::FakePersister::new(
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!(),
+        );
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
+
+        let cell = ResultsPersistedCell::new(RunId::unique());
+
+        let results = vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ];
+
+        let plan = cell.build_persist_results_plan(
+            &persistence,
+            results.clone(),
+            EligibleForRemoteDump::No,
+        );
+        plan.execute().await.unwrap();
+
+        assert!(cell.0.processing.load(atomic::ORDERING) == 0);
+    }
+
+    #[tokio::test]
+    async fn execute_not_eligible_for_persistence_is_not_last() {
+        let remote = remote::FakePersister::new(
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!(),
+        );
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
+
+        let cell = ResultsPersistedCell::new(RunId::unique());
+
+        cell.0.processing.fetch_add(1, atomic::ORDERING);
+
+        let results = vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ];
+
+        let plan = cell.build_persist_results_plan(
+            &persistence,
+            results.clone(),
+            EligibleForRemoteDump::No,
+        );
+        plan.execute().await.unwrap();
+
+        assert!(cell.0.processing.load(atomic::ORDERING) == 1);
+    }
+
+    #[tokio::test]
+    async fn execute_eligible_for_persistence_is_not_last() {
+        let remote = remote::FakePersister::new(
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!(),
+        );
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
+
+        let cell = ResultsPersistedCell::new(RunId::unique());
+
+        cell.0.processing.fetch_add(1, atomic::ORDERING);
+
+        let results = vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ];
+
+        let plan =
+            cell.build_persist_results_plan(&persistence, results, EligibleForRemoteDump::Yes);
+        plan.execute().await.unwrap();
+
+        assert!(cell.0.processing.load(atomic::ORDERING) == 1);
+    }
+
+    #[tokio::test]
+    async fn execute_eligible_for_persistence_is_last() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ];
+
+        let set_remote = Arc::new(AtomicBool::new(false));
+
+        let remote = remote::FakePersister::new(
+            |_, _, _| unreachable!(),
+            {
+                let results = ResultsLine::Results(results.clone());
+                let set_remote = set_remote.clone();
+                move |kind, run_id, path| {
+                    assert_eq!(kind, PersistenceKind::Results);
+                    assert_eq!(run_id.0, "test-run-id");
+                    let data = std::fs::read_to_string(path).unwrap();
+                    let read: ResultsLine = serde_json::from_str(&data).unwrap();
+                    assert_eq!(read, results);
+
+                    set_remote.store(true, atomic::ORDERING);
+
+                    Ok(())
+                }
+            },
+            |_, _, _| unreachable!(),
+        );
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
+
+        let cell = ResultsPersistedCell::new(run_id);
+
+        let plan =
+            cell.build_persist_results_plan(&persistence, results, EligibleForRemoteDump::Yes);
+        plan.execute().await.unwrap();
+
+        assert!(cell.0.processing.load(atomic::ORDERING) == 0);
+        assert!(set_remote.load(atomic::ORDERING));
     }
 }
