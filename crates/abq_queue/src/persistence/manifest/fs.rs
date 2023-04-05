@@ -230,7 +230,7 @@ mod test {
                         assert_eq!(run_id.0, "run-id");
                         assert_eq!(path, tempdir_path.join("run-id.manifest.json"));
                         let buf = std::fs::read_to_string(path).unwrap();
-                        let loaded_view = serde_json::from_slice(&buf.as_bytes()).unwrap();
+                        let loaded_view = serde_json::from_slice(buf.as_bytes()).unwrap();
                         assert_eq!(view, loaded_view);
                         Ok(())
                     }
