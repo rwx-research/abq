@@ -384,11 +384,11 @@ macro_rules! setup_queue {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_auto_workers_without_failure |name, conf: CSConfigOptions| {
-        // abq test --reporter dot (--token ...)? -- yarn jest
+    npm_jest_auto_workers_without_failure |name, conf: CSConfigOptions| {
+        // abq test --reporter dot (--token ...)? -- npm test
         let args = &["test", "--reporter", "dot", "-n", "cpu-cores", "--color=never"];
         let mut args = conf.extend_args_for_in_band_client(args);
-        args.extend(["--", "yarn", "jest"]);
+        args.extend(["--", "npm", "test"]);
         let CmdOutput {
             stdout,
             stderr: _,
@@ -405,11 +405,11 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_auto_workers_without_failure_worker_0 |name, conf: CSConfigOptions| {
-        // abq test --worker 0 --reporter dot (--token ...)? -- yarn jest
+    npm_jest_auto_workers_without_failure_worker_0 |name, conf: CSConfigOptions| {
+        // abq test --worker 0 --reporter dot (--token ...)? -- npm test
         let args = &["test", "--worker", "0", "--reporter", "dot", "-n", "cpu-cores", "--color=never"];
         let mut args = conf.extend_args_for_in_band_client(args);
-        args.extend(["--", "yarn", "jest"]);
+        args.extend(["--", "npm", "test"]);
         let CmdOutput {
             stdout,
             stderr: _,
@@ -506,7 +506,7 @@ fn assert_sum_of_run_test_retries<'a>(outputs: impl IntoIterator<Item = &'a str>
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_separate_queue_numbered_workers_test_without_failure |name, conf: CSConfigOptions| {
+    npm_jest_separate_queue_numbered_workers_test_without_failure |name, conf: CSConfigOptions| {
         let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
         let run_id = RunId::unique().to_string();
@@ -515,7 +515,7 @@ test_all_network_config_options! {
 
         let working_dir = npm_jest_project_path.display();
 
-        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- npm test
         let test_args = |worker: usize| {
             let args = vec![
                 format!("test"),
@@ -528,7 +528,7 @@ test_all_network_config_options! {
                 format!("--color=never"),
             ];
             let mut args = conf.extend_args_for_client(args);
-            args.extend([s!("--"), s!("yarn"), s!("jest")]);
+            args.extend([s!("--"), s!("npm"), s!("test")]);
             args
         };
 
@@ -579,7 +579,7 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_timeout_run_workers |name, conf: CSConfigOptions| {
+    npm_jest_timeout_run_workers |name, conf: CSConfigOptions| {
         let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
         let run_id = RunId::unique().to_string();
@@ -588,7 +588,7 @@ test_all_network_config_options! {
 
         let working_dir = npm_jest_project_path.display();
 
-        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- npm test
         let test_args = |worker: usize| {
             let args = vec![
                 format!("test"),
@@ -601,7 +601,7 @@ test_all_network_config_options! {
                 format!("--inactivity-timeout-seconds=0"),
             ];
             let mut args = conf.extend_args_for_client(args);
-            args.extend([s!("--"), s!("yarn"), s!("jest")]);
+            args.extend([s!("--"), s!("npm"), s!("test")]);
             args
         };
 
@@ -619,8 +619,8 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_auto_workers_with_failing_tests |name, conf: CSConfigOptions| {
-        // abq test --reporter dot (--token ...)? -- yarn jest
+    npm_jest_auto_workers_with_failing_tests |name, conf: CSConfigOptions| {
+        // abq test --reporter dot (--token ...)? -- npm test
         let test_args = &[
             "test",
             "--reporter",
@@ -631,7 +631,7 @@ test_all_network_config_options! {
             "--worker=0",
         ];
         let mut test_args = conf.extend_args_for_in_band_client(test_args);
-        test_args.extend(["--", "yarn", "jest"]);
+        test_args.extend(["--", "npm", "test"]);
         let CmdOutput {
             stdout,
             stderr: _,
@@ -652,7 +652,7 @@ test_all_network_config_options! {
 
 test_all_network_config_options! {
     #[cfg(feature = "test-abq-jest")]
-    yarn_jest_separate_queue_workers_with_failing_tests |name, conf: CSConfigOptions| {
+    npm_jest_separate_queue_workers_with_failing_tests |name, conf: CSConfigOptions| {
         let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
         let run_id = RunId::unique().to_string();
@@ -660,7 +660,7 @@ test_all_network_config_options! {
         let npm_jest_project_path = testdata_project("jest/npm-jest-project-with-failures");
         let working_dir = npm_jest_project_path.display();
 
-        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- npm test
         let test_args = |worker: usize| {
             let args = vec![
                 format!("test"),
@@ -673,7 +673,7 @@ test_all_network_config_options! {
                 format!("--color=never"),
             ];
             let mut args = conf.extend_args_for_client(args);
-            args.extend([s!("--"), s!("yarn"), s!("jest")]);
+            args.extend([s!("--"), s!("npm"), s!("test")]);
             args
         };
         let test1_proc = Abq::new(name.to_string() + "_test1").args(test_args(1)).spawn();
@@ -2245,7 +2245,7 @@ test_all_network_config_options! {
 
         let simulation = [pack_msgs_to_disk(simulation(true)), pack_msgs_to_disk(simulation(false))];
 
-        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- yarn jest
+        // abq test --worker N --reporter dot --queue-addr ... --working-dir ... --run-id ... (--token ...)? -- npm jest
         let test_args = |worker: usize| {
             let simulator = native_runner_simulation_bin();
             let simulation = &simulation[worker];
