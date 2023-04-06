@@ -275,7 +275,7 @@ fn sort_results_owned(results: &mut [FlatResult<'_>]) -> Vec<(u32, String)> {
         .collect()
 }
 
-fn flatten_queue_results<'a>(
+fn flatten_queue_results(
     results: impl std::borrow::Borrow<OpaqueLazyAssociatedTestResults>,
 ) -> (Vec<(u32, String)>, Summary) {
     let results = results.borrow();
