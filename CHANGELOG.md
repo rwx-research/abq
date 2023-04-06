@@ -1,3 +1,15 @@
+## 1.3.3
+
+ABQ 1.3.3 is a patch release with improvements to the stability of the queue
+implementation.
+
+- ABQ now uses the default musl libc memory allocator on x86 Linux targets,
+  replacing use of the mimalloc memory allocator. For larger workloads, the
+  default musl allocator is expected to provide better memory utilization
+  characteristics. (#16)
+- ABQ will now cancel active runs for which no progress has been made in an
+  hour. (#12)
+
 ## 1.3.2
 
 ABQ 1.3.2 includes bug fixes and improved output for `abq test` and `abq report`.
