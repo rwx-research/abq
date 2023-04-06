@@ -9,7 +9,7 @@ use abq_utils::{
     },
 };
 use async_trait::async_trait;
-use tokio::fs;
+use fs4::FileExt;
 
 use crate::persistence::remote::{PersistenceKind, RemotePersister};
 
@@ -45,29 +45,49 @@ impl FilesystemPersistor {
 
         self.root.join(format!("{run_id}.manifest.json"))
     }
+
+    fn get_sync_file(&self, run_id: &RunId) -> Result<std::fs::File> {
+        let fi = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.get_path(run_id))
+            .located(here!())?;
+
+        fi.lock_exclusive().located(here!())?;
+
+        Ok(fi)
+    }
 }
 
 #[async_trait]
 impl PersistentManifest for FilesystemPersistor {
     async fn dump(&self, run_id: &RunId, view: ManifestView) -> Result<()> {
-        let path = self.get_path(run_id);
+        // Write the manifest to disk with exclusive access.
+        let locked_file = {
+            let locked_file = self.get_sync_file(run_id)?;
+            let write_task = {
+                move || {
+                    serde_json::to_writer(&locked_file, &view).located(here!())?;
+                    Ok(locked_file)
+                }
+            };
 
-        let write_task = {
-            let path = path.clone();
-            move || {
-                let fd = std::fs::File::create(path).located(here!())?;
-                serde_json::to_writer(fd, &view).located(here!())?;
-                Ok(())
-            }
+            tokio::task::spawn_blocking(write_task)
+                .await
+                .located(here!())??
         };
 
-        tokio::task::spawn_blocking(write_task)
-            .await
-            .located(here!())??;
+        // Cede control to the remote persister so it can read from the path, while we still have
+        // exlusive access to the file.
+        {
+            let path = self.get_path(run_id);
+            self.remote
+                .store_from_disk(PersistenceKind::Manifest, run_id, &path)
+                .await?;
+        }
 
-        self.remote
-            .store_from_disk(PersistenceKind::Manifest, run_id, &path)
-            .await?;
+        locked_file.unlock().located(here!())?;
 
         Ok(())
     }
@@ -77,11 +97,19 @@ impl PersistentManifest for FilesystemPersistor {
         run_id: &RunId,
         entity_tag: Tag,
     ) -> Result<Vec<WorkerTest>> {
-        let path = self.get_path(run_id);
+        let locked_file = self.get_sync_file(run_id)?;
 
-        let packed = fs::read(path).await.located(here!())?;
+        let load_task = move || {
+            let view: ManifestView = serde_json::from_reader(&locked_file).located(here!())?;
 
-        let view: ManifestView = serde_json::from_slice(&packed).located(here!())?;
+            locked_file.unlock().located(here!())?;
+
+            Ok(view)
+        };
+
+        let view = tokio::task::spawn_blocking(load_task)
+            .await
+            .located(here!())??;
 
         Ok(view.get_partition_for_entity(entity_tag))
     }
@@ -183,7 +211,7 @@ mod test {
         let run_id = RunId::unique();
 
         let res = fs.dump(&run_id, view).await;
-        assert!(res.is_ok());
+        assert!(res.is_ok(), "{res:?}");
 
         let man1 = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
         assert_eq!(man1, vec![test1.clone(), test2.clone(), test5.clone()]);
