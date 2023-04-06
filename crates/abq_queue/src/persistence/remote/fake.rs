@@ -40,7 +40,7 @@ where
         (self.on_store_from_disk)(kind, run_id, from_local_path)
     }
 
-    async fn load(
+    async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,

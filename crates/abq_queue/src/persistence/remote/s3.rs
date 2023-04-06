@@ -120,7 +120,7 @@ where
         Ok(())
     }
 
-    async fn load(
+    async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
@@ -270,7 +270,7 @@ mod test {
 
         let manifest = NamedTempFile::new().unwrap();
 
-        s3.load(
+        s3.load_to_disk(
             PersistenceKind::Manifest,
             &RunId("test-run-id".to_owned()),
             manifest.path(),
@@ -325,7 +325,7 @@ mod test {
         let manifest = NamedTempFile::new().unwrap();
 
         let err = s3
-            .load(
+            .load_to_disk(
                 PersistenceKind::Manifest,
                 &RunId("test-run-id".to_owned()),
                 manifest.path(),

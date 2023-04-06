@@ -168,7 +168,7 @@ impl RemotePersistence for InMemoryRemote {
 
     /// Loads a file from the remote persistence to the local filesystem.
     /// The given local path must have all intermediate directories already created.
-    async fn load(
+    async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,

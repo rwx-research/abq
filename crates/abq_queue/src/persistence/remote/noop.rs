@@ -29,7 +29,7 @@ impl RemotePersistence for NoopPersister {
         Ok(())
     }
 
-    async fn load(
+    async fn load_to_disk(
         &self,
         _kind: PersistenceKind,
         _run_id: &RunId,

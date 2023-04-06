@@ -86,7 +86,12 @@ impl CustomPersister {
 
 #[async_trait]
 impl RemotePersistence for CustomPersister {
-    async fn load(&self, kind: PersistenceKind, run_id: &RunId, path: &Path) -> OpaqueResult<()> {
+    async fn load_to_disk(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        path: &Path,
+    ) -> OpaqueResult<()> {
         self.call(Action::Load, kind, run_id, path).await
     }
 
@@ -134,7 +139,7 @@ mod test {
         let persister = super::CustomPersister::new("node", vec![fi.path().display().to_string()]);
 
         persister
-            .load(
+            .load_to_disk(
                 super::PersistenceKind::Manifest,
                 &RunId("run-id".to_string()),
                 Path::new("/tmp/foo"),
@@ -155,7 +160,7 @@ mod test {
         let persister = super::CustomPersister::new("node", vec![fi.path().display().to_string()]);
 
         let err = persister
-            .load(
+            .load_to_disk(
                 super::PersistenceKind::Manifest,
                 &RunId("run-id".to_string()),
                 Path::new("/tmp/foo"),

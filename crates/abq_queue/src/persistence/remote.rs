@@ -59,7 +59,7 @@ pub trait RemotePersistence {
 
     /// Loads a file from the remote persistence to the local filesystem.
     /// The given local path must have all intermediate directories already created.
-    async fn load(
+    async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
@@ -102,6 +102,6 @@ impl RemotePersister {
         run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
-        self.0.load(kind, run_id, into_local_path).await
+        self.0.load_to_disk(kind, run_id, into_local_path).await
     }
 }
