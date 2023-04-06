@@ -250,7 +250,6 @@ mod test {
         let fs = FilesystemPersistor::new(
             tempdir.path(),
             FakePersister::new(
-                |_, _, _| unreachable!(),
                 {
                     let view = view.clone();
                     move |kind, run_id, path| {
@@ -285,7 +284,6 @@ mod test {
         let fs = FilesystemPersistor::new(
             tempdir.path(),
             FakePersister::new(
-                |_, _, _| unreachable!(),
                 |_, _, _| Err("i failed".located(here!())),
                 |_, _, _| unreachable!(),
             ),

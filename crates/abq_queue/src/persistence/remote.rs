@@ -49,9 +49,6 @@ impl PersistenceKind {
 
 #[async_trait]
 pub trait RemotePersistence {
-    async fn store(&self, kind: PersistenceKind, run_id: &RunId, data: Vec<u8>)
-        -> OpaqueResult<()>;
-
     /// Stores a file from the local filesystem to the remote persistence.
     async fn store_from_disk(
         &self,
@@ -88,15 +85,6 @@ where
 impl RemotePersister {
     pub fn new(persister: impl RemotePersistence + Send + Sync + 'static) -> RemotePersister {
         RemotePersister(Arc::new(Box::new(persister)))
-    }
-
-    pub async fn store(
-        &self,
-        kind: PersistenceKind,
-        run_id: &RunId,
-        data: Vec<u8>,
-    ) -> OpaqueResult<()> {
-        self.0.store(kind, run_id, data).await
     }
 
     pub async fn store_from_disk(

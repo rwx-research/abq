@@ -277,11 +277,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_last() {
-        let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-        );
+        let remote = remote::FakePersister::new(|_, _, _| unreachable!(), |_, _, _| unreachable!());
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -305,11 +301,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-        );
+        let remote = remote::FakePersister::new(|_, _, _| unreachable!(), |_, _, _| unreachable!());
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -335,11 +327,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-        );
+        let remote = remote::FakePersister::new(|_, _, _| unreachable!(), |_, _, _| unreachable!());
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -372,7 +360,6 @@ mod test {
         let set_remote = Arc::new(AtomicBool::new(false));
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             {
                 let results = ResultsLine::Results(results.clone());
                 let set_remote = set_remote.clone();

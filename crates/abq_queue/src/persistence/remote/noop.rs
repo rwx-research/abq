@@ -20,15 +20,6 @@ impl NoopPersister {
 
 #[async_trait]
 impl RemotePersistence for NoopPersister {
-    async fn store(
-        &self,
-        _kind: PersistenceKind,
-        _run_id: &RunId,
-        _data: Vec<u8>,
-    ) -> OpaqueResult<()> {
-        Ok(())
-    }
-
     async fn store_from_disk(
         &self,
         _kind: PersistenceKind,

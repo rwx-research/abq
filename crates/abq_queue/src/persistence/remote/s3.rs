@@ -104,20 +104,6 @@ impl<T> RemotePersistence for T
 where
     T: S3Impl + Clone + Send + Sync + 'static,
 {
-    async fn store(
-        &self,
-        kind: PersistenceKind,
-        run_id: &RunId,
-        data: Vec<u8>,
-    ) -> OpaqueResult<()> {
-        let key = build_key(self.key_prefix(), kind, run_id);
-        let body = ByteStream::from(data);
-
-        let _put_object = self.put(key, body).await.located(here!())?;
-
-        Ok(())
-    }
-
     async fn store_from_disk(
         &self,
         kind: PersistenceKind,
@@ -246,27 +232,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn store_okay() {
-        let s3 = S3Fake::new(
-            "bucket-prefix",
-            |key, body| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
-                assert_eq!(body, b"manifest-body");
-                Ok(PutObjectOutput::builder().build())
-            },
-            |_| unreachable!(),
-        );
-
-        s3.store(
-            PersistenceKind::Manifest,
-            &RunId("test-run-id".to_owned()),
-            b"manifest-body".to_vec(),
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
     async fn store_from_disk_okay() {
         let s3 = S3Fake::new(
             "bucket-prefix",
@@ -317,30 +282,6 @@ mod test {
         io::Read::read_to_end(&mut io::BufReader::new(manifest), &mut buf).unwrap();
 
         assert_eq!(buf, b"manifest-body");
-    }
-
-    #[tokio::test]
-    async fn store_error() {
-        let s3 = S3Fake::new(
-            "bucket-prefix",
-            |key, body| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
-                assert_eq!(body, b"manifest-body");
-                Err(SdkError::timeout_error("timed out"))
-            },
-            |_| unreachable!(),
-        );
-
-        let err = s3
-            .store(
-                PersistenceKind::Manifest,
-                &RunId("test-run-id".to_owned()),
-                b"manifest-body".to_vec(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("timed out"));
     }
 
     #[tokio::test]

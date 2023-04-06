@@ -342,7 +342,6 @@ mod test {
         ]);
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             {
                 let results = results.clone();
                 move |kind, run_id, path| {
@@ -371,7 +370,6 @@ mod test {
         let run_id = RunId("test-run-id".to_string());
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             |_, _, _| Err("i failed").located(abq_utils::here!()),
             |_, _, _| unreachable!(),
         );
@@ -390,7 +388,6 @@ mod test {
 
         // The remote should see the results, but the results will be empty.
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             move |kind, run_id, path| {
                 assert_eq!(kind, PersistenceKind::Results);
                 assert_eq!(run_id.0, "test-run-id");
@@ -428,7 +425,6 @@ mod test {
         ]);
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             {
                 let (results1, results2) = (results1.clone(), results2.clone());
                 move |kind, run_id, path| {
