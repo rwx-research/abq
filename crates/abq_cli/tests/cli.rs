@@ -3000,6 +3000,13 @@ fn write_to_temp(content: &str) -> NamedTempFile {
     fi
 }
 
+fn heuristic_wait_for_written_path(path: &Path) {
+    while !path.exists() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    thread::sleep(Duration::from_millis(10));
+}
+
 #[test]
 #[serial]
 fn custom_remote_persistence() {
@@ -3105,40 +3112,138 @@ fn custom_remote_persistence() {
         );
     }
 
-    let custom_persisted_manifest_path = custom_persisted_path.join("store-manifest-test-run-id");
-    while !custom_persisted_manifest_path.exists() {
-        thread::sleep(Duration::from_millis(10));
-    }
-    let manifest = std::fs::read_to_string(&custom_persisted_manifest_path)
-        .unwrap_or_else(|_| panic!("Nothing at {:?}", custom_persisted_manifest_path));
-
-    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
-    insta::assert_json_snapshot!(manifest, {
-        ".items[0].spec.work_id" => "[redacted]",
-    }, @r###"
     {
-      "assigned_entities": [
+        let custom_persisted_manifest_path =
+            custom_persisted_path.join("store-manifest-test-run-id");
+        heuristic_wait_for_written_path(&custom_persisted_manifest_path);
+
+        let manifest = std::fs::read_to_string(&custom_persisted_manifest_path)
+            .unwrap_or_else(|_| panic!("Nothing at {:?}", custom_persisted_manifest_path));
+
+        let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        insta::assert_json_snapshot!(manifest, {
+            ".items[0].spec.work_id" => "[redacted]",
+        }, @r###"
         {
-          "Runner": [
-            0,
-            1
+          "assigned_entities": [
+            {
+              "Runner": [
+                0,
+                1
+              ]
+            }
+          ],
+          "items": [
+            {
+              "run_number": 1,
+              "spec": {
+                "test_case": {
+                  "id": "test1",
+                  "meta": {}
+                },
+                "work_id": "[redacted]"
+              }
+            }
           ]
         }
-      ],
-      "items": [
-        {
-          "run_number": 1,
-          "spec": {
-            "test_case": {
-              "id": "test1",
-              "meta": {}
-            },
-            "work_id": "[redacted]"
-          }
-        }
-      ]
+        "###);
     }
-    "###);
+
+    {
+        use std::{fs::File, io::BufReader};
+
+        let custom_persisted_results_path = custom_persisted_path.join("store-results-test-run-id");
+        heuristic_wait_for_written_path(&custom_persisted_results_path);
+
+        let lines = BufReader::new(File::open(&custom_persisted_results_path).unwrap()).lines();
+        let mut lines: Vec<_> = lines.map(|line| line.unwrap()).collect();
+        lines.sort();
+
+        let result_lines: Vec<_> = lines
+            .into_iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(&line).unwrap())
+            .collect();
+
+        insta::assert_json_snapshot!(result_lines, {
+            "[0].Results[0].work_id" => "[redacted]",
+            "[0].Results[0].results[0].result.timestamp" => "[redacted]",
+        }, @r###"
+        [
+          {
+            "Results": [
+              {
+                "after_all_tests": null,
+                "before_any_test": {
+                  "stderr": [],
+                  "stdout": []
+                },
+                "results": [
+                  {
+                    "result": {
+                      "display_name": "zzz-faux",
+                      "finished_at": "1994-11-05T13:17:30Z",
+                      "id": "zzz-faux",
+                      "lineage": [
+                        "TopLevel",
+                        "SubModule",
+                        "Test"
+                      ],
+                      "location": {
+                        "column": 15,
+                        "file": "a/b/x.file",
+                        "line": 10
+                      },
+                      "meta": {},
+                      "output": "my test output",
+                      "runtime": {
+                        "Nanoseconds": 0
+                      },
+                      "started_at": "1994-11-05T13:15:30Z",
+                      "status": "Success",
+                      "stderr": [],
+                      "stdout": [],
+                      "timestamp": "[redacted]"
+                    },
+                    "source": {
+                      "has_stdout_reporters": false,
+                      "is_singleton": true,
+                      "runner": [
+                        0,
+                        1
+                      ]
+                    }
+                  }
+                ],
+                "run_number": 1,
+                "work_id": "[redacted]"
+              }
+            ]
+          },
+          {
+            "Summary": {
+              "manifest_size_nonce": 1,
+              "native_runner_info": {
+                "protocol_version": {
+                  "major": 0,
+                  "minor": 2,
+                  "type": "abq_protocol_version"
+                },
+                "specification": {
+                  "host": "ruby 3.1.2p20 (2022-04-12 revision 4491bb740a) [x86_64-darwin21]",
+                  "language": "ruby",
+                  "language_version": "3.1.2p20",
+                  "name": "test",
+                  "test_framework": "rspec",
+                  "test_framework_version": "3.12.0",
+                  "type": "abq_native_runner_specification",
+                  "version": "0.0.0"
+                }
+              }
+            }
+          }
+        ]
+        "###);
+    }
 
     term(queue_proc);
 }

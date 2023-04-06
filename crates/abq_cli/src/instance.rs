@@ -49,13 +49,14 @@ pub async fn start_abq_forever(
     let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
     let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
         manifests_path.path(),
-        remote_persistence,
+        remote_persistence.clone(),
     );
 
     let results_path = tempfile::tempdir().expect("unable to create a temporary file");
     let persist_results = persistence::results::FilesystemPersistor::new_shared(
         results_path.path(),
         RESULTS_PERSISTENCE_LRU_CAPACITY,
+        remote_persistence,
     );
 
     let run_timeout_strategy = RunTimeoutStrategy::RUN_BASED;
@@ -208,8 +209,11 @@ impl AbqInstance {
         );
 
         let results_path = tempfile::tempdir().expect("unable to create a temporary file");
-        let persist_results =
-            persistence::results::FilesystemPersistor::new_shared(results_path.path(), 10);
+        let persist_results = persistence::results::FilesystemPersistor::new_shared(
+            results_path.path(),
+            10,
+            NoopPersister,
+        );
 
         let mut config = QueueConfig::new(persist_manifest, persist_results);
         config.server_options = ServerOptions::new(server_auth, server_tls);

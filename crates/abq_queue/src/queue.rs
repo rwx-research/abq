@@ -47,7 +47,9 @@ use crate::job_queue::JobQueue;
 use crate::persistence::manifest::{
     self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
 };
-use crate::persistence::results::{ResultsPersistedCell, SharedPersistResults};
+use crate::persistence::results::{
+    EligibleForRemoteDump, ResultsPersistedCell, SharedPersistResults,
+};
 use crate::prelude::*;
 use crate::timeout::{FiredTimeout, RunTimeoutManager, RunTimeoutStrategy, TimeoutReason};
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
@@ -691,7 +693,7 @@ impl AllRuns {
     pub fn get_write_results_cell(
         &self,
         run_id: &RunId,
-    ) -> Result<ResultsPersistedCell, WriteResultsError> {
+    ) -> Result<(ResultsPersistedCell, EligibleForRemoteDump), WriteResultsError> {
         use WriteResultsError::*;
 
         let runs = self.runs.read();
@@ -705,12 +707,21 @@ impl AllRuns {
             RunState::HasWork {
                 results_persistence,
                 ..
-            } => Ok(results_persistence.clone()),
+            } => {
+                // Since there are still tests in the manifest, we're not yet eligible for a dump
+                // to the remote. We will be once the manifest is emptied, at which point we'll be
+                // receiving the test results that live at the tail of the manifest.
+                let elibible_for_remote_dump = EligibleForRemoteDump::No;
+
+                Ok((results_persistence.clone(), elibible_for_remote_dump))
+            }
             RunState::InitialManifestDone {
                 results_persistence,
                 ..
             } => match results_persistence {
-                ResultsPersistence::Persisted(cell) => Ok(cell.clone()),
+                ResultsPersistence::Persisted(cell) => {
+                    Ok((cell.clone(), EligibleForRemoteDump::Yes))
+                }
                 ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
             },
             RunState::Cancelled { .. } => Err(RunCancelled),
@@ -1625,9 +1636,12 @@ impl QueueServer {
                     });
                 }
                 HandleTimeout(fired_timeout) => {
-                    let ctx = ctx.clone();
+                    let queues = ctx.queues.clone();
+                    let timeout_manager = ctx.timeout_manager.clone();
                     tokio::spawn(async move {
-                        let result = Self::handle_timeout(ctx, fired_timeout).await.no_entity();
+                        let result = Self::handle_timeout(queues, timeout_manager, fired_timeout)
+                            .await
+                            .no_entity();
                         if let Err(error) = result {
                             log_entityful_error!(error, "error handling timeout: {}")
                         }
@@ -1913,10 +1927,15 @@ impl QueueServer {
                     manifest_size_nonce,
                     native_runner_info,
                 };
+
+                // The manifest was only just added; don't dump to the remote, as that will happen
+                // after all results come in.
+                let eligible_for_remote_dump = EligibleForRemoteDump::No;
                 run_summary_persistence_task(
                     entity,
                     &persist_results,
                     results_persistence,
+                    eligible_for_remote_dump,
                     summary,
                 )
                 .await?;
@@ -1976,10 +1995,15 @@ impl QueueServer {
                         native_runner_info,
                         manifest_size_nonce: 0,
                     };
+
+                    // Since this is the empty manifest and there will be no continuation of the
+                    // run, we can go ahead and offload the summary to the remote now.
+                    let eligible_for_remote_dump = EligibleForRemoteDump::Yes;
                     run_summary_persistence_task(
                         entity,
                         &persist_results,
                         results_persistence,
+                        eligible_for_remote_dump,
                         summary,
                     )
                     .await?
@@ -2022,8 +2046,13 @@ impl QueueServer {
         // tasks, then send the ACK, since we don't want to block the workers on the actual
         // persistence.
         let cell_result = queues.get_write_results_cell(&run_id).located(here!());
+
         let plan_result = match cell_result.as_ref() {
-            Ok(cell) => Ok(cell.build_persist_results_plan(&persist_results, results)),
+            Ok((cell, eligible_for_remote_dump)) => Ok(cell.build_persist_results_plan(
+                &persist_results,
+                results,
+                *eligible_for_remote_dump,
+            )),
             Err(e) => Err(e),
         };
 
@@ -2171,7 +2200,11 @@ impl QueueServer {
     ///   has been made in popping the manifest for a run.
     ///   If no progress has been made, the run is considered to be stuck and is cancelled.
     ///   If progress has been made but the manifest is still active, the timeout is re-enqueued.
-    async fn handle_timeout(ctx: QueueServerCtx, timeout: FiredTimeout) -> OpaqueResult<()> {
+    async fn handle_timeout(
+        queues: SharedRuns,
+        timeout_manager: RunTimeoutManager,
+        timeout: FiredTimeout,
+    ) -> OpaqueResult<()> {
         let FiredTimeout {
             run_id,
             reason,
@@ -2182,9 +2215,7 @@ impl QueueServer {
             last_observed_test_index,
         } = reason;
 
-        let opt_result = ctx
-            .queues
-            .handle_manifest_progress_timeout(&run_id, last_observed_test_index);
+        let opt_result = queues.handle_manifest_progress_timeout(&run_id, last_observed_test_index);
 
         match opt_result {
             Some(result) => match result {
@@ -2206,11 +2237,10 @@ impl QueueServer {
                 } => {
                     // Enqueue a new wait-for-manifest-progress timeout with the newly-observed
                     // progress.
-                    let timeout_spec = ctx
-                        .timeout_manager
+                    let timeout_spec = timeout_manager
                         .strategy()
                         .wait_for_manifest_progress_duration(newly_observed_test_index);
-                    ctx.timeout_manager.insert(run_id, timeout_spec).await;
+                    timeout_manager.insert(run_id, timeout_spec).await;
 
                     Ok(())
                 }
@@ -2466,9 +2496,14 @@ async fn run_summary_persistence_task(
     entity: Entity,
     persist_results: &SharedPersistResults,
     results_persistence: ResultsPersistedCell,
+    eligible_for_remote_dump: EligibleForRemoteDump,
     summary: results::Summary,
 ) -> OpaqueResult<()> {
-    let task = results_persistence.build_persist_summary_plan(persist_results, summary);
+    let task = results_persistence.build_persist_summary_plan(
+        persist_results,
+        summary,
+        eligible_for_remote_dump,
+    );
 
     task.execute().await.map_err(dearc_located)
 }

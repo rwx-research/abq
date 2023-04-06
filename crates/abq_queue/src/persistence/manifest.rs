@@ -34,6 +34,14 @@ impl ManifestView {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     fn get_partition_for_entity(self, entity_tag: Tag) -> Vec<WorkerTest> {
         let Self {
             mut items,

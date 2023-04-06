@@ -3,6 +3,7 @@ use std::{
     future::Future,
     num::{NonZeroU64, NonZeroUsize},
     panic,
+    path::Path,
     pin::Pin,
     sync::Arc,
     time::Duration,
@@ -10,13 +11,18 @@ use std::{
 
 use abq_native_runner_simulation::{legal_spawned_message, pack, pack_msgs_to_disk};
 use abq_queue::{
-    persistence,
+    persistence::{
+        self,
+        manifest::ManifestView,
+        remote::{PersistenceKind, RemotePersistence},
+    },
     queue::{Abq, QueueConfig},
     RunTimeoutStrategy, TimeoutReason,
 };
 use abq_test_utils::{artifacts_dir, assert_scoped_log, s};
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
+    error::OpaqueResult,
     exit::ExitCode,
     net_async::{ClientStream, ConfiguredClient},
     net_opt::ClientOptions,
@@ -45,6 +51,7 @@ use abq_workers::{
     workers::{WorkerContext, WorkersExit, WorkersExitStatus},
     DEFAULT_PROTOCOL_VERSION_TIMEOUT, DEFAULT_RUNNER_TEST_TIMEOUT,
 };
+use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt};
 use ntest::timeout;
 use parking_lot::Mutex;
@@ -78,26 +85,36 @@ struct QueueExtDeps {
 struct Server {
     config: QueueConfig,
     deps: QueueExtDeps,
+    remote: InMemoryRemote,
 }
 
 impl Default for Server {
     fn default() -> Self {
+        let remote = InMemoryRemote::default();
+
         let manifests_path = tempfile::tempdir().unwrap();
         let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
             manifests_path.path(),
-            persistence::remote::NoopPersister,
+            remote.clone(),
         );
 
         let results_path = tempfile::tempdir().unwrap();
-        let persist_results =
-            persistence::results::FilesystemPersistor::new_shared(results_path.path(), 10);
+        let persist_results = persistence::results::FilesystemPersistor::new_shared(
+            results_path.path(),
+            10,
+            remote.clone(),
+        );
 
         let config = QueueConfig::new(persist_manifest, persist_results);
         let deps = QueueExtDeps {
             _manifests_path: manifests_path,
             _results_path: results_path,
         };
-        Self { config, deps }
+        Self {
+            config,
+            deps,
+            remote,
+        }
     }
 }
 
@@ -105,6 +122,88 @@ impl Server {
     fn with_timeout_strategy(mut self, run_timeout_strategy: RunTimeoutStrategy) -> Self {
         self.config.run_timeout_strategy = run_timeout_strategy;
         self
+    }
+}
+
+#[derive(Default)]
+struct InMemoryRemoteInner {
+    manifests: HashMap<RunId, ManifestView>,
+    results: HashMap<RunId, OpaqueLazyAssociatedTestResults>,
+}
+
+#[derive(Default, Clone)]
+struct InMemoryRemote(Arc<tokio::sync::Mutex<InMemoryRemoteInner>>);
+
+#[async_trait]
+impl RemotePersistence for InMemoryRemote {
+    async fn store(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        data: Vec<u8>,
+    ) -> OpaqueResult<()> {
+        let mut inner = self.0.lock().await;
+        match kind {
+            PersistenceKind::Manifest => {
+                let manifest: ManifestView = serde_json::from_slice(&data).unwrap();
+                inner.manifests.insert(run_id.clone(), manifest);
+            }
+            PersistenceKind::Results => {
+                use tokio::io::AsyncBufReadExt;
+
+                let mut iter = tokio::io::BufReader::new(data.as_slice()).lines();
+                let mut opaque_jsonl = vec![];
+                while let Some(line) = iter.next_line().await.unwrap() {
+                    opaque_jsonl.push(serde_json::value::RawValue::from_string(line).unwrap())
+                }
+
+                let results = OpaqueLazyAssociatedTestResults::from_raw_json_lines(opaque_jsonl);
+                inner.results.insert(run_id.clone(), results);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores a file from the local filesystem to the remote persistence.
+    async fn store_from_disk(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        from_local_path: &Path,
+    ) -> OpaqueResult<()> {
+        let data = tokio::fs::read(from_local_path).await.unwrap();
+        self.store(kind, run_id, data).await
+    }
+
+    /// Loads a file from the remote persistence to the local filesystem.
+    /// The given local path must have all intermediate directories already created.
+    async fn load(
+        &self,
+        kind: PersistenceKind,
+        run_id: &RunId,
+        into_local_path: &Path,
+    ) -> OpaqueResult<()> {
+        let data = {
+            let inner = self.0.lock().await;
+            match kind {
+                PersistenceKind::Manifest => {
+                    let manifest = inner.manifests.get(run_id).unwrap();
+                    serde_json::to_vec(manifest).unwrap()
+                }
+                PersistenceKind::Results => {
+                    let results = inner.results.get(run_id).unwrap();
+                    serde_json::to_vec(results).unwrap()
+                }
+            }
+        };
+
+        tokio::fs::write(into_local_path, data).await.unwrap();
+
+        Ok(())
+    }
+
+    fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
+        Box::new(self.clone())
     }
 }
 
@@ -177,8 +276,9 @@ fn sort_results_owned(results: &mut [FlatResult<'_>]) -> Vec<(u32, String)> {
 }
 
 fn flatten_queue_results(
-    results: OpaqueLazyAssociatedTestResults,
+    results: impl std::borrow::Borrow<OpaqueLazyAssociatedTestResults>,
 ) -> (Vec<(u32, String)>, Summary) {
+    let results = results.borrow();
     let lines = results.decode().unwrap();
     let mut collected = Vec::with_capacity(lines.len());
     let mut summary = None;
@@ -245,6 +345,9 @@ enum Assert<'a> {
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, Box<dyn Fn(&WorkersExitStatus)>),
     WorkerResultStatus(Wid, &'a dyn Fn(&WorkersExitKind)),
+
+    RemoteManifest(Run, Box<dyn Fn(&ManifestView)>),
+    RemoteResults(Run, Box<dyn Fn(&OpaqueLazyAssociatedTestResults)>),
 }
 
 type Steps<'a> = Vec<(Vec<Action>, Vec<Assert<'a>>)>;
@@ -275,6 +378,11 @@ impl<'a> TestBuilder<'a> {
 
     fn act(mut self, actions: impl IntoIterator<Item = Action>) -> Self {
         self.steps.push((actions.into_iter().collect(), vec![]));
+        self
+    }
+
+    fn assert(mut self, asserts: impl IntoIterator<Item = Assert<'a>>) -> Self {
+        self.steps.push((vec![], asserts.into_iter().collect()));
         self
     }
 
@@ -488,6 +596,7 @@ async fn run_test(server: Server, steps: Steps<'_>) {
     let Server {
         config,
         deps: _deps,
+        remote,
     } = server;
     let mut queue = Abq::start(config).await;
 
@@ -580,6 +689,20 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                     let real_result = results.get(&n).expect("workers result not found");
                     workers_result(real_result)
                 }
+
+                RemoteManifest(n, check) => {
+                    let run_id = run_ids.get(&n).unwrap().clone();
+                    let remote = remote.0.lock().await;
+                    let manifest = remote.manifests.get(&run_id).unwrap();
+                    check(manifest)
+                }
+
+                RemoteResults(n, check) => {
+                    let run_id = run_ids.get(&n).unwrap().clone();
+                    let remote = remote.0.lock().await;
+                    let results = remote.results.get(&run_id).unwrap();
+                    check(results)
+                }
             }
         }
     }
@@ -643,6 +766,23 @@ async fn multiple_jobs_complete() {
                 ),
             ],
         )
+        // Check the remote
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 2);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(results, vec![(1, s!("echo1")), (1, s!("echo2"))]);
+                    assert_eq!(summary.manifest_size_nonce, 2);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -737,6 +877,31 @@ async fn multiple_worker_count() {
                 ),
             ],
         )
+        .assert([
+            RemoteManifest(
+                Run(73495),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 5);
+                }),
+            ),
+            RemoteResults(
+                Run(73495),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(
+                        results,
+                        vec![
+                            (1, s!("echo1")),
+                            (1, s!("echo2")),
+                            (1, s!("echo3")),
+                            (1, s!("echo4")),
+                            (1, s!("echo5"))
+                        ]
+                    );
+                    assert_eq!(summary.manifest_size_nonce, 5);
+                }),
+            ),
+        ])
         .test()
         .await;
 
@@ -850,6 +1015,40 @@ async fn multiple_invokers() {
                 ),
             ],
         )
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 2);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(results, vec![(1, s!("echo1")), (1, s!("echo2"))]);
+                    assert_eq!(summary.manifest_size_nonce, 2);
+                }),
+            ),
+            //
+            RemoteManifest(
+                Run(2),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 3);
+                }),
+            ),
+            RemoteResults(
+                Run(2),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(
+                        results,
+                        vec![(1, s!("echo3")), (1, s!("echo4")), (1, s!("echo5"))]
+                    );
+                    assert_eq!(summary.manifest_size_nonce, 3);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -920,6 +1119,30 @@ async fn batch_two_requests_at_a_time() {
                 ),
             ],
         )
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 4);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(
+                        results,
+                        [
+                            (1, s!("echo1")),
+                            (1, s!("echo2")),
+                            (1, s!("echo3")),
+                            (1, s!("echo4"))
+                        ]
+                    );
+                    assert_eq!(summary.manifest_size_nonce, 4);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -963,6 +1186,14 @@ async fn empty_manifest_exits_gracefully() {
                 ),
             ],
         )
+        .assert([RemoteResults(
+            Run(1),
+            Box::new(|results| {
+                let (results, summary) = flatten_queue_results(results);
+                assert_eq!(results, []);
+                assert_eq!(summary.manifest_size_nonce, 0);
+            }),
+        )])
         .test()
         .await;
 }
@@ -1289,6 +1520,23 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                 ),
             ],
         )
+        // Remote should also see the same results.
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 2);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(results, [(1, s!("echo1")), (1, s!("echo2"))]);
+                    assert_eq!(summary.manifest_size_nonce, 2);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -1534,6 +1782,32 @@ async fn multiple_tests_per_work_id_reported() {
                 ),
             ],
         )
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 2);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(
+                        vec![
+                            (1, s!("echo1")),
+                            (1, s!("echo2")),
+                            (1, s!("echo3")),
+                            (1, s!("echo4")),
+                            (1, s!("echo5")),
+                            (1, s!("echo6")),
+                        ],
+                        results
+                    );
+                    assert_eq!(summary.manifest_size_nonce, 2);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -1624,20 +1898,39 @@ async fn many_retries_complete() {
                 ),
                 QueueTestResults(
                     Run(1),
-                    Box::new(move |resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
-                            assert_eq!(results, expected_queue_results);
-                            assert_eq!(summary.manifest_size_nonce, 4);
+                    Box::new({
+                        let expected_queue_results = expected_queue_results.clone();
+                        move |resp| match resp {
+                            TestResultsResponse::Results {
+                                chunk,
+                                final_chunk: true,
+                            } => {
+                                let (results, summary) = flatten_queue_results(chunk);
+                                assert_eq!(results, expected_queue_results);
+                                assert_eq!(summary.manifest_size_nonce, 4);
+                            }
+                            _ => unreachable!("{resp:?}"),
                         }
-                        _ => unreachable!("{resp:?}"),
                     }),
                 ),
             ],
         )
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 4);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(move |results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(results, expected_queue_results);
+                    assert_eq!(summary.manifest_size_nonce, 4);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -1707,24 +2000,45 @@ async fn many_retries_many_workers_complete() {
             results == expected_workers_results
         }),
     ));
-    end_workers_asserts.push(QueueTestResults(
-        Run(1),
-        Box::new(move |resp| match resp {
-            TestResultsResponse::Results {
-                chunk,
-                final_chunk: true,
-            } => {
-                let (results, summary) = flatten_queue_results(chunk);
+    end_workers_asserts.push({
+        let expected_queue_results = expected_queue_results.clone();
+        QueueTestResults(
+            Run(1),
+            Box::new(move |resp| match resp {
+                TestResultsResponse::Results {
+                    chunk,
+                    final_chunk: true,
+                } => {
+                    let (results, summary) = flatten_queue_results(chunk);
+                    assert_eq!(results, expected_queue_results);
+                    assert_eq!(summary.manifest_size_nonce, num_tests);
+                }
+                _ => unreachable!("{resp:?}"),
+            }),
+        )
+    });
+
+    let remote_asserts = [
+        RemoteManifest(
+            Run(1),
+            Box::new(move |manifest| {
+                assert_eq!(manifest.len(), num_tests as usize);
+            }),
+        ),
+        RemoteResults(
+            Run(1),
+            Box::new(move |results| {
+                let (results, summary) = flatten_queue_results(results);
                 assert_eq!(results, expected_queue_results);
                 assert_eq!(summary.manifest_size_nonce, num_tests);
-            }
-            _ => unreachable!("{resp:?}"),
-        }),
-    ));
+            }),
+        ),
+    ];
 
     TestBuilder::default()
         .act(start_actions)
         .step(end_workers_actions, end_workers_asserts)
+        .assert(remote_asserts)
         .test()
         .await;
 }
@@ -1859,20 +2173,39 @@ async fn many_retries_many_workers_complete_native() {
                 ),
                 QueueTestResults(
                     Run(1),
-                    Box::new(move |resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
-                            assert_eq!(results, expected_queue_results);
-                            assert_eq!(summary.manifest_size_nonce, num_tests);
+                    Box::new({
+                        let expected_queue_results = expected_queue_results.clone();
+                        move |resp| match resp {
+                            TestResultsResponse::Results {
+                                chunk,
+                                final_chunk: true,
+                            } => {
+                                let (results, summary) = flatten_queue_results(chunk);
+                                assert_eq!(results, expected_queue_results);
+                                assert_eq!(summary.manifest_size_nonce, num_tests);
+                            }
+                            _ => unreachable!("{resp:?}"),
                         }
-                        _ => unreachable!("{resp:?}"),
                     }),
                 ),
             ],
         )
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(move |manifest| {
+                    assert_eq!(manifest.len(), num_tests as usize);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(move |results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(results, expected_queue_results);
+                    assert_eq!(summary.manifest_size_nonce, num_tests);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -2078,6 +2411,30 @@ async fn retry_out_of_process_worker() {
                 }),
             )],
         )
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 2);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(
+                        results,
+                        [
+                            (1, s!("echo1")),
+                            (1, s!("echo1")),
+                            (1, s!("echo2")),
+                            (1, s!("echo2"))
+                        ]
+                    );
+                    assert_eq!(summary.manifest_size_nonce, 2);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
@@ -2157,27 +2514,48 @@ async fn many_retries_of_many_out_of_process_workers() {
                     results == expected_workers_results
                 }),
             ),
-            QueueTestResults(
-                run,
-                Box::new(move |resp| match resp {
-                    TestResultsResponse::Results {
-                        chunk,
-                        final_chunk: true,
-                    } => {
-                        let (results, summary) = flatten_queue_results(chunk);
-                        assert_eq!(results, expected_queue_results);
-                        assert_eq!(summary.manifest_size_nonce, num_tests);
-                    }
-                    _ => unreachable!("{resp:?}"),
+            {
+                let expected_queue_results = expected_queue_results.clone();
+                QueueTestResults(
+                    run,
+                    Box::new(move |resp| match resp {
+                        TestResultsResponse::Results {
+                            chunk,
+                            final_chunk: true,
+                        } => {
+                            let (results, summary) = flatten_queue_results(chunk);
+                            assert_eq!(results, expected_queue_results);
+                            assert_eq!(summary.manifest_size_nonce, num_tests);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                )
+            },
+        ]);
+
+        let remote_asserts = [
+            RemoteManifest(
+                Run(1),
+                Box::new(move |manifest| {
+                    assert_eq!(manifest.len(), num_tests as usize);
                 }),
             ),
-        ]);
+            RemoteResults(
+                Run(1),
+                Box::new(move |results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(results, expected_queue_results);
+                    assert_eq!(summary.manifest_size_nonce, num_tests);
+                }),
+            ),
+        ];
 
         // Chain on the test, then do the next retry iteration.
         builder = builder
             .act(start_actions)
             .step(end_workers_actions, end_workers_asserts)
-            .step(end_run_actions, end_run_asserts);
+            .step(end_run_actions, end_run_asserts)
+            .assert(remote_asserts);
     }
 
     builder.test().await;
@@ -2259,13 +2637,13 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
             Wid(1),
             WorkersConfigBuilder::new(1, runner1).with_num_workers(two),
         )])
+        .act([
+            StopWorkers(Wid(1)),
+            // Run should now be seen as completed
+            WaitForCompletedRun(Run(1)),
+        ])
         .step(
-            [
-                StopWorkers(Wid(1)),
-                // Run should now be seen as completed
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [WaitForNoPendingResults(Run(1))],
             [
                 WorkerTestResults(
                     Run(1),
@@ -2301,12 +2679,9 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
             Wid(2),
             WorkersConfigBuilder::new(1, runner2).with_num_workers(two),
         )])
+        .act([CancelWorkers(Wid(2)), WaitForCompletedRun(Run(1))])
         .step(
-            [
-                CancelWorkers(Wid(2)),
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [WaitForNoPendingResults(Run(1))],
             [
                 WorkerTestResults(
                     Run(1),
@@ -2342,12 +2717,9 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
             Wid(3),
             WorkersConfigBuilder::new(1, runner3).with_num_workers(two),
         )])
+        .act([StopWorkers(Wid(3)), WaitForCompletedRun(Run(1))])
         .step(
-            [
-                StopWorkers(Wid(3)),
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [WaitForNoPendingResults(Run(1))],
             [
                 WorkerTestResults(
                     Run(1),
@@ -2377,6 +2749,22 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
                 ),
             ],
         )
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 1);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(results.len(), 2);
+                    assert_eq!(summary.manifest_size_nonce, 1);
+                }),
+            ),
+        ])
         .test()
         .await;
 }
