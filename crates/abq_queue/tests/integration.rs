@@ -22,8 +22,9 @@ use abq_queue::{
 use abq_test_utils::{artifacts_dir, assert_scoped_log, s};
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
-    error::OpaqueResult,
+    error::{ErrorLocation, OpaqueResult},
     exit::ExitCode,
+    here,
     net_async::{ClientStream, ConfiguredClient},
     net_opt::ClientOptions,
     net_protocol::{
@@ -178,11 +179,17 @@ impl RemotePersistence for InMemoryRemote {
             let inner = self.0.lock().await;
             match kind {
                 PersistenceKind::Manifest => {
-                    let manifest = inner.manifests.get(run_id).unwrap();
+                    let manifest = inner
+                        .manifests
+                        .get(run_id)
+                        .ok_or_else(|| "manifest for entry missing".located(here!()))?;
                     serde_json::to_vec(manifest).unwrap()
                 }
                 PersistenceKind::Results => {
-                    let results = inner.results.get(run_id).unwrap();
+                    let results = inner
+                        .results
+                        .get(run_id)
+                        .ok_or_else(|| "results for entry missing".located(here!()))?;
                     serde_json::to_vec(results).unwrap()
                 }
             }

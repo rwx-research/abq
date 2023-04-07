@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::{future::Future, path::PathBuf};
 
+use abq_utils::error::ErrorLocation;
+use abq_utils::here;
 use abq_utils::{error::OpaqueResult, net_protocol::workers::RunId};
 use async_trait::async_trait;
 
@@ -15,6 +17,11 @@ pub struct FakePersister<OnStoreFromDisk, OnLoad> {
 #[track_caller]
 pub async fn unreachable(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> OpaqueResult<()> {
     unreachable!()
+}
+
+#[track_caller]
+pub async fn error(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> OpaqueResult<()> {
+    Err("error".located(here!()))
 }
 
 impl<OnStoreFromDisk, OnStoreFromDiskF, OnLoad, OnLoadF> FakePersister<OnStoreFromDisk, OnLoad>
