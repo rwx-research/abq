@@ -147,7 +147,7 @@ impl PersistentManifest for FilesystemPersistor {
         };
 
         // Cede control to the remote persister so it can read from the path, while we still have
-        // exlusive access to the file.
+        // exclusive access to the file.
         {
             let path = self.get_path(run_id);
             self.remote
