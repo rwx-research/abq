@@ -830,10 +830,10 @@ mod test {
 
         let mut join_set = tokio::task::JoinSet::new();
 
-        for i in 0..N {
+        for results in other_results.iter() {
             let run_id = run_id.clone();
-            let results = other_results[i].clone();
             let fs = fs.clone();
+            let results = results.clone();
             join_set.spawn(async move {
                 fs.dump(&run_id, results).await.unwrap();
             });
