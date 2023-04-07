@@ -189,7 +189,7 @@ mod test {
     };
 
     use crate::persistence::{
-        remote::{self, fake_unreachable, PersistenceKind},
+        remote::{self, fake_error, fake_unreachable, PersistenceKind},
         results::EligibleForRemoteDump,
     };
 
@@ -284,7 +284,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_last() {
-        let remote = remote::FakePersister::new(fake_unreachable, fake_unreachable);
+        let remote = remote::FakePersister::new(fake_unreachable, fake_error);
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -308,7 +308,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(fake_unreachable, fake_unreachable);
+        let remote = remote::FakePersister::new(fake_unreachable, fake_error);
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -334,7 +334,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(fake_unreachable, fake_unreachable);
+        let remote = remote::FakePersister::new(fake_unreachable, fake_error);
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -386,7 +386,7 @@ mod test {
                     }
                 }
             },
-            fake_unreachable,
+            fake_error,
         );
 
         let tempdir = tempfile::tempdir().unwrap();
