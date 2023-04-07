@@ -1,8 +1,11 @@
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use abq_utils::{
     error::ResultLocation,
-    here,
+    here, log_assert,
     net_protocol::{
         entity::Tag,
         workers::{RunId, WorkerTest},
@@ -11,7 +14,10 @@ use abq_utils::{
 use async_trait::async_trait;
 use fs4::FileExt;
 
-use crate::persistence::remote::{PersistenceKind, RemotePersister};
+use crate::persistence::{
+    remote::{PersistenceKind, RemotePersister},
+    OffloadConfig,
+};
 
 use super::{ManifestView, PersistentManifest, Result, SharedPersistManifest};
 
@@ -41,10 +47,7 @@ impl FilesystemPersistor {
         root: impl Into<PathBuf>,
         remote: impl Into<RemotePersister>,
     ) -> SharedPersistManifest {
-        SharedPersistManifest(Box::new(Self {
-            root: root.into(),
-            remote: remote.into(),
-        }))
+        SharedPersistManifest(Box::new(Self::new(root, remote)))
     }
 
     fn get_path(&self, run_id: &RunId) -> PathBuf {
@@ -53,9 +56,31 @@ impl FilesystemPersistor {
         self.root.join(format!("{run_id}.manifest.json"))
     }
 
+    fn run_id_from_path(&self, path: &Path) -> Result<RunId> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("{path:?} has no file name"))
+            .located(here!())?;
+
+        let file_name = file_name
+            .to_str()
+            .ok_or_else(|| format!("file name is not valid UTF-8: {:?}", file_name))
+            .located(here!())?;
+
+        let run_id = file_name
+            .strip_suffix(".manifest.json")
+            .ok_or_else(|| format!("file name does not end in .manifest.json: {:?}", file_name))
+            .located(here!())?;
+
+        Ok(RunId(run_id.to_owned()))
+    }
+
     async fn get_locked_file(&self, run_id: &RunId) -> Result<LockedFile> {
         let path = self.get_path(run_id);
+        self.get_locked_file_path(path).await
+    }
 
+    async fn get_locked_file_path(&self, path: PathBuf) -> Result<LockedFile> {
         // NB: we use a blocking task here because the fs4 `lock_exclusive` blocks the
         // executor, even when using the async extension.
         //
@@ -131,6 +156,70 @@ impl FilesystemPersistor {
             }
         }
     }
+
+    /// Offloads to the remote all non-empty manifest files that are older than
+    /// the configured threshold.
+    async fn run_offload_job(&self, offload_config: OffloadConfig) -> Result<()> {
+        let time_now = SystemTime::now();
+        let mut manifest_files = tokio::fs::read_dir(&self.root).await.located(here!())?;
+        while let Some(manifest_file) = manifest_files.next_entry().await.located(here!())? {
+            let metadata = manifest_file.metadata().await.located(here!())?;
+            log_assert!(!metadata.is_dir(), path=?manifest_file.path(), "manifest file is a directory");
+
+            if eligible_for_offload(&time_now, &offload_config, &metadata).await? {
+                let path = manifest_file.path();
+                let run_id = self.run_id_from_path(&path)?;
+                self.perform_offload(path, &run_id, &time_now, &offload_config)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn perform_offload(
+        &self,
+        path: PathBuf,
+        run_id: &RunId,
+        time_now: &SystemTime,
+        offload_config: &OffloadConfig,
+    ) -> Result<()> {
+        // Grab an exclusive lock on the file so it isn't changed from under us.
+        let locked_file = self.get_locked_file_path(path.clone()).await?;
+
+        let locked_file = tokio::fs::File::from_std(locked_file);
+
+        // We must now check again whether the file is eligible for offload, since it may have been
+        // modified since we performed the non-locked check.
+        let metadata = locked_file.metadata().await.located(here!())?;
+        if !eligible_for_offload(time_now, offload_config, &metadata).await? {
+            return Ok(());
+        }
+
+        self.remote
+            .store_from_disk(PersistenceKind::Manifest, run_id, &path)
+            .await?;
+
+        // Truncate the file to 0 bytes, freeing the disk space.
+        // Note that this doesn't free the inode.
+        locked_file.set_len(0).await.located(here!())?;
+
+        Ok(())
+    }
+}
+
+async fn eligible_for_offload(
+    time_now: &SystemTime,
+    offload_config: &OffloadConfig,
+    metadata: &std::fs::Metadata,
+) -> Result<bool> {
+    let size = metadata.len();
+    let should_offload_time = || {
+        let accessed_time = metadata.accessed().located(here!())?;
+        let elapsed = time_now.duration_since(accessed_time).located(here!())?;
+        let should_offload = offload_config.should_offload(elapsed);
+        Ok(should_offload)
+    };
+    Ok(size > 0 && should_offload_time()?)
 }
 
 #[async_trait]
