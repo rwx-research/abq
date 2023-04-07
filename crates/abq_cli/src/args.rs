@@ -13,10 +13,13 @@ use abq_utils::{
 use clap::{ArgGroup, Parser, Subcommand};
 
 use crate::{
-    instance::remote_persistence::{
-        RemotePersistenceStrategy, ENV_REMOTE_PERSISTENCE_COMMAND,
-        ENV_REMOTE_PERSISTENCE_S3_BUCKET, ENV_REMOTE_PERSISTENCE_S3_KEY_PREFIX,
-        ENV_REMOTE_PERSISTENCE_STRATEGY,
+    instance::{
+        local_persistence::{ENV_PERSISTED_MANIFESTS_DIR, ENV_PERSISTED_RESULTS_DIR},
+        remote_persistence::{
+            RemotePersistenceStrategy, ENV_REMOTE_PERSISTENCE_COMMAND,
+            ENV_REMOTE_PERSISTENCE_S3_BUCKET, ENV_REMOTE_PERSISTENCE_S3_KEY_PREFIX,
+            ENV_REMOTE_PERSISTENCE_STRATEGY,
+        },
     },
     reporting::{ColorPreference, ReporterKind},
 };
@@ -121,6 +124,16 @@ pub enum Command {
         /// If provided, must also provide `--tls-cert`.
         #[clap(long, requires("tls_cert"))]
         tls_key: Option<PathBuf>,
+
+        /// The directory persisted manifests should be written to.
+        /// If unspecified, a temporary directory will be used.
+        #[clap(long, required = false, env(ENV_PERSISTED_MANIFESTS_DIR))]
+        persisted_manifests_dir: Option<PathBuf>,
+
+        /// The directory persisted results should be written to.
+        /// If unspecified, a temporary directory will be used.
+        #[clap(long, required = false, env(ENV_PERSISTED_RESULTS_DIR))]
+        persisted_results_dir: Option<PathBuf>,
 
         /// How files should be persisted to a remote location, if at all.{n}
         /// The default is that no remote persistence is performed, and instead results and
