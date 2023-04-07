@@ -453,18 +453,21 @@ mod test {
         assert_eq!(tests, vec![test1]);
     }
 
-    #[n_times(1000)]
+    #[n_times(100)]
     #[tokio::test]
     async fn race_multiple_reads_with_fetch_from_remote() {
-        let runner1 = Tag::runner(0, 1);
-        let runner2 = Tag::runner(0, 2);
+        const N: usize = 10;
 
-        let test1 = WorkerTest::new(spec(1), INIT_RUN_NUMBER);
-        let test2 = WorkerTest::new(spec(2), INIT_RUN_NUMBER);
+        let runners = (1..=N)
+            .map(|r| Tag::runner(0, r as u32))
+            .collect::<Vec<_>>();
+        let tests = (1..=N)
+            .map(|t| WorkerTest::new(spec(t), INIT_RUN_NUMBER))
+            .collect::<Vec<_>>();
 
         let view = ManifestView {
-            items: vec![test1.clone(), test2.clone()],
-            assigned_entities: vec![runner1, runner2],
+            items: tests.clone(),
+            assigned_entities: runners.clone(),
         };
 
         let run_id = RunId("run-id".to_string());
@@ -487,27 +490,22 @@ mod test {
             ),
         );
 
-        let load_task1 = {
+        let mut join_set = tokio::task::JoinSet::new();
+        for i in 0..N {
             let fs = fs.clone();
             let run_id = run_id.clone();
-            async move {
-                let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
-                assert_eq!(tests, vec![test1]);
-            }
-        };
 
-        let load_task2 = {
-            let fs = fs.clone();
-            async move {
-                let tests = fs.get_partition_for_entity(&run_id, runner2).await.unwrap();
-                assert_eq!(tests, vec![test2]);
-            }
-        };
+            let runner = runners[i].clone();
+            let test = tests[i].clone();
 
-        if i % 2 == 0 {
-            tokio::join!(load_task1, load_task2);
-        } else {
-            tokio::join!(load_task2, load_task1);
+            join_set.spawn(async move {
+                let tests = fs.get_partition_for_entity(&run_id, runner).await.unwrap();
+                assert_eq!(tests, vec![test]);
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            result.unwrap();
         }
     }
 }
