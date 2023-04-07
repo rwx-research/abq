@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 
 use abq_utils::net_protocol::workers::RunId;
 
@@ -215,6 +215,7 @@ const TEST_ADMIN_AUTH_TOKEN: &str = "abqadmin_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF";
 /// Configuration options for how clients and servers in an abq run communicate.
 /// Namely: whether they use an authentication header or not, and eventually, whether they use TLS
 /// or not.
+#[derive(Clone, Copy)]
 struct CSConfigOptions {
     use_auth_token: bool,
     tls: bool,
@@ -3264,6 +3265,55 @@ fn custom_remote_persistence() {
     term(queue_proc);
 }
 
+struct CopyToDirPersister {
+    tempdir: TempDir,
+    _script: NamedTempFile,
+    command: String,
+}
+
+impl CopyToDirPersister {
+    fn new() -> Self {
+        let custom_persisted_path = tempfile::tempdir().unwrap();
+        let custom_script = write_to_temp(&formatdoc! {
+            "
+            function run() {{
+                const fs = require(`fs`);
+
+                const dir = `{persist_dir}`;
+
+                const action = process.argv[2];
+
+                const kind = process.argv[3];
+                const runId = process.argv[4];
+
+                const theirs = process.argv[5];
+                const mine = `${{dir}}/${{kind}}-${{runId}}`;
+
+                //throw new Error(`mine: ${{mine}} theirs: ${{theirs}}`)
+
+                if (action === 'store') fs.copyFileSync(theirs, mine);
+                else if (action === 'load') fs.copyFileSync(mine, theirs);
+                else throw new Error(`Unknown action: ${{action}}`);
+            }}
+
+            run()
+            ",
+            persist_dir = custom_persisted_path.path().display(),
+        });
+        let custom_command = format!("node,{}", custom_script.path().to_str().unwrap());
+
+        Self {
+            tempdir: custom_persisted_path,
+            _script: custom_script,
+            command: custom_command,
+        }
+    }
+
+    fn dir(&self) -> &Path {
+        self.tempdir.path()
+    }
+}
+
 #[test]
 #[serial]
 fn manifest_loaded_from_remote_persistence() {
@@ -3273,34 +3323,13 @@ fn manifest_loaded_from_remote_persistence() {
         tls: true,
     };
 
-    let custom_persisted_path = tempfile::tempdir().unwrap().into_path();
-    let custom_script = write_to_temp(&formatdoc! {
-        "
-        const fs = require(`fs`);
-
-        const dir = `{persist_dir}`;
-
-        const action = process.argv[2];
-
-        const kind = process.argv[3];
-        const runId = process.argv[4];
-
-        const theirs = process.argv[5];
-        const mine = `${{dir}}/${{kind}}-${{runId}}`;
-
-        if (action === 'store') fs.copyFileSync(theirs, mine);
-        else if (action === 'load') fs.copyFileSync(mine, theirs);
-        else throw new Error(`Unknown action: ${{action}}`);
-        ",
-        persist_dir = custom_persisted_path.display(),
-    });
-    let custom_command = format!("node,{}", custom_script.path().to_str().unwrap());
+    let custom_persister = CopyToDirPersister::new();
 
     let local_manifests_dir = tempfile::tempdir().unwrap().into_path();
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
         ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
-        ("ABQ_REMOTE_PERSISTENCE_COMMAND", &custom_command),
+        ("ABQ_REMOTE_PERSISTENCE_COMMAND", &custom_persister.command),
         ("ABQ_PERSISTED_MANIFESTS_DIR", local_manifests_dir.to_str().unwrap()),
     ]);
 
@@ -3379,7 +3408,7 @@ fn manifest_loaded_from_remote_persistence() {
     }
 
     let local_manifest_path = local_manifests_dir.join("test-run-id.manifest.json");
-    let custom_persister_manifest_path = custom_persisted_path.join("manifest-test-run-id");
+    let custom_persister_manifest_path = custom_persister.dir().join("manifest-test-run-id");
 
     // There should now be a manifest in the local persisted directory. Delete it.
     {

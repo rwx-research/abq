@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use abq_utils::{
-    error::ResultLocation,
+    error::{OpaqueResult, ResultLocation},
     here,
     net_protocol::{
         results::{OpaqueLazyAssociatedTestResults, ResultsLine},
@@ -142,11 +142,19 @@ impl PersistResults for FilesystemPersistor {
         let mut fi = fi.lock().await;
         fi.rewind().await.located(here!())?;
 
-        let mut iter = tokio::io::BufReader::new(&mut *fi).lines();
-        let mut opaque_jsonl = vec![];
-        while let Some(line) = iter.next_line().await.located(here!())? {
-            opaque_jsonl.push(serde_json::value::RawValue::from_string(line).located(here!())?);
-        }
+        let opaque_jsonl = match read_results_lines(&mut fi).await {
+            Ok(results) if !results.is_empty() => results,
+            _ => {
+                // Slow path: the results are missing in the local cache, or corrupted.
+                // Load them in now and retry.
+                self.remote
+                    .load_to_disk(PersistenceKind::Results, run_id, &self.get_path(run_id))
+                    .await?;
+
+                fi.rewind().await.located(here!())?;
+                read_results_lines(&mut fi).await?
+            }
+        };
 
         Ok(OpaqueLazyAssociatedTestResults::from_raw_json_lines(
             opaque_jsonl,
@@ -158,14 +166,28 @@ impl PersistResults for FilesystemPersistor {
     }
 }
 
+async fn read_results_lines(fi: &mut File) -> OpaqueResult<Vec<Box<serde_json::value::RawValue>>> {
+    let mut iter = tokio::io::BufReader::new(fi).lines();
+    let mut opaque_jsonl = vec![];
+    while let Some(line) = iter.next_line().await.located(here!())? {
+        opaque_jsonl.push(serde_json::value::RawValue::from_string(line).located(here!())?);
+    }
+    Ok(opaque_jsonl)
+}
+
 #[cfg(test)]
 mod test {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::{atomic::AtomicUsize, Arc},
+    };
 
     use abq_run_n_times::n_times;
     use abq_test_utils::wid;
     use abq_utils::{
-        error::ResultLocation,
+        atomic,
+        error::{ErrorLocation, ResultLocation},
+        here,
         net_protocol::{
             queue::AssociatedTestResults,
             results::ResultsLine::{self, Results},
@@ -493,5 +515,128 @@ mod test {
         }
         dump_remote_result.unwrap();
         dump_results_result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_get_results_fetches_from_remote() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+
+        let remote = {
+            let results = results.clone();
+            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
+                let results = results.clone();
+                async move {
+                    tokio::fs::write(path, serde_json::to_vec(&results).unwrap())
+                        .await
+                        .unwrap();
+                    Ok(())
+                }
+            })
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = actual_results.decode().unwrap();
+        assert_eq!(actual_results, vec![results]);
+    }
+
+    #[tokio::test]
+    async fn missing_get_results_errors_if_remote_errors() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let remote = remote::FakePersister::new(fake_unreachable, |_, _, _| async {
+            Err("i failed".located(here!()))
+        });
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        let result = fs.get_results(&run_id).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("i failed"));
+    }
+
+    #[tokio::test]
+    async fn get_results_prefer_local_to_remote() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+
+        let remote = { remote::FakePersister::new(fake_unreachable, fake_unreachable) };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        fs.dump(&run_id, results.clone()).await.unwrap();
+
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = actual_results.decode().unwrap();
+        assert_eq!(actual_results, vec![results]);
+    }
+
+    #[n_times(100)]
+    #[tokio::test]
+    async fn race_getting_multiple_results_from_remote() {
+        // When we need to fetch results from the remote, they should only be loaded in once if the
+        // local cache is hot.
+        const N: usize = 10;
+
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+
+        let remote_loads = Arc::new(AtomicUsize::new(0));
+
+        let remote = {
+            let results = results.clone();
+            let remote_loads = remote_loads.clone();
+            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
+                let results = results.clone();
+                let remote_loads = remote_loads.clone();
+                async move {
+                    tokio::fs::write(path, serde_json::to_vec(&results).unwrap())
+                        .await
+                        .unwrap();
+                    remote_loads.fetch_add(1, atomic::ORDERING);
+                    Ok(())
+                }
+            })
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for _ in 0..N {
+            let run_id = run_id.clone();
+            let results = results.clone();
+            let fs = fs.clone();
+            join_set.spawn(async move {
+                let actual_results = fs.get_results(&run_id).await.unwrap();
+                let actual_results = actual_results.decode().unwrap();
+                assert_eq!(actual_results, vec![results]);
+            });
+        }
+
+        while let Some(join_handle) = join_set.join_next().await {
+            join_handle.unwrap();
+        }
+
+        assert_eq!(remote_loads.load(atomic::ORDERING), 1);
     }
 }
