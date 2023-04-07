@@ -264,7 +264,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             };
 
             let local_persistence_config =
-                LocalPersistenceConfig::new(persisted_results_dir, persisted_manifests_dir);
+                LocalPersistenceConfig::new(persisted_manifests_dir, persisted_results_dir);
 
             let remote_persistence_config = RemotePersistenceConfig::new(
                 remote_persistence_strategy,
