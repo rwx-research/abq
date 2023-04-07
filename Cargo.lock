@@ -160,6 +160,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "fs4",
  "futures",
  "indoc",
  "insta",
@@ -1166,8 +1167,10 @@ version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ea55201cc351fdb478217c0fb641b59813da9b4efe4c414a9d8f989a657d149"
 dependencies = [
+ "async-trait",
  "libc",
  "rustix 0.35.13",
+ "tokio",
  "winapi",
 ]
 

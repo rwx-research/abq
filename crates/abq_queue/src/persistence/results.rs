@@ -189,7 +189,7 @@ mod test {
     };
 
     use crate::persistence::{
-        remote::{self, PersistenceKind},
+        remote::{self, fake_unreachable, PersistenceKind},
         results::EligibleForRemoteDump,
     };
 
@@ -277,11 +277,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_last() {
-        let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-        );
+        let remote = remote::FakePersister::new(fake_unreachable, fake_unreachable);
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -305,11 +301,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-        );
+        let remote = remote::FakePersister::new(fake_unreachable, fake_unreachable);
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -335,11 +327,7 @@ mod test {
 
     #[tokio::test]
     async fn execute_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-            |_, _, _| unreachable!(),
-        );
+        let remote = remote::FakePersister::new(fake_unreachable, fake_unreachable);
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -372,23 +360,26 @@ mod test {
         let set_remote = Arc::new(AtomicBool::new(false));
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             {
                 let results = ResultsLine::Results(results.clone());
                 let set_remote = set_remote.clone();
                 move |kind, run_id, path| {
-                    assert_eq!(kind, PersistenceKind::Results);
-                    assert_eq!(run_id.0, "test-run-id");
-                    let data = std::fs::read_to_string(path).unwrap();
-                    let read: ResultsLine = serde_json::from_str(&data).unwrap();
-                    assert_eq!(read, results);
+                    let results = results.clone();
+                    let set_remote = set_remote.clone();
+                    async move {
+                        assert_eq!(kind, PersistenceKind::Results);
+                        assert_eq!(run_id.0, "test-run-id");
+                        let data = tokio::fs::read_to_string(path).await.unwrap();
+                        let read: ResultsLine = serde_json::from_str(&data).unwrap();
+                        assert_eq!(read, results);
 
-                    set_remote.store(true, atomic::ORDERING);
+                        set_remote.store(true, atomic::ORDERING);
 
-                    Ok(())
+                        Ok(())
+                    }
                 }
             },
-            |_, _, _| unreachable!(),
+            fake_unreachable,
         );
 
         let tempdir = tempfile::tempdir().unwrap();

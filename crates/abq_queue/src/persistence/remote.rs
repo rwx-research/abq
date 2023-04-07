@@ -23,6 +23,8 @@ pub use custom::CustomPersister;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
+pub use fake::unreachable as fake_unreachable;
+#[cfg(test)]
 pub use fake::FakePersister;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -49,9 +51,6 @@ impl PersistenceKind {
 
 #[async_trait]
 pub trait RemotePersistence {
-    async fn store(&self, kind: PersistenceKind, run_id: &RunId, data: Vec<u8>)
-        -> OpaqueResult<()>;
-
     /// Stores a file from the local filesystem to the remote persistence.
     async fn store_from_disk(
         &self,
@@ -62,7 +61,7 @@ pub trait RemotePersistence {
 
     /// Loads a file from the remote persistence to the local filesystem.
     /// The given local path must have all intermediate directories already created.
-    async fn load(
+    async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
@@ -90,15 +89,6 @@ impl RemotePersister {
         RemotePersister(Arc::new(Box::new(persister)))
     }
 
-    pub async fn store(
-        &self,
-        kind: PersistenceKind,
-        run_id: &RunId,
-        data: Vec<u8>,
-    ) -> OpaqueResult<()> {
-        self.0.store(kind, run_id, data).await
-    }
-
     pub async fn store_from_disk(
         &self,
         kind: PersistenceKind,
@@ -108,12 +98,12 @@ impl RemotePersister {
         self.0.store_from_disk(kind, run_id, from_local_path).await
     }
 
-    pub async fn load(
+    pub async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
-        self.0.load(kind, run_id, into_local_path).await
+        self.0.load_to_disk(kind, run_id, into_local_path).await
     }
 }

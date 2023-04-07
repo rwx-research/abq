@@ -173,10 +173,10 @@ mod test {
             workers::RunId,
         },
     };
-    use tokio::{runtime, task::JoinSet};
+    use tokio::task::JoinSet;
 
     use crate::persistence::{
-        remote::{self, PersistenceKind},
+        remote::{self, fake_unreachable, PersistenceKind},
         results::PersistResults,
     };
 
@@ -342,20 +342,22 @@ mod test {
         ]);
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             {
                 let results = results.clone();
                 move |kind, run_id, path| {
-                    assert_eq!(kind, PersistenceKind::Results);
-                    assert_eq!(run_id.0, "test-run-id");
-                    assert_eq!(path.file_name().unwrap(), "test-run-id.results.jsonl");
-                    let data = std::fs::read_to_string(path).unwrap();
-                    let read: ResultsLine = serde_json::from_str(&data).unwrap();
-                    assert_eq!(read, results);
-                    Ok(())
+                    let results = results.clone();
+                    async move {
+                        assert_eq!(kind, PersistenceKind::Results);
+                        assert_eq!(run_id.0, "test-run-id");
+                        assert_eq!(path.file_name().unwrap(), "test-run-id.results.jsonl");
+                        let data = tokio::fs::read_to_string(path).await.unwrap();
+                        let read: ResultsLine = serde_json::from_str(&data).unwrap();
+                        assert_eq!(read, results);
+                        Ok(())
+                    }
                 }
             },
-            |_, _, _| unreachable!(),
+            fake_unreachable,
         );
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -371,9 +373,8 @@ mod test {
         let run_id = RunId("test-run-id".to_string());
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            |_, _, _| Err("i failed").located(abq_utils::here!()),
-            |_, _, _| unreachable!(),
+            |_, _, _| async { Err("i failed").located(abq_utils::here!()) },
+            fake_unreachable,
         );
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -390,16 +391,15 @@ mod test {
 
         // The remote should see the results, but the results will be empty.
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
-            move |kind, run_id, path| {
+            move |kind, run_id, path| async move {
                 assert_eq!(kind, PersistenceKind::Results);
                 assert_eq!(run_id.0, "test-run-id");
                 assert_eq!(path.file_name().unwrap(), "test-run-id.results.jsonl");
-                let data = std::fs::read_to_string(path).unwrap();
+                let data = tokio::fs::read_to_string(path).await.unwrap();
                 assert!(data.is_empty());
                 Ok(())
             },
-            |_, _, _| unreachable!(),
+            fake_unreachable,
         );
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -409,8 +409,8 @@ mod test {
     }
 
     #[n_times(100)]
-    #[test]
-    fn dump_to_remote_while_another_results_line_comes_in() {
+    #[tokio::test]
+    async fn dump_to_remote_while_another_results_line_comes_in() {
         // Race dumping to the remote and having another results line come in.
         // Who wins is arbitrary - that's okay since we only want to enforce linearizability.
         // However, we must make sure that the remote does not dump the results in a partial state
@@ -428,78 +428,70 @@ mod test {
         ]);
 
         let remote = remote::FakePersister::new(
-            |_, _, _| unreachable!(),
             {
                 let (results1, results2) = (results1.clone(), results2.clone());
                 move |kind, run_id, path| {
-                    assert_eq!(kind, PersistenceKind::Results);
-                    assert_eq!(run_id.0, "test-run-id");
-                    assert_eq!(path.file_name().unwrap(), "test-run-id.results.jsonl");
+                    let (results1, results2) = (results1.clone(), results2.clone());
 
-                    use std::io::BufRead;
+                    async move {
+                        assert_eq!(kind, PersistenceKind::Results);
+                        assert_eq!(run_id.0, "test-run-id");
+                        assert_eq!(path.file_name().unwrap(), "test-run-id.results.jsonl");
 
-                    let mut fi = std::fs::File::open(path).unwrap();
-                    let lines = std::io::BufReader::new(&mut fi).lines();
+                        use tokio::io::AsyncBufReadExt;
 
-                    let data: Vec<ResultsLine> = lines
-                        .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
-                        .collect();
+                        let mut fi = tokio::fs::File::open(path).await.unwrap();
+                        let mut lines = tokio::io::BufReader::new(&mut fi).lines();
 
-                    if data.len() == 1 {
-                        assert_eq!(data[0], results1);
-                    } else if data.len() == 2 {
-                        assert_eq!(data[0], results1);
-                        assert_eq!(data[1], results2);
-                    } else {
-                        panic!("unexpected number of lines: {:?}", data);
+                        let mut data: Vec<ResultsLine> = vec![];
+                        while let Some(line) = lines.next_line().await.unwrap() {
+                            data.push(serde_json::from_str(&line).unwrap());
+                        }
+
+                        if data.len() == 1 {
+                            assert_eq!(data[0], results1);
+                        } else if data.len() == 2 {
+                            assert_eq!(data[0], results1);
+                            assert_eq!(data[1], results2);
+                        } else {
+                            panic!("unexpected number of lines: {:?}", data);
+                        }
+
+                        Ok(())
                     }
-
-                    Ok(())
                 }
             },
-            |_, _, _| unreachable!(),
+            fake_unreachable,
         );
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
 
-        let rt = || {
-            runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-        };
-
         // Dump the first results line.
         {
             let fs = fs.clone();
-            let run_id = run_id.clone();
-            rt().block_on(async move {
-                fs.dump(&run_id, results1).await.unwrap();
-            });
+            fs.dump(&run_id, results1).await.unwrap();
         }
 
         // Start the two tasks on separate threads, since the remote persister check is blocking.
         let dump_remote_task = {
             let fs = fs.clone();
             let run_id = run_id.clone();
-            move || rt().block_on(async move { fs.dump_to_remote(&run_id).await.unwrap() })
+            async move { fs.dump_to_remote(&run_id).await }
         };
 
-        let dump_results_task =
-            move || rt().block_on(async move { fs.dump(&run_id, results2).await.unwrap() });
+        let dump_results_task = { fs.dump(&run_id, results2) };
 
-        let dump_remote_thread;
-        let dump_results_thread;
+        let dump_remote_result;
+        let dump_results_result;
         if i % 2 == 0 {
-            dump_remote_thread = std::thread::spawn(dump_remote_task);
-            dump_results_thread = std::thread::spawn(dump_results_task);
+            (dump_remote_result, dump_results_result) =
+                tokio::join!(dump_remote_task, dump_results_task);
         } else {
-            dump_results_thread = std::thread::spawn(dump_results_task);
-            dump_remote_thread = std::thread::spawn(dump_remote_task);
+            (dump_results_result, dump_remote_result) =
+                tokio::join!(dump_remote_task, dump_results_task);
         }
-
-        dump_remote_thread.join().unwrap();
-        dump_results_thread.join().unwrap();
+        dump_remote_result.unwrap();
+        dump_results_result.unwrap();
     }
 }

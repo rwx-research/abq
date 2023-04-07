@@ -35,7 +35,11 @@ use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 
 use crate::{
-    args::Token, health::HealthCheckKind, instance::remote_persistence::RemotePersistenceConfig,
+    args::Token,
+    health::HealthCheckKind,
+    instance::{
+        local_persistence::LocalPersistenceConfig, remote_persistence::RemotePersistenceConfig,
+    },
     reporting::StdoutPreferences,
 };
 
@@ -230,6 +234,8 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             admin_token,
             tls_cert,
             tls_key,
+            persisted_results_dir,
+            persisted_manifests_dir,
             remote_persistence_strategy,
             remote_persistence_command,
             remote_persistence_s3_bucket,
@@ -257,6 +263,9 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 _ => unreachable!("Mutual dependency of TLS config should have been caught by clap during arg parsing!"),
             };
 
+            let local_persistence_config =
+                LocalPersistenceConfig::new(persisted_manifests_dir, persisted_results_dir);
+
             let remote_persistence_config = RemotePersistenceConfig::new(
                 remote_persistence_strategy,
                 remote_persistence_command,
@@ -271,6 +280,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 work_port,
                 negotiator_port,
                 ServerOptions::new(server_auth, server_tls),
+                local_persistence_config,
                 remote_persistence_config,
             )
             .await?;

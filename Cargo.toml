@@ -47,6 +47,7 @@ pin-project-lite = "0.2.9"
 
 parking_lot = "0.12.1"
 moka = { version = "0.10.0", features = ["future"] }
+fs4 = { version = "0.6.3", features = ["tokio-async"] }
 fnv = "1.0.7"
 
 signal-hook = "0.3.15"
@@ -78,7 +79,6 @@ derive_more = "0.99.17"
 insta = { version = "1.29.0", features = ["json", "redactions"] }
 paste = "1.0.12"
 
-fs4 = "0.6.3"
 tempfile = "3.4.0"
 tracing-test = { version = "0.2.4", features = ["no-env-filter"] }
 

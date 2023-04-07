@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::{future::Future, path::PathBuf};
 
 use abq_utils::{error::OpaqueResult, net_protocol::workers::RunId};
 use async_trait::async_trait;
@@ -6,21 +7,26 @@ use async_trait::async_trait;
 use super::{PersistenceKind, RemotePersistence};
 
 #[derive(Clone)]
-pub struct FakePersister<OnStore, OnStoreFromDisk, OnLoad> {
-    on_store: OnStore,
+pub struct FakePersister<OnStoreFromDisk, OnLoad> {
     on_store_from_disk: OnStoreFromDisk,
     on_load: OnLoad,
 }
 
-impl<OnStore, OnStoreFromDisk, OnLoad> FakePersister<OnStore, OnStoreFromDisk, OnLoad>
+#[track_caller]
+pub async fn unreachable(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> OpaqueResult<()> {
+    unreachable!()
+}
+
+impl<OnStoreFromDisk, OnStoreFromDiskF, OnLoad, OnLoadF> FakePersister<OnStoreFromDisk, OnLoad>
 where
-    OnStore: Fn(PersistenceKind, &RunId, Vec<u8>) -> OpaqueResult<()> + Send + Sync,
-    OnStoreFromDisk: Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync,
-    OnLoad: Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync,
+    OnStoreFromDisk: Fn(PersistenceKind, RunId, PathBuf) -> OnStoreFromDiskF + Send + Sync,
+    OnStoreFromDiskF: Future<Output = OpaqueResult<()>> + Send + Sync,
+
+    OnLoad: Fn(PersistenceKind, RunId, PathBuf) -> OnLoadF + Send + Sync,
+    OnLoadF: Future<Output = OpaqueResult<()>> + Send + Sync,
 {
-    pub fn new(on_store: OnStore, on_store_from_disk: OnStoreFromDisk, on_load: OnLoad) -> Self {
+    pub fn new(on_store_from_disk: OnStoreFromDisk, on_load: OnLoad) -> Self {
         Self {
-            on_store,
             on_store_from_disk,
             on_load,
         }
@@ -28,40 +34,32 @@ where
 }
 
 #[async_trait]
-impl<OnStore, OnStoreFromDisk, OnLoad> RemotePersistence
-    for FakePersister<OnStore, OnStoreFromDisk, OnLoad>
+impl<OnStoreFromDisk, OnStoreFromDiskF, OnLoad, OnLoadF> RemotePersistence
+    for FakePersister<OnStoreFromDisk, OnLoad>
 where
-    OnStore:
-        Fn(PersistenceKind, &RunId, Vec<u8>) -> OpaqueResult<()> + Send + Sync + Clone + 'static,
     OnStoreFromDisk:
-        Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync + Clone + 'static,
-    OnLoad: Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync + Clone + 'static,
-{
-    async fn store(
-        &self,
-        kind: PersistenceKind,
-        run_id: &RunId,
-        data: Vec<u8>,
-    ) -> OpaqueResult<()> {
-        (self.on_store)(kind, run_id, data)
-    }
+        Fn(PersistenceKind, RunId, PathBuf) -> OnStoreFromDiskF + Send + Sync + Clone + 'static,
+    OnStoreFromDiskF: Future<Output = OpaqueResult<()>> + Send + Sync,
 
+    OnLoad: Fn(PersistenceKind, RunId, PathBuf) -> OnLoadF + Send + Sync + Clone + 'static,
+    OnLoadF: Future<Output = OpaqueResult<()>> + Send + Sync,
+{
     async fn store_from_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
         from_local_path: &Path,
     ) -> OpaqueResult<()> {
-        (self.on_store_from_disk)(kind, run_id, from_local_path)
+        (self.on_store_from_disk)(kind, run_id.clone(), from_local_path.to_owned()).await
     }
 
-    async fn load(
+    async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
-        (self.on_load)(kind, run_id, into_local_path)
+        (self.on_load)(kind, run_id.clone(), into_local_path.to_owned()).await
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {

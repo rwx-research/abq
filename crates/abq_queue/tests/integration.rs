@@ -136,12 +136,14 @@ struct InMemoryRemote(Arc<tokio::sync::Mutex<InMemoryRemoteInner>>);
 
 #[async_trait]
 impl RemotePersistence for InMemoryRemote {
-    async fn store(
+    /// Stores a file from the local filesystem to the remote persistence.
+    async fn store_from_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,
-        data: Vec<u8>,
+        from_local_path: &Path,
     ) -> OpaqueResult<()> {
+        let data = tokio::fs::read(from_local_path).await.unwrap();
         let mut inner = self.0.lock().await;
         match kind {
             PersistenceKind::Manifest => {
@@ -164,20 +166,9 @@ impl RemotePersistence for InMemoryRemote {
         Ok(())
     }
 
-    /// Stores a file from the local filesystem to the remote persistence.
-    async fn store_from_disk(
-        &self,
-        kind: PersistenceKind,
-        run_id: &RunId,
-        from_local_path: &Path,
-    ) -> OpaqueResult<()> {
-        let data = tokio::fs::read(from_local_path).await.unwrap();
-        self.store(kind, run_id, data).await
-    }
-
     /// Loads a file from the remote persistence to the local filesystem.
     /// The given local path must have all intermediate directories already created.
-    async fn load(
+    async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,

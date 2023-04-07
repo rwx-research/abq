@@ -20,8 +20,10 @@ use tempfile::TempDir;
 use thiserror::Error;
 use tokio::select;
 
+use self::local_persistence::LocalPersistenceConfig;
 use self::remote_persistence::RemotePersistenceConfig;
 
+pub mod local_persistence;
 pub mod remote_persistence;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
@@ -39,22 +41,22 @@ pub async fn start_abq_forever(
     work_port: u16,
     negotiator_port: u16,
     server_options: ServerOptions,
+    local_persistence_config: LocalPersistenceConfig,
     remote_persistence_config: RemotePersistenceConfig,
 ) -> Result<ExitCode, clap::Error> {
     // Public IP defaults to the binding IP.
     let public_ip = public_ip.unwrap_or(bind_ip);
 
+    let local_persistence = local_persistence_config.build()?;
     let remote_persistence = remote_persistence_config.resolve().await?;
 
-    let manifests_path = tempfile::tempdir().expect("unable to create a temporary file");
     let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
-        manifests_path.path(),
+        local_persistence.manifests_dir(),
         remote_persistence.clone(),
     );
 
-    let results_path = tempfile::tempdir().expect("unable to create a temporary file");
     let persist_results = persistence::results::FilesystemPersistor::new_shared(
-        results_path.path(),
+        local_persistence.results_dir(),
         RESULTS_PERSISTENCE_LRU_CAPACITY,
         remote_persistence,
     );
@@ -78,9 +80,12 @@ pub async fn start_abq_forever(
 
     println!(
         "Persisting manifests at {}",
-        manifests_path.path().display()
+        local_persistence.manifests_dir().display(),
     );
-    println!("Persisting results at {}", results_path.path().display());
+    println!(
+        "Persisting results at {}",
+        local_persistence.results_dir().display()
+    );
 
     println!("Run the following to invoke a test run:");
     println!(
