@@ -209,7 +209,14 @@ mod test {
     #[tokio::test]
     async fn retrieve_is_some_when_no_pending() {
         let tempdir = tempfile::tempdir().unwrap();
-        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote::NoopPersister);
+        let persistence = FilesystemPersistor::new_shared(
+            tempdir.path(),
+            1,
+            remote::FakePersister::new(fake_unreachable, |_, _, _| async {
+                // Load nothing new into the file
+                Ok(())
+            }),
+        );
 
         let cell = ResultsPersistedCell::new(RunId::unique());
 
