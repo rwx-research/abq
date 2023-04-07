@@ -22,6 +22,11 @@ pub struct FilesystemPersistor {
     remote: RemotePersister,
 }
 
+enum LoadFromDisk {
+    Loaded(ManifestView),
+    TryLoadFromRemote { locked_file: std::fs::File },
+}
+
 impl FilesystemPersistor {
     pub fn new(root: impl Into<PathBuf>, remote: impl Into<RemotePersister>) -> Self {
         Self {
@@ -46,17 +51,87 @@ impl FilesystemPersistor {
         self.root.join(format!("{run_id}.manifest.json"))
     }
 
-    fn get_sync_file(&self, run_id: &RunId) -> Result<std::fs::File> {
-        let fi = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(self.get_path(run_id))
+    async fn get_sync_file(&self, run_id: &RunId) -> Result<std::fs::File> {
+        let path = self.get_path(run_id);
+
+        tokio::task::spawn_blocking(move || {
+            let fi = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(path)
+                .located(here!())?;
+
+            fi.lock_exclusive().located(here!())?;
+
+            Ok(fi)
+        })
+        .await
+        .located(here!())?
+    }
+
+    async fn load_manifest_from_disk_or_fallback(&self, run_id: &RunId) -> Result<LoadFromDisk> {
+        let locked_file = self.get_sync_file(run_id).await?;
+
+        let load_task = move || {
+            match serde_json::from_reader(&locked_file) {
+                Ok(view) => {
+                    // Fast path succeeded
+                    locked_file.unlock().located(here!())?;
+
+                    Ok(LoadFromDisk::Loaded(view))
+                }
+                Err(_) => {
+                    // The file is likely empty, or corrupted. We'll try to load from the remote
+                    Ok(LoadFromDisk::TryLoadFromRemote { locked_file })
+                }
+            }
+        };
+
+        let r = tokio::task::spawn_blocking(load_task)
+            .await
             .located(here!())?;
+        r
+    }
 
-        fi.lock_exclusive().located(here!())?;
+    async fn load_manifest_from_disk(&self, locked_file: std::fs::File) -> Result<ManifestView> {
+        let load_task = move || {
+            let view = serde_json::from_reader(&locked_file).located(here!())?;
 
-        Ok(fi)
+            locked_file.unlock().located(here!())?;
+
+            Ok(view)
+        };
+
+        tokio::task::spawn_blocking(load_task)
+            .await
+            .located(here!())?
+    }
+
+    async fn load_manifest_into_disk_from_remote(
+        &self,
+        run_id: &RunId,
+        _locked_file_witness: &std::fs::File,
+    ) -> Result<()> {
+        let path = self.get_path(run_id);
+
+        self.remote
+            .load_to_disk(PersistenceKind::Manifest, run_id, &path)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn load_manifest_view(&self, run_id: &RunId) -> Result<ManifestView> {
+        match self.load_manifest_from_disk_or_fallback(run_id).await? {
+            LoadFromDisk::Loaded(view) => Ok(view),
+            LoadFromDisk::TryLoadFromRemote { locked_file } => {
+                self.load_manifest_into_disk_from_remote(run_id, &locked_file)
+                    .await?;
+
+                self.load_manifest_from_disk(locked_file).await
+            }
+        }
     }
 }
 
@@ -65,7 +140,7 @@ impl PersistentManifest for FilesystemPersistor {
     async fn dump(&self, run_id: &RunId, view: ManifestView) -> Result<()> {
         // Write the manifest to disk with exclusive access.
         let locked_file = {
-            let locked_file = self.get_sync_file(run_id)?;
+            let locked_file = self.get_sync_file(run_id).await?;
             let write_task = {
                 move || {
                     serde_json::to_writer(&locked_file, &view).located(here!())?;
@@ -87,7 +162,9 @@ impl PersistentManifest for FilesystemPersistor {
                 .await?;
         }
 
-        locked_file.unlock().located(here!())?;
+        tokio::task::spawn_blocking(move || locked_file.unlock().located(here!()))
+            .await
+            .located(here!())??;
 
         Ok(())
     }
@@ -97,19 +174,7 @@ impl PersistentManifest for FilesystemPersistor {
         run_id: &RunId,
         entity_tag: Tag,
     ) -> Result<Vec<WorkerTest>> {
-        let locked_file = self.get_sync_file(run_id)?;
-
-        let load_task = move || {
-            let view: ManifestView = serde_json::from_reader(&locked_file).located(here!())?;
-
-            locked_file.unlock().located(here!())?;
-
-            Ok(view)
-        };
-
-        let view = tokio::task::spawn_blocking(load_task)
-            .await
-            .located(here!())??;
+        let view = self.load_manifest_view(run_id).await?;
 
         Ok(view.get_partition_for_entity(entity_tag))
     }
@@ -123,6 +188,7 @@ impl PersistentManifest for FilesystemPersistor {
 mod test {
     use std::path::PathBuf;
 
+    use abq_run_n_times::n_times;
     use abq_test_utils::spec;
     use abq_utils::{
         error::ErrorLocation,
@@ -135,7 +201,7 @@ mod test {
 
     use crate::persistence::{
         manifest::{ManifestView, PersistentManifest},
-        remote::{FakePersister, NoopPersister, PersistenceKind},
+        remote::{fake_unreachable, FakePersister, NoopPersister, PersistenceKind},
     };
 
     use super::FilesystemPersistor;
@@ -253,16 +319,20 @@ mod test {
                 {
                     let view = view.clone();
                     move |kind, run_id, path| {
-                        assert_eq!(kind, PersistenceKind::Manifest);
-                        assert_eq!(run_id.0, "run-id");
-                        assert_eq!(path, tempdir_path.join("run-id.manifest.json"));
-                        let buf = std::fs::read_to_string(path).unwrap();
-                        let loaded_view = serde_json::from_slice(buf.as_bytes()).unwrap();
-                        assert_eq!(view, loaded_view);
-                        Ok(())
+                        let view = view.clone();
+                        let tempdir_path = tempdir_path.clone();
+                        async move {
+                            assert_eq!(kind, PersistenceKind::Manifest);
+                            assert_eq!(run_id.0, "run-id");
+                            assert_eq!(path, tempdir_path.join("run-id.manifest.json"));
+                            let buf = tokio::fs::read_to_string(path).await.unwrap();
+                            let loaded_view = serde_json::from_slice(buf.as_bytes()).unwrap();
+                            assert_eq!(view, loaded_view);
+                            Ok(())
+                        }
                     }
                 },
-                |_, _, _| unreachable!(),
+                fake_unreachable,
             ),
         );
 
@@ -284,8 +354,8 @@ mod test {
         let fs = FilesystemPersistor::new(
             tempdir.path(),
             FakePersister::new(
-                |_, _, _| Err("i failed".located(here!())),
-                |_, _, _| unreachable!(),
+                |_, _, _| async { Err("i failed".located(here!())) },
+                fake_unreachable,
             ),
         );
 
@@ -293,5 +363,151 @@ mod test {
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert!(err.to_string().contains("i failed"));
+    }
+
+    #[tokio::test]
+    async fn missing_local_loads_from_remote() {
+        let runner1 = Tag::runner(0, 1);
+        let test1 = WorkerTest::new(spec(1), INIT_RUN_NUMBER);
+
+        let view = ManifestView {
+            items: vec![test1.clone()],
+            assigned_entities: vec![runner1],
+        };
+
+        let run_id = RunId("run-id".to_string());
+
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let fs = FilesystemPersistor::new(
+            tempdir.path(),
+            FakePersister::new(fake_unreachable, move |_, _, path| {
+                let view = view.clone();
+                async move {
+                    tokio::fs::write(path, serde_json::to_vec(&view).unwrap())
+                        .await
+                        .unwrap();
+                    Ok(())
+                }
+            }),
+        );
+
+        let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
+        assert_eq!(tests, vec![test1]);
+    }
+
+    #[tokio::test]
+    async fn missing_local_errors_if_remote_errors() {
+        let run_id = RunId("run-id".to_string());
+
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let fs = FilesystemPersistor::new(
+            tempdir.path(),
+            FakePersister::new(fake_unreachable, |_, _, _| async {
+                Err("i failed".located(here!()))
+            }),
+        );
+
+        let res = fs
+            .get_partition_for_entity(&run_id, Tag::runner(0, 1))
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.to_string().contains("i failed"));
+    }
+
+    #[tokio::test]
+    async fn prefer_local_over_remote() {
+        let runner1 = Tag::runner(0, 1);
+        let test1 = WorkerTest::new(spec(1), INIT_RUN_NUMBER);
+
+        let view = ManifestView {
+            items: vec![test1.clone()],
+            assigned_entities: vec![runner1],
+        };
+
+        let run_id = RunId("run-id".to_string());
+
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let fs = FilesystemPersistor::new(
+            tempdir.path(),
+            FakePersister::new(
+                |_, _, _| async { Ok(()) },
+                |_, _, path| async move {
+                    let fake_view = ManifestView {
+                        items: vec![],
+                        assigned_entities: vec![],
+                    };
+                    tokio::fs::write(path, serde_json::to_vec(&fake_view).unwrap())
+                        .await
+                        .unwrap();
+                    Ok(())
+                },
+            ),
+        );
+
+        fs.dump(&run_id, view).await.unwrap();
+        let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
+        assert_eq!(tests, vec![test1]);
+    }
+
+    #[n_times(1000)]
+    #[tokio::test]
+    async fn race_multiple_reads_with_fetch_from_remote() {
+        let runner1 = Tag::runner(0, 1);
+        let runner2 = Tag::runner(0, 2);
+
+        let test1 = WorkerTest::new(spec(1), INIT_RUN_NUMBER);
+        let test2 = WorkerTest::new(spec(2), INIT_RUN_NUMBER);
+
+        let view = ManifestView {
+            items: vec![test1.clone(), test2.clone()],
+            assigned_entities: vec![runner1, runner2],
+        };
+
+        let run_id = RunId("run-id".to_string());
+
+        let tempdir = tempfile::tempdir().unwrap();
+
+        let fs = FilesystemPersistor::new(
+            tempdir.path(),
+            FakePersister::new(
+                |_, _, _| async { Ok(()) },
+                move |_, _, path| {
+                    let view = view.clone();
+                    async move {
+                        tokio::fs::write(path, serde_json::to_vec(&view).unwrap())
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                },
+            ),
+        );
+
+        let load_task1 = {
+            let fs = fs.clone();
+            let run_id = run_id.clone();
+            async move {
+                let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
+                assert_eq!(tests, vec![test1]);
+            }
+        };
+
+        let load_task2 = {
+            let fs = fs.clone();
+            async move {
+                let tests = fs.get_partition_for_entity(&run_id, runner2).await.unwrap();
+                assert_eq!(tests, vec![test2]);
+            }
+        };
+
+        if i % 2 == 0 {
+            tokio::join!(load_task1, load_task2);
+        } else {
+            tokio::join!(load_task2, load_task1);
+        }
     }
 }

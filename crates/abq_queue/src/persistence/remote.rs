@@ -23,6 +23,8 @@ pub use custom::CustomPersister;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
+pub use fake::unreachable as fake_unreachable;
+#[cfg(test)]
 pub use fake::FakePersister;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -96,7 +98,7 @@ impl RemotePersister {
         self.0.store_from_disk(kind, run_id, from_local_path).await
     }
 
-    pub async fn load(
+    pub async fn load_to_disk(
         &self,
         kind: PersistenceKind,
         run_id: &RunId,

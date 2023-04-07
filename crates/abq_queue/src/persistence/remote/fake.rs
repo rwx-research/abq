@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::{future::Future, path::PathBuf};
 
 use abq_utils::{error::OpaqueResult, net_protocol::workers::RunId};
 use async_trait::async_trait;
@@ -11,10 +12,18 @@ pub struct FakePersister<OnStoreFromDisk, OnLoad> {
     on_load: OnLoad,
 }
 
-impl<OnStoreFromDisk, OnLoad> FakePersister<OnStoreFromDisk, OnLoad>
+#[track_caller]
+pub async fn unreachable(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> OpaqueResult<()> {
+    unreachable!()
+}
+
+impl<OnStoreFromDisk, OnStoreFromDiskF, OnLoad, OnLoadF> FakePersister<OnStoreFromDisk, OnLoad>
 where
-    OnStoreFromDisk: Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync,
-    OnLoad: Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync,
+    OnStoreFromDisk: Fn(PersistenceKind, RunId, PathBuf) -> OnStoreFromDiskF + Send + Sync,
+    OnStoreFromDiskF: Future<Output = OpaqueResult<()>> + Send + Sync,
+
+    OnLoad: Fn(PersistenceKind, RunId, PathBuf) -> OnLoadF + Send + Sync,
+    OnLoadF: Future<Output = OpaqueResult<()>> + Send + Sync,
 {
     pub fn new(on_store_from_disk: OnStoreFromDisk, on_load: OnLoad) -> Self {
         Self {
@@ -25,11 +34,15 @@ where
 }
 
 #[async_trait]
-impl<OnStoreFromDisk, OnLoad> RemotePersistence for FakePersister<OnStoreFromDisk, OnLoad>
+impl<OnStoreFromDisk, OnStoreFromDiskF, OnLoad, OnLoadF> RemotePersistence
+    for FakePersister<OnStoreFromDisk, OnLoad>
 where
     OnStoreFromDisk:
-        Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync + Clone + 'static,
-    OnLoad: Fn(PersistenceKind, &RunId, &Path) -> OpaqueResult<()> + Send + Sync + Clone + 'static,
+        Fn(PersistenceKind, RunId, PathBuf) -> OnStoreFromDiskF + Send + Sync + Clone + 'static,
+    OnStoreFromDiskF: Future<Output = OpaqueResult<()>> + Send + Sync,
+
+    OnLoad: Fn(PersistenceKind, RunId, PathBuf) -> OnLoadF + Send + Sync + Clone + 'static,
+    OnLoadF: Future<Output = OpaqueResult<()>> + Send + Sync,
 {
     async fn store_from_disk(
         &self,
@@ -37,7 +50,7 @@ where
         run_id: &RunId,
         from_local_path: &Path,
     ) -> OpaqueResult<()> {
-        (self.on_store_from_disk)(kind, run_id, from_local_path)
+        (self.on_store_from_disk)(kind, run_id.clone(), from_local_path.to_owned()).await
     }
 
     async fn load_to_disk(
@@ -46,7 +59,7 @@ where
         run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
-        (self.on_load)(kind, run_id, into_local_path)
+        (self.on_load)(kind, run_id.clone(), into_local_path.to_owned()).await
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
