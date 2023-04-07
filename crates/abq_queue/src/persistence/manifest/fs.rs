@@ -90,10 +90,9 @@ impl FilesystemPersistor {
             }
         };
 
-        let r = tokio::task::spawn_blocking(load_task)
+        tokio::task::spawn_blocking(load_task)
             .await
-            .located(here!())?;
-        r
+            .located(here!())?
     }
 
     async fn load_manifest_from_disk(&self, locked_file: LockedFile) -> Result<ManifestView> {
@@ -485,7 +484,7 @@ mod test {
             let fs = fs.clone();
             let run_id = run_id.clone();
 
-            let runner = runners[i].clone();
+            let runner = runners[i];
             let test = tests[i].clone();
 
             join_set.spawn(async move {
