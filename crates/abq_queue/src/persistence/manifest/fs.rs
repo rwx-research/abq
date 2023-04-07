@@ -27,6 +27,8 @@ enum LoadFromDisk {
     TryLoadFromRemote { locked_file: std::fs::File },
 }
 
+type LockedFile = std::fs::File;
+
 impl FilesystemPersistor {
     pub fn new(root: impl Into<PathBuf>, remote: impl Into<RemotePersister>) -> Self {
         Self {
@@ -51,9 +53,14 @@ impl FilesystemPersistor {
         self.root.join(format!("{run_id}.manifest.json"))
     }
 
-    async fn get_sync_file(&self, run_id: &RunId) -> Result<std::fs::File> {
+    async fn get_locked_file(&self, run_id: &RunId) -> Result<LockedFile> {
         let path = self.get_path(run_id);
 
+        // NB: we use a blocking task here because the fs4 `lock_exclusive` blocks the
+        // executor, even when using the async extension.
+        //
+        // NB: The behavior of `flock` is such that the lock over a file will be released when the
+        // file descriptor is dropped.
         tokio::task::spawn_blocking(move || {
             let fi = std::fs::OpenOptions::new()
                 .create(true)
@@ -71,16 +78,11 @@ impl FilesystemPersistor {
     }
 
     async fn load_manifest_from_disk_or_fallback(&self, run_id: &RunId) -> Result<LoadFromDisk> {
-        let locked_file = self.get_sync_file(run_id).await?;
+        let locked_file = self.get_locked_file(run_id).await?;
 
         let load_task = move || {
             match serde_json::from_reader(&locked_file) {
-                Ok(view) => {
-                    // Fast path succeeded
-                    locked_file.unlock().located(here!())?;
-
-                    Ok(LoadFromDisk::Loaded(view))
-                }
+                Ok(view) => Ok(LoadFromDisk::Loaded(view)),
                 Err(_) => {
                     // The file is likely empty, or corrupted. We'll try to load from the remote
                     Ok(LoadFromDisk::TryLoadFromRemote { locked_file })
@@ -94,12 +96,9 @@ impl FilesystemPersistor {
         r
     }
 
-    async fn load_manifest_from_disk(&self, locked_file: std::fs::File) -> Result<ManifestView> {
+    async fn load_manifest_from_disk(&self, locked_file: LockedFile) -> Result<ManifestView> {
         let load_task = move || {
             let view = serde_json::from_reader(&locked_file).located(here!())?;
-
-            locked_file.unlock().located(here!())?;
-
             Ok(view)
         };
 
@@ -139,14 +138,9 @@ impl FilesystemPersistor {
 impl PersistentManifest for FilesystemPersistor {
     async fn dump(&self, run_id: &RunId, view: ManifestView) -> Result<()> {
         // Write the manifest to disk with exclusive access.
-        let locked_file = {
-            let locked_file = self.get_sync_file(run_id).await?;
-            let write_task = {
-                move || {
-                    serde_json::to_writer(&locked_file, &view).located(here!())?;
-                    Ok(locked_file)
-                }
-            };
+        {
+            let locked_file = self.get_locked_file(run_id).await?;
+            let write_task = move || serde_json::to_writer(&locked_file, &view).located(here!());
 
             tokio::task::spawn_blocking(write_task)
                 .await
@@ -161,10 +155,6 @@ impl PersistentManifest for FilesystemPersistor {
                 .store_from_disk(PersistenceKind::Manifest, run_id, &path)
                 .await?;
         }
-
-        tokio::task::spawn_blocking(move || locked_file.unlock().located(here!()))
-            .await
-            .located(here!())??;
 
         Ok(())
     }
