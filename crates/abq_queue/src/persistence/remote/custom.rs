@@ -29,6 +29,7 @@ pub struct CustomPersister {
     head_args: Vec<String>,
 }
 
+#[derive(Debug)]
 enum Action {
     Load,
     Store,
@@ -53,6 +54,8 @@ impl CustomPersister {
         run_id: &RunId,
         path: &Path,
     ) -> OpaqueResult<()> {
+        tracing::info!(?path, ?action, "calling with");
+
         let action = match action {
             Action::Load => "load",
             Action::Store => "store",
