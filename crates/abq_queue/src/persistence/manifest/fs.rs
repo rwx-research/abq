@@ -679,14 +679,14 @@ mod test {
         assert!(remote.has_data());
     }
 
-    //#[n_times(1000)]
+    #[n_times(50)]
     #[tokio::test]
     async fn race_get_manifest_and_offload_job() {
         // We want to race the offload-manifests job and the fetching of a manifest to the
         // persistence layers. We should end up in a consistent state, and fetches should
         // succeed, regardless of who wins.
 
-        const N: usize = 20;
+        const N: usize = 10;
         let runners: Vec<_> = (0..N).map(|i| Tag::runner(0, i as u32)).collect();
         let tests: Vec<_> = (0..N)
             .map(|i| WorkerTest::new(spec(i), INIT_RUN_NUMBER))
@@ -728,7 +728,7 @@ mod test {
             }
         };
 
-        if 1 % 2 == 0 {
+        if i % 2 == 0 {
             tokio::join!(fetch_task, offload_task);
         } else {
             tokio::join!(offload_task, fetch_task);
