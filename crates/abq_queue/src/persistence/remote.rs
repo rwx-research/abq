@@ -23,6 +23,8 @@ pub use custom::CustomPersister;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
+pub use fake::error as fake_error;
+#[cfg(test)]
 pub use fake::unreachable as fake_unreachable;
 #[cfg(test)]
 pub use fake::FakePersister;

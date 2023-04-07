@@ -109,10 +109,34 @@ impl PersistResults for FilesystemPersistor {
         let fi = self.fds.get_or_insert(path).await?;
         let mut fi = fi.lock().await;
 
-        fi.seek(SeekFrom::End(0)).await.located(here!())?;
-        fi.write_all(&packed).await.located(here!())?;
-        fi.write_all(&[b'\n']).await.located(here!())?;
-        fi.flush().await.located(here!())?;
+        let end = fi.seek(SeekFrom::End(0)).await.located(here!())?;
+
+        if end == 0 {
+            dbg!();
+            // If the test results file is empty, it may have been offloaded to the remote
+            // previously. Eagerly try to load it from the remote; if that fails, suppose that the
+            // results file is indeed new.
+            let path = self.get_path(run_id);
+            let load_result = self
+                .remote
+                .load_to_disk(PersistenceKind::Results, run_id, &path)
+                .await;
+            dbg!();
+
+            match load_result {
+                Ok(()) => {
+                    tracing::info!(?run_id, "Loaded test results from remote.");
+                    // We must now re-seek to the end so that the write appends.
+                    dbg!(fi.seek(SeekFrom::End(0)).await.located(here!()))?;
+                }
+                Err(_) => {
+                    tracing::info!(?run_id, "Assuming new test results file.");
+                    dbg!();
+                }
+            }
+        }
+
+        write_packed_line(&mut fi, packed).await?;
 
         Ok(())
     }
@@ -144,7 +168,8 @@ impl PersistResults for FilesystemPersistor {
 
         let opaque_jsonl = match read_results_lines(&mut fi).await {
             Ok(results) if !results.is_empty() => results,
-            _ => {
+            e => {
+                dbg!(&e);
                 // Slow path: the results are missing in the local cache, or corrupted.
                 // Load them in now and retry.
                 self.remote
@@ -166,11 +191,23 @@ impl PersistResults for FilesystemPersistor {
     }
 }
 
+async fn write_packed_line(fi: &mut File, packed: Vec<u8>) -> OpaqueResult<()> {
+    fi.write_all(&packed).await.located(here!())?;
+    fi.write_all(&[b'\n']).await.located(here!())?;
+    fi.flush().await.located(here!())
+}
+
 async fn read_results_lines(fi: &mut File) -> OpaqueResult<Vec<Box<serde_json::value::RawValue>>> {
     let mut iter = tokio::io::BufReader::new(fi).lines();
     let mut opaque_jsonl = vec![];
     while let Some(line) = iter.next_line().await.located(here!())? {
-        opaque_jsonl.push(serde_json::value::RawValue::from_string(line).located(here!())?);
+        match serde_json::value::RawValue::from_string(line.clone()).located(here!()) {
+            Ok(line) => opaque_jsonl.push(line),
+            Err(e) => {
+                dbg!((&e, line));
+                return Err(e);
+            }
+        }
     }
     Ok(opaque_jsonl)
 }
@@ -198,8 +235,8 @@ mod test {
     use tokio::task::JoinSet;
 
     use crate::persistence::{
-        remote::{self, fake_unreachable, PersistenceKind},
-        results::PersistResults,
+        remote::{self, fake_error, fake_unreachable, PersistenceKind},
+        results::{fs::write_packed_line, PersistResults},
     };
 
     use super::FilesystemPersistor;
@@ -379,7 +416,7 @@ mod test {
                     }
                 }
             },
-            fake_unreachable,
+            fake_error,
         );
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -483,7 +520,7 @@ mod test {
                     }
                 }
             },
-            fake_unreachable,
+            fake_error,
         );
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -573,7 +610,7 @@ mod test {
             AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
         ]);
 
-        let remote = { remote::FakePersister::new(fake_unreachable, fake_unreachable) };
+        let remote = { remote::FakePersister::new(fake_unreachable, fake_error) };
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
@@ -638,5 +675,190 @@ mod test {
         }
 
         assert_eq!(remote_loads.load(atomic::ORDERING), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_write_results_fetches_from_remote() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results1 = Results(vec![AssociatedTestResults::fake(
+            wid(1),
+            vec![TestResult::fake()],
+        )]);
+        let results2 = Results(vec![AssociatedTestResults::fake(
+            wid(2),
+            vec![TestResult::fake()],
+        )]);
+
+        let remote = {
+            let results = results1.clone();
+            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
+                let results = results.clone();
+                async move {
+                    let mut fi = tokio::fs::File::create(path).await.unwrap();
+                    write_packed_line(&mut fi, serde_json::to_vec(&results).unwrap())
+                        .await
+                        .unwrap();
+                    Ok(())
+                }
+            })
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        // Write locally. We should try a fetch from the remote and append to it.
+        fs.dump(&run_id, results2.clone()).await.unwrap();
+
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+
+        let actual_results = actual_results.decode().unwrap();
+        assert_eq!(actual_results, vec![results1, results2]);
+    }
+
+    #[tokio::test]
+    async fn missing_write_results_fetches_from_remote_with_error_starts_new_file() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+
+        let remote_loads = Arc::new(AtomicUsize::new(0));
+
+        let remote = {
+            let remote_loads = remote_loads.clone();
+            remote::FakePersister::new(fake_unreachable, move |_, _, _| {
+                let remote_loads = remote_loads.clone();
+                async move {
+                    remote_loads.fetch_add(1, atomic::ORDERING);
+                    Err("i failed".located(here!()))
+                }
+            })
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        // Write locally. The remote fetch should fail, so we should assume this is a new results
+        // file.
+        fs.dump(&run_id, results.clone()).await.unwrap();
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+
+        let actual_results = actual_results.decode().unwrap();
+        assert_eq!(actual_results, vec![results]);
+
+        assert_eq!(remote_loads.load(atomic::ORDERING), 1);
+    }
+
+    #[tokio::test]
+    async fn write_results_prefer_local_to_remote() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results1 = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+        let results2 = Results(vec![
+            AssociatedTestResults::fake(wid(3), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
+        ]);
+
+        let remote = {
+            remote::FakePersister::new(fake_unreachable, |_, _, _| async {
+                Err("").located(here!())
+            })
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        fs.dump(&run_id, results1.clone()).await.unwrap();
+        fs.dump(&run_id, results2.clone()).await.unwrap();
+
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = actual_results.decode().unwrap();
+        assert_eq!(actual_results, vec![results1, results2]);
+    }
+
+    #[n_times(100)]
+    #[tokio::test]
+    async fn race_writing_results_with_fetch_from_remote() {
+        // When we need to fetch results from the remote, they should only be loaded in once if the
+        // local cache is hot.
+        const N: usize = 10;
+
+        let run_id = RunId("test-run-id".to_string());
+
+        let remote_results = Results(vec![AssociatedTestResults::fake(
+            wid(1),
+            vec![TestResult::fake()],
+        )]);
+
+        let other_results: Vec<_> = (1..=N)
+            .map(|i| {
+                Results(vec![AssociatedTestResults::fake(
+                    wid(i * 10),
+                    vec![TestResult::fake()],
+                )])
+            })
+            .collect();
+
+        let remote_loads = Arc::new(AtomicUsize::new(0));
+
+        let remote = {
+            let results = remote_results.clone();
+            let remote_loads = remote_loads.clone();
+            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
+                let results = results.clone();
+                let remote_loads = remote_loads.clone();
+                async move {
+                    let mut fi = tokio::fs::File::create(path).await.unwrap();
+                    write_packed_line(&mut fi, serde_json::to_vec(&results).unwrap())
+                        .await
+                        .unwrap();
+
+                    remote_loads.fetch_add(1, atomic::ORDERING);
+                    Ok(())
+                }
+            })
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for i in 0..N {
+            let run_id = run_id.clone();
+            let results = other_results[i].clone();
+            let fs = fs.clone();
+            join_set.spawn(async move {
+                fs.dump(&run_id, results).await.unwrap();
+            });
+        }
+
+        while let Some(join_handle) = join_set.join_next().await {
+            join_handle.unwrap();
+        }
+
+        assert_eq!(remote_loads.load(atomic::ORDERING), 1);
+
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let mut actual_results = actual_results.decode().unwrap();
+        actual_results.sort_by_key(|x| match x {
+            Results(x) => x[0].work_id,
+            _ => unreachable!(),
+        });
+
+        let expected_results = {
+            let mut results = vec![remote_results];
+            results.extend(other_results);
+            results
+        };
+
+        assert_eq!(actual_results.len(), expected_results.len());
+        assert_eq!(actual_results, expected_results);
     }
 }
