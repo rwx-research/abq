@@ -80,6 +80,7 @@ struct Abq {
     env: Vec<(String, String)>,
     always_capture_stderr: bool,
     working_dir: Option<PathBuf>,
+    inherit: bool,
 }
 
 impl Abq {
@@ -90,6 +91,7 @@ impl Abq {
             env: Default::default(),
             always_capture_stderr: false,
             working_dir: None,
+            inherit: false,
         }
     }
 
@@ -122,6 +124,13 @@ impl Abq {
         self
     }
 
+    // For debugging, pipe stdout/stderr to parent.
+    #[allow(unused)]
+    fn inherit(mut self) -> Self {
+        self.inherit = true;
+        self
+    }
+
     fn run(self) -> CmdOutput {
         let Output {
             status,
@@ -146,6 +155,7 @@ impl Abq {
             env,
             always_capture_stderr,
             working_dir,
+            inherit,
         } = self;
         let working_dir = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
 
@@ -153,11 +163,17 @@ impl Abq {
 
         cmd.args(args);
         cmd.current_dir(working_dir);
-        cmd.stdout(Stdio::piped());
-        if debug_log_for_ci() && !always_capture_stderr {
+
+        if inherit {
+            cmd.stdout(Stdio::inherit());
             cmd.stderr(Stdio::inherit());
         } else {
-            cmd.stderr(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+            if debug_log_for_ci() && !always_capture_stderr {
+                cmd.stderr(Stdio::inherit());
+            } else {
+                cmd.stderr(Stdio::piped());
+            }
         }
 
         cmd.envs(env);
@@ -3243,6 +3259,155 @@ fn custom_remote_persistence() {
           }
         ]
         "###);
+    }
+
+    term(queue_proc);
+}
+
+#[test]
+#[serial]
+fn manifest_loaded_from_remote_persistence() {
+    let name = "manifest_loaded_from_remote_persistence";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let custom_persisted_path = tempfile::tempdir().unwrap().into_path();
+    let custom_script = write_to_temp(&formatdoc! {
+        "
+        const fs = require(`fs`);
+
+        const dir = `{persist_dir}`;
+
+        const action = process.argv[2];
+
+        const kind = process.argv[3];
+        const runId = process.argv[4];
+
+        const theirs = process.argv[5];
+        const mine = `${{dir}}/${{kind}}-${{runId}}`;
+
+        if (action === 'store') fs.copyFileSync(theirs, mine);
+        else if (action === 'load') fs.copyFileSync(mine, theirs);
+        else throw new Error(`Unknown action: ${{action}}`);
+        ",
+        persist_dir = custom_persisted_path.display(),
+    });
+    let custom_command = format!("node,{}", custom_script.path().to_str().unwrap());
+
+    let local_manifests_dir = tempfile::tempdir().unwrap().into_path();
+
+    let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
+        ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
+        ("ABQ_REMOTE_PERSISTENCE_COMMAND", &custom_command),
+        ("ABQ_PERSISTED_MANIFESTS_DIR", local_manifests_dir.to_str().unwrap()),
+    ]);
+
+    let run_id = "test-run-id";
+
+    use abq_native_runner_simulation::{pack, Msg::*};
+    use abq_utils::net_protocol::runners::{
+        InitSuccessMessage, Manifest, ManifestMessage, Test, TestOrGroup,
+    };
+
+    let proto = ProtocolWitness::TEST;
+
+    let test = TestOrGroup::test(Test::new(proto, "test1", vec![], Default::default()));
+    let manifest = ManifestMessage::new(Manifest::new(vec![test], Default::default()));
+
+    let packed;
+    let test_args = {
+        let simulation = [
+            Connect,
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![
+                    OpaqueWrite(pack(&manifest)),
+                    // Finish
+                    Exit(0),
+                ],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    // Read first test, write okay
+                    OpaqueRead,
+                    OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                ],
+            },
+            Exit(0),
+        ];
+
+        packed = pack_msgs_to_disk(simulation);
+
+        // abq test ...
+        move || {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = packed.path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker=0"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        }
+    };
+
+    // Run `abq test` once. We should succeed.
+    {
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt1"))
+            .args(test_args())
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+
+    let local_manifest_path = local_manifests_dir.join("test-run-id.manifest.json");
+    let custom_persister_manifest_path = custom_persisted_path.join("manifest-test-run-id");
+
+    // There should now be a manifest in the local persisted directory. Delete it.
+    {
+        heuristic_wait_for_written_path(&local_manifest_path);
+        heuristic_wait_for_written_path(&custom_persister_manifest_path);
+        std::fs::remove_file(&local_manifest_path).unwrap();
+    }
+
+    // Run `abq test` again. It should succeed, with the manifest loaded from the remote.
+    {
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt2"))
+            .args(test_args())
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+
+    // There should again be a manifest in the local persisted directory.
+    {
+        heuristic_wait_for_written_path(&local_manifest_path);
+        heuristic_wait_for_written_path(&custom_persister_manifest_path);
     }
 
     term(queue_proc);
