@@ -28,6 +28,8 @@ pub use fake::error as fake_error;
 pub use fake::unreachable as fake_unreachable;
 #[cfg(test)]
 pub use fake::FakePersister;
+#[cfg(test)]
+pub use fake::OneWriteFakePersister;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PersistenceKind {
