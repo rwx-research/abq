@@ -761,7 +761,7 @@ mod test {
                     .await
                     .unwrap();
 
-                assert!(offloaded_run_ids == &[run_id] || offloaded_run_ids.is_empty());
+                assert!(offloaded_run_ids == [run_id] || offloaded_run_ids.is_empty());
             }
         };
 
