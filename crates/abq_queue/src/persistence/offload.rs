@@ -1,4 +1,9 @@
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+use abq_utils::{
+    error::{OpaqueResult, ResultLocation},
+    here,
+};
 
 #[derive(Clone, Copy)]
 enum OffloadConfigInner {
@@ -17,10 +22,29 @@ impl OffloadConfig {
         Self(OffloadConfigInner::After(offload_after))
     }
 
-    pub fn should_offload(&self, elapsed_duration: Duration) -> bool {
+    fn should_offload(&self, elapsed_duration: Duration) -> bool {
         match self.0 {
             OffloadConfigInner::Never => false,
             OffloadConfigInner::After(offload_after) => elapsed_duration >= offload_after,
         }
+    }
+
+    pub fn file_eligible_for_offload(
+        &self,
+        time_now: &SystemTime,
+        file_metadata: &std::fs::Metadata,
+    ) -> OpaqueResult<bool> {
+        let size = file_metadata.len();
+        let should_offload_time = || {
+            let accessed_time = file_metadata.accessed().located(here!())?;
+            if accessed_time > *time_now {
+                return Ok(false);
+            }
+
+            let elapsed = time_now.duration_since(accessed_time).located(here!())?;
+            let should_offload = self.should_offload(elapsed);
+            Ok(should_offload)
+        };
+        Ok(size > 0 && should_offload_time()?)
     }
 }

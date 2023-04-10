@@ -1,8 +1,12 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
+};
 
 use abq_utils::{
     error::{OpaqueResult, ResultLocation},
-    here,
+    here, log_assert,
     net_protocol::{
         results::{OpaqueLazyAssociatedTestResults, ResultsLine},
         workers::RunId,
@@ -15,7 +19,10 @@ use tokio::{
     sync::Mutex,
 };
 
-use crate::persistence::remote::{PersistenceKind, RemotePersister};
+use crate::persistence::{
+    remote::{PersistenceKind, RemotePersister},
+    OffloadConfig,
+};
 
 use super::{ArcResult, PersistResults, SharedPersistResults};
 
@@ -86,6 +93,78 @@ impl FilesystemPersistor {
         self.root.join(format!("{run_id}.results.jsonl"))
     }
 
+    fn run_id_of_path(&self, path: &Path) -> ArcResult<RunId> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("path {path:?} has no file name"))
+            .located(here!())?;
+
+        let file_name = file_name
+            .to_str()
+            .ok_or_else(|| format!("{path:?} is not valid UTF-8"))
+            .located(here!())?;
+
+        let run_id = file_name
+            .strip_suffix(".results.jsonl")
+            .ok_or_else(|| format!("file name {path:?} does not end with '.results.jsonl'"))
+            .located(here!())?;
+
+        Ok(RunId(run_id.to_owned()))
+    }
+
+    /// Offloads to the remote all non-empty results files that are older than
+    /// the configured threshold.
+    pub async fn run_offload_job(&self, offload_config: OffloadConfig) -> ArcResult<()> {
+        let time_now = SystemTime::now();
+        let mut results_files = tokio::fs::read_dir(&self.root).await.located(here!())?;
+        while let Some(results_file) = results_files.next_entry().await.located(here!())? {
+            let metadata = results_file.metadata().await.located(here!())?;
+            log_assert!(!metadata.is_dir(), path=?results_file.path(), "results file is a directory");
+
+            if offload_config.file_eligible_for_offload(&time_now, &metadata)? {
+                let path = results_file.path();
+                self.perform_offload(path, time_now, offload_config).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn perform_offload(
+        &self,
+        path: PathBuf,
+        time_now: SystemTime,
+        offload_config: OffloadConfig,
+    ) -> ArcResult<()> {
+        let fi = self.fds.get_or_insert(path.clone()).await?;
+
+        // Take an exclusive lock so that new results don't come in while we flush to the remote.
+        let fi = fi.lock().await;
+
+        // We must now check again whether the file is eligible for offload, since it may have been
+        // modified since we performed the non-locked check.
+        let metadata = fi.metadata().await.located(here!())?;
+        if !offload_config.file_eligible_for_offload(&time_now, &metadata)? {
+            return Ok(());
+        }
+
+        // While we have this opportunity, also instruct the OS to totally sync all data to disk
+        // rather than keeping it possibly in memory.
+        fi.sync_all().await.located(here!())?;
+
+        let run_id = self.run_id_of_path(&path).located(here!())?;
+
+        self.remote
+            .store_from_disk(PersistenceKind::Results, &run_id, &path)
+            .await?;
+
+        // Truncate the file to 0 bytes, freeing the disk space.
+        // Note that this doesn't free the inode.
+        fi.set_len(0).await.located(here!())?;
+        fi.sync_all().await.located(here!())?;
+
+        Ok(())
+    }
+
     #[cfg(test)]
     async fn invalidate(&self, run_id: &RunId) {
         let path = self.get_path(run_id);
@@ -112,7 +191,6 @@ impl PersistResults for FilesystemPersistor {
         let end = fi.seek(SeekFrom::End(0)).await.located(here!())?;
 
         if end == 0 {
-            dbg!();
             // If the test results file is empty, it may have been offloaded to the remote
             // previously. Eagerly try to load it from the remote; if that fails, suppose that the
             // results file is indeed new.
@@ -121,17 +199,15 @@ impl PersistResults for FilesystemPersistor {
                 .remote
                 .load_to_disk(PersistenceKind::Results, run_id, &path)
                 .await;
-            dbg!();
 
             match load_result {
                 Ok(()) => {
                     tracing::info!(?run_id, "Loaded test results from remote.");
                     // We must now re-seek to the end so that the write appends.
-                    dbg!(fi.seek(SeekFrom::End(0)).await.located(here!()))?;
+                    fi.seek(SeekFrom::End(0)).await.located(here!())?;
                 }
                 Err(_) => {
                     tracing::info!(?run_id, "Assuming new test results file.");
-                    dbg!();
                 }
             }
         }
@@ -168,8 +244,7 @@ impl PersistResults for FilesystemPersistor {
 
         let opaque_jsonl = match read_results_lines(&mut fi).await {
             Ok(results) if !results.is_empty() => results,
-            e => {
-                dbg!(&e);
+            _ => {
                 // Slow path: the results are missing in the local cache, or corrupted.
                 // Load them in now and retry.
                 self.remote
@@ -204,7 +279,6 @@ async fn read_results_lines(fi: &mut File) -> OpaqueResult<Vec<Box<serde_json::v
         match serde_json::value::RawValue::from_string(line.clone()).located(here!()) {
             Ok(line) => opaque_jsonl.push(line),
             Err(e) => {
-                dbg!((&e, line));
                 return Err(e);
             }
         }
@@ -217,6 +291,7 @@ mod test {
     use std::{
         path::PathBuf,
         sync::{atomic::AtomicUsize, Arc},
+        time::Duration,
     };
 
     use abq_run_n_times::n_times;
@@ -235,8 +310,9 @@ mod test {
     use tokio::task::JoinSet;
 
     use crate::persistence::{
-        remote::{self, fake_error, fake_unreachable, PersistenceKind},
+        remote::{self, fake_error, fake_unreachable, OneWriteFakePersister, PersistenceKind},
         results::{fs::write_packed_line, PersistResults},
+        OffloadConfig,
     };
 
     use super::FilesystemPersistor;
@@ -860,5 +936,221 @@ mod test {
 
         assert_eq!(actual_results.len(), expected_results.len());
         assert_eq!(actual_results, expected_results);
+    }
+
+    #[tokio::test]
+    async fn offload_test_results_file() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+
+        let remote = OneWriteFakePersister::default();
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote.clone());
+
+        // Dump the data. Nothing should be synced to the remote yet.
+        {
+            fs.dump(&run_id, results.clone()).await.unwrap();
+
+            assert!(!remote.has_data());
+            assert_eq!(remote.stores(), 0);
+            assert_eq!(remote.loads(), 0);
+        }
+
+        // Run the offload job. Only the results should be stored.
+        {
+            fs.run_offload_job(OffloadConfig::new(Duration::ZERO))
+                .await
+                .unwrap();
+
+            assert!(remote.has_data());
+            assert_eq!(remote.stores(), 1);
+            assert_eq!(remote.loads(), 0);
+
+            let file_size = tokio::fs::metadata(fs.get_path(&run_id))
+                .await
+                .unwrap()
+                .len();
+            assert_eq!(file_size, 0);
+        }
+
+        // Now when we load the results, we should force a fetch of the remote.
+        {
+            let tests = fs.get_results(&run_id).await.unwrap();
+            assert_eq!(tests.decode().unwrap(), vec![results]);
+
+            assert!(remote.has_data());
+            assert_eq!(remote.stores(), 1);
+            assert_eq!(remote.loads(), 1);
+        }
+    }
+
+    #[n_times(50)]
+    #[tokio::test]
+    async fn race_dump_new_results_and_offload_job() {
+        // We want to race the offload-results job and the introduction of new results to the
+        // persistence layers. We should end up in a consistent state, and fetches of the results
+        // should succeed, regardless of who wins.
+        let run_id = RunId("test-run-id".to_string());
+
+        let results1 = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+        let results2 = Results(vec![
+            AssociatedTestResults::fake(wid(3), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
+        ]);
+
+        // Two cases:
+        //   - Offload job wins
+        //     - the remote sees one result to load/store
+        //   - Write-results job win
+        //     - the remote sees two results to load/store
+
+        let remote = OneWriteFakePersister::default();
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote.clone());
+
+        // Dump the first results line.
+        {
+            let fs = fs.clone();
+            fs.dump(&run_id, results1.clone()).await.unwrap();
+        }
+
+        let offload_config = OffloadConfig::new(Duration::ZERO);
+
+        // Run both tasks.
+        {
+            let offload_task = {
+                let fs = fs.clone();
+                async move { fs.run_offload_job(offload_config).await }
+            };
+
+            let dump_results_task = {
+                let fs = fs.clone();
+                let run_id = run_id.clone();
+                let results2 = results2.clone();
+                async move { fs.dump(&run_id, results2).await }
+            };
+
+            let dump_remote_result;
+            let dump_results_result;
+            if i % 2 == 0 {
+                (dump_remote_result, dump_results_result) =
+                    tokio::join!(offload_task, dump_results_task);
+            } else {
+                (dump_results_result, dump_remote_result) =
+                    tokio::join!(offload_task, dump_results_task);
+            }
+            dump_remote_result.unwrap();
+            dump_results_result.unwrap();
+        }
+
+        // Now, loads of the results should succeed with both.
+        let results = fs.get_results(&run_id).await.unwrap();
+        let results = results.decode().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], results1);
+        assert_eq!(results[1], results2);
+
+        assert_eq!(remote.stores(), 1);
+        assert_eq!(remote.loads(), 1);
+
+        let stored_in_remote = remote.get_data().unwrap();
+        let stored_in_remote: Vec<ResultsLine> =
+            std::io::BufRead::split(stored_in_remote.as_slice(), b'\n')
+                .map(|line| serde_json::from_slice(&line.unwrap()).unwrap())
+                .collect();
+
+        match stored_in_remote.as_slice() {
+            [r1] => {
+                assert_eq!(r1, &results1);
+            }
+            [r1, r2] => {
+                assert_eq!(r1, &results1);
+                assert_eq!(r2, &results2);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[n_times(100)]
+    #[tokio::test]
+    async fn race_get_results_and_offload_job() {
+        // We want to race the offload-results job and the fetching of results to the
+        // persistence layers. We should end up in a consistent state, and fetches of the results
+        // should succeed, regardless of who wins.
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+
+        // Two cases:
+        //   - Offload job wins
+        //     - the remote sees one result to load/store, or nothing at all.
+        //   - Get-results job win
+        //     - the remote sees one results in store, no loads
+
+        let remote = OneWriteFakePersister::default();
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote.clone());
+
+        // Dump the first results line.
+        {
+            let fs = fs.clone();
+            fs.dump(&run_id, results.clone()).await.unwrap();
+        }
+
+        let offload_config = OffloadConfig::new(Duration::ZERO);
+
+        // Run both tasks.
+        {
+            let offload_task = {
+                let fs = fs.clone();
+                async move { fs.run_offload_job(offload_config).await.unwrap() }
+            };
+
+            let fetch_results_task = {
+                let fs = fs.clone();
+                let run_id = run_id.clone();
+                let results = results.clone();
+                async move {
+                    let real_results = fs.get_results(&run_id).await.unwrap();
+                    let real_results = real_results.decode().unwrap();
+                    assert_eq!(real_results, vec![results])
+                }
+            };
+
+            if i % 2 == 0 {
+                tokio::join!(offload_task, fetch_results_task);
+            } else {
+                tokio::join!(fetch_results_task, offload_task);
+            }
+        }
+
+        match remote.stores() {
+            // Offload job won.
+            1 => {
+                assert_eq!(remote.loads(), 1);
+                let stored_in_remote = remote.get_data().unwrap();
+                let stored_in_remote: Vec<ResultsLine> =
+                    std::io::BufRead::split(stored_in_remote.as_slice(), b'\n')
+                        .map(|line| serde_json::from_slice(&line.unwrap()).unwrap())
+                        .collect();
+
+                assert_eq!(stored_in_remote.len(), 1);
+                assert_eq!(stored_in_remote[0], results);
+            }
+            // Get-results job won, nothing should be offloaded at all.
+            0 => assert_eq!(remote.loads(), 0),
+            _ => unreachable!(),
+        }
     }
 }

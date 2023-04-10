@@ -144,7 +144,7 @@ impl FilesystemPersistor {
             let metadata = manifest_file.metadata().await.located(here!())?;
             log_assert!(!metadata.is_dir(), path=?manifest_file.path(), "manifest file is a directory");
 
-            if eligible_for_offload(&time_now, &offload_config, &metadata)? {
+            if offload_config.file_eligible_for_offload(&time_now, &metadata)? {
                 let path = manifest_file.path();
                 self.perform_offload(path, time_now, offload_config).await?;
             }
@@ -165,7 +165,7 @@ impl FilesystemPersistor {
             // We must now check again whether the file is eligible for offload, since it may have been
             // modified since we performed the non-locked check.
             let metadata = locked_file.metadata().located(here!())?;
-            if !eligible_for_offload(&time_now, &offload_config, &metadata)? {
+            if !offload_config.file_eligible_for_offload(&time_now, &metadata)? {
                 return Ok(());
             }
 
@@ -184,25 +184,6 @@ impl FilesystemPersistor {
 
         Ok(())
     }
-}
-
-fn eligible_for_offload(
-    time_now: &SystemTime,
-    offload_config: &OffloadConfig,
-    metadata: &std::fs::Metadata,
-) -> Result<bool> {
-    let size = metadata.len();
-    let should_offload_time = || {
-        let accessed_time = metadata.accessed().located(here!())?;
-        if accessed_time > *time_now {
-            return Ok(false);
-        }
-
-        let elapsed = time_now.duration_since(accessed_time).located(here!())?;
-        let should_offload = offload_config.should_offload(elapsed);
-        Ok(should_offload)
-    };
-    Ok(size > 0 && should_offload_time()?)
 }
 
 #[async_trait]
