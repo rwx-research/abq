@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 use abq_utils::{
     error::{OpaqueResult, ResultLocation},
     here,
+    net_protocol::workers::RunId,
 };
 
 #[derive(Clone, Copy)]
@@ -47,4 +48,9 @@ impl OffloadConfig {
         };
         Ok(size > 0 && should_offload_time()?)
     }
+}
+
+#[must_use]
+pub struct OffloadSummary {
+    pub offloaded_run_ids: Vec<RunId>,
 }

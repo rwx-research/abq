@@ -21,7 +21,7 @@ use tokio::{
 
 use crate::persistence::{
     remote::{PersistenceKind, RemotePersister},
-    OffloadConfig,
+    OffloadConfig, OffloadSummary,
 };
 
 use super::{ArcResult, PersistResults, SharedPersistResults};
@@ -114,19 +114,30 @@ impl FilesystemPersistor {
 
     /// Offloads to the remote all non-empty results files that are older than
     /// the configured threshold.
-    pub async fn run_offload_job(&self, offload_config: OffloadConfig) -> ArcResult<()> {
+    pub async fn run_offload_job(
+        &self,
+        offload_config: OffloadConfig,
+    ) -> ArcResult<OffloadSummary> {
         let time_now = SystemTime::now();
         let mut results_files = tokio::fs::read_dir(&self.root).await.located(here!())?;
+        let mut offloaded_run_ids = vec![];
+
         while let Some(results_file) = results_files.next_entry().await.located(here!())? {
             let metadata = results_file.metadata().await.located(here!())?;
             log_assert!(!metadata.is_dir(), path=?results_file.path(), "results file is a directory");
 
             if offload_config.file_eligible_for_offload(&time_now, &metadata)? {
                 let path = results_file.path();
-                self.perform_offload(path, time_now, offload_config).await?;
+                let did_offload = self.perform_offload(path, time_now, offload_config).await?;
+
+                if did_offload {
+                    let run_id = self.run_id_of_path(&results_file.path())?;
+                    offloaded_run_ids.push(run_id);
+                }
             }
         }
-        Ok(())
+
+        Ok(OffloadSummary { offloaded_run_ids })
     }
 
     async fn perform_offload(
@@ -134,7 +145,7 @@ impl FilesystemPersistor {
         path: PathBuf,
         time_now: SystemTime,
         offload_config: OffloadConfig,
-    ) -> ArcResult<()> {
+    ) -> ArcResult<bool> {
         let fi = self.fds.get_or_insert(path.clone()).await?;
 
         // Take an exclusive lock so that new results don't come in while we flush to the remote.
@@ -144,7 +155,7 @@ impl FilesystemPersistor {
         // modified since we performed the non-locked check.
         let metadata = fi.metadata().await.located(here!())?;
         if !offload_config.file_eligible_for_offload(&time_now, &metadata)? {
-            return Ok(());
+            return Ok(false);
         }
 
         // While we have this opportunity, also instruct the OS to totally sync all data to disk
@@ -162,7 +173,7 @@ impl FilesystemPersistor {
         fi.set_len(0).await.located(here!())?;
         fi.sync_all().await.located(here!())?;
 
-        Ok(())
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -312,7 +323,7 @@ mod test {
     use crate::persistence::{
         remote::{self, fake_error, fake_unreachable, OneWriteFakePersister, PersistenceKind},
         results::{fs::write_packed_line, PersistResults},
-        OffloadConfig,
+        OffloadConfig, OffloadSummary,
     };
 
     use super::FilesystemPersistor;
@@ -963,9 +974,12 @@ mod test {
 
         // Run the offload job. Only the results should be stored.
         {
-            fs.run_offload_job(OffloadConfig::new(Duration::ZERO))
+            let OffloadSummary { offloaded_run_ids } = fs
+                .run_offload_job(OffloadConfig::new(Duration::ZERO))
                 .await
                 .unwrap();
+
+            assert_eq!(offloaded_run_ids, vec![run_id.clone()]);
 
             assert!(remote.has_data());
             assert_eq!(remote.stores(), 1);
@@ -1028,27 +1042,27 @@ mod test {
         {
             let offload_task = {
                 let fs = fs.clone();
-                async move { fs.run_offload_job(offload_config).await }
+                let run_id = run_id.clone();
+                async move {
+                    let OffloadSummary { offloaded_run_ids } =
+                        fs.run_offload_job(offload_config).await.unwrap();
+
+                    assert_eq!(offloaded_run_ids, &[run_id]);
+                }
             };
 
             let dump_results_task = {
                 let fs = fs.clone();
                 let run_id = run_id.clone();
                 let results2 = results2.clone();
-                async move { fs.dump(&run_id, results2).await }
+                async move { fs.dump(&run_id, results2).await.unwrap() }
             };
 
-            let dump_remote_result;
-            let dump_results_result;
             if i % 2 == 0 {
-                (dump_remote_result, dump_results_result) =
-                    tokio::join!(offload_task, dump_results_task);
+                tokio::join!(dump_results_task, offload_task);
             } else {
-                (dump_results_result, dump_remote_result) =
-                    tokio::join!(offload_task, dump_results_task);
+                tokio::join!(offload_task, dump_results_task);
             }
-            dump_remote_result.unwrap();
-            dump_results_result.unwrap();
         }
 
         // Now, loads of the results should succeed with both.
@@ -1111,6 +1125,7 @@ mod test {
         let offload_config = OffloadConfig::new(Duration::ZERO);
 
         // Run both tasks.
+        let offload_summary;
         {
             let offload_task = {
                 let fs = fs.clone();
@@ -1129,12 +1144,13 @@ mod test {
             };
 
             if i % 2 == 0 {
-                tokio::join!(offload_task, fetch_results_task);
+                (offload_summary, ()) = tokio::join!(offload_task, fetch_results_task);
             } else {
-                tokio::join!(fetch_results_task, offload_task);
+                ((), offload_summary) = tokio::join!(fetch_results_task, offload_task);
             }
         }
 
+        let OffloadSummary { offloaded_run_ids } = offload_summary;
         match remote.stores() {
             // Offload job won.
             1 => {
@@ -1147,9 +1163,14 @@ mod test {
 
                 assert_eq!(stored_in_remote.len(), 1);
                 assert_eq!(stored_in_remote[0], results);
+
+                assert_eq!(offloaded_run_ids, &[run_id]);
             }
             // Get-results job won, nothing should be offloaded at all.
-            0 => assert_eq!(remote.loads(), 0),
+            0 => {
+                assert_eq!(remote.loads(), 0);
+                assert!(offloaded_run_ids.is_empty());
+            }
             _ => unreachable!(),
         }
     }
