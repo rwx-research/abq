@@ -588,6 +588,12 @@ mod test {
             .await
             .unwrap();
 
+        let file_size = tokio::fs::metadata(fs.get_path(&run_id))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(file_size, 0);
+
         // Now when we load again, we should force a fetch of the remote.
         let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
         assert_eq!(tests, vec![test1]);
