@@ -81,6 +81,10 @@ impl Clone for SharedPersistManifest {
 }
 
 impl SharedPersistManifest {
+    pub fn new(persister: impl PersistentManifest + 'static) -> Self {
+        Self(Box::new(persister))
+    }
+
     pub fn borrowed(&self) -> &dyn PersistentManifest {
         &*self.0
     }

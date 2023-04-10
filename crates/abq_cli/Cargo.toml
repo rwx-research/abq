@@ -35,6 +35,10 @@ tempfile.workspace = true
 fnv.workspace = true
 
 tokio.workspace = true
+
+tokio-cron-scheduler.workspace = true
+cron.workspace = true
+
 futures.workspace = true
 
 tracing.workspace = true

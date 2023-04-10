@@ -22,7 +22,7 @@ use async_trait::async_trait;
 type ArcResult<T> = std::result::Result<T, Arc<LocatedError>>;
 
 #[async_trait]
-trait PersistResults: Send + Sync {
+pub trait PersistResults: Send + Sync {
     /// Dumps a summary line.
     async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()>;
 
@@ -36,6 +36,12 @@ trait PersistResults: Send + Sync {
 }
 
 pub struct SharedPersistResults(Box<dyn PersistResults>);
+
+impl SharedPersistResults {
+    pub fn new<T: PersistResults + 'static>(inner: T) -> Self {
+        Self(Box::new(inner))
+    }
+}
 
 impl Clone for SharedPersistResults {
     fn clone(&self) -> Self {
