@@ -1152,9 +1152,15 @@ mod test {
 
         let OffloadSummary { offloaded_run_ids } = offload_summary;
         match remote.stores() {
-            // Offload job won.
+            // Offload job completed.
+            //
+            // Just because the offload job completed, does not mean it won first and happened
+            // before the read of the results. It could have happened after the read of the results,
+            // since we've configured a zero-time offload job. As such, we may see either one load
+            // from the remote (if the offload job finished before the read), or no loads at all
+            // (if the offload job was after the read).
             1 => {
-                assert_eq!(remote.loads(), 1);
+                assert!(remote.loads() == 1 || remote.loads() == 0);
                 let stored_in_remote = remote.get_data().unwrap();
                 let stored_in_remote: Vec<ResultsLine> =
                     std::io::BufRead::split(stored_in_remote.as_slice(), b'\n')
