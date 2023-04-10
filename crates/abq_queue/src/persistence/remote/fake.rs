@@ -98,6 +98,10 @@ impl OneWriteFakePersister {
     pub fn has_data(&self) -> bool {
         self.stored.lock().is_some()
     }
+
+    pub fn get_data(&self) -> Option<Vec<u8>> {
+        self.stored.lock().clone()
+    }
 }
 
 #[async_trait]
@@ -121,8 +125,11 @@ impl RemotePersistence for OneWriteFakePersister {
         _run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
+        let data = match self.stored.lock().clone() {
+            Some(data) => data,
+            None => return Err("no data in storage".located(here!())),
+        };
         self.loaded_from.fetch_add(1, atomic::ORDERING);
-        let data = self.stored.lock().clone().unwrap();
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .truncate(true)

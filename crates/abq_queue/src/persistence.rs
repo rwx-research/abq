@@ -4,4 +4,4 @@ pub mod results;
 pub mod remote;
 
 mod offload;
-pub use offload::OffloadConfig;
+pub use offload::{OffloadConfig, OffloadSummary};

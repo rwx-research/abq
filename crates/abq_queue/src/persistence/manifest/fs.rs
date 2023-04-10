@@ -1,4 +1,7 @@
-use std::{path::PathBuf, time::SystemTime};
+use std::{
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
 
 use abq_utils::{
     error::ResultLocation,
@@ -13,7 +16,7 @@ use fs4::FileExt;
 
 use crate::persistence::{
     remote::{PersistenceKind, RemotePersister},
-    OffloadConfig,
+    OffloadConfig, OffloadSummary,
 };
 
 use super::{ManifestView, PersistentManifest, Result, SharedPersistManifest};
@@ -51,6 +54,25 @@ impl FilesystemPersistor {
         let run_id = &run_id.0;
 
         self.root.join(format!("{run_id}.manifest.json"))
+    }
+
+    fn run_id_of_path(&self, path: &Path) -> Result<RunId> {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("path {path:?} has no file name"))
+            .located(here!())?;
+
+        let file_name = file_name
+            .to_str()
+            .ok_or_else(|| format!("{path:?} is not valid UTF-8"))
+            .located(here!())?;
+
+        let run_id = file_name
+            .strip_suffix(".manifest.json")
+            .ok_or_else(|| format!("file name {path:?} does not end with '.results.jsonl'"))
+            .located(here!())?;
+
+        Ok(RunId(run_id.to_owned()))
     }
 
     async fn get_locked_file(&self, run_id: &RunId) -> Result<LockedFile> {
@@ -137,19 +159,29 @@ impl FilesystemPersistor {
 
     /// Offloads to the remote all non-empty manifest files that are older than
     /// the configured threshold.
-    pub async fn run_offload_job(&self, offload_config: OffloadConfig) -> Result<()> {
+    pub async fn run_offload_job(&self, offload_config: OffloadConfig) -> Result<OffloadSummary> {
         let time_now = SystemTime::now();
+
         let mut manifest_files = tokio::fs::read_dir(&self.root).await.located(here!())?;
+        let mut offloaded_run_ids = vec![];
+
         while let Some(manifest_file) = manifest_files.next_entry().await.located(here!())? {
             let metadata = manifest_file.metadata().await.located(here!())?;
             log_assert!(!metadata.is_dir(), path=?manifest_file.path(), "manifest file is a directory");
 
-            if eligible_for_offload(&time_now, &offload_config, &metadata)? {
+            if offload_config.file_eligible_for_offload(&time_now, &metadata)? {
                 let path = manifest_file.path();
-                self.perform_offload(path, time_now, offload_config).await?;
+
+                let did_offload = self.perform_offload(path, time_now, offload_config).await?;
+
+                if did_offload {
+                    let run_id = self.run_id_of_path(&manifest_file.path())?;
+                    offloaded_run_ids.push(run_id);
+                }
             }
         }
-        Ok(())
+
+        Ok(OffloadSummary { offloaded_run_ids })
     }
 
     async fn perform_offload(
@@ -157,7 +189,7 @@ impl FilesystemPersistor {
         path: PathBuf,
         time_now: SystemTime,
         offload_config: OffloadConfig,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Grab an exclusive lock on the file so it isn't changed from under us.
         let locked_file = self.get_locked_file_path(path.clone()).await?;
 
@@ -165,8 +197,8 @@ impl FilesystemPersistor {
             // We must now check again whether the file is eligible for offload, since it may have been
             // modified since we performed the non-locked check.
             let metadata = locked_file.metadata().located(here!())?;
-            if !eligible_for_offload(&time_now, &offload_config, &metadata)? {
-                return Ok(());
+            if !offload_config.file_eligible_for_offload(&time_now, &metadata)? {
+                return Ok(false);
             }
 
             // The manifest will already have been persisted to the remote when it was first persisted
@@ -177,32 +209,13 @@ impl FilesystemPersistor {
             locked_file.set_len(0).located(here!())?;
             locked_file.sync_all().located(here!())?;
 
-            Ok(())
+            Ok(true)
         };
 
-        tokio::task::spawn_blocking(task).await.located(here!())??;
+        let offloaded = tokio::task::spawn_blocking(task).await.located(here!())??;
 
-        Ok(())
+        Ok(offloaded)
     }
-}
-
-fn eligible_for_offload(
-    time_now: &SystemTime,
-    offload_config: &OffloadConfig,
-    metadata: &std::fs::Metadata,
-) -> Result<bool> {
-    let size = metadata.len();
-    let should_offload_time = || {
-        let accessed_time = metadata.accessed().located(here!())?;
-        if accessed_time > *time_now {
-            return Ok(false);
-        }
-
-        let elapsed = time_now.duration_since(accessed_time).located(here!())?;
-        let should_offload = offload_config.should_offload(elapsed);
-        Ok(should_offload)
-    };
-    Ok(size > 0 && should_offload_time()?)
 }
 
 #[async_trait]
@@ -272,7 +285,7 @@ mod test {
         remote::{
             fake_unreachable, FakePersister, NoopPersister, OneWriteFakePersister, PersistenceKind,
         },
-        OffloadConfig,
+        OffloadConfig, OffloadSummary,
     };
 
     use super::FilesystemPersistor;
@@ -603,9 +616,19 @@ mod test {
         assert!(remote.loads() == 0);
 
         // Run the offloader
-        fs.run_offload_job(OffloadConfig::new(Duration::ZERO))
+        let OffloadSummary { offloaded_run_ids } = fs
+            .run_offload_job(OffloadConfig::new(Duration::ZERO))
             .await
             .unwrap();
+
+        let file_size = tokio::fs::metadata(fs.get_path(&run_id))
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(file_size, 0);
+
+        assert_eq!(offloaded_run_ids.len(), 1);
+        assert_eq!(offloaded_run_ids[0], run_id);
 
         // Now when we load again, we should force a fetch of the remote.
         let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
@@ -652,14 +675,15 @@ mod test {
             async move {
                 fs.run_offload_job(OffloadConfig::new(Duration::ZERO))
                     .await
-                    .unwrap();
+                    .unwrap()
             }
         };
 
+        let offloaded_summary;
         if i % 2 == 0 {
-            tokio::join!(dump_task, offload_task);
+            ((), offloaded_summary) = tokio::join!(dump_task, offload_task);
         } else {
-            tokio::join!(offload_task, dump_task);
+            (offloaded_summary, ()) = tokio::join!(offload_task, dump_task);
         }
 
         // Two cases now:
@@ -674,8 +698,18 @@ mod test {
         let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
         assert_eq!(tests, vec![test1]);
 
+        let OffloadSummary { offloaded_run_ids } = offloaded_summary;
+
         assert!(remote.stores() == 1);
-        assert!(remote.loads() == 0 || remote.loads() == 1);
+        match remote.loads() {
+            1 => {
+                // Case 1: offload finished first, so the dump was offloaded.
+                assert_eq!(offloaded_run_ids.len(), 1);
+                assert_eq!(offloaded_run_ids[0], run_id);
+            }
+            0 => assert!(offloaded_run_ids.is_empty()),
+            _ => unreachable!(),
+        }
         assert!(remote.has_data());
     }
 
@@ -722,9 +756,12 @@ mod test {
         let offload_task = {
             let fs = fs.clone();
             async move {
-                fs.run_offload_job(OffloadConfig::new(Duration::ZERO))
+                let OffloadSummary { offloaded_run_ids } = fs
+                    .run_offload_job(OffloadConfig::new(Duration::ZERO))
                     .await
                     .unwrap();
+
+                assert!(offloaded_run_ids == [run_id] || offloaded_run_ids.is_empty());
             }
         };
 
