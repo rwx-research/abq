@@ -2,10 +2,12 @@
 
 ABQ 1.3.4 is patch release with feature preview of remote persisted storage.
 
-A remote storage source can be used to synchronize and offload ABQ manifests and
-test results usually stored on local disk.
-The remote storage source is used to download offloaded manifests and test results
-on-demand.
+A remote storage source is used to
+- synchronize ABQ manifests and test results stored on local disk to the remote
+  source
+- offload manifests and test results at a configured frequency, synchronizing
+  the data to the remote source and removing it from local disk
+- download offloaded manifests and test results on-demand
 
 When configured, files will be synced to the remote persistence target with
 the following behavior:
