@@ -1,3 +1,99 @@
+## 1.3.4
+
+ABQ 1.3.4 is patch release with feature preview of remote persisted storage.
+
+A remote storage source can be used to synchronize and offload ABQ manifests and
+test results usually stored on local disk.
+The remote storage source is used to download offloaded manifests and test results
+on-demand.
+
+When configured, files will be synced to the remote persistence target with
+the following behavior:
+
+- Manifests are synced to the remote persistence target after all entries in
+  a test run's manifest have been assigned to a worker. The manifest is not
+  modified again.
+- Results are synced to the remote persitence target when there are no writes of
+  results to the local persistence target in-flight. That is, writes to the
+  remote target are batched and executed when the local state is stable.
+
+The following environment configuration variables are available for configuring
+remote storage on `abq start`:
+
+- `ABQ_REMOTE_PERSISTENCE_STRATEGY`: What remote persistence strategy should be
+  used. If unset, no remote persistence will be configured. The options for
+  remote persistence are:
+  - `s3`: manifests and results will be persisted to an AWS S3 bucket. This
+    strategy requires the following additional environment variables to be
+    set:
+
+    - `ABQ_REMOTE_PERSISTENCE_S3_BUCKET`: The S3 bucket files should be written
+      to.
+    - `ABQ_REMOTE_PERSISTENCE_S3_KEY_PREFIX`: The prefix to use for keys written
+      to the configured S3 bucket.
+
+    AWS credentials and region information are read from the environment, using
+    the [standard AWS environment variable support](https://docs.aws.amazon.com/sdkref/latest/guide/environment-variables.html).
+
+  - `custom`: Files are remotely persisted by calling a provided executable.
+    This strategy requires the following additional environment variables to be
+    set:
+
+    - `ABQ_REMOTE_PERSISTENCE_COMMAND`: A comma-delimited string of the executable
+      and the head arguments that should be called to perform an operation on the
+      remote persistence target. The executable will be called in the following form:
+        
+      ```
+      <executable> <...arguments> <mode> <file-type> <run-id> <local-path>
+      ```
+
+      Where
+        - `<mode>` is either "store" or "load", depending on whether the file should be stored
+        into the remote location, or loaded from the remote location.
+        - `<file-type>` is either "manifest" or "results".
+        - `<run-id>` is the run ID of the test suite run.
+        - `<local-path>` is the path to the file on the local filesystem. If the mode is "store",
+        the content to upload should be read from this path. If the mode is "load", the
+        downloaded content should be written to this path.
+
+      The provided executable must be discoverable in the PATH that `abq start`
+      is executed with.
+
+      For example, if you have a Node.js script `abq-remote-persister.js` that
+      performs remote persistence operations, the configured environment
+      variable would be
+
+      ```
+      ABQ_REMOTE_PERSISTENCE_COMMAND="node,abq-remote-persister.js"
+      ```
+
+      Supposing that `node` is in the PATH.
+
+- `ABQ_OFFLOAD_MANIFESTS_CRON`: If configured, the [cron schedule](https://docs.rs/cron/latest/cron/)
+  by which manifest files stored locally should be offloaded to the remote
+  storage location.
+  A manifest file is only eligible for offload if it is stale; see
+  `ABQ_OFFLOAD_STALE_FILE_THRESHOLD_HOURS` below.
+  All time in the cron expression will be interpreted as UTC.
+
+- `ABQ_OFFLOAD_RESULTS_CRON`: If configured, the [cron schedule](https://docs.rs/cron/latest/cron/)
+  by which results files stored locally should be offloaded to the remote
+  storage location.
+  A results file is only eligible for offload if it is stale; see
+  `ABQ_OFFLOAD_STALE_FILE_THRESHOLD_HOURS` below.
+  All time in the cron expression will be interpreted as UTC.
+
+- `ABQ_OFFLOAD_STALE_FILE_THRESHOLD_HOURS`: The threshold, in hours, since the
+  last time a while was accessed before it is eligible for offloading to the
+  configured remote persistence location, if any is configured.
+  The default is 6 hours.
+
+A future release of ABQ may support synchronizing manifests and test results
+between ABQ queue instances, by way of a configured remote persistence target.
+
+As this is a feature preview, the interface presented here may have a breaking
+change in a future ABQ release.
+
 ## 1.3.3
 
 ABQ 1.3.3 is a patch release with improvements to the stability of the queue
