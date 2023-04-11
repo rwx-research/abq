@@ -16,7 +16,8 @@ use crate::{
     instance::{
         local_persistence::{ENV_PERSISTED_MANIFESTS_DIR, ENV_PERSISTED_RESULTS_DIR},
         remote_persistence::{
-            RemotePersistenceStrategy, ENV_REMOTE_PERSISTENCE_COMMAND,
+            RemotePersistenceStrategy, ENV_OFFLOAD_MANIFESTS_CRON, ENV_OFFLOAD_RESULTS_CRON,
+            ENV_OFFLOAD_STALE_FILE_THRESHOLD_HOURS, ENV_REMOTE_PERSISTENCE_COMMAND,
             ENV_REMOTE_PERSISTENCE_S3_BUCKET, ENV_REMOTE_PERSISTENCE_S3_KEY_PREFIX,
             ENV_REMOTE_PERSISTENCE_STRATEGY,
         },
@@ -140,7 +141,7 @@ pub enum Command {
         /// manifest files are only persisted locally.{n}
         ///
         /// The remote persistence options are:{n}
-        ///  - s3: files are remotely persisted to an S3 bucket. Requires `ABQ_REMOTE_PERISTENCE_S3_BUCKET`
+        ///  - s3: files are remotely persisted to an S3 bucket. Requires `ABQ_REMOTE_PERSISTENCE_S3_BUCKET`
         ///  and `ABQ_REMOTE_PERSISTENCE_S3_KEY_PREFIX` to be set as well. AWS credentials and region
         ///  information are read from the environment, using the standard AWS environment variable
         ///  support (https://docs.aws.amazon.com/sdkref/latest/guide/environment-variables.html).{n}
@@ -178,6 +179,29 @@ pub enum Command {
         /// Only relevant if `--remote-persistence-strategy` is set to `s3`.{n}
         #[clap(long, required = false, env(ENV_REMOTE_PERSISTENCE_S3_KEY_PREFIX))]
         remote_persistence_s3_key_prefix: Option<String>,
+
+        /// What cron schedule to offload manifests to the configured remote persistence
+        /// location on, if any remote persistence is configured.{n}
+        /// The schedule is a cron expression 6/7-stanza cron, given by the specification{n}
+        /// "Sec Min Hour DayOfMonth Month DayOfWeek Year?"{n}
+        /// All time will be interpreted as UTC.{n}
+        #[clap(long, required = false, env(ENV_OFFLOAD_MANIFESTS_CRON))]
+        offload_manifests_cron: Option<cron::Schedule>,
+
+        /// What cron schedule to offload results to the configured remote persistence
+        /// location on, if any remote persistence is configured.{n}
+        /// The schedule is a cron expression 6/7-stanza cron, given by the specification{n}
+        /// "Sec Min Hour DayOfMonth Month DayOfWeek Year?"{n}
+        /// All time will be interpreted as UTC.{n}
+        #[clap(long, required = false, env(ENV_OFFLOAD_RESULTS_CRON))]
+        offload_results_cron: Option<cron::Schedule>,
+
+        /// The threshold, in hours, since the last time a while was accessed before it is eligible
+        /// for offloading to the configured remote persistence location, if any is configured.{n}
+        /// Only relevant if `ABQ_OFFLOAD_MANIFESTS_CRON` or `ABQ_OFFLOAD_RESULTS_CRON` is
+        /// set.{n}
+        #[clap(long, default_value_t = 6, env(ENV_OFFLOAD_STALE_FILE_THRESHOLD_HOURS))]
+        offload_stale_file_threshold_hours: u32,
     },
     /// Starts an instance of an ABQ test suite run, or connects a worker to a test suite run.
     ///

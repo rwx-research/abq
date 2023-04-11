@@ -6,7 +6,7 @@ use std::{
 use tempfile::TempDir;
 
 pub const ENV_PERSISTED_MANIFESTS_DIR: &str = "ABQ_PERSISTED_MANIFESTS_DIR";
-pub const ENV_PERSISTED_RESULTS_DIR: &str = "ABQ_PERISTED_RESULTS_DIR";
+pub const ENV_PERSISTED_RESULTS_DIR: &str = "ABQ_PERSISTED_RESULTS_DIR";
 
 pub struct LocalPersistenceConfig {
     manifests_dir: Option<PathBuf>,

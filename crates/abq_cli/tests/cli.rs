@@ -18,6 +18,7 @@ use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
+use std::ops::{Deref, DerefMut};
 use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
 use std::thread;
 use std::time::Duration;
@@ -81,6 +82,36 @@ struct Abq {
     always_capture_stderr: bool,
     working_dir: Option<PathBuf>,
     inherit: bool,
+}
+
+struct AbqProc(Option<Child>);
+
+impl Drop for AbqProc {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+        }
+    }
+}
+
+impl Deref for AbqProc {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for AbqProc {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+
+impl AbqProc {
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.0.take().unwrap().wait_with_output()
+    }
 }
 
 impl Abq {
@@ -148,7 +179,7 @@ impl Abq {
         }
     }
 
-    fn spawn(self) -> Child {
+    fn spawn(self) -> AbqProc {
         let Self {
             name,
             args,
@@ -187,8 +218,10 @@ impl Abq {
             cmd.env("ABQ_LOG", "abq=debug");
         }
 
-        cmd.spawn()
-            .unwrap_or_else(|_| panic!("{} cli failed to spawn", abq_binary().display()))
+        let child = cmd
+            .spawn()
+            .unwrap_or_else(|_| panic!("{} cli failed to spawn", abq_binary().display()));
+        AbqProc(Some(child))
     }
 }
 
@@ -326,7 +359,7 @@ macro_rules! test_all_network_config_options {
     }};
 }
 
-fn term(mut queue_proc: Child) {
+fn term(mut queue_proc: AbqProc) {
     queue_proc.kill().unwrap();
 }
 
@@ -3024,6 +3057,12 @@ fn heuristic_wait_for_written_path(path: &Path) {
     thread::sleep(Duration::from_millis(10));
 }
 
+fn heuristic_wait_for_offloaded_file(path: &Path) {
+    while std::fs::metadata(path).unwrap().len() != 0 {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 #[serial]
 fn custom_remote_persistence() {
@@ -3437,6 +3476,266 @@ fn manifest_loaded_from_remote_persistence() {
     {
         heuristic_wait_for_written_path(&local_manifest_path);
         heuristic_wait_for_written_path(&custom_persister_manifest_path);
+    }
+
+    term(queue_proc);
+}
+
+#[test]
+#[serial]
+fn manifest_offloaded_to_remote_persistence_and_restored() {
+    let name = "manifest_offloaded_to_remote_persistence_and_restored";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let custom_persister = CopyToDirPersister::new();
+
+    let local_manifests_dir = tempfile::tempdir().unwrap().into_path();
+
+    let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
+        ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
+        ("ABQ_REMOTE_PERSISTENCE_COMMAND", &custom_persister.command),
+        ("ABQ_PERSISTED_MANIFESTS_DIR", local_manifests_dir.to_str().unwrap()),
+        ("ABQ_OFFLOAD_STALE_FILE_THRESHOLD_HOURS", "0"), // allow immediate offloading of manifests
+        ("ABQ_OFFLOAD_MANIFESTS_CRON", "* * * * * *"), // allow immediate offloading of manifests
+    ]);
+
+    let run_id = "test-run-id";
+
+    use abq_native_runner_simulation::{pack, Msg::*};
+    use abq_utils::net_protocol::runners::{
+        InitSuccessMessage, Manifest, ManifestMessage, Test, TestOrGroup,
+    };
+
+    let proto = ProtocolWitness::TEST;
+
+    let test = TestOrGroup::test(Test::new(proto, "test1", vec![], Default::default()));
+    let manifest = ManifestMessage::new(Manifest::new(vec![test], Default::default()));
+
+    let packed;
+    let test_args = {
+        let simulation = [
+            Connect,
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![
+                    OpaqueWrite(pack(&manifest)),
+                    // Finish
+                    Exit(0),
+                ],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    // Read first test, write okay
+                    OpaqueRead,
+                    OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                ],
+            },
+            Exit(0),
+        ];
+
+        packed = pack_msgs_to_disk(simulation);
+
+        // abq test ...
+        move || {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = packed.path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker=0"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        }
+    };
+
+    // Run `abq test` once. We should succeed.
+    {
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt1"))
+            .args(test_args())
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+
+    let local_manifest_path = local_manifests_dir.join("test-run-id.manifest.json");
+    let custom_persister_manifest_path = custom_persister.dir().join("manifest-test-run-id");
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    // The manifest should now be offloaded from the local persistence path.
+    {
+        heuristic_wait_for_written_path(&custom_persister_manifest_path);
+        heuristic_wait_for_offloaded_file(&local_manifest_path);
+    }
+
+    // Run `abq test` again. It should succeed, with the manifest loaded from the remote.
+    {
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt2"))
+            .args(test_args())
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+
+    term(queue_proc);
+}
+
+#[test]
+#[serial]
+fn results_offloaded_to_remote_persistence_and_restored() {
+    let name = "results_offloaded_to_remote_persistence_and_restored";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let custom_persister = CopyToDirPersister::new();
+
+    let local_results_dir = tempfile::tempdir().unwrap().into_path();
+
+    let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
+        ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
+        ("ABQ_REMOTE_PERSISTENCE_COMMAND", &custom_persister.command),
+        ("ABQ_PERSISTED_RESULTS_DIR", local_results_dir.to_str().unwrap()),
+        ("ABQ_OFFLOAD_STALE_FILE_THRESHOLD_HOURS", "0"), // allow immediate offloading of results
+        ("ABQ_OFFLOAD_RESULTS_CRON", "* * * * * *"), // allow immediate offloading of results
+    ]);
+
+    let run_id = "test-run-id";
+
+    use abq_native_runner_simulation::{pack, Msg::*};
+    use abq_utils::net_protocol::runners::{
+        InitSuccessMessage, Manifest, ManifestMessage, Test, TestOrGroup,
+    };
+
+    let proto = ProtocolWitness::TEST;
+
+    let test = TestOrGroup::test(Test::new(proto, "test1", vec![], Default::default()));
+    let manifest = ManifestMessage::new(Manifest::new(vec![test], Default::default()));
+
+    let packed;
+    let test_args = {
+        let simulation = [
+            Connect,
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![
+                    OpaqueWrite(pack(&manifest)),
+                    // Finish
+                    Exit(0),
+                ],
+                else_do: vec![
+                    //
+                    // Read init context message + write ACK
+                    OpaqueRead,
+                    OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    // Read first test, write okay
+                    OpaqueRead,
+                    OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                ],
+            },
+            Exit(0),
+        ];
+
+        packed = pack_msgs_to_disk(simulation);
+
+        let queue_addr = queue_addr.clone();
+
+        // abq test ...
+        move || {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = packed.path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker=0"),
+                format!("--queue-addr={queue_addr}"),
+                format!("--run-id={run_id}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        }
+    };
+
+    let report_args = move || {
+        let args = vec![
+            format!("report"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    // Run `abq test` once. We should succeed.
+    {
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_worker0_attempt1"))
+            .args(test_args())
+            .run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+
+    let local_results_path = local_results_dir.join("test-run-id.results.jsonl");
+    let custom_persister_results_path = custom_persister.dir().join("results-test-run-id");
+
+    std::thread::sleep(Duration::from_secs(1));
+
+    // The results should now be offloaded from the local persistence path.
+    {
+        heuristic_wait_for_written_path(&custom_persister_results_path);
+        heuristic_wait_for_offloaded_file(&local_results_path);
+    }
+
+    // Run `abq report`. It should succeed, with the results loaded from the remote.
+    {
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+        } = Abq::new(format!("{name}_report")).args(report_args()).run();
+
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert_sum_of_run_tests([stdout.as_str()], 1);
     }
 
     term(queue_proc);

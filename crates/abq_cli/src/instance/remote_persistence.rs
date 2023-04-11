@@ -1,4 +1,4 @@
-use std::{fmt::Display, str::FromStr};
+use std::{fmt::Display, str::FromStr, time::Duration};
 
 use abq_queue::persistence::remote::{CustomPersister, NoopPersister, RemotePersister};
 #[cfg(feature = "s3")]
@@ -12,6 +12,10 @@ pub const ENV_REMOTE_PERSISTENCE_STRATEGY: &str = "ABQ_REMOTE_PERSISTENCE_STRATE
 pub const ENV_REMOTE_PERSISTENCE_COMMAND: &str = "ABQ_REMOTE_PERSISTENCE_COMMAND";
 pub const ENV_REMOTE_PERSISTENCE_S3_BUCKET: &str = "ABQ_REMOTE_PERSISTENCE_S3_BUCKET";
 pub const ENV_REMOTE_PERSISTENCE_S3_KEY_PREFIX: &str = "ABQ_REMOTE_PERSISTENCE_S3_KEY_PREFIX";
+
+pub const ENV_OFFLOAD_STALE_FILE_THRESHOLD_HOURS: &str = "ABQ_OFFLOAD_STALE_FILE_THRESHOLD_HOURS";
+pub const ENV_OFFLOAD_MANIFESTS_CRON: &str = "ABQ_OFFLOAD_MANIFESTS_CRON";
+pub const ENV_OFFLOAD_RESULTS_CRON: &str = "ABQ_OFFLOAD_RESULTS_CRON";
 
 #[derive(Clone)]
 pub enum RemotePersistenceStrategy {
@@ -48,6 +52,12 @@ pub struct RemotePersistenceConfig {
 }
 
 pub type RemotePersisterResult = Result<RemotePersister, clap::Error>;
+
+pub struct OffloadToRemoteConfig {
+    pub offload_manifests_cron: Option<cron::Schedule>,
+    pub offload_results_cron: Option<cron::Schedule>,
+    pub stale_duration: Duration,
+}
 
 impl RemotePersistenceConfig {
     pub fn new(

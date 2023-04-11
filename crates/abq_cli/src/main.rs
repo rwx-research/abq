@@ -38,7 +38,8 @@ use crate::{
     args::Token,
     health::HealthCheckKind,
     instance::{
-        local_persistence::LocalPersistenceConfig, remote_persistence::RemotePersistenceConfig,
+        local_persistence::LocalPersistenceConfig,
+        remote_persistence::{OffloadToRemoteConfig, RemotePersistenceConfig},
     },
     reporting::StdoutPreferences,
 };
@@ -240,6 +241,9 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             remote_persistence_command,
             remote_persistence_s3_bucket,
             remote_persistence_s3_key_prefix,
+            offload_manifests_cron,
+            offload_results_cron,
+            offload_stale_file_threshold_hours,
         } => {
             let server_auth = match (user_token, admin_token) {
                 (Some(user), Some(admin)) => {
@@ -273,6 +277,17 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 remote_persistence_s3_key_prefix,
             );
 
+            let offload_to_remote_config = {
+                let offload_state_file_threshold_seconds =
+                    (offload_stale_file_threshold_hours as u64) * 60 * 60;
+
+                OffloadToRemoteConfig {
+                    offload_manifests_cron,
+                    offload_results_cron,
+                    stale_duration: Duration::from_secs(offload_state_file_threshold_seconds),
+                }
+            };
+
             let code = instance::start_abq_forever(
                 public_ip,
                 bind_ip,
@@ -282,6 +297,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 ServerOptions::new(server_auth, server_tls),
                 local_persistence_config,
                 remote_persistence_config,
+                offload_to_remote_config,
             )
             .await?;
             Ok(code)

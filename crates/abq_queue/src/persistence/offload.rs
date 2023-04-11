@@ -6,7 +6,7 @@ use abq_utils::{
     net_protocol::workers::RunId,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum OffloadConfigInner {
     Never,
     After(Duration),
@@ -47,6 +47,12 @@ impl OffloadConfig {
             Ok(should_offload)
         };
         Ok(size > 0 && should_offload_time()?)
+    }
+}
+
+impl std::fmt::Debug for OffloadConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 

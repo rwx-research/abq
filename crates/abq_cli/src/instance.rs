@@ -1,8 +1,11 @@
-use abq_queue::persistence;
+use abq_queue::persistence::manifest::SharedPersistManifest;
 use abq_queue::persistence::remote::NoopPersister;
+use abq_queue::persistence::results::SharedPersistResults;
+use abq_queue::persistence::{self, OffloadConfig, OffloadSummary};
 use abq_queue::queue::{Abq, QueueConfig};
 use abq_queue::RunTimeoutStrategy;
 use abq_utils::auth::{AdminToken, ServerAuthStrategy, UserToken};
+use abq_utils::error::{LocatedError, Location};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::Entity;
@@ -11,17 +14,19 @@ use abq_utils::net_protocol::publicize_addr;
 use abq_utils::net_protocol::workers::RunId;
 use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
 use abq_workers::negotiate::{QueueNegotiatorHandle, QueueNegotiatorHandleError};
+use futures::FutureExt;
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
 use std::net::{IpAddr, SocketAddr};
 use std::thread;
 use tempfile::TempDir;
+use tokio_cron_scheduler::JobScheduler;
 
 use thiserror::Error;
 use tokio::select;
 
 use self::local_persistence::LocalPersistenceConfig;
-use self::remote_persistence::RemotePersistenceConfig;
+use self::remote_persistence::{OffloadToRemoteConfig, RemotePersistenceConfig};
 
 pub mod local_persistence;
 pub mod remote_persistence;
@@ -33,6 +38,9 @@ type ClientAuthStrategy = abq_utils::auth::ClientAuthStrategy<abq_utils::auth::U
 /// time.
 const RESULTS_PERSISTENCE_LRU_CAPACITY: usize = 25;
 
+type ManifestPersister = persistence::manifest::FilesystemPersistor;
+type ResultsPersister = persistence::results::FilesystemPersistor;
+
 /// Starts an [Abq] instance in the current process forever.
 pub async fn start_abq_forever(
     public_ip: Option<IpAddr>,
@@ -43,23 +51,37 @@ pub async fn start_abq_forever(
     server_options: ServerOptions,
     local_persistence_config: LocalPersistenceConfig,
     remote_persistence_config: RemotePersistenceConfig,
-) -> Result<ExitCode, clap::Error> {
+    offload_to_remote_config: OffloadToRemoteConfig,
+) -> anyhow::Result<ExitCode> {
     // Public IP defaults to the binding IP.
     let public_ip = public_ip.unwrap_or(bind_ip);
 
     let local_persistence = local_persistence_config.build()?;
     let remote_persistence = remote_persistence_config.resolve().await?;
 
-    let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
+    let persist_manifest = ManifestPersister::new(
         local_persistence.manifests_dir(),
         remote_persistence.clone(),
     );
 
-    let persist_results = persistence::results::FilesystemPersistor::new_shared(
+    let persist_results = ResultsPersister::new(
         local_persistence.results_dir(),
         RESULTS_PERSISTENCE_LRU_CAPACITY,
         remote_persistence,
     );
+
+    {
+        // TODO(PERF): would it be better to place these jobs on a separate runtime in a different
+        // thread?
+        let scheduled_jobs = build_scheduled_jobs(
+            offload_to_remote_config,
+            persist_manifest.clone(),
+            persist_results.clone(),
+        )
+        .await?;
+
+        tokio::spawn(async move { scheduled_jobs.start().await });
+    }
 
     let run_timeout_strategy = RunTimeoutStrategy::RUN_BASED;
 
@@ -70,14 +92,13 @@ pub async fn start_abq_forever(
         work_port,
         negotiator_port,
         server_options,
-        persist_manifest,
-        persist_results,
+        persist_manifest: SharedPersistManifest::new(persist_manifest),
+        persist_results: SharedPersistResults::new(persist_results),
         run_timeout_strategy,
     };
     let mut abq = Abq::start(queue_config).await;
 
-    tracing::debug!("Queue active at {}", abq.server_addr());
-
+    println!("ABQ is live on {}", abq.server_addr());
     println!(
         "Persisting manifests at {}",
         local_persistence.manifests_dir().display(),
@@ -135,6 +156,116 @@ pub async fn start_abq_forever(
     abq.shutdown().await.unwrap();
 
     Ok(ExitCode::SUCCESS)
+}
+
+async fn build_scheduled_jobs(
+    offload_to_remote_config: OffloadToRemoteConfig,
+    manifest_persister: persistence::manifest::FilesystemPersistor,
+    results_persister: persistence::results::FilesystemPersistor,
+) -> anyhow::Result<JobScheduler> {
+    use tokio_cron_scheduler::Job;
+
+    let OffloadToRemoteConfig {
+        offload_manifests_cron,
+        offload_results_cron,
+        stale_duration,
+    } = offload_to_remote_config;
+
+    let offload_config = OffloadConfig::new(stale_duration);
+
+    let scheduler = JobScheduler::new().await?;
+
+    tracing::info!(?stale_duration, "using stale file duration");
+
+    if let Some(offload_manifest_cron) = offload_manifests_cron {
+        let run = move |uuid, _| {
+            let manifest_persister = manifest_persister.clone();
+            async move { do_manifest_offload(uuid, manifest_persister, offload_config).await }
+                .boxed()
+        };
+
+        scheduler
+            .add(Job::new_async(offload_manifest_cron, run)?)
+            .await?;
+    }
+
+    if let Some(offload_results_cron) = offload_results_cron {
+        let run = move |uuid, _| {
+            let results_persister = results_persister.clone();
+            async move { do_results_offload(uuid, results_persister, offload_config).await }.boxed()
+        };
+
+        scheduler
+            .add(Job::new_async(offload_results_cron, run)?)
+            .await?;
+    }
+
+    scheduler.shutdown_on_ctrl_c();
+
+    Ok(scheduler)
+}
+
+async fn do_manifest_offload<T: std::fmt::Display>(
+    uuid: T,
+    manifest_persister: ManifestPersister,
+    offload_config: OffloadConfig,
+) {
+    let offload_result = manifest_persister.run_offload_job(offload_config).await;
+
+    match offload_result {
+        Ok(OffloadSummary { offloaded_run_ids }) => {
+            tracing::info!(
+                ?offloaded_run_ids,
+                len=%offloaded_run_ids.len(),
+                "Offloaded manifests to remote",
+            )
+        }
+        Err(LocatedError {
+            error,
+            location: Location { file, line, column },
+        }) => {
+            tracing::error!(
+                %uuid,
+                file,
+                line,
+                column,
+                "error offloading manifests to remote: {}",
+                error
+            );
+        }
+    }
+}
+
+async fn do_results_offload<T: std::fmt::Display>(
+    uuid: T,
+    results_persister: ResultsPersister,
+    offload_config: OffloadConfig,
+) {
+    let offload_result = results_persister.run_offload_job(offload_config).await;
+
+    match offload_result {
+        Ok(OffloadSummary { offloaded_run_ids }) => {
+            tracing::info!(
+                ?offloaded_run_ids,
+                len=%offloaded_run_ids.len(),
+                "Offloaded results to remote",
+            )
+        }
+        Err(err) => {
+            let LocatedError {
+                error,
+                location: Location { file, line, column },
+            } = &*err;
+            tracing::error!(
+                %uuid,
+                file,
+                line,
+                column,
+                "error offloading results to remote: {}",
+                error
+            );
+        }
+    }
 }
 
 pub(crate) struct AbqInstance {
