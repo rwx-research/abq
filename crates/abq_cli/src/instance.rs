@@ -25,10 +25,13 @@ use tokio_cron_scheduler::JobScheduler;
 use thiserror::Error;
 use tokio::select;
 
+use crate::instance::periodic_job::ConcurrencyControlledJob;
+
 use self::local_persistence::LocalPersistenceConfig;
 use self::remote_persistence::{OffloadToRemoteConfig, RemotePersistenceConfig};
 
 pub mod local_persistence;
+mod periodic_job;
 pub mod remote_persistence;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
@@ -178,10 +181,14 @@ async fn build_scheduled_jobs(
     tracing::info!(?stale_duration, "using stale file duration");
 
     if let Some(offload_manifest_cron) = offload_manifests_cron {
-        let run = move |uuid, _| {
+        let job = ConcurrencyControlledJob::new("offload manifests", move || {
             let manifest_persister = manifest_persister.clone();
-            async move { do_manifest_offload(uuid, manifest_persister, offload_config).await }
-                .boxed()
+            do_manifest_offload(manifest_persister, offload_config).boxed()
+        });
+
+        let run = move |_, _| {
+            let job = job.clone();
+            async move { job.run().await }.boxed()
         };
 
         scheduler
@@ -190,9 +197,14 @@ async fn build_scheduled_jobs(
     }
 
     if let Some(offload_results_cron) = offload_results_cron {
-        let run = move |uuid, _| {
+        let job = ConcurrencyControlledJob::new("offload results", move || {
             let results_persister = results_persister.clone();
-            async move { do_results_offload(uuid, results_persister, offload_config).await }.boxed()
+            do_results_offload(results_persister, offload_config).boxed()
+        });
+
+        let run = move |_, _| {
+            let job = job.clone();
+            async move { job.run().await }.boxed()
         };
 
         scheduler
@@ -205,11 +217,7 @@ async fn build_scheduled_jobs(
     Ok(scheduler)
 }
 
-async fn do_manifest_offload<T: std::fmt::Display>(
-    uuid: T,
-    manifest_persister: ManifestPersister,
-    offload_config: OffloadConfig,
-) {
+async fn do_manifest_offload(manifest_persister: ManifestPersister, offload_config: OffloadConfig) {
     let offload_result = manifest_persister.run_offload_job(offload_config).await;
 
     match offload_result {
@@ -225,7 +233,6 @@ async fn do_manifest_offload<T: std::fmt::Display>(
             location: Location { file, line, column },
         }) => {
             tracing::error!(
-                %uuid,
                 file,
                 line,
                 column,
@@ -236,11 +243,7 @@ async fn do_manifest_offload<T: std::fmt::Display>(
     }
 }
 
-async fn do_results_offload<T: std::fmt::Display>(
-    uuid: T,
-    results_persister: ResultsPersister,
-    offload_config: OffloadConfig,
-) {
+async fn do_results_offload(results_persister: ResultsPersister, offload_config: OffloadConfig) {
     let offload_result = results_persister.run_offload_job(offload_config).await;
 
     match offload_result {
@@ -257,7 +260,6 @@ async fn do_results_offload<T: std::fmt::Display>(
                 location: Location { file, line, column },
             } = &*err;
             tracing::error!(
-                %uuid,
                 file,
                 line,
                 column,
