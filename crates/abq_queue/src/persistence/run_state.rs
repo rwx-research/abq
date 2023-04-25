@@ -1,6 +1,8 @@
 //! Representation of run state that can be persisted to a remote and loaded from a remote.
 //! See [crate::queue::RunState::InitialManifestDone].
 
+use std::io;
+
 use abq_utils::{
     exit::ExitCode,
     net_protocol::{entity::Entity, runners::MetadataMap},
@@ -12,7 +14,7 @@ const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// The version of the schema used by this serialized state.
 /// Incompatible schemas cannot be read.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone, Copy)]
 struct SchemaVersion {
     schema_version: u32,
 }
@@ -24,16 +26,31 @@ pub struct RunState {
     pub seen_workers: Vec<Entity>,
 }
 
-/// Internal representation of a run state, that can be serialized to and deserialized from a
-/// remote.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct SerializedRunState {
+impl RunState {
+    #[cfg(test)]
+    pub fn fake() -> RunState {
+        RunState {
+            new_worker_exit_code: ExitCode::SUCCESS,
+            init_metadata: MetadataMap::new(),
+            seen_workers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
+struct SerializedRunStateInner {
     #[serde(flatten)]
     schema_version: SchemaVersion,
 
     #[serde(flatten)]
     run_state: RunState,
 }
+
+/// Internal representation of a run state, that can be serialized to and deserialized from a
+/// remote.
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[repr(transparent)]
+pub struct SerializableRunState(SerializedRunStateInner);
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -43,23 +60,23 @@ pub enum ParseError {
     Other(#[from] serde_json::Error),
 }
 
-impl SerializedRunState {
+impl SerializableRunState {
     pub fn new(run_state: RunState) -> Self {
-        Self {
+        Self(SerializedRunStateInner {
             schema_version: SchemaVersion {
                 schema_version: CURRENT_SCHEMA_VERSION,
             },
             run_state,
-        }
+        })
     }
 
     pub fn into_run_state(self) -> RunState {
-        self.run_state
+        self.0.run_state
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, ParseError> {
         let err = match serde_json::from_slice(bytes) {
-            Ok(run_state) => return Ok(run_state),
+            Ok(run_state) => return Ok(Self(run_state)),
             Err(err) => err,
         };
 
@@ -75,8 +92,14 @@ impl SerializedRunState {
         }
     }
 
+    pub fn serialize_to(&self, writer: &mut impl io::Write) -> serde_json::Result<()> {
+        serde_json::to_writer(writer, &self.0)
+    }
+
     pub fn serialize(&self) -> serde_json::Result<Vec<u8>> {
-        serde_json::to_vec(self)
+        let mut writer = Vec::new();
+        self.serialize_to(&mut writer)?;
+        Ok(writer)
     }
 }
 
@@ -91,12 +114,12 @@ mod test {
             init_metadata: MetadataMap::new(),
             seen_workers: vec![],
         };
-        let serialized = SerializedRunState::new(run_state.clone());
+        let serialized = SerializableRunState::new(run_state.clone());
         let serialized_bytes = serialized.serialize().unwrap();
-        let deserialized = SerializedRunState::deserialize(&serialized_bytes).unwrap();
+        let deserialized = SerializableRunState::deserialize(&serialized_bytes).unwrap();
         assert_eq!(deserialized.into_run_state(), run_state);
 
-        insta::assert_json_snapshot!(serialized, @r###"
+        insta::assert_json_snapshot!(serialized.0, @r###"
         {
           "schema_version": 1,
           "new_worker_exit_code": 0,
@@ -114,7 +137,7 @@ mod test {
             "worker_foobar": {}
         }
         "###;
-        let err = SerializedRunState::deserialize(&serialized.as_bytes()).unwrap_err();
+        let err = SerializableRunState::deserialize(&serialized.as_bytes()).unwrap_err();
 
         assert!(matches!(
             err,
@@ -132,14 +155,14 @@ mod test {
             init_metadata: MetadataMap::new(),
             seen_workers: vec![],
         };
-        let serialized = SerializedRunState {
+        let serialized = SerializableRunState(SerializedRunStateInner {
             schema_version: SchemaVersion {
                 schema_version: CURRENT_SCHEMA_VERSION + 10,
             },
             run_state: run_state.clone(),
-        };
+        });
         let serialized_bytes = serialized.serialize().unwrap();
-        let deserialized = SerializedRunState::deserialize(&serialized_bytes).unwrap();
+        let deserialized = SerializableRunState::deserialize(&serialized_bytes).unwrap();
         assert_eq!(deserialized.into_run_state(), run_state);
     }
 
@@ -149,7 +172,7 @@ mod test {
         {
             "schema_version": 16,
         "###;
-        let err = SerializedRunState::deserialize(&serialized.as_bytes()).unwrap_err();
+        let err = SerializableRunState::deserialize(&serialized.as_bytes()).unwrap_err();
 
         assert!(matches!(err, ParseError::Other(..)));
     }

@@ -31,10 +31,14 @@ pub use fake::FakePersister;
 #[cfg(test)]
 pub use fake::OneWriteFakePersister;
 
+use super::run_state::RunState;
+use super::run_state::SerializableRunState;
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum PersistenceKind {
     Manifest,
     Results,
+    RunState,
 }
 
 impl PersistenceKind {
@@ -42,6 +46,7 @@ impl PersistenceKind {
         match self {
             Self::Manifest => "manifest",
             Self::Results => "results",
+            Self::RunState => "run_state",
         }
     }
 
@@ -49,8 +54,16 @@ impl PersistenceKind {
         match self {
             Self::Manifest => "json",
             Self::Results => "jsonl",
+            Self::RunState => "json",
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoadedRunState {
+    Found(RunState),
+    NotFound,
+    IncompatibleSchemaVersion { found: u32, expected: u32 },
 }
 
 #[async_trait]
@@ -72,11 +85,15 @@ pub trait RemotePersistence {
         into_local_path: &Path,
     ) -> OpaqueResult<()>;
 
-    /// Returns `true` if and only if the remote persistence has an entry for the given run ID.
-    ///
-    /// The remote persistence implementation should check whether an entry for a manifest exists
-    /// for the given run ID.
-    async fn has_run_id(&self, run_id: &RunId) -> OpaqueResult<bool>;
+    /// Stores a [RunState] to the remote persistence.
+    async fn store_run_state(
+        &self,
+        run_id: &RunId,
+        state: SerializableRunState,
+    ) -> OpaqueResult<()>;
+
+    /// Tries to load a [RunState] from the remote persistence.
+    async fn try_load_run_state(&self, run_id: &RunId) -> OpaqueResult<LoadedRunState>;
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync>;
 }

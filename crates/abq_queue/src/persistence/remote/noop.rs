@@ -7,7 +7,9 @@ use abq_utils::{
 };
 use async_trait::async_trait;
 
-use super::{PersistenceKind, RemotePersistence};
+use crate::persistence::run_state::SerializableRunState;
+
+use super::{LoadedRunState, PersistenceKind, RemotePersistence};
 
 #[derive(Clone, Default)]
 pub struct NoopPersister;
@@ -38,8 +40,16 @@ impl RemotePersistence for NoopPersister {
         Err("NoopPersister does not support loading.".located(here!()))
     }
 
-    async fn has_run_id(&self, _run_id: &RunId) -> OpaqueResult<bool> {
-        unimplemented!("NoopPersister does not support checking for run_id existence.")
+    async fn store_run_state(
+        &self,
+        _run_id: &RunId,
+        _state: SerializableRunState,
+    ) -> OpaqueResult<()> {
+        Ok(())
+    }
+
+    async fn try_load_run_state(&self, _run_id: &RunId) -> OpaqueResult<LoadedRunState> {
+        Ok(LoadedRunState::NotFound)
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {

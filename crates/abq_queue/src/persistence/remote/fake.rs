@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 
-use super::{PersistenceKind, RemotePersistence};
+use crate::persistence::run_state::SerializableRunState;
+
+use super::{LoadedRunState, PersistenceKind, RemotePersistence};
 
 #[derive(Clone)]
 pub struct FakePersister<OnStoreFromDisk, OnLoad> {
@@ -74,8 +76,16 @@ where
         (self.on_load)(kind, run_id.clone(), into_local_path.to_owned()).await
     }
 
-    async fn has_run_id(&self, _run_id: &RunId) -> OpaqueResult<bool> {
-        unimplemented!("FakePersister does not support checking for run_id existence.");
+    async fn store_run_state(
+        &self,
+        _run_id: &RunId,
+        _run_state: SerializableRunState,
+    ) -> OpaqueResult<()> {
+        unimplemented!("FakePersister does not support storing run state.")
+    }
+
+    async fn try_load_run_state(&self, _run_id: &RunId) -> OpaqueResult<LoadedRunState> {
+        unimplemented!("FakePersister does not support loading run state.")
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
@@ -145,8 +155,16 @@ impl RemotePersistence for OneWriteFakePersister {
         Ok(())
     }
 
-    async fn has_run_id(&self, _run_id: &RunId) -> OpaqueResult<bool> {
-        Ok(self.has_data())
+    async fn store_run_state(
+        &self,
+        _run_id: &RunId,
+        _run_state: SerializableRunState,
+    ) -> OpaqueResult<()> {
+        unimplemented!("FakePersister does not support storing run state.");
+    }
+
+    async fn try_load_run_state(&self, _run_id: &RunId) -> OpaqueResult<LoadedRunState> {
+        unimplemented!("FakePersister does not support loading run state.");
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
