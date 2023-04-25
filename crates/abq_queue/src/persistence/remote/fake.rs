@@ -74,6 +74,10 @@ where
         (self.on_load)(kind, run_id.clone(), into_local_path.to_owned()).await
     }
 
+    async fn has_run_id(&self, _run_id: &RunId) -> OpaqueResult<bool> {
+        unimplemented!("FakePersister does not support checking for run_id existence.");
+    }
+
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
         Box::new(self.clone())
     }
@@ -139,6 +143,10 @@ impl RemotePersistence for OneWriteFakePersister {
         file.write_all(&data).await.unwrap();
         file.flush().await.unwrap();
         Ok(())
+    }
+
+    async fn has_run_id(&self, _run_id: &RunId) -> OpaqueResult<bool> {
+        Ok(self.has_data())
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {

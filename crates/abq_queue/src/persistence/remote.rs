@@ -72,6 +72,12 @@ pub trait RemotePersistence {
         into_local_path: &Path,
     ) -> OpaqueResult<()>;
 
+    /// Returns `true` if and only if the remote persistence has an entry for the given run ID.
+    ///
+    /// The remote persistence implementation should check whether an entry for a manifest exists
+    /// for the given run ID.
+    async fn has_run_id(&self, run_id: &RunId) -> OpaqueResult<bool>;
+
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync>;
 }
 

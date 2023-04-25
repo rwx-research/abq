@@ -200,6 +200,10 @@ impl RemotePersistence for InMemoryRemote {
         Ok(())
     }
 
+    async fn has_run_id(&self, run_id: &RunId) -> OpaqueResult<bool> {
+        Ok(self.0.lock().await.manifests.contains_key(run_id))
+    }
+
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
         Box::new(self.clone())
     }
