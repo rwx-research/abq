@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroUsize;
-use std::ops::Deref;
+use std::ops::{ControlFlow, Deref};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,7 +37,7 @@ use abq_workers::negotiate::{QueueNegotiator, QueueNegotiatorHandle, QueueNegoti
 use abq_workers::{AssignedRun, AssignedRunStatus, GetAssignedRun};
 
 use async_trait::async_trait;
-use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
@@ -171,8 +171,6 @@ struct AllRuns {
     /// the number of active runs in tandem with the `runs` map.
     num_active: AtomicU64,
 }
-
-type RunsWriteGuard<'a> = RwLockWriteGuard<'a, HashMap<RunId, RwLock<Run>>>;
 
 #[derive(Default, Clone)]
 struct SharedRuns(Arc<AllRuns>);
@@ -313,26 +311,14 @@ impl AllRuns {
         batch_size_hint: NonZeroUsize,
         entity: Entity,
     ) -> AssignedRunStatus {
-        {
-            if self.runs.read().get(run_id).is_none() {
-                let runs = self.runs.write();
-
-                // Possible TOCTOU race here, so we must check whether the run is still missing
-                // before we create a fresh queue.
-                //
-                // If the run state is now populated, defer to that, since it can only
-                // monotonically advance the state machine (run states move forward and are
-                // never removed).
-                if !runs.contains_key(run_id) {
-                    return Self::create_fresh_run(
-                        runs,
-                        &self.num_active,
-                        entity,
-                        run_id.clone(),
-                        batch_size_hint,
-                    );
+        if !self.runs.read().contains_key(run_id) {
+            match self.possibly_create_fresh_run(run_id, batch_size_hint, entity) {
+                ControlFlow::Break(assigned) => return assigned,
+                ControlFlow::Continue(()) => {
+                    // Pass through, the run was not actually fresh and is now
+                    // emplaced in the run state.
                 }
-            };
+            }
         }
 
         let runs = self.runs.read();
@@ -449,34 +435,48 @@ impl AllRuns {
     }
 
     #[must_use]
-    fn create_fresh_run(
-        mut runs: RunsWriteGuard<'_>,
-        num_active: &AtomicU64,
-        worker_entity: Entity,
-        run_id: RunId,
+    #[inline]
+    fn possibly_create_fresh_run(
+        &self,
+        run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-    ) -> AssignedRunStatus {
-        let mut worker_timings = WorkerSet::default();
-        worker_timings.insert_by_tag(worker_entity, time::Instant::now());
+        entity: Entity,
+    ) -> ControlFlow<AssignedRunStatus> {
+        let run = {
+            let mut worker_timings = WorkerSet::default();
+            worker_timings.insert_by_tag(entity, time::Instant::now());
 
-        // NB: Always add first for conversative estimation.
-        num_active.fetch_add(1, atomic::ORDERING);
-
-        tracing::info!(?run_id, entity=?worker_entity, "creating fresh run");
-
-        // The run ID is fresh; create a new queue for it.
-        let run = Run {
-            state: RunState::WaitingForManifest {
-                worker_connection_times: Mutex::new(worker_timings),
-                batch_size_hint,
-            },
+            // The run ID is fresh; create a new queue for it.
+            Run {
+                state: RunState::WaitingForManifest {
+                    worker_connection_times: Mutex::new(worker_timings),
+                    batch_size_hint,
+                },
+            }
         };
-        let old_run = runs.insert(run_id, RwLock::new(run));
-        log_assert!(old_run.is_none(), "can only be called when run is fresh!");
 
-        AssignedRunStatus::Run(AssignedRun::Fresh {
-            should_generate_manifest: true,
-        })
+        // Possible TOCTOU race here, so we must check whether the run is still missing
+        // before we add it freshly.
+        //
+        // If the run state is now populated, defer to that, since it can only
+        // monotonically advance the state machine (run states move forward and are
+        // never removed).
+        let mut runs = self.runs.write();
+        if !runs.contains_key(run_id) {
+            // NB: Always add first for conversative estimation.
+            self.num_active.fetch_add(1, atomic::ORDERING);
+
+            let old_run = runs.insert(run_id.clone(), RwLock::new(run));
+            log_assert!(old_run.is_none(), "can only be called when run is fresh!");
+
+            tracing::info!(?run_id, ?entity, "created fresh run");
+
+            ControlFlow::Break(AssignedRunStatus::Run(AssignedRun::Fresh {
+                should_generate_manifest: true,
+            }))
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 
     /// Adds the initial manifest for an ABQ test suite run.
