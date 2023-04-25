@@ -254,11 +254,10 @@ async fn do_results_offload(results_persister: ResultsPersister, offload_config:
                 "Offloaded results to remote",
             )
         }
-        Err(err) => {
-            let LocatedError {
-                error,
-                location: Location { file, line, column },
-            } = &*err;
+        Err(LocatedError {
+            error,
+            location: Location { file, line, column },
+        }) => {
             tracing::error!(
                 file,
                 line,
