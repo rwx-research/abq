@@ -137,7 +137,7 @@ mod test {
             "worker_foobar": {}
         }
         "###;
-        let err = SerializableRunState::deserialize(&serialized.as_bytes()).unwrap_err();
+        let err = SerializableRunState::deserialize(serialized.as_bytes()).unwrap_err();
 
         assert!(matches!(
             err,
@@ -172,7 +172,7 @@ mod test {
         {
             "schema_version": 16,
         "###;
-        let err = SerializableRunState::deserialize(&serialized.as_bytes()).unwrap_err();
+        let err = SerializableRunState::deserialize(serialized.as_bytes()).unwrap_err();
 
         assert!(matches!(err, ParseError::Other(..)));
     }

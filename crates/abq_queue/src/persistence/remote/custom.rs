@@ -162,7 +162,7 @@ impl RemotePersistence for CustomPersister {
             return Ok(LoadedRunState::NotFound);
         }
 
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut temp_file = temp_file.reopen().located(here!())?;
             let mut bytes = vec![];
             temp_file.read_to_end(&mut bytes).located(here!())?;
@@ -176,9 +176,7 @@ impl RemotePersistence for CustomPersister {
             }
         })
         .await
-        .located(here!())?;
-
-        result
+        .located(here!())?
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {
@@ -386,7 +384,7 @@ mod test {
 
     #[tokio::test]
     async fn load_run_state_incompatible_versions() {
-        let fi = write_js(&indoc!(
+        let fi = write_js(indoc!(
             r#"
             if (process.argv[2] !== "load") process.exit(1);
             if (process.argv[3] !== "run_state") process.exit(1);
