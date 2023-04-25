@@ -19,6 +19,7 @@ pub enum AssignedRunStatus {
     AlreadyDone {
         exit_code: abq_utils::exit::ExitCode,
     },
+    FatalError(String),
 }
 
 impl AssignedRunStatus {

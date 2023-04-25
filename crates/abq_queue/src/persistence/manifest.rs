@@ -120,6 +120,10 @@ impl ManifestPersistedCell {
     pub fn is_persisted(&self) -> bool {
         self.0.load(atomic::ORDERING)
     }
+
+    pub fn new_already_persisted() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
 }
 
 #[derive(Debug)]

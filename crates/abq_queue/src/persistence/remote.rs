@@ -136,4 +136,8 @@ impl RemotePersister {
     ) -> OpaqueResult<()> {
         self.0.load_to_disk(kind, run_id, into_local_path).await
     }
+
+    pub async fn has_run_id(&self, run_id: &RunId) -> OpaqueResult<bool> {
+        self.0.has_run_id(run_id).await
+    }
 }

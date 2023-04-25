@@ -314,7 +314,7 @@ impl AllRuns {
     ) -> AssignedRunStatus {
         if !self.runs.read().contains_key(run_id) {
             match self
-                .possibly_create_fresh_run(run_id, batch_size_hint, entity, remote)
+                .try_create_run(run_id, batch_size_hint, entity, remote)
                 .await
             {
                 ControlFlow::Break(assigned) => return assigned,
@@ -438,13 +438,51 @@ impl AllRuns {
         }
     }
 
+    /// Optimistically creates a fresh state for a run. If at the time of creation, the run is
+    /// still not present in the queue state, the fresh state will be emplaced in the queue state.
+    ///
+    /// Otherwise, returning [ControlFlow::Continue] should fall back to loading the run from the
+    /// queue state.
     #[inline]
-    async fn possibly_create_fresh_run(
+    async fn try_create_run(
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
         entity: Entity,
-        _remote: &RemotePersister,
+        remote: &RemotePersister,
+    ) -> ControlFlow<AssignedRunStatus> {
+        let result = async move {
+            if remote.has_run_id(run_id).await? {
+                // This run is known in the remote, so we should load it as completed.
+                self.try_load_remote_run(run_id, entity, remote).await
+            } else {
+                // This run is not present in the remote persister, so we can create a fresh run.
+                Ok(self.try_create_globally_fresh_run(run_id, batch_size_hint, entity))
+            }
+        }
+        .await;
+
+        match result {
+            Ok(control_flow) => control_flow,
+            Err(error) => {
+                let err_string = error.error.to_string();
+                log_entityful_error!(
+                    EntityfulError {
+                        error,
+                        entity: Some(entity)
+                    },
+                    "fatal error trying to create fresh run: {}"
+                );
+                ControlFlow::Break(AssignedRunStatus::FatalError(err_string))
+            }
+        }
+    }
+
+    fn try_create_globally_fresh_run(
+        &self,
+        run_id: &RunId,
+        batch_size_hint: NonZeroUsize,
+        entity: Entity,
     ) -> ControlFlow<AssignedRunStatus> {
         let run = {
             let mut worker_timings = WorkerSet::default();
@@ -481,6 +519,48 @@ impl AllRuns {
         } else {
             ControlFlow::Continue(())
         }
+    }
+
+    async fn try_load_remote_run(
+        &self,
+        run_id: &RunId,
+        entity: Entity,
+        _remote: &RemotePersister,
+    ) -> OpaqueResult<ControlFlow<AssignedRunStatus>> {
+        // TODO: populate the run state here correctly.
+        let run = Run {
+            state: RunState::InitialManifestDone {
+                new_worker_exit_code: ExitCode::SUCCESS,
+                seen_workers: RwLock::new(WorkerSet::default()),
+                init_metadata: Default::default(),
+                manifest_persistence: ManifestPersistence::Persisted(
+                    ManifestPersistedCell::new_already_persisted(),
+                ),
+                results_persistence: ResultsPersistence::Persisted(ResultsPersistedCell::new(
+                    run_id.clone(),
+                )),
+            },
+        };
+
+        // Possible TOCTOU race here, so we must check whether the run is still missing
+        // before we add it freshly.
+        //
+        // If the run state is now populated, defer to that.
+        let mut runs = self.runs.write();
+        if !runs.contains_key(run_id) {
+            let old_run = runs.insert(run_id.clone(), RwLock::new(run));
+            log_assert!(old_run.is_none(), "can only be called when run is fresh!");
+
+            tracing::info!(
+                ?run_id,
+                ?entity,
+                "loaded previously-executed run from remote"
+            );
+        }
+
+        // In either case, tell the caller to continue reading from the run state, since we've now
+        // loaded in a run that only deals with out-of-process retries.
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Adds the initial manifest for an ABQ test suite run.
