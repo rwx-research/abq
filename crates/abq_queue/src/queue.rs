@@ -2066,7 +2066,7 @@ impl QueueServer {
 
         match plan_result {
             Ok(plan) => {
-                let result = plan.execute().await.map_err(dearc_located);
+                let result = plan.execute().await;
                 result.or(opt_ack_error)
             }
             Err(_) => Err(cell_result.unwrap_err()),
@@ -2254,12 +2254,6 @@ impl QueueServer {
             }
         }
     }
-}
-
-/// Unwrap the Arc from a [LocatedError]. Needed sometimes when the return type expects a
-/// non-counted error; since a [LocatedError] is opaque, this simply converts it to a string.
-fn dearc_located(e: Arc<LocatedError>) -> LocatedError {
-    e.error.to_string().located(e.location)
 }
 
 fn log_deprecations(entity: Entity, run_id: RunId, deprecations: meta::DeprecationRecord) {
@@ -2505,7 +2499,7 @@ async fn run_summary_persistence_task(
         eligible_for_remote_dump,
     );
 
-    task.execute().await.map_err(dearc_located)
+    task.execute().await
 }
 
 #[instrument(level = "info", skip_all, fields(run_id=?run_id, entity=?entity))]
