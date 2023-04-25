@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
@@ -14,9 +15,9 @@ use abq_utils::{
 };
 use async_trait::async_trait;
 use tokio::{
-    fs::{self, File},
+    fs::{File, OpenOptions},
     io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
-    sync::Mutex,
+    sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock},
 };
 
 use crate::persistence::{
@@ -24,9 +25,22 @@ use crate::persistence::{
     OffloadConfig, OffloadSummary,
 };
 
-use super::{ArcResult, PersistResults, SharedPersistResults};
+use super::{PersistResults, Result, SharedPersistResults};
 
-/// A concurrent LRU cache of open file descriptors.
+enum FdState {
+    Open(File),
+    Offloaded,
+}
+
+type FdMap = HashMap<RunId, Mutex<FdState>>;
+
+struct FdCacheInner {
+    root: PathBuf,
+    cache: RwLock<FdMap>,
+    remote: RemotePersister,
+}
+
+/// Persists results on a filesystem, encoding/decoding via JSON.
 //
 // TODO: reading and writing to results files asynchronously may be an expensive task,
 // given that results file may be quite large. Would it be better to use [std::fs::File]
@@ -34,66 +48,38 @@ use super::{ArcResult, PersistResults, SharedPersistResults};
 //
 //     https://docs.rs/tokio/latest/tokio/fs/index.html#usage
 #[derive(Clone)]
-struct FdCache(moka::future::Cache<PathBuf, Arc<Mutex<File>>>);
+#[repr(transparent)]
+pub struct FilesystemPersistor(Arc<FdCacheInner>);
 
-impl FdCache {
-    fn new(cap: usize) -> Self {
-        Self(moka::future::Cache::new(cap as _))
-    }
-
-    async fn get_or_insert(&self, path: PathBuf) -> ArcResult<Arc<Mutex<File>>> {
-        let open_path = path.clone();
-        let open_fi = async {
-            let fi = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(open_path)
-                .await
-                .located(here!())?;
-            Ok(Arc::new(Mutex::new(fi)))
-        };
-        self.0.try_get_with(path, open_fi).await
-    }
-}
-
-/// Persists results on a filesystem, encoding/decoding via JSON.
-/// Uses an LRU cache to store open file descriptors for quick access.
-#[derive(Clone)]
-pub struct FilesystemPersistor {
-    root: PathBuf,
-    fds: FdCache,
-    remote: RemotePersister,
+#[async_trait]
+trait WithFile<T> {
+    async fn run(self, fi: &mut File) -> Result<T>;
 }
 
 impl FilesystemPersistor {
-    pub fn new(
-        root: impl Into<PathBuf>,
-        lru_capacity: usize,
-        remote: impl Into<RemotePersister>,
-    ) -> Self {
-        Self {
+    pub fn new(root: impl Into<PathBuf>, cap: usize, remote: impl Into<RemotePersister>) -> Self {
+        Self(Arc::new(FdCacheInner {
             root: root.into(),
-            fds: FdCache::new(lru_capacity),
+            cache: RwLock::new(HashMap::with_capacity(cap)),
             remote: remote.into(),
-        }
+        }))
     }
 
     pub fn new_shared(
         root: impl Into<PathBuf>,
-        lru_capacity: usize,
+        capacity: usize,
         remote: impl Into<RemotePersister>,
     ) -> SharedPersistResults {
-        SharedPersistResults(Box::new(Self::new(root, lru_capacity, remote)))
+        SharedPersistResults(Box::new(Self::new(root, capacity, remote)))
     }
 
     fn get_path(&self, run_id: &RunId) -> PathBuf {
         let run_id = &run_id.0;
 
-        self.root.join(format!("{run_id}.results.jsonl"))
+        self.0.root.join(format!("{run_id}.results.jsonl"))
     }
 
-    fn run_id_of_path(&self, path: &Path) -> ArcResult<RunId> {
+    fn run_id_of_path(&self, path: &Path) -> Result<RunId> {
         let file_name = path
             .file_name()
             .ok_or_else(|| format!("path {path:?} has no file name"))
@@ -112,14 +98,101 @@ impl FilesystemPersistor {
         Ok(RunId(run_id.to_owned()))
     }
 
+    #[cfg(test)] // for now
+    async fn insert_offloaded<'a>(&self, run_id: RunId) -> Result<()> {
+        use abq_utils::error::ErrorLocation;
+
+        let mut cache = self.0.cache.write().await;
+        if cache.contains_key(&run_id) {
+            return Err(format!("run ID {run_id:?} already inserted in cache").located(here!()));
+        }
+        cache.insert(run_id, Mutex::new(FdState::Offloaded));
+        Ok(())
+    }
+
+    async fn open_file(&self, run_id: &RunId) -> Result<File> {
+        let path = self.get_path(run_id);
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .await
+            .located(here!())
+    }
+
+    async fn get_open_file_fast_path<'a>(
+        map: &'a FdMap,
+        run_id: &RunId,
+    ) -> Option<MappedMutexGuard<'a, File>> {
+        let fi = map.get(run_id)?;
+        let fi = fi.lock().await;
+        MutexGuard::try_map(fi, |fd| match fd {
+            FdState::Open(fi) => Some(fi),
+            FdState::Offloaded => None,
+        })
+        .ok()
+    }
+
+    async fn with_file<T>(&self, run_id: &RunId, f: impl WithFile<T>) -> Result<T> {
+        {
+            // Fast path: try to read an open file descriptor from the cache.
+            let cache = self.0.cache.read().await;
+            if let Some(mut fi) = Self::get_open_file_fast_path(&cache, run_id).await {
+                return f.run(&mut fi).await;
+            };
+        }
+
+        // Slow path: open the file, cache the file descriptor, and then read from it.
+        let mut cache = self.0.cache.write().await;
+        match cache.get(run_id) {
+            None => {
+                let mut fi = self.open_file(run_id).await?;
+
+                // Compute the result, then place the fd into the cache.
+                let result = f.run(&mut fi).await;
+
+                let fi = Mutex::new(FdState::Open(fi));
+                cache.insert(run_id.clone(), fi);
+
+                result
+            }
+            Some(state) => {
+                let mut state = state.lock().await;
+                match &mut *state {
+                    FdState::Open(fi) => {
+                        // We hit a TOCTOU: that's okay.
+                        f.run(&mut *fi).await
+                    }
+                    FdState::Offloaded => {
+                        // Load the file from the remote, then update the fd state.
+                        let path = self.get_path(run_id);
+                        self.0
+                            .remote
+                            .load_to_disk(PersistenceKind::Results, run_id, &path)
+                            .await?;
+
+                        tracing::info!(?run_id, "Loaded test results from remote.");
+
+                        let mut fi = self.open_file(run_id).await?;
+
+                        // Compute the result, then update the fd state.
+                        let result = f.run(&mut fi).await;
+
+                        *state = FdState::Open(fi);
+
+                        result
+                    }
+                }
+            }
+        }
+    }
+
     /// Offloads to the remote all non-empty results files that are older than
     /// the configured threshold.
-    pub async fn run_offload_job(
-        &self,
-        offload_config: OffloadConfig,
-    ) -> ArcResult<OffloadSummary> {
+    pub async fn run_offload_job(&self, offload_config: OffloadConfig) -> Result<OffloadSummary> {
         let time_now = SystemTime::now();
-        let mut results_files = tokio::fs::read_dir(&self.root).await.located(here!())?;
+        let mut results_files = tokio::fs::read_dir(&self.0.root).await.located(here!())?;
         let mut offloaded_run_ids = vec![];
 
         while let Some(results_file) = results_files.next_entry().await.located(here!())? {
@@ -128,10 +201,12 @@ impl FilesystemPersistor {
 
             if offload_config.file_eligible_for_offload(&time_now, &metadata)? {
                 let path = results_file.path();
-                let did_offload = self.perform_offload(path, time_now, offload_config).await?;
+                let run_id = self.run_id_of_path(&path)?;
+                let did_offload = self
+                    .perform_offload(&run_id, &path, time_now, offload_config)
+                    .await?;
 
                 if did_offload {
-                    let run_id = self.run_id_of_path(&results_file.path())?;
                     offloaded_run_ids.push(run_id);
                 }
             }
@@ -142,14 +217,32 @@ impl FilesystemPersistor {
 
     async fn perform_offload(
         &self,
-        path: PathBuf,
+        run_id: &RunId,
+        path: &Path,
         time_now: SystemTime,
         offload_config: OffloadConfig,
-    ) -> ArcResult<bool> {
-        let fi = self.fds.get_or_insert(path.clone()).await?;
-
+    ) -> Result<bool> {
         // Take an exclusive lock so that new results don't come in while we flush to the remote.
-        let fi = fi.lock().await;
+        let cache = self.0.cache.write().await;
+        let fd_state = cache
+            .get(run_id)
+            .ok_or_else(|| format!("run ID {run_id:?} has results on disk, but not found in cache"))
+            .located(here!())?;
+        let mut fd_state = fd_state.lock().await;
+        let fi = match &*fd_state {
+            FdState::Open(fi) => fi,
+            FdState::Offloaded => {
+                // THEORY: this is only possible if the file was offloaded by another
+                // thread. In practice we expect offloading jobs to be serialized, so
+                // this is an unexpected state.
+                tracing::warn!(
+                    ?run_id,
+                    "run ID has results on disk, but is not in an open state"
+                );
+
+                return Ok(false);
+            }
+        };
 
         // We must now check again whether the file is eligible for offload, since it may have been
         // modified since we performed the non-locked check.
@@ -162,10 +255,11 @@ impl FilesystemPersistor {
         // rather than keeping it possibly in memory.
         fi.sync_all().await.located(here!())?;
 
-        let run_id = self.run_id_of_path(&path).located(here!())?;
+        let run_id = self.run_id_of_path(path).located(here!())?;
 
-        self.remote
-            .store_from_disk(PersistenceKind::Results, &run_id, &path)
+        self.0
+            .remote
+            .store_from_disk(PersistenceKind::Results, &run_id, path)
             .await?;
 
         // Truncate the file to 0 bytes, freeing the disk space.
@@ -173,103 +267,84 @@ impl FilesystemPersistor {
         fi.set_len(0).await.located(here!())?;
         fi.sync_all().await.located(here!())?;
 
+        *fd_state = FdState::Offloaded;
+
         Ok(true)
-    }
-
-    #[cfg(test)]
-    async fn invalidate(&self, run_id: &RunId) {
-        let path = self.get_path(run_id);
-        self.fds.0.invalidate(&path).await
-    }
-
-    #[cfg(test)]
-    fn contains(&self, run_id: &RunId) -> bool {
-        let path = self.get_path(run_id);
-        self.fds.0.contains_key(&path)
     }
 }
 
 #[async_trait]
 impl PersistResults for FilesystemPersistor {
-    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()> {
-        let path = self.get_path(run_id);
+    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> Result<()> {
+        struct Dump {
+            packed: Vec<u8>,
+        }
+        #[async_trait]
+        impl WithFile<()> for Dump {
+            #[inline]
+            async fn run(self, fi: &mut File) -> Result<()> {
+                fi.seek(SeekFrom::End(0)).await.located(here!())?;
 
-        let packed = serde_json::to_vec(&results).located(here!())?;
+                write_packed_line(fi, self.packed).await?;
 
-        let fi = self.fds.get_or_insert(path).await?;
-        let mut fi = fi.lock().await;
-
-        let end = fi.seek(SeekFrom::End(0)).await.located(here!())?;
-
-        if end == 0 {
-            // If the test results file is empty, it may have been offloaded to the remote
-            // previously. Eagerly try to load it from the remote; if that fails, suppose that the
-            // results file is indeed new.
-            let path = self.get_path(run_id);
-            let load_result = self
-                .remote
-                .load_to_disk(PersistenceKind::Results, run_id, &path)
-                .await;
-
-            match load_result {
-                Ok(()) => {
-                    tracing::info!(?run_id, "Loaded test results from remote.");
-                    // We must now re-seek to the end so that the write appends.
-                    fi.seek(SeekFrom::End(0)).await.located(here!())?;
-                }
-                Err(_) => {
-                    tracing::info!(?run_id, "Assuming new test results file.");
-                }
+                Ok(())
             }
         }
 
-        write_packed_line(&mut fi, packed).await?;
-
-        Ok(())
+        let packed = serde_json::to_vec(&results).located(here!())?;
+        self.with_file(run_id, Dump { packed }).await
     }
 
-    async fn dump_to_remote(&self, run_id: &RunId) -> ArcResult<()> {
-        let path = self.get_path(run_id);
-        let fi = self.fds.get_or_insert(path.clone()).await?;
+    async fn dump_to_remote(&self, run_id: &RunId) -> Result<()> {
+        struct DumpToRemote<'a> {
+            remote: &'a RemotePersister,
+            path: PathBuf,
+            run_id: &'a RunId,
+        }
+        #[async_trait]
+        impl<'a> WithFile<()> for DumpToRemote<'a> {
+            #[inline]
+            async fn run(self, fi: &mut File) -> Result<()> {
+                // While we have this opportunity, also instruct the OS to totally sync all data to disk
+                // rather than keeping it possibly in memory.
+                fi.sync_all().await.located(here!())?;
 
-        // Take an exclusive lock so that new results don't come in while we flush to the remote.
-        let fi = fi.lock().await;
-
-        // While we have this opportunity, also instruct the OS to totally sync all data to disk
-        // rather than keeping it possibly in memory.
-        fi.sync_all().await.located(here!())?;
-
-        self.remote
-            .store_from_disk(PersistenceKind::Results, run_id, &path)
-            .await?;
-
-        Ok(())
-    }
-
-    async fn get_results(&self, run_id: &RunId) -> ArcResult<OpaqueLazyAssociatedTestResults> {
-        let path = self.get_path(run_id);
-
-        let fi = self.fds.get_or_insert(path).await?;
-        let mut fi = fi.lock().await;
-        fi.rewind().await.located(here!())?;
-
-        let opaque_jsonl = match read_results_lines(&mut fi).await {
-            Ok(results) if !results.is_empty() => results,
-            _ => {
-                // Slow path: the results are missing in the local cache, or corrupted.
-                // Load them in now and retry.
                 self.remote
-                    .load_to_disk(PersistenceKind::Results, run_id, &self.get_path(run_id))
+                    .store_from_disk(PersistenceKind::Results, self.run_id, &self.path)
                     .await?;
 
-                fi.rewind().await.located(here!())?;
-                read_results_lines(&mut fi).await?
+                Ok(())
             }
-        };
+        }
 
-        Ok(OpaqueLazyAssociatedTestResults::from_raw_json_lines(
-            opaque_jsonl,
-        ))
+        self.with_file(
+            run_id,
+            DumpToRemote {
+                remote: &self.0.remote,
+                path: self.get_path(run_id),
+                run_id,
+            },
+        )
+        .await
+    }
+
+    async fn get_results(&self, run_id: &RunId) -> Result<OpaqueLazyAssociatedTestResults> {
+        struct GetResults;
+        #[async_trait]
+        impl WithFile<OpaqueLazyAssociatedTestResults> for GetResults {
+            #[inline]
+            async fn run(self, fi: &mut File) -> Result<OpaqueLazyAssociatedTestResults> {
+                fi.rewind().await.located(here!())?;
+
+                let opaque_jsonl = read_results_lines(fi).await?;
+
+                Ok(OpaqueLazyAssociatedTestResults::from_raw_json_lines(
+                    opaque_jsonl,
+                ))
+            }
+        }
+
+        self.with_file(run_id, GetResults).await
     }
 
     fn boxed_clone(&self) -> Box<dyn PersistResults> {
@@ -406,33 +481,6 @@ mod test {
 
     #[n_times(1000)]
     #[tokio::test]
-    async fn dump_and_load_results_after_eviction() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let fs = FilesystemPersistor::new(tempdir.path(), 1, remote::NoopPersister);
-
-        let run_id = RunId::unique();
-
-        let results1 = Results(vec![
-            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
-            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
-        ]);
-
-        fs.dump(&run_id, results1.clone()).await.unwrap();
-
-        // Evict the active run from the cache
-        fs.invalidate(&run_id).await;
-        assert!(
-            !fs.contains(&run_id),
-            "active file not evicted from the cache!"
-        );
-
-        let results = fs.get_results(&run_id).await.unwrap().decode().unwrap();
-
-        assert_eq!(results, vec![results1]);
-    }
-
-    #[n_times(1000)]
-    #[tokio::test]
     async fn dump_and_load_results_multiple_concurrent() {
         const RUNS: usize = 10;
 
@@ -466,6 +514,54 @@ mod test {
 
             join_set.spawn(task);
             expected_for_run.push((run_id, vec![results1, results2]));
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            result.unwrap();
+        }
+
+        for (run_id, expected) in expected_for_run {
+            let actual = fs.get_results(&run_id).await.unwrap().decode().unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[n_times(10)]
+    #[tokio::test]
+    async fn dump_and_load_results_high_count_contention() {
+        const RUNS: usize = 10;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), RUNS, remote::NoopPersister);
+
+        let mut join_set = JoinSet::new();
+        let mut expected_for_run = Vec::with_capacity(RUNS);
+
+        let results = (0..10)
+            .map(|i| {
+                Results(vec![
+                    AssociatedTestResults::fake(wid(i * 2), vec![TestResult::fake()]),
+                    AssociatedTestResults::fake(wid(i * 2 + 1), vec![TestResult::fake()]),
+                ])
+            })
+            .collect::<Vec<_>>();
+
+        for res in results.iter() {
+            for _ in 0..RUNS {
+                let run_id = RunId::unique();
+
+                let task = {
+                    let fs = fs.clone();
+                    let run_id = run_id.clone();
+                    let res = res.clone();
+                    async move {
+                        fs.dump(&run_id, res).await.unwrap();
+                    }
+                };
+
+                join_set.spawn(task);
+                expected_for_run.push((run_id, vec![res.clone()]));
+            }
         }
 
         while let Some(result) = join_set.join_next().await {
@@ -666,6 +762,8 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
 
+        fs.insert_offloaded(run_id.clone()).await.unwrap();
+
         let actual_results = fs.get_results(&run_id).await.unwrap();
         let actual_results = actual_results.decode().unwrap();
         assert_eq!(actual_results, vec![results]);
@@ -681,6 +779,8 @@ mod test {
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        fs.insert_offloaded(run_id.clone()).await.unwrap();
 
         let result = fs.get_results(&run_id).await;
         assert!(result.is_err());
@@ -744,6 +844,9 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
 
+        // Prime the cache with the run ID offloaded.
+        fs.insert_offloaded(run_id.clone()).await.unwrap();
+
         let mut join_set = tokio::task::JoinSet::new();
 
         for _ in 0..N {
@@ -794,6 +897,8 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
 
+        fs.insert_offloaded(run_id.clone()).await.unwrap();
+
         // Write locally. We should try a fetch from the remote and append to it.
         fs.dump(&run_id, results2.clone()).await.unwrap();
 
@@ -804,7 +909,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn missing_write_results_fetches_from_remote_with_error_starts_new_file() {
+    async fn missing_write_results_fetches_from_remote_with_error_is_error() {
         let run_id = RunId("test-run-id".to_string());
 
         let results = Results(vec![
@@ -828,15 +933,14 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
 
+        fs.insert_offloaded(run_id.clone()).await.unwrap();
+
         // Write locally. The remote fetch should fail, so we should assume this is a new results
         // file.
-        fs.dump(&run_id, results.clone()).await.unwrap();
-        let actual_results = fs.get_results(&run_id).await.unwrap();
-
-        let actual_results = actual_results.decode().unwrap();
-        assert_eq!(actual_results, vec![results]);
-
-        assert_eq!(remote_loads.load(atomic::ORDERING), 1);
+        let err = fs.dump(&run_id, results.clone()).await;
+        assert!(err.is_err());
+        let err = err.unwrap_err();
+        assert!(err.to_string().contains("i failed"));
     }
 
     #[tokio::test]
@@ -914,6 +1018,9 @@ mod test {
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        // Prime the cache with the run ID offloaded.
+        fs.insert_offloaded(run_id.clone()).await.unwrap();
 
         let mut join_set = tokio::task::JoinSet::new();
 

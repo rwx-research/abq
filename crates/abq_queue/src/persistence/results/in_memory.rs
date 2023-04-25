@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use serde_json::value::RawValue;
 use tokio::sync::RwLock;
 
-use super::{ArcResult, PersistResults, SharedPersistResults};
+use super::{PersistResults, Result, SharedPersistResults};
 
 #[derive(Default, Clone)]
 pub struct InMemoryPersistor {
@@ -27,7 +27,7 @@ impl InMemoryPersistor {
 
 #[async_trait]
 impl PersistResults for InMemoryPersistor {
-    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()> {
+    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> Result<()> {
         let raw_line = serde_json::value::to_raw_value(&results).located(here!())?;
         let mut results = self.results.write().await;
         let entry = results.entry(run_id.clone()).or_default();
@@ -35,11 +35,11 @@ impl PersistResults for InMemoryPersistor {
         Ok(())
     }
 
-    async fn dump_to_remote(&self, _run_id: &RunId) -> ArcResult<()> {
+    async fn dump_to_remote(&self, _run_id: &RunId) -> Result<()> {
         Ok(())
     }
 
-    async fn get_results(&self, run_id: &RunId) -> ArcResult<OpaqueLazyAssociatedTestResults> {
+    async fn get_results(&self, run_id: &RunId) -> Result<OpaqueLazyAssociatedTestResults> {
         let results = self.results.read().await;
         let json_lines = results
             .get(run_id)

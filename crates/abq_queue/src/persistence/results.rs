@@ -19,18 +19,18 @@ use abq_utils::{
 };
 use async_trait::async_trait;
 
-type ArcResult<T> = std::result::Result<T, Arc<LocatedError>>;
+type Result<T> = std::result::Result<T, LocatedError>;
 
 #[async_trait]
 pub trait PersistResults: Send + Sync {
     /// Dumps a summary line.
-    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> ArcResult<()>;
+    async fn dump(&self, run_id: &RunId, results: ResultsLine) -> Result<()>;
 
     /// Dumps the persisted results to a remote, if any is configured.
-    async fn dump_to_remote(&self, run_id: &RunId) -> ArcResult<()>;
+    async fn dump_to_remote(&self, run_id: &RunId) -> Result<()>;
 
     /// Load a set of test results as [OpaqueLazyAssociatedTestResults].
-    async fn get_results(&self, run_id: &RunId) -> ArcResult<OpaqueLazyAssociatedTestResults>;
+    async fn get_results(&self, run_id: &RunId) -> Result<OpaqueLazyAssociatedTestResults>;
 
     fn boxed_clone(&self) -> Box<dyn PersistResults>;
 }
@@ -141,7 +141,7 @@ impl ResultsPersistedCell {
     pub async fn retrieve(
         &self,
         persistence: &SharedPersistResults,
-    ) -> Option<ArcResult<OpaqueLazyAssociatedTestResults>> {
+    ) -> Option<Result<OpaqueLazyAssociatedTestResults>> {
         if self.0.processing.load(atomic::ORDERING) != 0 {
             return None;
         }
@@ -157,7 +157,7 @@ pub struct PersistencePlan<'a> {
 }
 
 impl<'a> PersistencePlan<'a> {
-    pub async fn execute(self) -> ArcResult<()> {
+    pub async fn execute(self) -> Result<()> {
         let result = self
             .persist_results
             .dump(&self.cell.run_id, self.line)
