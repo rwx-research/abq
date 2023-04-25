@@ -98,6 +98,9 @@ pub trait RemotePersistence {
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync>;
 }
 
+/// A shared wrapper around [RemotePersister].
+///
+/// Clones are cheap, as they are atomically reference counted.
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct RemotePersister(Arc<Box<dyn RemotePersistence + Send + Sync>>);
