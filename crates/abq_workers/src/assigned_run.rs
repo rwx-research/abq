@@ -11,6 +11,7 @@ pub enum AssignedRun {
     Retry,
 }
 
+#[must_use]
 #[derive(Debug, PartialEq, Eq)]
 pub enum AssignedRunStatus {
     RunUnknown,

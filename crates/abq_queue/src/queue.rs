@@ -305,16 +305,18 @@ enum ManifestProgressResult {
 impl AllRuns {
     /// Finds a queue for a run, or creates a new one if the run is observed as fresh.
     /// If the given run ID already has an associated queue, an error is returned.
-    #[must_use]
-    pub fn find_or_create_run(
+    pub async fn find_or_create_run(
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
         entity: Entity,
-        _remote: &RemotePersister,
+        remote: &RemotePersister,
     ) -> AssignedRunStatus {
         if !self.runs.read().contains_key(run_id) {
-            match self.possibly_create_fresh_run(run_id, batch_size_hint, entity) {
+            match self
+                .possibly_create_fresh_run(run_id, batch_size_hint, entity, remote)
+                .await
+            {
                 ControlFlow::Break(assigned) => return assigned,
                 ControlFlow::Continue(()) => {
                     // Pass through, the run was not actually fresh and is now
@@ -436,13 +438,13 @@ impl AllRuns {
         }
     }
 
-    #[must_use]
     #[inline]
-    fn possibly_create_fresh_run(
+    async fn possibly_create_fresh_run(
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
         entity: Entity,
+        _remote: &RemotePersister,
     ) -> ControlFlow<AssignedRunStatus> {
         let run = {
             let mut worker_timings = WorkerSet::default();
@@ -1521,9 +1523,10 @@ impl GetAssignedRun for ChooseRunForWorker {
                 .unwrap()
             };
 
-        let assigned_run =
-            self.queues
-                .find_or_create_run(run_id, batch_size_hint, entity, &self.remote);
+        let assigned_run = self
+            .queues
+            .find_or_create_run(run_id, batch_size_hint, entity, &self.remote)
+            .await;
 
         // Now that we've found a run for this ID, if the run is fresh, enqueue a job to check
         // whether any progress has been made for it later.
@@ -2900,55 +2903,61 @@ mod test {
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn active_runs_when_some_waiting_on_manifest() {
+    async fn active_runs_when_some_waiting_on_manifest() {
         let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            Entity::runner(0, 1),
-            &remote::NoopPersister::new().into(),
-        );
+        let _ = queues
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                Entity::runner(0, 1),
+                &remote::NoopPersister::new().into(),
+            )
+            .await;
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn active_runs_when_running() {
+    async fn active_runs_when_running() {
         let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            Entity::runner(0, 1),
-            &remote::NoopPersister::new().into(),
-        );
+        let _ = queues
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                Entity::runner(0, 1),
+                &remote::NoopPersister::new().into(),
+            )
+            .await;
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn active_runs_when_all_done() {
+    async fn active_runs_when_all_done() {
         let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            Entity::runner(0, 1),
-            &remote::NoopPersister::new().into(),
-        );
+        let _ = queues
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                Entity::runner(0, 1),
+                &remote::NoopPersister::new().into(),
+            )
+            .await;
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
         queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
@@ -2956,9 +2965,9 @@ mod test {
         assert_eq!(queues.estimate_num_active_runs(), 0);
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn active_runs_multiple_in_various_states() {
+    async fn active_runs_multiple_in_various_states() {
         let queues = SharedRuns::default();
 
         let run_id1 = RunId::unique(); // DONE
@@ -2968,12 +2977,14 @@ mod test {
         let expected_active = 2;
 
         for run_id in [&run_id1, &run_id2, &run_id3, &run_id4] {
-            let _ = queues.find_or_create_run(
-                run_id,
-                one_nonzero_usize(),
-                Entity::runner(0, 1),
-                &remote::NoopPersister::new().into(),
-            );
+            let _ = queues
+                .find_or_create_run(
+                    run_id,
+                    one_nonzero_usize(),
+                    Entity::runner(0, 1),
+                    &remote::NoopPersister::new().into(),
+                )
+                .await;
         }
 
         for run_id in [&run_id1, &run_id2, &run_id4] {
@@ -2988,19 +2999,21 @@ mod test {
         assert_eq!(queues.estimate_num_active_runs(), expected_active);
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn mark_cancellation_when_some_waiting_on_manifest() {
+    async fn mark_cancellation_when_some_waiting_on_manifest() {
         let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
 
-        let _ = queues.find_or_create_run(
-            &run_id,
-            one_nonzero_usize(),
-            Entity::runner(0, 1),
-            &remote::NoopPersister::new().into(),
-        );
+        let _ = queues
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                Entity::runner(0, 1),
+                &remote::NoopPersister::new().into(),
+            )
+            .await;
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
 
@@ -3013,16 +3026,17 @@ mod test {
         ));
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn mark_cancellation_after_already_done_does_nothing() {
+    async fn mark_cancellation_after_already_done_does_nothing() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
         let _ = queues.add_manifest(&run_id, vec![], Default::default());
         let persist_plan = queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
         assert!(persist_plan.is_some());
@@ -3037,16 +3051,17 @@ mod test {
         ));
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn mark_cancellation_when_running() {
+    async fn mark_cancellation_when_running() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
 
         let added = queues.add_manifest(&run_id, vec![], Default::default());
         assert!(matches!(added, AddedManifest::Added { .. }));
@@ -3062,9 +3077,9 @@ mod test {
         ));
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn track_worker_entities_over_run_state() {
+    async fn track_worker_entities_over_run_state() {
         let queues = SharedRuns::default();
 
         let run_id = RunId::unique();
@@ -3077,8 +3092,9 @@ mod test {
 
         // worker0 creates run
         {
-            let assigned_lookup =
-                queues.find_or_create_run(&run_id, one_nonzero_usize(), worker0, &remote);
+            let assigned_lookup = queues
+                .find_or_create_run(&run_id, one_nonzero_usize(), worker0, &remote)
+                .await;
             assert_eq!(
                 assigned_lookup,
                 AssignedRunStatus::Run(AssignedRun::Fresh {
@@ -3091,8 +3107,9 @@ mod test {
 
         // worker1 attaches
         {
-            let assigned_lookup =
-                queues.find_or_create_run(&run_id, one_nonzero_usize(), worker1, &remote);
+            let assigned_lookup = queues
+                .find_or_create_run(&run_id, one_nonzero_usize(), worker1, &remote)
+                .await;
             assert_eq!(
                 assigned_lookup,
                 AssignedRunStatus::Run(AssignedRun::Fresh {
@@ -3113,8 +3130,9 @@ mod test {
 
         // worker2 attaches
         {
-            let assigned_lookup =
-                queues.find_or_create_run(&run_id, one_nonzero_usize(), worker2, &remote);
+            let assigned_lookup = queues
+                .find_or_create_run(&run_id, one_nonzero_usize(), worker2, &remote)
+                .await;
             assert_eq!(
                 assigned_lookup,
                 AssignedRunStatus::Run(AssignedRun::Fresh {
@@ -3191,12 +3209,9 @@ mod test {
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            let _ = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                Entity::runner(0, 1),
-                &remote,
-            );
+            let _ = queues
+                .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+                .await;
             queues
         };
 
@@ -3271,12 +3286,9 @@ mod test {
         let run_id = RunId::unique();
         let queues = {
             let queues = SharedRuns::default();
-            let _ = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                Entity::runner(0, 1),
-                &remote,
-            );
+            let _ = queues
+                .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+                .await;
             queues
         };
 
@@ -3349,12 +3361,9 @@ mod test {
         let remote = remote::NoopPersister::new().into();
         let queues = {
             let queues = SharedRuns::default();
-            let _ = queues.find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                Entity::runner(0, 1),
-                &remote,
-            );
+            let _ = queues
+                .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+                .await;
             let added = queues.add_manifest(&run_id, vec![], Default::default());
             assert!(matches!(added, AddedManifest::Added { .. }));
             queues
@@ -3388,16 +3397,17 @@ mod test {
         ));
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn handle_manifest_progress_timeout_while_waiting_for_manifest() {
+    async fn handle_manifest_progress_timeout_while_waiting_for_manifest() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
         assert_eq!(
@@ -3408,16 +3418,17 @@ mod test {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn handle_manifest_progress_timeout_while_manifest_exists() {
+    async fn handle_manifest_progress_timeout_while_manifest_exists() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
@@ -3429,16 +3440,17 @@ mod test {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn handle_manifest_progress_timeout_when_manifest_progress_made() {
+    async fn handle_manifest_progress_timeout_when_manifest_progress_made() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
         let _ = queues.next_work(Entity::runner(0, 1), &run_id);
 
@@ -3451,16 +3463,17 @@ mod test {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn handle_manifest_progress_timeout_when_manifest_completed() {
+    async fn handle_manifest_progress_timeout_when_manifest_completed() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
         let _ = queues.next_work(Entity::runner(0, 1), &run_id);
 
@@ -3468,16 +3481,17 @@ mod test {
         assert_eq!(result, Some(ManifestProgressResult::RunComplete));
     }
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn handle_manifest_progress_timeout_when_cancelled() {
+    async fn handle_manifest_progress_timeout_when_cancelled() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
         queues.mark_cancelled(&run_id, Entity::runner(0, 1), CancelReason::User);
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
@@ -3496,14 +3510,15 @@ mod test {
     }
 
     #[n_times(1_000)]
-    #[test]
-    fn handle_manifest_progress_timeout_while_run_is_active_races() {
+    #[tokio::test]
+    async fn handle_manifest_progress_timeout_while_run_is_active_races() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
         let run_id = RunId::unique();
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
 
         // Race popping an item off the manifest, and handling the no-progress timeout.
@@ -3695,9 +3710,9 @@ mod retry_manifest {
     use ntest::timeout;
     use tokio::task::JoinHandle;
 
-    #[test]
+    #[tokio::test]
     #[with_protocol_version]
-    fn worker_told_to_pull_retry_manifest() {
+    async fn worker_told_to_pull_retry_manifest() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
@@ -3714,7 +3729,9 @@ mod retry_manifest {
 
         // Create run, add manifest by worker0
         {
-            let _ = queues.find_or_create_run(&run_id, one_nonzero_usize(), worker0, &remote);
+            let _ = queues
+                .find_or_create_run(&run_id, one_nonzero_usize(), worker0, &remote)
+                .await;
             let _ = queues.add_manifest(
                 &run_id,
                 vec![test1.clone(), test2, test3],
@@ -3733,8 +3750,9 @@ mod retry_manifest {
 
         // Suppose worker0 sporadically dies. Now worker0_shadow should be told to pull a retry
         // manifest.
-        let assigned =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), worker0_shadow, &remote);
+        let assigned = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), worker0_shadow, &remote)
+            .await;
         assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
     }
 
@@ -3910,8 +3928,9 @@ mod retry_manifest {
 
         let entity = Entity::runner(0, 1);
 
-        let _ =
-            queues.find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote);
+        let _ = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
         let _ = queues.add_manifest(
             &run_id,
             vec![test1.clone(), test2.clone(), test3],
