@@ -169,9 +169,27 @@ impl FilesystemPersistor {
             let mut cache = self.0.cache.write().await;
             match cache.get(run_id) {
                 None => {
+                    // Try to load the file from the remote, then update the fd state.
+                    //
+                    // TODO: this blocks reads for a possibly-long time; consider instead loading
+                    // the results into a tempfile, and then atomically renaming when holding a
+                    // lock over the cache.
+                    let path = self.get_path(run_id);
+                    let remote_load_result = self
+                        .0
+                        .remote
+                        .load_to_disk(PersistenceKind::Results, run_id, &path)
+                        .await;
+
                     let fi = self.open_file(run_id).await?;
-                    let fi = Mutex::new(FdState::Open(fi));
-                    cache.insert(run_id.clone(), fi);
+
+                    if remote_load_result.is_ok() {
+                        tracing::info!(?run_id, "Created local results file from remote data.");
+                    } else {
+                        tracing::info!(?run_id, "Created fresh local results file.");
+                    }
+
+                    cache.insert(run_id.clone(), Mutex::new(FdState::Open(fi)));
                 }
                 Some(_) => {
                     // We hit a TOCTOU race; that's fine, release our write lock and go into a reader.
@@ -626,6 +644,7 @@ mod test {
             .on_store_from_disk(|_, _, _| {
                 async { Err("i failed").located(abq_utils::here!()) }.boxed()
             })
+            .on_load_to_disk(fake_error)
             .build();
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -653,6 +672,7 @@ mod test {
                 }
                 .boxed()
             })
+            .on_load_to_disk(fake_error)
             .build();
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -750,7 +770,40 @@ mod test {
     }
 
     #[tokio::test]
-    async fn missing_get_results_fetches_from_remote() {
+    async fn first_get_results_fetches_from_remote() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results = Results(vec![
+            AssociatedTestResults::fake(wid(1), vec![TestResult::fake()]),
+            AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
+        ]);
+
+        let remote = {
+            let results = results.clone();
+            remote::FakePersister::builder()
+                .on_load_to_disk(move |_, _, path| {
+                    let results = results.clone();
+                    async move {
+                        tokio::fs::write(path, serde_json::to_vec(&results).unwrap())
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build()
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = actual_results.decode().unwrap();
+        assert_eq!(actual_results, vec![results]);
+    }
+
+    #[tokio::test]
+    async fn missing_get_results_fetches_from_remote_offloaded() {
         let run_id = RunId("test-run-id".to_string());
 
         let results = Results(vec![
@@ -785,7 +838,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn missing_get_results_errors_if_remote_errors() {
+    async fn missing_get_results_errors_if_remote_errors_offloaded() {
         let run_id = RunId("test-run-id".to_string());
 
         let remote = remote::FakePersister::builder()
@@ -890,7 +943,49 @@ mod test {
     }
 
     #[tokio::test]
-    async fn missing_write_results_fetches_from_remote() {
+    async fn first_write_results_fetches_from_remote() {
+        let run_id = RunId("test-run-id".to_string());
+
+        let results1 = Results(vec![AssociatedTestResults::fake(
+            wid(1),
+            vec![TestResult::fake()],
+        )]);
+        let results2 = Results(vec![AssociatedTestResults::fake(
+            wid(2),
+            vec![TestResult::fake()],
+        )]);
+
+        let remote = {
+            let results = results1.clone();
+            remote::FakePersister::builder()
+                .on_load_to_disk(move |_, _, path| {
+                    let results = results.clone();
+                    async move {
+                        let mut fi = tokio::fs::File::create(path).await.unwrap();
+                        write_packed_line(&mut fi, serde_json::to_vec(&results).unwrap())
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build()
+        };
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
+
+        // Write locally. We should try a fetch from the remote and append to it.
+        fs.dump(&run_id, results2.clone()).await.unwrap();
+
+        let actual_results = fs.get_results(&run_id).await.unwrap();
+
+        let actual_results = actual_results.decode().unwrap();
+        assert_eq!(actual_results, vec![results1, results2]);
+    }
+
+    #[tokio::test]
+    async fn missing_write_results_fetches_from_remote_offloaded() {
         let run_id = RunId("test-run-id".to_string());
 
         let results1 = Results(vec![AssociatedTestResults::fake(
@@ -934,7 +1029,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn missing_write_results_fetches_from_remote_with_error_is_error() {
+    async fn missing_write_results_fetches_from_remote_with_error_is_error_offloaded() {
         let run_id = RunId("test-run-id".to_string());
 
         let results = Results(vec![
