@@ -1,6 +1,11 @@
+## 1.3.5
+
+ABQ 1.3.5 is a patch release that fixes a bug related to a race condition in how
+test results are stored.
+
 ## 1.3.4
 
-ABQ 1.3.4 is patch release with feature preview of remote persisted storage.
+ABQ 1.3.4 is a patch release with feature preview of remote persisted storage.
 
 A remote storage source is used to
 - synchronize ABQ manifests and test results stored on local disk to the remote
