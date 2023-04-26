@@ -20,7 +20,7 @@ following restrictions:
 
 - `run_state` files are schema-versioned, and no schema-version compatibility
     guarantees across versions of ABQ queues are provided at this time.
-    `run_state` files are guaranteed to be compatible if shared betwen ABQ
+    `run_state` files are guaranteed to be compatible if shared between ABQ
     queues of the same version.
     If an ABQ queue loads a `run_state` file that it is incompatible with, the
     remote test run state will not be loaded. Executing a test suite whose
