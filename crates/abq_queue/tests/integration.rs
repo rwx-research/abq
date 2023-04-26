@@ -14,7 +14,7 @@ use abq_queue::{
     persistence::{
         self,
         manifest::ManifestView,
-        remote::{LoadedRunState, PersistenceKind, RemotePersistence},
+        remote::{LoadedRunState, PersistenceKind, RemotePersistence, RemotePersister},
         SerializableRunState,
     },
     queue::{Abq, QueueConfig},

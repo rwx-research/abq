@@ -47,14 +47,14 @@ use crate::job_queue::JobQueue;
 use crate::persistence::manifest::{
     self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
 };
-use crate::persistence::remote::RemotePersister;
+use crate::persistence::remote::{LoadedRunState, RemotePersister};
 use crate::persistence::results::{
     EligibleForRemoteDump, ResultsPersistedCell, SharedPersistResults,
 };
-use crate::prelude::*;
 use crate::timeout::{FiredTimeout, RunTimeoutManager, RunTimeoutStrategy, TimeoutReason};
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
+use crate::{persistence, prelude::*};
 
 #[derive(Debug)]
 enum RunState {
@@ -213,11 +213,15 @@ impl PulledTestsStatus {
     }
 }
 
+struct PersistAfterManifestDone<'a> {
+    persist_manifest_plan: PersistManifestPlan<'a>,
+}
+
 /// Result of trying to pull a batch of tests for a worker.
 struct NextWorkResult<'a> {
     bundle: NextWorkBundle,
     status: PulledTestsStatus,
-    opt_persistent_manifest_plan: Option<PersistManifestPlan<'a>>,
+    opt_persistence: Option<PersistAfterManifestDone<'a>>,
 }
 
 #[derive(Debug)]
@@ -452,12 +456,23 @@ impl AllRuns {
         remote: &RemotePersister,
     ) -> ControlFlow<AssignedRunStatus> {
         let result = async move {
-            if remote.has_run_id(run_id).await? {
-                // This run is known in the remote, so we should load it as completed.
-                self.try_load_remote_run(run_id, entity, remote).await
-            } else {
-                // This run is not present in the remote persister, so we can create a fresh run.
-                Ok(self.try_create_globally_fresh_run(run_id, batch_size_hint, entity))
+            match remote.try_load_run_state(run_id).await? {
+                LoadedRunState::Found(run_state) => {
+                    self.try_load_remote_run(run_id, entity, run_state)
+                }
+                LoadedRunState::NotFound => {
+                    // This run is not present in the remote persister, so we can create a fresh run.
+                    Ok(self.try_create_globally_fresh_run(run_id, batch_size_hint, entity))
+                }
+                LoadedRunState::IncompatibleSchemaVersion { found, expected } => {
+                    tracing::info!(
+                        ?run_id,
+                        ?found,
+                        ?expected,
+                        "found an existing run, but its state has an incompatible schema version"
+                    );
+                    Ok(self.try_create_globally_fresh_run(run_id, batch_size_hint, entity))
+                }
             }
         }
         .await;
@@ -521,18 +536,31 @@ impl AllRuns {
         }
     }
 
-    async fn try_load_remote_run(
+    fn try_load_remote_run(
         &self,
         run_id: &RunId,
         entity: Entity,
-        _remote: &RemotePersister,
+        run_state: persistence::run_state::RunState,
     ) -> OpaqueResult<ControlFlow<AssignedRunStatus>> {
-        // TODO: populate the run state here correctly.
+        let persistence::run_state::RunState {
+            new_worker_exit_code,
+            init_metadata,
+            seen_workers,
+        } = run_state;
+
+        // No worker is currently active, as this is the first time we're seeing them on this
+        // queue instance.
+        let worker_active = false;
+        let seen_workers = seen_workers
+            .into_iter()
+            .map(|worker| (worker, worker_active))
+            .collect();
+
         let run = Run {
             state: RunState::InitialManifestDone {
-                new_worker_exit_code: ExitCode::SUCCESS,
-                seen_workers: RwLock::new(WorkerSet::default()),
-                init_metadata: Default::default(),
+                new_worker_exit_code,
+                seen_workers: RwLock::new(seen_workers),
+                init_metadata,
                 manifest_persistence: ManifestPersistence::Persisted(
                     ManifestPersistedCell::new_already_persisted(),
                 ),
@@ -682,20 +710,20 @@ impl AllRuns {
                     PulledTestsStatus::MoreTestsRemaining => NextWorkResult {
                         bundle,
                         status,
-                        opt_persistent_manifest_plan: None,
+                        opt_persistence: None,
                     },
                     PulledTestsStatus::PulledLastTest { .. } | PulledTestsStatus::QueueWasEmpty => {
                         drop(run);
                         drop(runs);
                         tracing::debug!(?entity, ?run_id, "saw end of manifest for entity");
 
-                        let opt_persistent_manifest_plan =
+                        let opt_persistence =
                             self.try_mark_reached_end_of_manifest(run_id, ExitCode::SUCCESS);
 
                         NextWorkResult {
                             bundle,
                             status,
-                            opt_persistent_manifest_plan,
+                            opt_persistence,
                         }
                     }
                 }
@@ -706,20 +734,20 @@ impl AllRuns {
                 NextWorkResult {
                     bundle: NextWorkBundle::new([], Eow(true)),
                     status: PulledTestsStatus::QueueWasEmpty,
-                    opt_persistent_manifest_plan: None,
+                    opt_persistence: None,
                 }
             }
             RunState::Cancelled { .. } => NextWorkResult {
                 bundle: NextWorkBundle::new([], Eow(true)),
                 status: PulledTestsStatus::QueueWasEmpty,
-                opt_persistent_manifest_plan: None,
+                opt_persistence: None,
             },
             RunState::WaitingForManifest { .. } => {
                 illegal_state!("work can only be requested after initialization metadata, at which point the manifest is known.", ?run_id, ?entity);
                 NextWorkResult {
                     bundle: NextWorkBundle::new([], Eow(true)),
                     status: PulledTestsStatus::QueueWasEmpty,
-                    opt_persistent_manifest_plan: None,
+                    opt_persistence: None,
                 }
             }
         }
@@ -992,7 +1020,7 @@ impl AllRuns {
         &self,
         run_id: &'a RunId,
         new_worker_exit_code: ExitCode,
-    ) -> Option<PersistManifestPlan<'a>> {
+    ) -> Option<PersistAfterManifestDone<'a>> {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
@@ -1047,7 +1075,8 @@ impl AllRuns {
 
         // Build the plan to persist the manifest.
         let view = queue.into_manifest_view();
-        let (manifest_persisted, plan) = manifest::build_persistence_plan(run_id, view);
+        let (manifest_persisted, persist_manifest_plan) =
+            manifest::build_persistence_plan(run_id, view);
 
         run.state = RunState::InitialManifestDone {
             new_worker_exit_code,
@@ -1060,7 +1089,9 @@ impl AllRuns {
         // NB: Always sub last for conversative estimation.
         self.num_active.fetch_sub(1, atomic::ORDERING);
 
-        Some(plan)
+        Some(PersistAfterManifestDone {
+            persist_manifest_plan,
+        })
     }
 
     pub fn mark_failed_to_receive_manifest(&self, run_id: RunId) {
@@ -2541,7 +2572,7 @@ impl WorkScheduler {
             let NextWorkResult {
                 bundle,
                 status,
-                opt_persistent_manifest_plan,
+                opt_persistence,
             } = next_work_result;
 
             let response = NextTestResponse::Bundle(bundle);
@@ -2550,7 +2581,10 @@ impl WorkScheduler {
                 .await
                 .located(here!())?;
 
-            if let Some(persist_manifest_plan) = opt_persistent_manifest_plan {
+            if let Some(PersistAfterManifestDone {
+                persist_manifest_plan,
+            }) = opt_persistence
+            {
                 // Our last task will be to execute manifest persistence.
                 run_manifest_persistence_task(
                     &persist_manifest,
@@ -4093,8 +4127,8 @@ mod persist_results {
     };
 
     use super::{
-        ManifestPersistence, QueueServer, ReadResultsError, ResultsPersistence, RetryManifestState,
-        RunState, SharedRuns,
+        ManifestPersistence, PersistAfterManifestDone, QueueServer, ReadResultsError,
+        ResultsPersistence, RetryManifestState, RunState, SharedRuns,
     };
 
     #[tokio::test]
@@ -4368,12 +4402,14 @@ mod persist_results {
         }
 
         // Move into a completed state
-        let persistence_plan = queues
+        let PersistAfterManifestDone {
+            persist_manifest_plan,
+        } = queues
             .try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS)
             .unwrap();
         persistence::manifest::make_persistence_task(
             manifest_persistence.borrowed(),
-            persistence_plan,
+            persist_manifest_plan,
         )
         .await
         .unwrap();
