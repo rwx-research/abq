@@ -14,7 +14,8 @@ use abq_queue::{
     persistence::{
         self,
         manifest::ManifestView,
-        remote::{PersistenceKind, RemotePersistence},
+        remote::{LoadedRunState, PersistenceKind, RemotePersistence},
+        SerializableRunState,
     },
     queue::{Abq, QueueConfig},
     RunTimeoutStrategy, TimeoutReason,
@@ -130,6 +131,7 @@ impl Server {
 struct InMemoryRemoteInner {
     manifests: HashMap<RunId, ManifestView>,
     results: HashMap<RunId, OpaqueLazyAssociatedTestResults>,
+    run_states: HashMap<RunId, SerializableRunState>,
 }
 
 #[derive(Default, Clone)]
@@ -163,6 +165,9 @@ impl RemotePersistence for InMemoryRemote {
                 let results = OpaqueLazyAssociatedTestResults::from_raw_json_lines(opaque_jsonl);
                 inner.results.insert(run_id.clone(), results);
             }
+            PersistenceKind::RunState => {
+                unimplemented!();
+            }
         }
         Ok(())
     }
@@ -192,6 +197,9 @@ impl RemotePersistence for InMemoryRemote {
                         .ok_or_else(|| "results for entry missing".located(here!()))?;
                     serde_json::to_vec(results).unwrap()
                 }
+                PersistenceKind::RunState => {
+                    unimplemented!();
+                }
             }
         };
 
@@ -200,8 +208,22 @@ impl RemotePersistence for InMemoryRemote {
         Ok(())
     }
 
-    async fn has_run_id(&self, run_id: &RunId) -> OpaqueResult<bool> {
-        Ok(self.0.lock().await.manifests.contains_key(run_id))
+    async fn store_run_state(
+        &self,
+        run_id: &RunId,
+        run_state: SerializableRunState,
+    ) -> OpaqueResult<()> {
+        let mut inner = self.0.lock().await;
+        inner.run_states.insert(run_id.clone(), run_state);
+        Ok(())
+    }
+
+    async fn try_load_run_state(&self, run_id: &RunId) -> OpaqueResult<LoadedRunState> {
+        let inner = self.0.lock().await;
+        match inner.run_states.get(run_id) {
+            Some(run_state) => Ok(LoadedRunState::Found(run_state.clone().into_run_state())),
+            None => Ok(LoadedRunState::NotFound),
+        }
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {

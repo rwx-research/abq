@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use abq_utils::{
-    error::{OpaqueResult, ResultLocation},
+    error::{ErrorLocation, OpaqueResult, ResultLocation},
     here,
     net_protocol::workers::RunId,
 };
@@ -11,13 +11,14 @@ use s3::{
     error::SdkError,
     operation::{
         get_object::{GetObjectError, GetObjectOutput},
-        head_object::{HeadObjectError, HeadObjectOutput},
         put_object::{PutObjectError, PutObjectOutput},
     },
     primitives::ByteStream,
 };
 
-use super::{PersistenceKind, RemotePersistence};
+use crate::persistence::{run_state, SerializableRunState};
+
+use super::{LoadedRunState, PersistenceKind, RemotePersistence};
 
 /// A representation of an AWS S3 client.
 ///
@@ -35,14 +36,12 @@ impl S3Client {
 
 type PutResult = Result<PutObjectOutput, SdkError<PutObjectError>>;
 type GetResult = Result<GetObjectOutput, SdkError<GetObjectError>>;
-type HeadResult = Result<HeadObjectOutput, SdkError<HeadObjectError>>;
 
 #[async_trait]
 trait S3Impl {
     fn key_prefix(&self) -> &str;
     async fn put(&self, key: impl Into<String> + Send, body: ByteStream) -> PutResult;
     async fn get(&self, key: impl Into<String> + Send) -> GetResult;
-    async fn head(&self, key: impl Into<String> + Send) -> HeadResult;
 }
 
 #[derive(Clone)]
@@ -82,15 +81,6 @@ impl S3Impl for S3Persister {
     async fn get(&self, key: impl Into<String> + Send) -> GetResult {
         self.client
             .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-    }
-
-    async fn head(&self, key: impl Into<String> + Send) -> HeadResult {
-        self.client
-            .head_object()
             .bucket(&self.bucket)
             .key(key)
             .send()
@@ -152,17 +142,43 @@ where
         Ok(())
     }
 
-    async fn has_run_id(&self, run_id: &RunId) -> OpaqueResult<bool> {
-        let key = build_key(self.key_prefix(), PersistenceKind::Manifest, run_id);
-        let result = self.head(key).await;
-        match result {
-            Ok(_) => Ok(true),
-            Err(e) => match e {
-                SdkError::ServiceError(e) if matches!(e.err(), HeadObjectError::NotFound(_)) => {
-                    Ok(false)
+    async fn store_run_state(
+        &self,
+        run_id: &RunId,
+        run_state: SerializableRunState,
+    ) -> OpaqueResult<()> {
+        let key = build_key(self.key_prefix(), PersistenceKind::RunState, run_id);
+        let body = ByteStream::from(run_state.serialize().located(here!())?);
+
+        let _put_object = self.put(key, body).await.located(here!())?;
+
+        Ok(())
+    }
+
+    async fn try_load_run_state(&self, run_id: &RunId) -> OpaqueResult<LoadedRunState> {
+        let key = build_key(self.key_prefix(), PersistenceKind::RunState, run_id);
+        let get_result = self.get(key).await;
+
+        let get_object = match get_result {
+            Ok(object) => object,
+            Err(err) => {
+                let err = err.into_service_error();
+                if err.is_no_such_key() {
+                    return Ok(LoadedRunState::NotFound);
+                } else {
+                    return Err(err.located(here!()));
                 }
-                _ => Err(e).located(here!()),
-            },
+            }
+        };
+
+        let body = get_object.body.collect().await.located(here!())?;
+        let body = body.into_bytes();
+        match SerializableRunState::deserialize(&body) {
+            Ok(run_state) => Ok(LoadedRunState::Found(run_state.into_run_state())),
+            Err(run_state::ParseError::IncompatibleSchemaVersion { found, expected }) => {
+                Ok(LoadedRunState::IncompatibleSchemaVersion { found, expected })
+            }
+            Err(e) => Err(e.located(here!())),
         }
     }
 
@@ -177,43 +193,34 @@ mod fake {
     use aws_sdk_s3::primitives::ByteStream;
     use tokio::io::AsyncReadExt;
 
-    use super::{GetResult, HeadResult, PutResult, S3Impl};
+    use super::{GetResult, PutResult, S3Impl};
 
     #[derive(Clone)]
-    pub struct S3Fake<OnPut, OnGet, OnHead> {
+    pub struct S3Fake<OnPut, OnGet> {
         key_prefix: String,
         on_put: OnPut,
         on_get: OnGet,
-        on_head: OnHead,
     }
 
-    impl<OnPut, OnGet, OnHead> S3Fake<OnPut, OnGet, OnHead>
+    impl<OnPut, OnGet> S3Fake<OnPut, OnGet>
     where
         OnPut: Fn(String, &[u8]) -> PutResult + Send + Sync,
         OnGet: Fn(String) -> GetResult + Send + Sync,
-        OnHead: Fn(String) -> HeadResult + Send + Sync,
     {
-        pub fn new(
-            key_prefix: impl Into<String>,
-            on_put: OnPut,
-            on_get: OnGet,
-            on_head: OnHead,
-        ) -> Self {
+        pub fn new(key_prefix: impl Into<String>, on_put: OnPut, on_get: OnGet) -> Self {
             Self {
                 key_prefix: key_prefix.into(),
                 on_put,
                 on_get,
-                on_head,
             }
         }
     }
 
     #[async_trait]
-    impl<OnPut, OnGet, OnHead> S3Impl for S3Fake<OnPut, OnGet, OnHead>
+    impl<OnPut, OnGet> S3Impl for S3Fake<OnPut, OnGet>
     where
         OnPut: Fn(String, &[u8]) -> PutResult + Send + Sync,
         OnGet: Fn(String) -> GetResult + Send + Sync,
-        OnHead: Fn(String) -> HeadResult + Send + Sync,
     {
         fn key_prefix(&self) -> &str {
             &self.key_prefix
@@ -229,10 +236,6 @@ mod fake {
         async fn get(&self, key: impl Into<String> + Send) -> GetResult {
             (self.on_get)(key.into())
         }
-
-        async fn head(&self, key: impl Into<String> + Send) -> HeadResult {
-            (self.on_head)(key.into())
-        }
     }
 }
 
@@ -242,15 +245,15 @@ mod test {
 
     use super::fake::S3Fake;
     use super::{build_key, PersistenceKind};
-    use crate::persistence::remote::RemotePersistence;
+    use crate::persistence::remote::{LoadedRunState, RemotePersistence};
+    use crate::persistence::run_state::RunState;
+    use crate::persistence::SerializableRunState;
     use abq_utils::net_protocol::workers::RunId;
     use aws_sdk_s3::error::SdkError;
-    use aws_sdk_s3::operation::get_object::GetObjectOutput;
-    use aws_sdk_s3::operation::head_object::builders::HeadObjectOutputBuilder;
-    use aws_sdk_s3::operation::head_object::HeadObjectError;
+    use aws_sdk_s3::operation::get_object::{GetObjectError, GetObjectOutput};
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::primitives::{ByteStream, SdkBody};
-    use aws_sdk_s3::types::error::NotFound;
+    use aws_sdk_s3::types::error::NoSuchKey;
     use aws_smithy_http::operation::Response;
     use aws_smithy_http::result::ServiceError;
     use tempfile::NamedTempFile;
@@ -285,7 +288,6 @@ mod test {
                 Ok(PutObjectOutput::builder().build())
             },
             |_| unreachable!(),
-            |_| unreachable!(),
         );
 
         let mut manifest = NamedTempFile::new().unwrap();
@@ -311,7 +313,6 @@ mod test {
                     .body(ByteStream::from(b"manifest-body".to_vec()))
                     .build())
             },
-            |_| unreachable!(),
         );
 
         let manifest = NamedTempFile::new().unwrap();
@@ -340,7 +341,6 @@ mod test {
                 Err(SdkError::timeout_error("timed out"))
             },
             |_| unreachable!(),
-            |_| unreachable!(),
         );
 
         let mut manifest = NamedTempFile::new().unwrap();
@@ -367,7 +367,6 @@ mod test {
                 assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
                 Err(SdkError::timeout_error("timed out"))
             },
-            |_| unreachable!(),
         );
 
         let manifest = NamedTempFile::new().unwrap();
@@ -385,65 +384,132 @@ mod test {
     }
 
     #[tokio::test]
-    async fn run_id_exists_yes() {
+    async fn store_run_state_okay() {
         let s3 = S3Fake::new(
             "bucket-prefix",
-            |_key, _body| unreachable!(),
-            |_key| unreachable!(),
-            |_key| Ok(HeadObjectOutputBuilder::default().build()),
+            |key, _body| {
+                assert_eq!(key, "bucket-prefix/test-run-id/run_state.json");
+                Ok(PutObjectOutput::builder().build())
+            },
+            |_| unreachable!(),
         );
 
-        let exists = s3
-            .has_run_id(&RunId("test-run-id".to_owned()))
-            .await
-            .unwrap();
-
-        assert!(exists);
+        s3.store_run_state(
+            &RunId("test-run-id".to_owned()),
+            SerializableRunState::new(RunState::fake()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn run_id_exists_no() {
+    async fn store_run_state_error() {
         let s3 = S3Fake::new(
             "bucket-prefix",
-            |_key, _body| unreachable!(),
-            |_key| unreachable!(),
-            |_key| {
+            |key, _body| {
+                assert_eq!(key, "bucket-prefix/test-run-id/run_state.json");
+                Err(SdkError::timeout_error("timed out"))
+            },
+            |_| unreachable!(),
+        );
+
+        let err = s3
+            .store_run_state(
+                &RunId("test-run-id".to_owned()),
+                SerializableRunState::new(RunState::fake()),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn load_run_state_okay() {
+        let run_state = SerializableRunState::new(RunState::fake());
+
+        let s3 = S3Fake::new("bucket-prefix", |_, _| unreachable!(), {
+            let run_state = run_state.clone();
+            move |key| {
+                assert_eq!(key, "bucket-prefix/test-run-id/run_state.json");
+                Ok(GetObjectOutput::builder()
+                    .body(ByteStream::from(run_state.serialize().unwrap()))
+                    .build())
+            }
+        });
+
+        let loaded = s3
+            .try_load_run_state(&RunId("test-run-id".to_owned()))
+            .await
+            .unwrap();
+
+        assert_eq!(loaded, LoadedRunState::Found(run_state.into_run_state()));
+    }
+
+    #[tokio::test]
+    async fn load_run_state_not_found() {
+        let s3 = S3Fake::new("bucket-prefix", |_, _| unreachable!(), {
+            move |key| {
+                assert_eq!(key, "bucket-prefix/test-run-id/run_state.json");
                 Err(SdkError::ServiceError(
                     ServiceError::builder()
-                        .source(HeadObjectError::NotFound(NotFound::builder().build()))
+                        .source(GetObjectError::NoSuchKey(NoSuchKey::builder().build()))
                         .raw(Response::new(http::response::Response::new(
                             SdkBody::empty(),
                         )))
                         .build(),
                 ))
-            },
-        );
+            }
+        });
 
-        let exists = s3
-            .has_run_id(&RunId("test-run-id".to_owned()))
+        let loaded = s3
+            .try_load_run_state(&RunId("test-run-id".to_owned()))
             .await
             .unwrap();
 
-        assert!(!exists);
+        assert_eq!(loaded, LoadedRunState::NotFound);
     }
 
     #[tokio::test]
-    async fn run_id_exists_error() {
-        let s3 = S3Fake::new(
-            "bucket-prefix",
-            |_key, _body| unreachable!(),
-            |_key| unreachable!(),
-            |key| {
-                assert_eq!(key, "bucket-prefix/test-run-id/manifest.json");
-                Err(SdkError::timeout_error("timed out"))
-            },
-        );
+    async fn load_run_state_incompatible_versions() {
+        let s3 = S3Fake::new("bucket-prefix", |_, _| unreachable!(), {
+            move |key| {
+                assert_eq!(key, "bucket-prefix/test-run-id/run_state.json");
+                Ok(GetObjectOutput::builder()
+                    .body(ByteStream::from(br#"{"schema_version": 999}"#.to_vec()))
+                    .build())
+            }
+        });
 
-        let err = s3
-            .has_run_id(&RunId("test-run-id".to_owned()))
+        let loaded = s3
+            .try_load_run_state(&RunId("test-run-id".to_owned()))
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(err.to_string().contains("timed out"));
+        assert!(matches!(
+            loaded,
+            LoadedRunState::IncompatibleSchemaVersion {
+                found: 999,
+                expected: _
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn load_run_state_corrupted() {
+        let s3 = S3Fake::new("bucket-prefix", |_, _| unreachable!(), {
+            move |key| {
+                assert_eq!(key, "bucket-prefix/test-run-id/run_state.json");
+                Ok(GetObjectOutput::builder()
+                    .body(ByteStream::from(b"definitely not json".to_vec()))
+                    .build())
+            }
+        });
+
+        let result = s3
+            .try_load_run_state(&RunId("test-run-id".to_owned()))
+            .await;
+
+        assert!(result.is_err());
     }
 }
