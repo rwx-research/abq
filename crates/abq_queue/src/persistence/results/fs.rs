@@ -1,13 +1,14 @@
 use std::{
     collections::HashMap,
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
 };
 
 use abq_utils::{
-    error::{OpaqueResult, ResultLocation},
-    here, log_assert,
+    error::{ErrorLocation, OpaqueResult, ResultLocation},
+    here, illegal_state, log_assert,
     net_protocol::{
         results::{OpaqueLazyAssociatedTestResults, ResultsLine},
         workers::RunId,
@@ -17,7 +18,7 @@ use async_trait::async_trait;
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
-    sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock},
+    sync::{Mutex, RwLock},
 };
 
 use crate::persistence::{
@@ -100,8 +101,6 @@ impl FilesystemPersistor {
 
     #[cfg(test)] // for now
     async fn insert_offloaded<'a>(&self, run_id: RunId) -> Result<()> {
-        use abq_utils::error::ErrorLocation;
-
         let mut cache = self.0.cache.write().await;
         if cache.contains_key(&run_id) {
             return Err(format!("run ID {run_id:?} already inserted in cache").located(here!()));
@@ -121,69 +120,76 @@ impl FilesystemPersistor {
             .located(here!())
     }
 
-    async fn get_open_file_fast_path<'a>(
-        map: &'a FdMap,
+    async fn with_file_fast_path<T, F: WithFile<T>>(
+        &self,
         run_id: &RunId,
-    ) -> Option<MappedMutexGuard<'a, File>> {
-        let fi = map.get(run_id)?;
-        let fi = fi.lock().await;
-        MutexGuard::try_map(fi, |fd| match fd {
-            FdState::Open(fi) => Some(fi),
-            FdState::Offloaded => None,
-        })
-        .ok()
-    }
+        f: F,
+    ) -> Result<ControlFlow<Result<T>, F>> {
+        // Fast path: try to read or load in an open file descriptor from the cache.
+        let cache = self.0.cache.read().await;
+        let state = match cache.get(run_id) {
+            Some(state) => state,
+            None => return Ok(ControlFlow::Continue(f)),
+        };
 
-    async fn with_file<T>(&self, run_id: &RunId, f: impl WithFile<T>) -> Result<T> {
-        {
-            // Fast path: try to read an open file descriptor from the cache.
-            let cache = self.0.cache.read().await;
-            if let Some(mut fi) = Self::get_open_file_fast_path(&cache, run_id).await {
-                return f.run(&mut fi).await;
-            };
-        }
+        let mut state = state.lock().await;
+        let result = match &mut *state {
+            FdState::Open(fi) => f.run(&mut *fi).await,
+            FdState::Offloaded => {
+                // Load the file from the remote, then update the fd state.
+                let path = self.get_path(run_id);
+                self.0
+                    .remote
+                    .load_to_disk(PersistenceKind::Results, run_id, &path)
+                    .await?;
 
-        // Slow path: open the file, cache the file descriptor, and then read from it.
-        let mut cache = self.0.cache.write().await;
-        match cache.get(run_id) {
-            None => {
+                tracing::info!(?run_id, "Loaded test results from remote.");
+
                 let mut fi = self.open_file(run_id).await?;
 
-                // Compute the result, then place the fd into the cache.
+                // Compute the result, then update the fd state.
                 let result = f.run(&mut fi).await;
 
-                let fi = Mutex::new(FdState::Open(fi));
-                cache.insert(run_id.clone(), fi);
+                *state = FdState::Open(fi);
 
                 result
             }
-            Some(state) => {
-                let mut state = state.lock().await;
-                match &mut *state {
-                    FdState::Open(fi) => {
-                        // We hit a TOCTOU: that's okay.
-                        f.run(&mut *fi).await
-                    }
-                    FdState::Offloaded => {
-                        // Load the file from the remote, then update the fd state.
-                        let path = self.get_path(run_id);
-                        self.0
-                            .remote
-                            .load_to_disk(PersistenceKind::Results, run_id, &path)
-                            .await?;
+        };
+        Ok(ControlFlow::Break(result))
+    }
 
-                        tracing::info!(?run_id, "Loaded test results from remote.");
+    async fn with_file<T>(&self, run_id: &RunId, f: impl WithFile<T>) -> Result<T> {
+        let f = match self.with_file_fast_path(run_id, f).await? {
+            ControlFlow::Break(result) => return result,
+            ControlFlow::Continue(f) => f,
+        };
 
-                        let mut fi = self.open_file(run_id).await?;
-
-                        // Compute the result, then update the fd state.
-                        let result = f.run(&mut fi).await;
-
-                        *state = FdState::Open(fi);
-
-                        result
-                    }
+        {
+            // Slow path: we may need to insert a new file descriptor into the cache.
+            let mut cache = self.0.cache.write().await;
+            match cache.get(run_id) {
+                None => {
+                    let fi = self.open_file(run_id).await?;
+                    let fi = Mutex::new(FdState::Open(fi));
+                    cache.insert(run_id.clone(), fi);
                 }
+                Some(_) => {
+                    // We hit a TOCTOU race; that's fine, release our write lock and go into a reader.
+                }
+            }
+        }
+
+        match self.with_file_fast_path(run_id, f).await? {
+            ControlFlow::Break(result) => result,
+            ControlFlow::Continue(_) => {
+                illegal_state!(
+                    "file descriptor missing after insertion into cache",
+                    ?run_id
+                );
+                Err(
+                    format!("file descriptor missing after insertion into cache for {run_id:?}")
+                        .located(here!()),
+                )
             }
         }
     }
