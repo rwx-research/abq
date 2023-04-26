@@ -4193,7 +4193,7 @@ mod persistence_on_end_of_manifest {
                 let stored_run_state = stored_run_state.clone();
                 move |run_id, run_state| {
                     assert_eq!(run_id, &expected_run_id);
-                    stored_run_state.lock().replace(run_state.clone());
+                    stored_run_state.lock().replace(run_state);
                     async { Ok(()) }.boxed()
                 }
             })
@@ -4275,16 +4275,13 @@ mod persistence_on_end_of_manifest {
 
         // In time, we should see that the run state was persisted.
         loop {
-            let run_state = stored_run_state.lock();
-            match &*run_state {
-                None => tokio::time::sleep(Duration::from_micros(100)).await,
-                Some(run_state) => {
-                    let run_state = run_state.clone().into_run_state();
-                    assert_eq!(run_state.seen_workers.len(), 1);
-                    assert_eq!(run_state.new_worker_exit_code.get(), 0);
-                    break;
-                }
+            if let Some(run_state) = &*stored_run_state.lock() {
+                let run_state = run_state.clone().into_run_state();
+                assert_eq!(run_state.seen_workers.len(), 1);
+                assert_eq!(run_state.new_worker_exit_code.get(), 0);
+                break;
             }
+            tokio::time::sleep(Duration::from_micros(100)).await;
         }
 
         shutdown_tx.shutdown_immediately().unwrap();
