@@ -2685,7 +2685,12 @@ mod test {
     use std::{io, time::Instant};
 
     use crate::{
-        persistence::{self, manifest::InMemoryPersistor, remote},
+        persistence::{
+            self,
+            manifest::InMemoryPersistor,
+            remote::{self, LoadedRunState},
+            run_state,
+        },
         queue::{
             AddedManifest, CancelReason, ManifestProgressCancelReason, ManifestProgressResult,
             PulledTestsStatus, QueueServer, RunStatus, SharedRuns, WorkScheduler,
@@ -2699,7 +2704,9 @@ mod test {
     };
     use abq_utils::{
         auth::{build_strategies, AdminToken, ClientAuthStrategy, ServerAuthStrategy, UserToken},
+        error::ErrorLocation,
         exit::ExitCode,
+        here,
         net_opt::{ClientOptions, ServerOptions},
         net_protocol::{
             self,
@@ -2716,6 +2723,7 @@ mod test {
     };
     use abq_with_protocol_version::with_protocol_version;
     use abq_workers::{AssignedRun, AssignedRunStatus};
+    use futures::FutureExt;
     use tracing_test::traced_test;
 
     fn test_queue() -> QueueServer {
@@ -3694,6 +3702,185 @@ mod test {
                 (result, work_bundle, work_status)
             ),
         }
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn create_run_if_no_remote_run_present() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let remote = remote::NoopPersister::new().into();
+
+        let assigned = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
+
+        assert_eq!(queues.estimate_num_active_runs(), 1);
+        assert_eq!(
+            assigned,
+            AssignedRunStatus::Run(AssignedRun::Fresh {
+                should_generate_manifest: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn create_run_defers_to_remote_if_present_with_active_worker() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let entity = Entity::runner(0, 1);
+
+        let remote = remote::FakePersister::builder()
+            .on_try_load_run_state({
+                let expected_run_id = run_id.clone();
+                move |run_id| {
+                    assert_eq!(run_id, &expected_run_id);
+                    let run_state = run_state::RunState {
+                        seen_workers: vec![entity],
+                        ..run_state::RunState::fake()
+                    };
+                    async { Ok(LoadedRunState::Found(run_state)) }.boxed()
+                }
+            })
+            .build()
+            .into();
+
+        let assigned = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), entity, &remote)
+            .await;
+
+        assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn create_run_defers_to_remote_if_present_with_inactive_worker() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let remote = remote::FakePersister::builder()
+            .on_try_load_run_state({
+                let expected_run_id = run_id.clone();
+                move |run_id| {
+                    assert_eq!(run_id, &expected_run_id);
+                    let run_state = run_state::RunState {
+                        seen_workers: vec![],
+                        new_worker_exit_code: ExitCode::new(77),
+                        ..run_state::RunState::fake()
+                    };
+                    async { Ok(LoadedRunState::Found(run_state)) }.boxed()
+                }
+            })
+            .build()
+            .into();
+
+        let assigned = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
+
+        assert_eq!(
+            assigned,
+            AssignedRunStatus::AlreadyDone {
+                exit_code: ExitCode::new(77)
+            }
+        );
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn create_run_defers_to_local_if_remote_not_found() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let remote = remote::FakePersister::builder()
+            .on_try_load_run_state({
+                let expected_run_id = run_id.clone();
+                move |run_id| {
+                    assert_eq!(run_id, &expected_run_id);
+                    async { Ok(LoadedRunState::NotFound) }.boxed()
+                }
+            })
+            .build()
+            .into();
+
+        let assigned = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
+
+        assert_eq!(
+            assigned,
+            AssignedRunStatus::Run(AssignedRun::Fresh {
+                should_generate_manifest: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn create_run_defers_to_local_if_remote_schema_version_mismatch() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let remote = remote::FakePersister::builder()
+            .on_try_load_run_state({
+                let expected_run_id = run_id.clone();
+                move |run_id| {
+                    assert_eq!(run_id, &expected_run_id);
+                    async {
+                        Ok(LoadedRunState::IncompatibleSchemaVersion {
+                            found: 1,
+                            expected: 2,
+                        })
+                    }
+                    .boxed()
+                }
+            })
+            .build()
+            .into();
+
+        let assigned = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
+
+        assert_eq!(
+            assigned,
+            AssignedRunStatus::Run(AssignedRun::Fresh {
+                should_generate_manifest: true
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn create_run_errors_if_remote_check_errors() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let remote = remote::FakePersister::builder()
+            .on_try_load_run_state({
+                let expected_run_id = run_id.clone();
+                move |run_id| {
+                    assert_eq!(run_id, &expected_run_id);
+                    async { Err("i failed".located(here!())) }.boxed()
+                }
+            })
+            .build()
+            .into();
+
+        let assigned = queues
+            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .await;
+
+        assert!(matches!(assigned, AssignedRunStatus::FatalError(_)));
     }
 }
 
