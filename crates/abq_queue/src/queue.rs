@@ -51,6 +51,7 @@ use crate::persistence::remote::{LoadedRunState, RemotePersister};
 use crate::persistence::results::{
     EligibleForRemoteDump, ResultsPersistedCell, SharedPersistResults,
 };
+use crate::persistence::run_state::PersistRunStatePlan;
 use crate::timeout::{FiredTimeout, RunTimeoutManager, RunTimeoutStrategy, TimeoutReason};
 use crate::worker_timings::{log_workers_waited_for_manifest_latency, WorkerTimings};
 use crate::worker_tracking::WorkerSet;
@@ -215,6 +216,7 @@ impl PulledTestsStatus {
 
 struct PersistAfterManifestDone<'a> {
     persist_manifest_plan: PersistManifestPlan<'a>,
+    persist_run_state_plan: PersistRunStatePlan<'a>,
 }
 
 /// Result of trying to pull a batch of tests for a worker.
@@ -1078,6 +1080,16 @@ impl AllRuns {
         let (manifest_persisted, persist_manifest_plan) =
             manifest::build_persistence_plan(run_id, view);
 
+        // Build the plan to persist the run state at manifest completion.
+        let persist_run_state_plan = PersistRunStatePlan::new(
+            run_id,
+            persistence::run_state::RunState {
+                new_worker_exit_code,
+                init_metadata: init_metadata.clone(),
+                seen_workers: seen_workers.iter().map(|(worker, _)| *worker).collect(),
+            },
+        );
+
         run.state = RunState::InitialManifestDone {
             new_worker_exit_code,
             init_metadata,
@@ -1091,6 +1103,7 @@ impl AllRuns {
 
         Some(PersistAfterManifestDone {
             persist_manifest_plan,
+            persist_run_state_plan,
         })
     }
 
@@ -1566,6 +1579,7 @@ async fn start_queue(config: QueueConfig) -> Abq {
         let scheduler = WorkScheduler {
             queues,
             persist_manifest,
+            remote: remote.clone(),
         };
         scheduler.start(new_work_server, work_scheduler_shutdown_rx)
     });
@@ -2390,6 +2404,7 @@ fn log_deprecations(entity: Entity, run_id: RunId, deprecations: meta::Deprecati
 struct WorkScheduler {
     queues: SharedRuns,
     persist_manifest: SharedPersistManifest,
+    remote: RemotePersister,
 }
 
 /// An error that happens in the construction or execution of the work-scheduling server.
@@ -2412,6 +2427,7 @@ struct SchedulerCtx {
     queues: SharedRuns,
     handshake_ctx: Arc<Box<dyn net_async::ServerHandshakeCtx>>,
     persist_manifest: SharedPersistManifest,
+    remote: RemotePersister,
 }
 
 impl WorkScheduler {
@@ -2423,11 +2439,13 @@ impl WorkScheduler {
         let Self {
             queues,
             persist_manifest,
+            remote,
         } = self;
         let ctx = SchedulerCtx {
             queues,
             handshake_ctx: Arc::new(listener.handshake_ctx()),
             persist_manifest,
+            remote,
         };
 
         loop {
@@ -2510,6 +2528,7 @@ impl WorkScheduler {
                 tokio::spawn(Self::start_persistent_next_tests_requests_task(
                     ctx.queues,
                     ctx.persist_manifest,
+                    ctx.remote,
                     run_id,
                     stream,
                     entity,
@@ -2543,6 +2562,7 @@ impl WorkScheduler {
     async fn start_persistent_next_tests_requests_task(
         queues: SharedRuns,
         persist_manifest: SharedPersistManifest,
+        remote: RemotePersister,
         run_id: RunId,
         mut conn: Box<dyn net_async::ServerStream>,
         entity: Entity,
@@ -2583,16 +2603,20 @@ impl WorkScheduler {
 
             if let Some(PersistAfterManifestDone {
                 persist_manifest_plan,
+                persist_run_state_plan,
             }) = opt_persistence
             {
-                // Our last task will be to execute manifest persistence.
-                run_manifest_persistence_task(
+                // Our last task will be to execute manifest and run-state persistence.
+                let manifest_persistence_task = run_manifest_persistence_task(
                     &persist_manifest,
                     &run_id,
                     persist_manifest_plan,
                     entity,
-                )
-                .await;
+                );
+                let run_state_persistence_task =
+                    run_persist_run_state_task(&remote, &run_id, persist_run_state_plan, entity);
+
+                tokio::join!(manifest_persistence_task, run_state_persistence_task);
 
                 log_assert!(
                     status.reached_end_of_tests(),
@@ -2639,6 +2663,18 @@ async fn run_manifest_persistence_task(
 
     if let Err(error) = task.await.entity(entity) {
         log_entityful_error!(error, "failed to execute manifest persistence job: {}");
+    }
+}
+
+#[instrument(level = "info", skip_all, fields(run_id=?run_id, entity=?entity))]
+async fn run_persist_run_state_task(
+    remote: &RemotePersister,
+    run_id: &RunId,
+    persist_run_state: PersistRunStatePlan<'_>,
+    entity: Entity,
+) {
+    if let Err(error) = persist_run_state.persist(remote).await.entity(entity) {
+        log_entityful_error!(error, "failed to execute run state persistence job: {}");
     }
 }
 
@@ -2815,6 +2851,7 @@ mod test {
         let work_scheduler = WorkScheduler {
             queues: Default::default(),
             persist_manifest: InMemoryPersistor::shared(),
+            remote: remote::NoopPersister::new().into(),
         };
         let work_server_handle = tokio::spawn(work_scheduler.start(server, server_shutdown_rx));
 
@@ -2847,6 +2884,7 @@ mod test {
         let server = WorkScheduler {
             queues: Default::default(),
             persist_manifest: InMemoryPersistor::shared(),
+            remote: remote::NoopPersister::new().into(),
         };
 
         let listener = server_opts.bind_async("0.0.0.0:0").await.unwrap();
@@ -2954,6 +2992,7 @@ mod test {
         let server = WorkScheduler {
             queues: Default::default(),
             persist_manifest: InMemoryPersistor::shared(),
+            remote: remote::NoopPersister::new().into(),
         };
 
         let (server_auth, client_auth, _) = build_random_strategies();
@@ -2990,6 +3029,7 @@ mod test {
         let server = WorkScheduler {
             queues: Default::default(),
             persist_manifest: InMemoryPersistor::shared(),
+            remote: remote::NoopPersister::new().into(),
         };
 
         let (server_auth, _, _) = build_random_strategies();
@@ -3980,14 +4020,15 @@ mod test_pull_work {
 }
 
 #[cfg(test)]
-mod retry_manifest {
-    use std::{net::SocketAddr, time::Duration};
+mod persistence_on_end_of_manifest {
+    use futures::FutureExt;
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
 
     use crate::{
         job_queue::JobQueue,
         persistence::{
             manifest::{InMemoryPersistor, SharedPersistManifest},
-            remote,
+            remote::{self, RemotePersister},
             results::ResultsPersistedCell,
         },
         queue::{fake_test_spec, NextWorkResult, RunState, SharedRuns, WorkScheduler},
@@ -4009,6 +4050,7 @@ mod retry_manifest {
     use abq_with_protocol_version::with_protocol_version;
     use abq_workers::{AssignedRun, AssignedRunStatus};
     use ntest::timeout;
+    use parking_lot::Mutex;
     use tokio::task::JoinHandle;
 
     #[tokio::test]
@@ -4063,10 +4105,15 @@ mod retry_manifest {
             Self(WorkScheduler {
                 queues,
                 persist_manifest: InMemoryPersistor::shared(),
+                remote: remote::NoopPersister::new().into(),
             })
         }
         fn with_persist_manifest(mut self, persist: SharedPersistManifest) -> Self {
             self.0.persist_manifest = persist;
+            self
+        }
+        fn with_remote(mut self, remote: RemotePersister) -> Self {
+            self.0.remote = remote;
             self
         }
     }
@@ -4108,7 +4155,7 @@ mod retry_manifest {
     #[tokio::test]
     #[with_protocol_version]
     #[timeout(1000)]
-    async fn pulling_end_of_manifest_eventually_persists_manifest() {
+    async fn pulling_end_of_manifest_eventually_persists_manifest_and_run_state() {
         let spec1 = spec(1);
         let spec2 = spec(2);
 
@@ -4139,6 +4186,19 @@ mod retry_manifest {
 
         let persist_manifest = InMemoryPersistor::shared();
 
+        let stored_run_state = Arc::new(Mutex::new(None));
+        let remote = remote::FakePersister::builder()
+            .on_store_run_state({
+                let expected_run_id = run_id.clone();
+                let stored_run_state = stored_run_state.clone();
+                move |run_id, run_state| {
+                    assert_eq!(run_id, &expected_run_id);
+                    stored_run_state.lock().replace(run_state.clone());
+                    async { Ok(()) }.boxed()
+                }
+            })
+            .build();
+
         let WorkSchedulerState {
             mut shutdown_tx,
             server_task,
@@ -4147,7 +4207,8 @@ mod retry_manifest {
             client,
         } = build_work_scheduler(
             WorkSchedulerBuilder::new(queues.clone())
-                .with_persist_manifest(persist_manifest.clone()),
+                .with_persist_manifest(persist_manifest.clone())
+                .with_remote(remote.into()),
         )
         .await;
 
@@ -4209,6 +4270,20 @@ mod retry_manifest {
                     continue;
                 }
                 response => unreachable!("{response:?}"),
+            }
+        }
+
+        // In time, we should see that the run state was persisted.
+        loop {
+            let run_state = stored_run_state.lock();
+            match &*run_state {
+                None => tokio::time::sleep(Duration::from_micros(100)).await,
+                Some(run_state) => {
+                    let run_state = run_state.clone().into_run_state();
+                    assert_eq!(run_state.seen_workers.len(), 1);
+                    assert_eq!(run_state.new_worker_exit_code.get(), 0);
+                    break;
+                }
             }
         }
 
@@ -4591,6 +4666,7 @@ mod persist_results {
         // Move into a completed state
         let PersistAfterManifestDone {
             persist_manifest_plan,
+            persist_run_state_plan: _,
         } = queues
             .try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS)
             .unwrap();
