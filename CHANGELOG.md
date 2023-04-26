@@ -1,3 +1,47 @@
+## 1.4.0
+
+ABQ 1.4.0 adds support for loading test runs from other queue instances via
+remote storage.
+
+Until 1.4.0, a test run that executed on one instance of ABQ could not be loaded
+and re-executed on another instance. Executing a test suite with the same run ID
+on two different ABQ instances would run the test suite twice, with no sharing
+of test results.
+
+ABQ now writes `run_state` files to remote persistence locations, when remote
+persistence is configured via the `ABQ_REMOTE_PERSISTENCE_STRATEGY` environment
+variable, and its accompanying environment variables. If the same remote
+persistence strategy is configured between multiple ABQ queue instances, queue
+instances will have the capability to load test runs that initially executed on
+previous queue instances.
+
+At this time, loading test runs from other queue instances includes the
+following restrictions:
+
+- `run_state` files are schema-versioned, and no schema-version compatibility
+    guarantees across versions of ABQ queues are provided at this time.
+    `run_state` files are guaranteed to be compatible if shared betwen ABQ
+    queues of the same version.
+    If an ABQ queue loads a `run_state` file that it is incompatible with, the
+    remote test run state will not be loaded. Executing a test suite whose
+    run state file failed to be loaded will fall back on executing the test
+    suite as a fresh run, similar to the pre-1.4.0 behavior.
+
+- The same run ID may not be executed, in parallel, on two different ABQ queue
+    instances sharing the same remote persistence. For a given run ID, an ABQ
+    queue will **assume** exclusive ownership of the test suite run associated
+    with that run ID.
+    At this time, ABQ does **not** verify whether it indeed has exclusive
+    ownership of a run ID. If you are self-hosting ABQ, you must ensure that
+    run IDs are routed to a unique ABQ instance for the duration of a test run;
+    however, once a test run is complete, retries of the test run may be routed
+    to another ABQ instance, so long as the exclusive ownership constraint
+    continues to apply for the duration of the retry.
+    If you would like to avoid self-hosting, [RWX's managed hosting of ABQ][abq_pricing]
+    supports routing test runs under these constraints.
+
+See the [ABQ documentation][abq_docs_persistence] for more details on persistence.
+
 ## 1.3.5
 
 ABQ 1.3.5 is a patch release that fixes a bug related to a race condition in how
@@ -180,6 +224,8 @@ This version of ABQ supports [ABQ native runner protocol 0.2][native_runner_prot
 Learn more about using ABQ [at the docs][abq_docs].
 
 [abq_docs]: https://www.rwx.com/docs/abq
+[abq_docs]: https://www.rwx.com/docs/abq/persistence
 [abq_homepage]: https://www.rwx.com/abq
+[abq_pricing]: https://www.rwx.com/abq#abq-pricing
 [captain_homepage]: https://www.rwx.com/captain
 [native_runner_protocol_0_2]: https://rwx.notion.site/ABQ-Native-Runner-Protocol-0-2-70b3ec70b2f64b84aa3253a558eba16f
