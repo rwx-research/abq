@@ -193,9 +193,10 @@ mod test {
             queue::AssociatedTestResults, results::ResultsLine, runners::TestResult, workers::RunId,
         },
     };
+    use futures::FutureExt;
 
     use crate::persistence::{
-        remote::{self, fake_error, fake_unreachable, PersistenceKind},
+        remote::{self, fake_error, PersistenceKind},
         results::EligibleForRemoteDump,
     };
 
@@ -218,10 +219,15 @@ mod test {
         let persistence = FilesystemPersistor::new_shared(
             tempdir.path(),
             1,
-            remote::FakePersister::new(fake_unreachable, |_, _, _| async {
-                // Load nothing new into the file
-                Ok(())
-            }),
+            remote::FakePersister::builder()
+                .on_load_to_disk(|_, _, _| {
+                    async {
+                        // Load nothing new into the file
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build(),
         );
 
         let cell = ResultsPersistedCell::new(RunId::unique());
@@ -290,7 +296,9 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_last() {
-        let remote = remote::FakePersister::new(fake_unreachable, fake_error);
+        let remote = remote::FakePersister::builder()
+            .on_load_to_disk(fake_error)
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -314,7 +322,9 @@ mod test {
 
     #[tokio::test]
     async fn execute_not_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(fake_unreachable, fake_error);
+        let remote = remote::FakePersister::builder()
+            .on_load_to_disk(fake_error)
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -340,7 +350,9 @@ mod test {
 
     #[tokio::test]
     async fn execute_eligible_for_persistence_is_not_last() {
-        let remote = remote::FakePersister::new(fake_unreachable, fake_error);
+        let remote = remote::FakePersister::builder()
+            .on_load_to_disk(fake_error)
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
@@ -372,8 +384,8 @@ mod test {
 
         let set_remote = Arc::new(AtomicBool::new(false));
 
-        let remote = remote::FakePersister::new(
-            {
+        let remote = remote::FakePersister::builder()
+            .on_store_from_disk({
                 let results = ResultsLine::Results(results.clone());
                 let set_remote = set_remote.clone();
                 move |kind, run_id, path| {
@@ -390,10 +402,11 @@ mod test {
 
                         Ok(())
                     }
+                    .boxed()
                 }
-            },
-            fake_error,
-        );
+            })
+            .on_load_to_disk(fake_error)
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote);
