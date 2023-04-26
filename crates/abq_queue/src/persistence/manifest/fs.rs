@@ -279,12 +279,11 @@ mod test {
             workers::{RunId, WorkerTest, INIT_RUN_NUMBER},
         },
     };
+    use futures::FutureExt;
 
     use crate::persistence::{
         manifest::{ManifestView, PersistentManifest},
-        remote::{
-            fake_unreachable, FakePersister, NoopPersister, OneWriteFakePersister, PersistenceKind,
-        },
+        remote::{FakePersister, NoopPersister, OneWriteFakePersister, PersistenceKind},
         OffloadConfig, OffloadSummary,
     };
 
@@ -399,8 +398,8 @@ mod test {
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
-            FakePersister::new(
-                {
+            FakePersister::builder()
+                .on_store_from_disk({
                     let view = view.clone();
                     move |kind, run_id, path| {
                         let view = view.clone();
@@ -414,10 +413,10 @@ mod test {
                             assert_eq!(view, loaded_view);
                             Ok(())
                         }
+                        .boxed()
                     }
-                },
-                fake_unreachable,
-            ),
+                })
+                .build(),
         );
 
         let res = fs.dump(&run_id, view).await;
@@ -437,10 +436,9 @@ mod test {
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
-            FakePersister::new(
-                |_, _, _| async { Err("i failed".located(here!())) },
-                fake_unreachable,
-            ),
+            FakePersister::builder()
+                .on_store_from_disk(|_, _, _| async { Err("i failed".located(here!())) }.boxed())
+                .build(),
         );
 
         let res = fs.dump(&run_id, view).await;
@@ -465,15 +463,18 @@ mod test {
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
-            FakePersister::new(fake_unreachable, move |_, _, path| {
-                let view = view.clone();
-                async move {
-                    tokio::fs::write(path, serde_json::to_vec(&view).unwrap())
-                        .await
-                        .unwrap();
-                    Ok(())
-                }
-            }),
+            FakePersister::builder()
+                .on_load_to_disk(move |_, _, path| {
+                    let view = view.clone();
+                    async move {
+                        tokio::fs::write(path, serde_json::to_vec(&view).unwrap())
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build(),
         );
 
         let tests = fs.get_partition_for_entity(&run_id, runner1).await.unwrap();
@@ -488,9 +489,9 @@ mod test {
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
-            FakePersister::new(fake_unreachable, |_, _, _| async {
-                Err("i failed".located(here!()))
-            }),
+            FakePersister::builder()
+                .on_load_to_disk(|_, _, _| async { Err("i failed".located(here!())) }.boxed())
+                .build(),
         );
 
         let res = fs
@@ -517,19 +518,22 @@ mod test {
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
-            FakePersister::new(
-                |_, _, _| async { Ok(()) },
-                |_, _, path| async move {
-                    let fake_view = ManifestView {
-                        items: vec![],
-                        assigned_entities: vec![],
-                    };
-                    tokio::fs::write(path, serde_json::to_vec(&fake_view).unwrap())
-                        .await
-                        .unwrap();
-                    Ok(())
-                },
-            ),
+            FakePersister::builder()
+                .on_store_from_disk(|_, _, _| async { Ok(()) }.boxed())
+                .on_load_to_disk(|_, _, path| {
+                    async move {
+                        let fake_view = ManifestView {
+                            items: vec![],
+                            assigned_entities: vec![],
+                        };
+                        tokio::fs::write(path, serde_json::to_vec(&fake_view).unwrap())
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build(),
         );
 
         fs.dump(&run_id, view).await.unwrap();
@@ -560,9 +564,9 @@ mod test {
 
         let fs = FilesystemPersistor::new(
             tempdir.path(),
-            FakePersister::new(
-                |_, _, _| async { Ok(()) },
-                move |_, _, path| {
+            FakePersister::builder()
+                .on_store_from_disk(|_, _, _| async { Ok(()) }.boxed())
+                .on_load_to_disk(move |_, _, path| {
                     let view = view.clone();
                     async move {
                         tokio::fs::write(path, serde_json::to_vec(&view).unwrap())
@@ -570,8 +574,9 @@ mod test {
                             .unwrap();
                         Ok(())
                     }
-                },
-            ),
+                    .boxed()
+                })
+                .build(),
         );
 
         let mut join_set = tokio::task::JoinSet::new();

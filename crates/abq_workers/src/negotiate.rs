@@ -82,6 +82,7 @@ enum MessageFromQueueNegotiator {
     /// The context a worker set should execute a run with.
     ExecutionContext(ExecutionContext),
     RunUnknown,
+    FatalError(String),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -121,6 +122,10 @@ pub enum WorkersNegotiateError {
     CouldNotConnect,
     #[error("illegal message received from queue")]
     BadQueueMessage,
+    #[error(
+        "ABQ failed to create a run: {0}. This is a fatal error in ABQ. Please report it to RWX."
+    )]
+    FatalErrorCreatingRun(String),
     #[error("{0}")]
     Io(#[from] io::Error),
 }
@@ -293,6 +298,9 @@ async fn wait_for_execution_context(
             MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
             MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code } => {
                 Err(NegotiatedWorkers::Redundant { exit_code })
+            }
+            MessageFromQueueNegotiator::FatalError(err) => {
+                return Err(WorkersNegotiateError::FatalErrorCreatingRun(err))
             }
             MessageFromQueueNegotiator::RunUnknown => {
                 // We are still waiting for this run, sleep on the decay and retry.
@@ -553,6 +561,10 @@ impl QueueNegotiator {
                     RunUnknown => {
                         tracing::debug!(?run_id, "run not yet known");
                         MessageFromQueueNegotiator::RunUnknown
+                    }
+                    FatalError(error) => {
+                        tracing::error!(?run_id, "fatal error trying to fetch run");
+                        MessageFromQueueNegotiator::FatalError(error)
                     }
                 };
 

@@ -3083,7 +3083,10 @@ fn custom_remote_persistence() {
         const kind = process.argv[3];
         const runId = process.argv[4];
         const readFrom = process.argv[5];
-        const writeTo = `${{dir}}/${{action}}-${{kind}}-${{runId}}`
+        const writeTo = `${{dir}}/${{action}}-${{kind}}-${{runId}}`;
+
+        // If we're loading a run state, fail - each run should be fresh.
+        if (kind === 'run_state' && action === 'load') process.exit(1);
 
         const data = fs.readFileSync(readFrom, `utf8`);
         fs.writeFileSync(writeTo, data);

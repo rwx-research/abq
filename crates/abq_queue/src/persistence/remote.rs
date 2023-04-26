@@ -98,6 +98,9 @@ pub trait RemotePersistence {
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync>;
 }
 
+/// A shared wrapper around [RemotePersister].
+///
+/// Clones are cheap, as they are atomically reference counted.
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct RemotePersister(Arc<Box<dyn RemotePersistence + Send + Sync>>);
@@ -132,5 +135,17 @@ impl RemotePersister {
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
         self.0.load_to_disk(kind, run_id, into_local_path).await
+    }
+
+    pub async fn store_run_state(
+        &self,
+        run_id: &RunId,
+        state: SerializableRunState,
+    ) -> OpaqueResult<()> {
+        self.0.store_run_state(run_id, state).await
+    }
+
+    pub async fn try_load_run_state(&self, run_id: &RunId) -> OpaqueResult<LoadedRunState> {
+        self.0.try_load_run_state(run_id).await
     }
 }

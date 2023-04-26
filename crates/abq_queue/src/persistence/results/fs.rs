@@ -393,10 +393,11 @@ mod test {
             workers::RunId,
         },
     };
+    use futures::FutureExt;
     use tokio::task::JoinSet;
 
     use crate::persistence::{
-        remote::{self, fake_error, fake_unreachable, OneWriteFakePersister, PersistenceKind},
+        remote::{self, fake_error, OneWriteFakePersister, PersistenceKind},
         results::{fs::write_packed_line, PersistResults},
         OffloadConfig, OffloadSummary,
     };
@@ -583,8 +584,8 @@ mod test {
             AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
         ]);
 
-        let remote = remote::FakePersister::new(
-            {
+        let remote = remote::FakePersister::builder()
+            .on_store_from_disk({
                 let results = results.clone();
                 move |kind, run_id, path| {
                     let results = results.clone();
@@ -597,10 +598,11 @@ mod test {
                         assert_eq!(read, results);
                         Ok(())
                     }
+                    .boxed()
                 }
-            },
-            fake_error,
-        );
+            })
+            .on_load_to_disk(fake_error)
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
@@ -614,10 +616,11 @@ mod test {
     async fn dump_to_remote_err() {
         let run_id = RunId("test-run-id".to_string());
 
-        let remote = remote::FakePersister::new(
-            |_, _, _| async { Err("i failed").located(abq_utils::here!()) },
-            fake_unreachable,
-        );
+        let remote = remote::FakePersister::builder()
+            .on_store_from_disk(|_, _, _| {
+                async { Err("i failed").located(abq_utils::here!()) }.boxed()
+            })
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
@@ -632,17 +635,19 @@ mod test {
         let run_id = RunId("test-run-id".to_string());
 
         // The remote should see the results, but the results will be empty.
-        let remote = remote::FakePersister::new(
-            move |kind, run_id, path| async move {
-                assert_eq!(kind, PersistenceKind::Results);
-                assert_eq!(run_id.0, "test-run-id");
-                assert_eq!(path.file_name().unwrap(), "test-run-id.results.jsonl");
-                let data = tokio::fs::read_to_string(path).await.unwrap();
-                assert!(data.is_empty());
-                Ok(())
-            },
-            fake_unreachable,
-        );
+        let remote = remote::FakePersister::builder()
+            .on_store_from_disk(move |kind, run_id, path| {
+                async move {
+                    assert_eq!(kind, PersistenceKind::Results);
+                    assert_eq!(run_id.0, "test-run-id");
+                    assert_eq!(path.file_name().unwrap(), "test-run-id.results.jsonl");
+                    let data = tokio::fs::read_to_string(path).await.unwrap();
+                    assert!(data.is_empty());
+                    Ok(())
+                }
+                .boxed()
+            })
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
@@ -669,8 +674,8 @@ mod test {
             AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
         ]);
 
-        let remote = remote::FakePersister::new(
-            {
+        let remote = remote::FakePersister::builder()
+            .on_store_from_disk({
                 let (results1, results2) = (results1.clone(), results2.clone());
                 move |kind, run_id, path| {
                     let (results1, results2) = (results1.clone(), results2.clone());
@@ -701,10 +706,11 @@ mod test {
 
                         Ok(())
                     }
+                    .boxed()
                 }
-            },
-            fake_error,
-        );
+            })
+            .on_load_to_disk(fake_error)
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
@@ -748,15 +754,18 @@ mod test {
 
         let remote = {
             let results = results.clone();
-            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
-                let results = results.clone();
-                async move {
-                    tokio::fs::write(path, serde_json::to_vec(&results).unwrap())
-                        .await
-                        .unwrap();
-                    Ok(())
-                }
-            })
+            remote::FakePersister::builder()
+                .on_load_to_disk(move |_, _, path| {
+                    let results = results.clone();
+                    async move {
+                        tokio::fs::write(path, serde_json::to_vec(&results).unwrap())
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build()
         };
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -773,9 +782,9 @@ mod test {
     async fn missing_get_results_errors_if_remote_errors() {
         let run_id = RunId("test-run-id".to_string());
 
-        let remote = remote::FakePersister::new(fake_unreachable, |_, _, _| async {
-            Err("i failed".located(here!()))
-        });
+        let remote = remote::FakePersister::builder()
+            .on_load_to_disk(|_, _, _| async { Err("i failed".located(here!())) }.boxed())
+            .build();
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
@@ -797,7 +806,11 @@ mod test {
             AssociatedTestResults::fake(wid(2), vec![TestResult::fake()]),
         ]);
 
-        let remote = { remote::FakePersister::new(fake_unreachable, fake_error) };
+        let remote = {
+            remote::FakePersister::builder()
+                .on_load_to_disk(fake_error)
+                .build()
+        };
 
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
@@ -828,17 +841,20 @@ mod test {
         let remote = {
             let results = results.clone();
             let remote_loads = remote_loads.clone();
-            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
-                let results = results.clone();
-                let remote_loads = remote_loads.clone();
-                async move {
-                    tokio::fs::write(path, serde_json::to_vec(&results).unwrap())
-                        .await
-                        .unwrap();
-                    remote_loads.fetch_add(1, atomic::ORDERING);
-                    Ok(())
-                }
-            })
+            remote::FakePersister::builder()
+                .on_load_to_disk(move |_, _, path| {
+                    let results = results.clone();
+                    let remote_loads = remote_loads.clone();
+                    async move {
+                        tokio::fs::write(path, serde_json::to_vec(&results).unwrap())
+                            .await
+                            .unwrap();
+                        remote_loads.fetch_add(1, atomic::ORDERING);
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build()
         };
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -882,16 +898,19 @@ mod test {
 
         let remote = {
             let results = results1.clone();
-            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
-                let results = results.clone();
-                async move {
-                    let mut fi = tokio::fs::File::create(path).await.unwrap();
-                    write_packed_line(&mut fi, serde_json::to_vec(&results).unwrap())
-                        .await
-                        .unwrap();
-                    Ok(())
-                }
-            })
+            remote::FakePersister::builder()
+                .on_load_to_disk(move |_, _, path| {
+                    let results = results.clone();
+                    async move {
+                        let mut fi = tokio::fs::File::create(path).await.unwrap();
+                        write_packed_line(&mut fi, serde_json::to_vec(&results).unwrap())
+                            .await
+                            .unwrap();
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build()
         };
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -921,13 +940,16 @@ mod test {
 
         let remote = {
             let remote_loads = remote_loads.clone();
-            remote::FakePersister::new(fake_unreachable, move |_, _, _| {
-                let remote_loads = remote_loads.clone();
-                async move {
-                    remote_loads.fetch_add(1, atomic::ORDERING);
-                    Err("i failed".located(here!()))
-                }
-            })
+            remote::FakePersister::builder()
+                .on_load_to_disk(move |_, _, _| {
+                    let remote_loads = remote_loads.clone();
+                    async move {
+                        remote_loads.fetch_add(1, atomic::ORDERING);
+                        Err("i failed".located(here!()))
+                    }
+                    .boxed()
+                })
+                .build()
         };
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -957,9 +979,9 @@ mod test {
         ]);
 
         let remote = {
-            remote::FakePersister::new(fake_unreachable, |_, _, _| async {
-                Err("").located(here!())
-            })
+            remote::FakePersister::builder()
+                .on_load_to_disk(|_, _, _| async { Err("").located(here!()) }.boxed())
+                .build()
         };
 
         let tempdir = tempfile::tempdir().unwrap();
@@ -1001,19 +1023,22 @@ mod test {
         let remote = {
             let results = remote_results.clone();
             let remote_loads = remote_loads.clone();
-            remote::FakePersister::new(fake_unreachable, move |_, _, path| {
-                let results = results.clone();
-                let remote_loads = remote_loads.clone();
-                async move {
-                    let mut fi = tokio::fs::File::create(path).await.unwrap();
-                    write_packed_line(&mut fi, serde_json::to_vec(&results).unwrap())
-                        .await
-                        .unwrap();
+            remote::FakePersister::builder()
+                .on_load_to_disk(move |_, _, path| {
+                    let results = results.clone();
+                    let remote_loads = remote_loads.clone();
+                    async move {
+                        let mut fi = tokio::fs::File::create(path).await.unwrap();
+                        write_packed_line(&mut fi, serde_json::to_vec(&results).unwrap())
+                            .await
+                            .unwrap();
 
-                    remote_loads.fetch_add(1, atomic::ORDERING);
-                    Ok(())
-                }
-            })
+                        remote_loads.fetch_add(1, atomic::ORDERING);
+                        Ok(())
+                    }
+                    .boxed()
+                })
+                .build()
         };
 
         let tempdir = tempfile::tempdir().unwrap();

@@ -11,6 +11,7 @@ pub enum AssignedRun {
     Retry,
 }
 
+#[must_use]
 #[derive(Debug, PartialEq, Eq)]
 pub enum AssignedRunStatus {
     RunUnknown,
@@ -18,6 +19,7 @@ pub enum AssignedRunStatus {
     AlreadyDone {
         exit_code: abq_utils::exit::ExitCode,
     },
+    FatalError(String),
 }
 
 impl AssignedRunStatus {

@@ -1,13 +1,15 @@
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::{future::Future, path::PathBuf};
 
 use abq_utils::atomic;
 use abq_utils::error::ErrorLocation;
 use abq_utils::here;
 use abq_utils::{error::OpaqueResult, net_protocol::workers::RunId};
 use async_trait::async_trait;
+use futures::future::BoxFuture;
+use futures::FutureExt;
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
 
@@ -15,10 +17,23 @@ use crate::persistence::run_state::SerializableRunState;
 
 use super::{LoadedRunState, PersistenceKind, RemotePersistence};
 
+type OnStoreFromDisk = Box<
+    dyn Fn(PersistenceKind, RunId, PathBuf) -> BoxFuture<'static, OpaqueResult<()>> + Send + Sync,
+>;
+type OnLoadToDisk = Box<
+    dyn Fn(PersistenceKind, RunId, PathBuf) -> BoxFuture<'static, OpaqueResult<()>> + Send + Sync,
+>;
+type OnStoreRunState =
+    Box<dyn Fn(&RunId, SerializableRunState) -> BoxFuture<'static, OpaqueResult<()>> + Send + Sync>;
+type OnTryLoadRunState =
+    Box<dyn Fn(&RunId) -> BoxFuture<'static, OpaqueResult<LoadedRunState>> + Send + Sync>;
+
 #[derive(Clone)]
-pub struct FakePersister<OnStoreFromDisk, OnLoad> {
-    on_store_from_disk: OnStoreFromDisk,
-    on_load: OnLoad,
+pub struct FakePersister {
+    on_store_from_disk: Arc<OnStoreFromDisk>,
+    on_load_to_disk: Arc<OnLoadToDisk>,
+    on_store_run_state: Arc<OnStoreRunState>,
+    on_try_load_run_state: Arc<OnTryLoadRunState>,
 }
 
 #[track_caller]
@@ -27,37 +42,82 @@ pub async fn unreachable(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> OpaqueR
 }
 
 #[track_caller]
-pub async fn error(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> OpaqueResult<()> {
-    Err("error".located(here!()))
+pub fn error(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> BoxFuture<'static, OpaqueResult<()>> {
+    async { Err("error".located(here!())) }.boxed()
 }
 
-impl<OnStoreFromDisk, OnStoreFromDiskF, OnLoad, OnLoadF> FakePersister<OnStoreFromDisk, OnLoad>
-where
-    OnStoreFromDisk: Fn(PersistenceKind, RunId, PathBuf) -> OnStoreFromDiskF + Send + Sync,
-    OnStoreFromDiskF: Future<Output = OpaqueResult<()>> + Send,
+pub struct FakePersisterBuilder {
+    on_store_from_disk: OnStoreFromDisk,
+    on_load_to_disk: OnLoadToDisk,
+    on_store_run_state: OnStoreRunState,
+    on_try_load_run_state: OnTryLoadRunState,
+}
 
-    OnLoad: Fn(PersistenceKind, RunId, PathBuf) -> OnLoadF + Send + Sync,
-    OnLoadF: Future<Output = OpaqueResult<()>> + Send,
-{
-    pub fn new(on_store_from_disk: OnStoreFromDisk, on_load: OnLoad) -> Self {
-        Self {
-            on_store_from_disk,
-            on_load,
+impl FakePersisterBuilder {
+    pub fn build(self) -> FakePersister {
+        FakePersister {
+            on_store_from_disk: Arc::new(self.on_store_from_disk),
+            on_load_to_disk: Arc::new(self.on_load_to_disk),
+            on_store_run_state: Arc::new(self.on_store_run_state),
+            on_try_load_run_state: Arc::new(self.on_try_load_run_state),
+        }
+    }
+
+    pub fn on_store_from_disk<F>(mut self, f: F) -> Self
+    where
+        F: Fn(PersistenceKind, RunId, PathBuf) -> BoxFuture<'static, OpaqueResult<()>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.on_store_from_disk = Box::new(f);
+        self
+    }
+
+    pub fn on_load_to_disk<F>(mut self, f: F) -> Self
+    where
+        F: Fn(PersistenceKind, RunId, PathBuf) -> BoxFuture<'static, OpaqueResult<()>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.on_load_to_disk = Box::new(f);
+        self
+    }
+
+    pub fn on_store_run_state<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&RunId, SerializableRunState) -> BoxFuture<'static, OpaqueResult<()>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.on_store_run_state = Box::new(f);
+        self
+    }
+
+    pub fn on_try_load_run_state<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&RunId) -> BoxFuture<'static, OpaqueResult<LoadedRunState>> + Send + Sync + 'static,
+    {
+        self.on_try_load_run_state = Box::new(f);
+        self
+    }
+}
+
+impl FakePersister {
+    pub fn builder() -> FakePersisterBuilder {
+        FakePersisterBuilder {
+            on_store_from_disk: Box::new(|_, _, _| async { unimplemented!() }.boxed()),
+            on_load_to_disk: Box::new(|_, _, _| async { unimplemented!() }.boxed()),
+            on_store_run_state: Box::new(|_, _| async { unimplemented!() }.boxed()),
+            on_try_load_run_state: Box::new(|_| async { unimplemented!() }.boxed()),
         }
     }
 }
 
 #[async_trait]
-impl<OnStoreFromDisk, OnStoreFromDiskF, OnLoad, OnLoadF> RemotePersistence
-    for FakePersister<OnStoreFromDisk, OnLoad>
-where
-    OnStoreFromDisk:
-        Fn(PersistenceKind, RunId, PathBuf) -> OnStoreFromDiskF + Send + Sync + Clone + 'static,
-    OnStoreFromDiskF: Future<Output = OpaqueResult<()>> + Send,
-
-    OnLoad: Fn(PersistenceKind, RunId, PathBuf) -> OnLoadF + Send + Sync + Clone + 'static,
-    OnLoadF: Future<Output = OpaqueResult<()>> + Send,
-{
+impl RemotePersistence for FakePersister {
     async fn store_from_disk(
         &self,
         kind: PersistenceKind,
@@ -73,19 +133,19 @@ where
         run_id: &RunId,
         into_local_path: &Path,
     ) -> OpaqueResult<()> {
-        (self.on_load)(kind, run_id.clone(), into_local_path.to_owned()).await
+        (self.on_load_to_disk)(kind, run_id.clone(), into_local_path.to_owned()).await
     }
 
     async fn store_run_state(
         &self,
-        _run_id: &RunId,
-        _run_state: SerializableRunState,
+        run_id: &RunId,
+        run_state: SerializableRunState,
     ) -> OpaqueResult<()> {
-        unimplemented!("FakePersister does not support storing run state.")
+        (self.on_store_run_state)(run_id, run_state).await
     }
 
-    async fn try_load_run_state(&self, _run_id: &RunId) -> OpaqueResult<LoadedRunState> {
-        unimplemented!("FakePersister does not support loading run state.")
+    async fn try_load_run_state(&self, run_id: &RunId) -> OpaqueResult<LoadedRunState> {
+        (self.on_try_load_run_state)(run_id).await
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {

@@ -14,7 +14,7 @@ use abq_queue::{
     persistence::{
         self,
         manifest::ManifestView,
-        remote::{LoadedRunState, PersistenceKind, RemotePersistence},
+        remote::{LoadedRunState, PersistenceKind, RemotePersistence, RemotePersister},
         SerializableRunState,
     },
     queue::{Abq, QueueConfig},
@@ -92,7 +92,8 @@ struct Server {
 
 impl Default for Server {
     fn default() -> Self {
-        let remote = InMemoryRemote::default();
+        let raw_remote = InMemoryRemote::default();
+        let remote: RemotePersister = raw_remote.clone().into();
 
         let manifests_path = tempfile::tempdir().unwrap();
         let persist_manifest = persistence::manifest::FilesystemPersistor::new_shared(
@@ -107,7 +108,7 @@ impl Default for Server {
             remote.clone(),
         );
 
-        let config = QueueConfig::new(persist_manifest, persist_results);
+        let config = QueueConfig::new(persist_manifest, persist_results, remote);
         let deps = QueueExtDeps {
             _manifests_path: manifests_path,
             _results_path: results_path,
@@ -115,7 +116,7 @@ impl Default for Server {
         Self {
             config,
             deps,
-            remote,
+            remote: raw_remote,
         }
     }
 }
