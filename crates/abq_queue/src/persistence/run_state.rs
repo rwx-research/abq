@@ -4,11 +4,14 @@
 use std::io;
 
 use abq_utils::{
+    error::OpaqueResult,
     exit::ExitCode,
-    net_protocol::{entity::Entity, runners::MetadataMap},
+    net_protocol::{entity::Entity, runners::MetadataMap, workers::RunId},
 };
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::remote::RemotePersister;
 
 const CURRENT_SCHEMA_VERSION: u32 = 1;
 
@@ -100,6 +103,25 @@ impl SerializableRunState {
         let mut writer = Vec::new();
         self.serialize_to(&mut writer)?;
         Ok(writer)
+    }
+}
+
+#[derive(Debug)]
+pub struct PersistRunStatePlan<'a> {
+    run_id: &'a RunId,
+    run_state: SerializableRunState,
+}
+
+impl<'a> PersistRunStatePlan<'a> {
+    pub fn new(run_id: &'a RunId, run_state: RunState) -> Self {
+        Self {
+            run_id,
+            run_state: SerializableRunState::new(run_state),
+        }
+    }
+
+    pub async fn persist(self, remote: &RemotePersister) -> OpaqueResult<()> {
+        remote.store_run_state(self.run_id, self.run_state).await
     }
 }
 
