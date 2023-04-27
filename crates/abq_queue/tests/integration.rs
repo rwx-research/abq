@@ -756,12 +756,9 @@ async fn multiple_jobs_complete() {
             Wid(1),
             WorkersConfigBuilder::new(1, runner),
         )])
+        .act([StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))])
         .step(
-            [
-                StopWorkers(Wid(1)),
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [WaitForNoPendingResults(Run(1))],
             [
                 WorkerTestResults(
                     Run(1),
@@ -841,14 +838,14 @@ async fn multiple_worker_count() {
 
     TestBuilder::default()
         .act([start_worker(4), start_worker(5), start_worker(6)])
+        .act([
+            StopWorkers(Wid(4)),
+            StopWorkers(Wid(6)),
+            StopWorkers(Wid(5)),
+            WaitForCompletedRun(Run(73495)),
+        ])
         .step(
-            [
-                StopWorkers(Wid(4)),
-                StopWorkers(Wid(6)),
-                StopWorkers(Wid(5)),
-                WaitForCompletedRun(Run(73495)),
-                WaitForNoPendingResults(Run(73495)),
-            ],
+            [WaitForNoPendingResults(Run(73495))],
             [
                 WorkerTestResults(
                     Run(73495),
@@ -971,12 +968,14 @@ async fn multiple_invokers() {
             //
             StartWorkers(Run(2), Wid(2), WorkersConfigBuilder::new(2, runner2)),
         ])
+        .act([
+            StopWorkers(Wid(1)),
+            StopWorkers(Wid(2)),
+            WaitForCompletedRun(Run(1)),
+            WaitForCompletedRun(Run(2)),
+        ])
         .step(
             [
-                StopWorkers(Wid(1)),
-                StopWorkers(Wid(2)),
-                WaitForCompletedRun(Run(1)),
-                WaitForCompletedRun(Run(2)),
                 WaitForNoPendingResults(Run(1)),
                 WaitForNoPendingResults(Run(2)),
             ],
@@ -1101,12 +1100,9 @@ async fn batch_two_requests_at_a_time() {
             Wid(1),
             WorkersConfigBuilder::new(1, runner),
         )])
+        .act([StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))])
         .step(
-            [
-                StopWorkers(Wid(1)),
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [WaitForNoPendingResults(Run(1))],
             [
                 WorkerTestResults(
                     Run(1),
@@ -1183,12 +1179,9 @@ async fn empty_manifest_exits_gracefully() {
             Wid(1),
             WorkersConfigBuilder::new(1, runner),
         )])
+        .act([StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))])
         .step(
-            [
-                StopWorkers(Wid(1)),
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [WaitForNoPendingResults(Run(1))],
             [
                 WorkerTestResults(Run(1), Box::new(|results| results.is_empty())),
                 WorkerExitStatus(
@@ -1753,13 +1746,13 @@ async fn multiple_tests_per_work_id_reported() {
             Wid(1),
             WorkersConfigBuilder::new(1, runner),
         )])
+        .act([
+            StopWorkers(Wid(1)),
+            // Run should be seen as completed
+            WaitForCompletedRun(Run(1)),
+        ])
         .step(
-            [
-                StopWorkers(Wid(1)),
-                // Run should be seen as completed
-                WaitForCompletedRun(Run(1)),
-                WaitForNoPendingResults(Run(1)),
-            ],
+            [WaitForNoPendingResults(Run(1))],
             [
                 WorkerTestResults(
                     Run(1),
