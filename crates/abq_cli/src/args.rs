@@ -162,11 +162,14 @@ pub enum Command {
         /// Where{n}
         ///   - <mode> is either "store" or "load", depending on whether the file should be stored
         ///   into the remote location, or loaded from the remote location.{n}
-        ///   - <file-type> is either "manifest" or "results".{n}
+        ///   - <file-type> is "manifest", "results", or "run_state".{n}
         ///   - <run-id> is the run ID of the test suite run.{n}
-        ///   - <local-path> is the path to the file on the local filesystem. If the mode is "store",
-        ///   the content to upload should be read from this path. If the mode is "load", the
-        ///   downloaded content should be written to this path.{n}
+        ///   - <local-path> is the path to the file on the local filesystem.{n}
+        ///     If the mode is "store", the content to upload should be read from this path.{n}
+        ///     If the mode is "load", the downloaded content should be written to this path.{n}
+        ///     If the mode is "load" and the file does not exist, the executable should exit with
+        ///     a non-zero exit code, and optionally a message on either stdout or stderr
+        ///     indicating the failure.
         #[clap(long, required = false, env(ENV_REMOTE_PERSISTENCE_COMMAND))]
         remote_persistence_command: Option<String>,
 
