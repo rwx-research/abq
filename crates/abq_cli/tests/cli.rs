@@ -3331,7 +3331,12 @@ impl CopyToDirPersister {
                 const theirs = process.argv[5];
                 const mine = `${{dir}}/${{kind}}-${{runId}}`;
 
-                //throw new Error(`mine: ${{mine}} theirs: ${{theirs}}`)
+                if (kind === 'run_state' && action === 'load') {{
+                    if (!fs.existsSync(mine)) {{
+                        console.error(`Not found`);
+                        process.exit(1);
+                    }}
+                }}
 
                 if (action === 'store') fs.copyFileSync(theirs, mine);
                 else if (action === 'load') fs.copyFileSync(mine, theirs);
@@ -3742,4 +3747,170 @@ fn results_offloaded_to_remote_persistence_and_restored() {
     }
 
     term(queue_proc);
+}
+
+#[test]
+#[serial]
+fn persisted_runs_between_queue_instances() {
+    let custom_persister = CopyToDirPersister::new();
+
+    let local_results_dir = tempfile::tempdir().unwrap().into_path();
+    let local_manifests_dir = tempfile::tempdir().unwrap().into_path();
+
+    let run_cycle = |n| {
+        let name = &format!("results_offloaded_to_remote_persistence_and_restored_{n}");
+        let conf = CSConfigOptions {
+            use_auth_token: true,
+            tls: true,
+        };
+
+        let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
+            ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
+            ("ABQ_REMOTE_PERSISTENCE_COMMAND", &custom_persister.command),
+            ("ABQ_PERSISTED_RESULTS_DIR", local_results_dir.to_str().unwrap()),
+            ("ABQ_PERSISTED_MANIFESTS_DIR", local_manifests_dir.to_str().unwrap()),
+            // allow immediate offloading
+            ("ABQ_OFFLOAD_STALE_FILE_THRESHOLD_HOURS", "0"),
+            ("ABQ_OFFLOAD_RESULTS_CRON", "* * * * * *"),
+            ("ABQ_OFFLOAD_MANIFESTS_CRON", "* * * * * *"),
+        ]);
+
+        let run_id = "test-run-id";
+
+        use abq_native_runner_simulation::{pack, Msg::*};
+        use abq_utils::net_protocol::runners::{
+            InitSuccessMessage, Manifest, ManifestMessage, Test, TestOrGroup,
+        };
+
+        let proto = ProtocolWitness::TEST;
+
+        let test = TestOrGroup::test(Test::new(proto, "test1", vec![], Default::default()));
+        let manifest = ManifestMessage::new(Manifest::new(vec![test], Default::default()));
+
+        let packed;
+        let test_args = {
+            let simulation = [
+                Connect,
+                // Write spawn message
+                OpaqueWrite(pack(legal_spawned_message(proto))),
+                // Write the manifest if we need to.
+                // Otherwise handle the one test.
+                IfGenerateManifest {
+                    then_do: vec![
+                        OpaqueWrite(pack(&manifest)),
+                        // Finish
+                        Exit(0),
+                    ],
+                    else_do: vec![
+                        //
+                        // Read init context message + write ACK
+                        OpaqueRead,
+                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                        // Read first test, write okay
+                        OpaqueRead,
+                        OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                    ],
+                },
+                Exit(0),
+            ];
+
+            packed = pack_msgs_to_disk(simulation);
+
+            let queue_addr = queue_addr.clone();
+
+            // abq test ...
+            move || {
+                let simulator = native_runner_simulation_bin();
+                let simfile_path = packed.path.display().to_string();
+                let args = vec![
+                    format!("test"),
+                    format!("--worker=0"),
+                    format!("--queue-addr={queue_addr}"),
+                    format!("--run-id={run_id}"),
+                    format!("-n=1"),
+                ];
+                let mut args = conf.extend_args_for_client(args);
+                args.extend([s!("--"), simulator, simfile_path]);
+                args
+            }
+        };
+
+        // Run `abq test` once. We should succeed.
+        {
+            let CmdOutput {
+                exit_status,
+                stdout,
+                stderr,
+            } = Abq::new(format!("{name}_worker0_attempt1"))
+                .args(test_args())
+                .run();
+
+            assert!(
+                exit_status.success(),
+                "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            );
+        }
+
+        let custom_persister_results_path = custom_persister.dir().join("results-test-run-id");
+        let custom_persister_manifest_path = custom_persister.dir().join("manifest-test-run-id");
+        let custom_persister_run_state_path = custom_persister.dir().join("run_state-test-run-id");
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        // The results, manifest, and run state should now be offloaded from the local persistence path.
+        {
+            heuristic_wait_for_written_path(&custom_persister_results_path);
+            heuristic_wait_for_written_path(&custom_persister_manifest_path);
+            heuristic_wait_for_written_path(&custom_persister_run_state_path);
+        }
+
+        // Run `abq report`. It should succeed.
+        {
+            let CmdOutput {
+                exit_status,
+                stdout,
+                stderr,
+            } = Abq::new(format!("{name}_report"))
+                .args(conf.extend_args_for_client(vec![
+                    format!("report"),
+                    format!("--queue-addr={queue_addr}"),
+                    format!("--run-id={run_id}"),
+                ]))
+                .run();
+
+            assert!(
+                exit_status.success(),
+                "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+            );
+            assert_sum_of_run_tests([stdout.as_str()], 1);
+            if n > 1 {
+                assert_sum_of_run_test_retries([stdout.as_str()], (n - 1) as _);
+            }
+        }
+
+        term(queue_proc);
+
+        let size_of_results = std::fs::metadata(&custom_persister_results_path)
+            .unwrap()
+            .len();
+        let size_of_manifest = std::fs::metadata(&custom_persister_manifest_path)
+            .unwrap()
+            .len();
+        let size_of_run_state = std::fs::metadata(&custom_persister_run_state_path)
+            .unwrap()
+            .len();
+        (size_of_results, size_of_manifest, size_of_run_state)
+    };
+
+    // Run the test once.
+    let (init_results_size, init_manifest_size, init_run_state_size) = run_cycle(1);
+    // Run the test again, on a new queue. Only the results should increase.
+    let (next_results_size, next_manifest_size, next_run_state_size) = run_cycle(2);
+
+    assert!(
+        init_results_size < next_results_size,
+        "init: {init_results_size} vs next: {next_results_size}"
+    );
+    assert_eq!(init_manifest_size, next_manifest_size);
+    assert_eq!(init_run_state_size, next_run_state_size);
 }
