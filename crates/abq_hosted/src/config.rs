@@ -18,12 +18,14 @@ pub struct HostedQueueConfig {
     pub auth_token: UserToken,
     /// `Some` is TLS should be used, `None` otherwise.
     pub tls_public_certificate: Option<Vec<u8>>,
+    pub rwx_access_token_kind: String,
 }
 
 #[derive(Deserialize, Debug)]
 struct HostedQueueResponse {
     queue_url: Url,
     tls_public_certificate: Option<String>,
+    rwx_access_token_kind: String,
 }
 
 impl HostedQueueConfig {
@@ -62,6 +64,7 @@ impl HostedQueueConfig {
         let HostedQueueResponse {
             queue_url,
             tls_public_certificate,
+            rwx_access_token_kind,
         } = resp;
 
         let addr = match queue_url.socket_addrs(|| None).as_deref() {
@@ -100,6 +103,7 @@ impl HostedQueueConfig {
             run_id: resolved_run_id,
             auth_token,
             tls_public_certificate: tls_public_certificate.map(String::into_bytes),
+            rwx_access_token_kind
         })
     }
 }
@@ -230,6 +234,7 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
+            rwx_access_token_kind
         } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
@@ -268,6 +273,7 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
+            rwx_access_token_kind
         } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());

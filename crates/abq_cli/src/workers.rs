@@ -3,6 +3,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use abq_hosted::record_test_run_metadata;
 use abq_reporting::output::ShortSummaryGrouping;
 use abq_reporting::CompletedSummary;
 use abq_utils::capture_output::ProcessOutput;
@@ -42,6 +43,7 @@ pub async fn start_workers_standalone(
     test_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
+    should_send_results: bool,
 ) -> ! {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let has_stdout_reporters = reporter_kinds
@@ -72,6 +74,7 @@ pub async fn start_workers_standalone(
         test_timeout,
         results_batch_size_hint: batch_size.get(),
         max_run_number,
+        should_send_results
     };
 
     tracing::debug!(
