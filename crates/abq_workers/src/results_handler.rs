@@ -16,14 +16,14 @@ use crate::test_fetching;
 
 /// A results handler that dispatches results to the remote queue, and also any local handlers.
 pub(crate) struct MultiplexingResultsHandler {
-    remote_handler: QueueResultsSender,
+    remote_handler: Box<dyn NotifyResults + Send>,
     local_handler: SharedResultsHandler,
     results_retry_tracker: test_fetching::ResultsTracker,
 }
 
 impl MultiplexingResultsHandler {
     pub fn new(
-        remote_handler: QueueResultsSender,
+        remote_handler: Box<dyn NotifyResults + Send>,
         local_handler: SharedResultsHandler,
         results_retry_tracker: test_fetching::ResultsTracker,
     ) -> Self {

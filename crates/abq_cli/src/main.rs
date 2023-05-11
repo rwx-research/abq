@@ -63,6 +63,7 @@ struct ConfigFromApi {
     queue_addr: SocketAddr,
     token: UserToken,
     tls_public_certificate: Option<Vec<u8>>,
+    rwx_access_token_kind: String,
 }
 
 struct RunIdEnvironment {
@@ -336,6 +337,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
+                rwx_access_token_kind,
             } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
 
             let client_auth = resolved_token.into();
@@ -364,6 +366,11 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
+            let should_send_results = match rwx_access_token_kind.as_ref().map(String::as_ref) {
+                Some("personal_access_token") => false,
+                _ => true,
+            };
+
             statefile::optional_write_worker_statefile(&run_id)?;
 
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
@@ -386,6 +393,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
                 startup_timeout,
+                should_send_results,
             )
             .await
         }
@@ -416,6 +424,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
+                rwx_access_token_kind: resolved_rwx_access_token_kind,
             } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
 
             let client_auth = resolved_token.into();
@@ -530,6 +539,7 @@ struct ResolvedConfig {
     queue_addr: Option<SocketAddr>,
     token: Option<UserToken>,
     tls_cert: Option<Vec<u8>>,
+    rwx_access_token_kind: Option<String>,
 }
 
 fn resolve_config(
@@ -539,16 +549,17 @@ fn resolve_config(
     access_token: &Option<AccessToken>,
     run_id: &RunId,
 ) -> anyhow::Result<ResolvedConfig> {
-    let (queue_addr_from_api, token_from_api, tls_from_api) = match access_token.as_ref() {
+    let (queue_addr_from_api, token_from_api, tls_from_api, rwx_access_token_kind) = match access_token.as_ref() {
         Some(access_token) => {
             let config = get_config_from_api(access_token, run_id)?;
             (
                 Some(config.queue_addr),
                 Some(config.token),
                 config.tls_public_certificate,
+                Some(config.rwx_access_token_kind),
             )
         }
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
 
     let token = token_from_api.or(token_from_cli);
@@ -559,6 +570,7 @@ fn resolve_config(
         queue_addr,
         token,
         tls_cert,
+        rwx_access_token_kind,
     })
 }
 
@@ -579,12 +591,14 @@ fn get_config_from_api(
         run_id: _,
         auth_token,
         tls_public_certificate,
+        rwx_access_token_kind
     } = HostedQueueConfig::from_api(api_url, access_token, run_id)?;
 
     Ok(ConfigFromApi {
         queue_addr: addr,
         token: auth_token,
         tls_public_certificate,
+        rwx_access_token_kind,
     })
 }
 
