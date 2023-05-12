@@ -367,10 +367,10 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
-            let should_send_results = match rwx_access_token_kind.as_ref() {
-                Some(AccessTokenKind::Personal) => false,
-                _ => true,
-            };
+            let should_send_results = !matches!(
+                rwx_access_token_kind.as_ref(),
+                Some(AccessTokenKind::Personal)
+            );
 
             statefile::optional_write_worker_statefile(&run_id)?;
 
@@ -550,18 +550,19 @@ fn resolve_config(
     access_token: &Option<AccessToken>,
     run_id: &RunId,
 ) -> anyhow::Result<ResolvedConfig> {
-    let (queue_addr_from_api, token_from_api, tls_from_api, rwx_access_token_kind) = match access_token.as_ref() {
-        Some(access_token) => {
-            let config = get_config_from_api(access_token, run_id)?;
-            (
-                Some(config.queue_addr),
-                Some(config.token),
-                config.tls_public_certificate,
-                Some(config.rwx_access_token_kind),
-            )
-        }
-        None => (None, None, None, None),
-    };
+    let (queue_addr_from_api, token_from_api, tls_from_api, rwx_access_token_kind) =
+        match access_token.as_ref() {
+            Some(access_token) => {
+                let config = get_config_from_api(access_token, run_id)?;
+                (
+                    Some(config.queue_addr),
+                    Some(config.token),
+                    config.tls_public_certificate,
+                    Some(config.rwx_access_token_kind),
+                )
+            }
+            None => (None, None, None, None),
+        };
 
     let token = token_from_api.or(token_from_cli);
     let queue_addr = queue_addr_from_api.or(queue_addr_from_cli);
@@ -592,7 +593,7 @@ fn get_config_from_api(
         run_id: _,
         auth_token,
         tls_public_certificate,
-        rwx_access_token_kind
+        rwx_access_token_kind,
     } = HostedQueueConfig::from_api(api_url, access_token, run_id)?;
 
     Ok(ConfigFromApi {

@@ -3,7 +3,6 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-
 use abq_reporting::output::ShortSummaryGrouping;
 use abq_reporting::CompletedSummary;
 use abq_utils::capture_output::ProcessOutput;
@@ -75,7 +74,7 @@ pub async fn start_workers_standalone(
         test_timeout,
         results_batch_size_hint: batch_size.get(),
         max_run_number,
-        should_send_results
+        should_send_results,
     };
 
     tracing::debug!(
