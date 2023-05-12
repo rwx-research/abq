@@ -3,7 +3,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use abq_hosted::record_test_run_metadata;
+
 use abq_reporting::output::ShortSummaryGrouping;
 use abq_reporting::CompletedSummary;
 use abq_utils::capture_output::ProcessOutput;
