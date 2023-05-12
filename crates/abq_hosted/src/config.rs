@@ -8,6 +8,7 @@ use abq_utils::auth::UserToken;
 use abq_utils::net_protocol::workers::RunId;
 use reqwest::{blocking::RequestBuilder, StatusCode, Url};
 use serde::Deserialize;
+use serde::Serialize;
 
 use crate::{error::Error, AccessToken};
 
@@ -18,14 +19,22 @@ pub struct HostedQueueConfig {
     pub auth_token: UserToken,
     /// `Some` is TLS should be used, `None` otherwise.
     pub tls_public_certificate: Option<Vec<u8>>,
-    pub rwx_access_token_kind: String,
+    pub rwx_access_token_kind: AccessTokenKind,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub enum AccessTokenKind {
+    #[serde(rename="personal_access_token")]
+    Personal,
+    #[serde(rename="organization_access_token")]
+    Organization,
 }
 
 #[derive(Deserialize, Debug)]
 struct HostedQueueResponse {
     queue_url: Url,
     tls_public_certificate: Option<String>,
-    rwx_access_token_kind: String,
+    rwx_access_token_kind: AccessTokenKind,
 }
 
 impl HostedQueueConfig {
@@ -181,6 +190,8 @@ mod test {
     use abq_utils::{auth::UserToken, net_protocol::workers::RunId};
     use reqwest::StatusCode;
 
+    use crate::AccessTokenKind;
+
     use super::{send_request_with_decay_help, AccessToken};
 
     use super::{Error, HostedQueueConfig};
@@ -223,7 +234,7 @@ mod test {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
-                r#"{{"queue_url":"abqs://168.220.85.45:8080?run_id=1234\u0026token={}","tls_public_certificate":"{}"}}"#,
+                r#"{{"queue_url":"abqs://168.220.85.45:8080?run_id=1234\u0026token={}","tls_public_certificate":"{}","rwx_access_token_kind":"organization_access_token"}}"#,
                 test_auth_token(),
                 test_mock_cert()
             ))
@@ -234,13 +245,14 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-            rwx_access_token_kind
+            rwx_access_token_kind,
         } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
         assert_eq!(auth_token, test_auth_token());
         assert_eq!(tls_public_certificate.unwrap(), test_mock_cert().as_bytes());
+        assert_eq!(rwx_access_token_kind, AccessTokenKind::Organization)
     }
 
     #[test]
@@ -263,7 +275,7 @@ mod test {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
-                r#"{{"queue_url":"abq://168.220.85.45:8080?run_id=1234\u0026token={}"}}"#,
+                r#"{{"queue_url":"abq://168.220.85.45:8080?run_id=1234\u0026token={}","rwx_access_token_kind":"personal_access_token"}}"#,
                 test_auth_token()
             ))
             .create();
@@ -273,13 +285,14 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-            rwx_access_token_kind
+            rwx_access_token_kind,
         } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
         assert_eq!(auth_token, test_auth_token());
         assert!(tls_public_certificate.is_none());
+        assert_eq!(rwx_access_token_kind, AccessTokenKind::Personal)
     }
 
     #[test]
@@ -335,7 +348,7 @@ mod test {
             )]))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"queue_url":"tcp://168.220.85.45:8080"}"#)
+            .with_body(r#"{"queue_url":"tcp://168.220.85.45:8080","rwx_access_token_kind":"organization_access_token"}"#)
             .create();
 
         let err = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)

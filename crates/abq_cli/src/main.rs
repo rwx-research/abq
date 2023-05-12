@@ -11,6 +11,7 @@ use std::{
 };
 
 use abq_hosted::AccessToken;
+use abq_hosted::AccessTokenKind;
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     exit::ExitCode,
@@ -63,7 +64,7 @@ struct ConfigFromApi {
     queue_addr: SocketAddr,
     token: UserToken,
     tls_public_certificate: Option<Vec<u8>>,
-    rwx_access_token_kind: String,
+    rwx_access_token_kind: AccessTokenKind,
 }
 
 struct RunIdEnvironment {
@@ -366,8 +367,8 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
-            let should_send_results = match rwx_access_token_kind.as_ref().map(String::as_ref) {
-                Some("personal_access_token") => false,
+            let should_send_results = match rwx_access_token_kind.as_ref() {
+                Some(AccessTokenKind::Personal) => false,
                 _ => true,
             };
 
@@ -424,7 +425,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
-                rwx_access_token_kind: resolved_rwx_access_token_kind,
+                rwx_access_token_kind: _resolved_rwx_access_token_kind,
             } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
 
             let client_auth = resolved_token.into();
@@ -539,7 +540,7 @@ struct ResolvedConfig {
     queue_addr: Option<SocketAddr>,
     token: Option<UserToken>,
     tls_cert: Option<Vec<u8>>,
-    rwx_access_token_kind: Option<String>,
+    rwx_access_token_kind: Option<AccessTokenKind>,
 }
 
 fn resolve_config(
