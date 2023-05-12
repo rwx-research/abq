@@ -13,7 +13,7 @@ use abq_utils::{
         queue::{self, RunAlreadyCompleted},
         workers::{ManifestResult, RunId},
     },
-    results_handler::{ResultsHandler, SharedResultsHandler, NoopResultsHandler, NotifyResults},
+    results_handler::{NoopResultsHandler, NotifyResults, ResultsHandler, SharedResultsHandler},
     retry::async_retry_n,
 };
 use async_trait::async_trait;
@@ -134,7 +134,7 @@ impl StrategyGenerator for RunnerStrategyGenerator {
                     runner_entity,
                     run_id.clone(),
                 )),
-                false => Box::new(NoopResultsHandler)
+                false => Box::new(NoopResultsHandler),
             };
             let notifier = MultiplexingResultsHandler::new(
                 queue_handler,

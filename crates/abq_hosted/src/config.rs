@@ -22,11 +22,11 @@ pub struct HostedQueueConfig {
     pub rwx_access_token_kind: AccessTokenKind,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AccessTokenKind {
-    #[serde(rename="personal_access_token")]
+    #[serde(rename = "personal_access_token")]
     Personal,
-    #[serde(rename="organization_access_token")]
+    #[serde(rename = "organization_access_token")]
     Organization,
 }
 
@@ -112,7 +112,7 @@ impl HostedQueueConfig {
             run_id: resolved_run_id,
             auth_token,
             tls_public_certificate: tls_public_certificate.map(String::into_bytes),
-            rwx_access_token_kind
+            rwx_access_token_kind,
         })
     }
 }

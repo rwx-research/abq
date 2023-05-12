@@ -228,7 +228,7 @@ impl WorkersNegotiator {
             max_run_number,
             protocol_version_timeout,
             test_timeout,
-            should_send_results
+            should_send_results,
         } = workers_config;
 
         let some_runner_should_generate_manifest = match assigned {
