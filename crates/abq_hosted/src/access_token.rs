@@ -2,9 +2,10 @@
 
 use core::fmt;
 use std::str::FromStr;
+use serde_derive::{Serialize, Deserialize};
 use thiserror::Error;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct AccessToken(String);
 
 #[derive(Debug, Error)]

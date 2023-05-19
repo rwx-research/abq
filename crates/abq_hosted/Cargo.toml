@@ -7,6 +7,7 @@ edition = "2021"
 abq_utils = { path = "../abq_utils" }
 
 serde.workspace = true
+serde_derive.workspace = true
 url = { version = "2.3.1", features = ["serde"] }
 thiserror.workspace = true
 tracing.workspace = true

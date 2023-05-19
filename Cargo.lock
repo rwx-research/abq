@@ -100,6 +100,7 @@ dependencies = [
  "mockito",
  "reqwest",
  "serde",
+ "serde_derive",
  "thiserror",
  "tracing",
  "url",
