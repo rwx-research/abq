@@ -58,6 +58,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Stores RWX access token.
+    Login {
+    },
     /// Starts the "abq" ephemeral queue.
     Start {
         /// Host IP address to bind the queue to.
