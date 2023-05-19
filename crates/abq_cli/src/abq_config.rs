@@ -1,13 +1,13 @@
-use std::{path::{PathBuf}, fs};
 use anyhow::anyhow;
+use std::{fs, path::PathBuf};
 
 use abq_hosted::AccessToken;
-use serde_derive::{Deserialize, Serialize};
 use etcetera::{app_strategy, AppStrategy, AppStrategyArgs};
+use serde_derive::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
 pub struct AbqConfig {
-  pub rwx_access_token: AccessToken,
+    pub rwx_access_token: AccessToken,
 }
 
 fn abq_config_filepath() -> anyhow::Result<PathBuf> {
@@ -22,7 +22,9 @@ fn abq_config_filepath() -> anyhow::Result<PathBuf> {
 
 pub fn write_abq_config(config: AbqConfig) -> anyhow::Result<PathBuf> {
     let abq_config_filepath = abq_config_filepath()?;
-    let config_dir = abq_config_filepath.parent().ok_or(anyhow!("abq config file must have parent dir"))?;
+    let config_dir = abq_config_filepath
+        .parent()
+        .ok_or(anyhow!("abq config file must have parent dir"))?;
     fs::create_dir_all(config_dir)?;
     let toml_str = toml::to_string(&config)?;
     fs::write(&abq_config_filepath, toml_str)?;

@@ -83,6 +83,9 @@ pub mod entity {
         pub const fn new(workers_number: u32) -> Self {
             Self(workers_number)
         }
+        pub fn index(&self) -> u32 {
+            self.0
+        }
     }
 
     #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Debug)]
