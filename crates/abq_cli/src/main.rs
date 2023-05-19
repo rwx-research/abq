@@ -1,3 +1,4 @@
+mod abq_config;
 mod args;
 mod health;
 mod instance;
@@ -5,7 +6,6 @@ mod report;
 mod reporting;
 mod statefile;
 mod workers;
-mod abq_config;
 
 use std::io;
 use std::str::FromStr;
@@ -35,9 +35,10 @@ use args::{
 use clap::Parser;
 
 use instance::AbqInstance;
+use std::fs;
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
-use std::fs;
+use workers::ExecutionMode;
 
 use crate::{
     args::Token,
@@ -236,7 +237,9 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let mut input = String::new();
             println!("Enter your RWX Personal Access Token:");
 
-            io::stdin().read_line(&mut input).expect("Failed to read line");
+            io::stdin()
+                .read_line(&mut input)
+                .expect("Failed to read line");
 
             input = input.trim().to_string();
 
@@ -392,10 +395,10 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 Fixed(num) => num,
             };
 
-            let should_send_results = !matches!(
-                rwx_access_token_kind.as_ref(),
-                Some(AccessTokenKind::Personal)
-            );
+            let execution_mode = match rwx_access_token_kind.as_ref() {
+                Some(AccessTokenKind::Personal) => ExecutionMode::Readonly,
+                _ => ExecutionMode::WriteNormal,
+            };
 
             statefile::optional_write_worker_statefile(&run_id)?;
 
@@ -416,7 +419,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tests_timeout,
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
-                should_send_results,
+                execution_mode,
             )
             .await
         }
