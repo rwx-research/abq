@@ -27,6 +27,8 @@ serde = "1.0.158"
 serde_derive = "1.0.158"
 serde_json = { version = "1.0.94", features = ["raw_value"] }
 
+etcetera = "0.8.0"
+toml = "0.7.4"
 rustls = "0.20.8"
 rustls-pemfile = "1.0.2"
 

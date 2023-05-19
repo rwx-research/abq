@@ -34,6 +34,7 @@ use clap::Parser;
 use instance::AbqInstance;
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
+use std::fs;
 
 use crate::{
     args::Token,
@@ -44,6 +45,7 @@ use crate::{
     },
     reporting::StdoutPreferences,
 };
+use etcetera::{app_strategy, AppStrategy, AppStrategyArgs};
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
@@ -216,6 +218,30 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
     run_id_result.ok().map(RunId)
 }
 
+
+use std::io;
+use serde::{Deserialize,Serialize};
+use toml::from_str;
+use std::str::FromStr;
+
+#[derive(Deserialize, Serialize)]
+struct AbqConfig {
+    rwx_access_token: String,
+}
+
+fn read_abq_config() -> Result<AbqConfig, Box<dyn std::error::Error>> {
+    let strategy = app_strategy::Unix::new(AppStrategyArgs {
+        top_level_domain: "org".to_string(),
+        author: "rwx".to_string(),
+        app_name: "abq".to_string(),
+    }).unwrap();
+    let config_dir = strategy.config_dir();
+    let config_file = format!("{}/{}", config_dir.to_str().unwrap(), "config.toml");
+    let toml_str = fs::read_to_string(config_file)?;
+    let config = from_str(&toml_str)?;
+    Ok(config)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn abq_main() -> anyhow::Result<ExitCode> {
     use clap::{error::ErrorKind, CommandFactory};
@@ -226,7 +252,40 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
     let Cli { command } = Cli::parse();
 
+    match read_abq_config() {
+        Ok(config) => {
+            println!("token: {}", config.rwx_access_token);
+        }
+        Err(e) => {
+            println!("Error: {}", e);
+        }
+    }
+
     match command {
+        Command::Login {} => {
+            let mut input = String::new();
+            println!("Paste your RWX Personal Access Token:");
+
+            io::stdin().read_line(&mut input).expect("Failed to read line");
+
+            input = input.trim().to_string();
+
+            let new_config = AbqConfig {
+                rwx_access_token: input,
+            };
+            let toml_str = toml::to_string(&new_config)?;
+            let strategy = app_strategy::Unix::new(AppStrategyArgs {
+                top_level_domain: "org".to_string(),
+                author: "rwx".to_string(),
+                app_name: "abq".to_string(),
+            }).unwrap();
+            let config_dir = strategy.config_dir();
+            let config_file = format!("{}/{}", config_dir.to_str().unwrap(), "config.toml");
+            std::fs::write(config_file.clone(), toml_str)?;
+
+            println!("Your token is now stored in {}", config_file.as_str());
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Start {
             bind: bind_ip,
             public_ip,
@@ -332,6 +391,15 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
+
+            let access_token = access_token.or_else(|| {
+                match read_abq_config() {
+                    Ok(config) => {
+                        Some(AccessToken::from_str(config.rwx_access_token.as_str()).unwrap())
+                    }
+                    Err(_) => None
+                }
+            });
 
             let ResolvedConfig {
                 queue_addr: resolved_queue_addr,

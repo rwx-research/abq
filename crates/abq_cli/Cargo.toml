@@ -24,6 +24,8 @@ serde.workspace = true
 serde_json.workspace = true
 serde_derive.workspace = true
 thiserror.workspace = true
+etcetera.workspace = true
+toml.workspace = true
 
 clap.workspace = true
 num_cpus.workspace = true
