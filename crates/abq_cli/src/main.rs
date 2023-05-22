@@ -366,15 +366,23 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             });
 
             let ResolvedConfig {
-                queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
                 rwx_access_token_kind,
-            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
+                queue_location,
+            } = resolve_config(token, queue_addr, tls_cert, tls_key, &access_token, &run_id)?;
+
+            if let QueueLocation::Remote(_queue_addr) = queue_location {
+                if access_token.is_none() {
+                    let mut cmd = Cli::command();
+                    Err(cmd.error(
+                        ErrorKind::MissingRequiredArgument,
+                        "`abq test` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
+                    ))?;
+                }
+            }
 
             let client_auth = resolved_token.into();
-
-            let queue_addr_or_opt_tls_key = resolved_queue_addr.ok_or(tls_key);
 
             let runner_params = validate_abq_test_args(args)?;
 
@@ -382,7 +390,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let abq = find_or_create_abq(
                 entity,
                 run_id.clone(),
-                queue_addr_or_opt_tls_key,
+                queue_location,
                 resolved_token,
                 client_auth,
                 resolved_tls,
@@ -450,27 +458,29 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_cert = read_opt_path_bytes(tls_cert)?;
 
             let ResolvedConfig {
-                queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
                 rwx_access_token_kind: _resolved_rwx_access_token_kind,
-            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
+                queue_location,
+            } = resolve_config(token, queue_addr, tls_cert, None, &access_token, &run_id)?;
 
             let client_auth = resolved_token.into();
 
-            let queue_addr = resolved_queue_addr.ok_or_else(|| {
-                let mut cmd = Cli::command();
-                cmd.error(
-                    ErrorKind::InvalidValue,
-                    "`abq report` could not detect the queue to connect to. Consider setting `--access-token` or the `RWX_ACCESS_TOKEN` environment variable.",
-                )
-            })?;
+            if let QueueLocation::Remote(_queue_addr) = queue_location {
+                if access_token.is_none() {
+                    let mut cmd = Cli::command();
+                    Err(cmd.error(
+                        ErrorKind::MissingRequiredArgument,
+                        "`abq report` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
+                    ))?;
+                }
+            }
 
             let entity = Entity::local_client();
             let abq = find_or_create_abq(
                 entity,
                 run_id.clone(),
-                Ok(queue_addr),
+                queue_location,
                 resolved_token,
                 client_auth,
                 resolved_tls,
@@ -565,16 +575,22 @@ fn read_path_bytes(p: PathBuf) -> anyhow::Result<Vec<u8>> {
 }
 
 struct ResolvedConfig {
-    queue_addr: Option<SocketAddr>,
     token: Option<UserToken>,
     tls_cert: Option<Vec<u8>>,
     rwx_access_token_kind: Option<AccessTokenKind>,
+    queue_location: QueueLocation,
+}
+
+enum QueueLocation {
+    Remote(SocketAddr),
+    Ephemeral { opt_tls_key: Option<Vec<u8>> },
 }
 
 fn resolve_config(
     token_from_cli: Option<UserToken>,
     queue_addr_from_cli: Option<SocketAddr>,
     tls_cert_from_cli: Option<Vec<u8>>,
+    tls_key: Option<Vec<u8>>,
     access_token: &Option<AccessToken>,
     run_id: &RunId,
 ) -> anyhow::Result<ResolvedConfig> {
@@ -595,12 +611,18 @@ fn resolve_config(
     let token = token_from_api.or(token_from_cli);
     let queue_addr = queue_addr_from_api.or(queue_addr_from_cli);
     let tls_cert = tls_from_api.or(tls_cert_from_cli);
+    let queue_location = match queue_addr {
+        Some(queue_addr) => QueueLocation::Remote(queue_addr),
+        None => QueueLocation::Ephemeral {
+            opt_tls_key: tls_key,
+        },
+    };
 
     Ok(ResolvedConfig {
-        queue_addr,
         token,
         tls_cert,
         rwx_access_token_kind,
+        queue_location,
     })
 }
 
@@ -657,7 +679,7 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
 async fn find_or_create_abq(
     entity: Entity,
     run_id: RunId,
-    queue_addr_or_opt_tls: Result<SocketAddr, Option<Vec<u8>>>,
+    queue_location: QueueLocation,
     opt_user_token: Option<UserToken>,
     client_auth: ClientAuthStrategy<User>,
     client_tls_cert: Option<Vec<u8>>,
@@ -668,8 +690,8 @@ async fn find_or_create_abq(
         None => ClientTlsStrategy::no_tls(),
     };
 
-    match queue_addr_or_opt_tls {
-        Ok(queue_addr) => {
+    match queue_location {
+        QueueLocation::Remote(queue_addr) => {
             let instance = AbqInstance::from_remote(
                 entity,
                 run_id,
@@ -680,7 +702,7 @@ async fn find_or_create_abq(
             )?;
             Ok(instance)
         }
-        Err(opt_tls_key) => {
+        QueueLocation::Ephemeral { opt_tls_key } => {
             let server_tls = match (client_tls_cert, opt_tls_key) {
                 (Some(cert), Some(key)) => ServerTlsStrategy::from_cert(&cert, &key)?,
                 (None, None) => ServerTlsStrategy::no_tls(),
@@ -688,7 +710,6 @@ async fn find_or_create_abq(
                     "any other configuration would have been caught during arg parsing"
                 ),
             };
-
             Ok(
                 AbqInstance::new_ephemeral(opt_user_token, client_auth, server_tls, client_tls)
                     .await,
