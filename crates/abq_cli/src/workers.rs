@@ -29,7 +29,7 @@ use self::reporting::ReportingTaskHandle;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionMode {
     WriteNormal,
     Readonly,
@@ -174,19 +174,16 @@ async fn do_shutdown(
         .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)
         .unwrap();
     print!("\n\n");
-    match execution_mode {
-        ExecutionMode::WriteNormal => {
-            print!("To replay these tests locally login with `abq login` using a personal access token. Then, run the following command:");
-            print!("\n\n");
-            print!(
-                "abq test --run-id {} --worker {} --num {}",
-                run_id,
-                worker_tag.index(),
-                num_runners
-            );
-            print!("\n\n");
-        }
-        _ => {}
+    if execution_mode == ExecutionMode::WriteNormal {
+        print!("To replay these tests locally login with `abq login` using a personal access token. Then, run the following command:");
+        print!("\n\n");
+        print!(
+            "abq test --run-id {} --worker {} --num {}",
+            run_id,
+            worker_tag.index(),
+            num_runners
+        );
+        print!("\n\n");
     }
 
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,

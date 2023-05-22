@@ -24,7 +24,7 @@ pub fn write_abq_config(config: AbqConfig) -> anyhow::Result<PathBuf> {
     let abq_config_filepath = abq_config_filepath()?;
     let config_dir = abq_config_filepath
         .parent()
-        .ok_or(anyhow!("abq config file must have parent dir"))?;
+        .ok_or_else(|| anyhow!("abq config file must have parent dir"))?;
     fs::create_dir_all(config_dir)?;
     let toml_str = toml::to_string(&config)?;
     fs::write(&abq_config_filepath, toml_str)?;
