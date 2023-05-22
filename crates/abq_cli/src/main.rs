@@ -35,7 +35,6 @@ use args::{
 use clap::Parser;
 
 use instance::AbqInstance;
-use std::fs;
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
 use workers::ExecutionMode;
@@ -49,7 +48,6 @@ use crate::{
     },
     reporting::StdoutPreferences,
 };
-use etcetera::{app_strategy, AppStrategy, AppStrategyArgs};
 
 fn main() -> anyhow::Result<()> {
     let exit_code = abq_main()?;
@@ -235,6 +233,8 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
     match command {
         Command::Login {} => {
             let mut input = String::new();
+            println!("Generate a Personal Access Token at https://account.rwx.com/_/personal_access_tokens");
+            println!("\n\n");
             println!("Enter your RWX Personal Access Token:");
 
             io::stdin()
@@ -248,7 +248,10 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             };
             let abq_filepath = abq_config::write_abq_config(new_config)?;
 
-            println!("Your token is now stored in {}", abq_filepath.display());
+            println!(
+                "Your access token is now stored at {}",
+                abq_filepath.display()
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Start {

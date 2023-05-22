@@ -58,7 +58,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Stores RWX access token.
+    /// Stores an RWX access token for local usage. You can generate RWX Personal Access Tokens at: https://account.rwx.com/_/personal_access_tokens
     Login {},
     /// Starts the "abq" ephemeral queue.
     Start {
