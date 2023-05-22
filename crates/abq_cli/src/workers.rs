@@ -175,7 +175,7 @@ async fn do_shutdown(
         .unwrap();
     print!("\n\n");
     if execution_mode == ExecutionMode::WriteNormal {
-        print!("To replay these tests locally login with `abq login` using a personal access token. Then, run the following command:");
+        print!("Run the following command to replay these tests locally:");
         print!("\n\n");
         print!(
             "abq test --run-id {} --worker {} --num {}",
