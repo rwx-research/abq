@@ -353,6 +353,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let stdout_preferences = StdoutPreferences::new(color);
 
             let external_run_id = run_id.or(inferred_run_id);
+            let explicit_run_id_provided = external_run_id.is_some();
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
 
             let working_dir =
@@ -373,14 +374,12 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 queue_location,
             } = resolve_config(token, queue_addr, tls_cert, tls_key, &access_token, &run_id)?;
 
-            if let QueueLocation::Remote(_queue_addr) = queue_location {
-                if access_token.is_none() {
-                    let mut cmd = Cli::command();
-                    Err(cmd.error(
-                        ErrorKind::MissingRequiredArgument,
-                        "`abq test` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
-                    ))?;
-                }
+            if explicit_run_id_provided && !queue_location.is_remote() {
+                let mut cmd = Cli::command();
+                Err(cmd.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "`abq test` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
+                ))?;
             }
 
             let client_auth = resolved_token.into();
@@ -451,6 +450,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let deprecations = DeprecationRecord::default();
             let stdout_preferences = StdoutPreferences::new(color);
 
+            let explicit_run_id_provided = run_id.is_some();
             let run_id = run_id.or(inferred_run_id).ok_or_else (|| {
                 let mut cmd = Cli::command();
                 cmd.error(
@@ -470,14 +470,12 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let client_auth = resolved_token.into();
 
-            if let QueueLocation::Remote(_queue_addr) = queue_location {
-                if access_token.is_none() {
-                    let mut cmd = Cli::command();
-                    Err(cmd.error(
-                        ErrorKind::MissingRequiredArgument,
-                        "`abq report` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
-                    ))?;
-                }
+            if explicit_run_id_provided && !queue_location.is_remote() {
+                let mut cmd = Cli::command();
+                Err(cmd.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "`abq report` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
+                ))?;
             }
 
             let entity = Entity::local_client();
@@ -588,6 +586,15 @@ struct ResolvedConfig {
 enum QueueLocation {
     Remote(SocketAddr),
     Ephemeral { opt_tls_key: Option<Vec<u8>> },
+}
+
+impl QueueLocation {
+    fn is_remote(&self) -> bool {
+        match self {
+            QueueLocation::Remote(_) => true,
+            QueueLocation::Ephemeral { .. } => false,
+        }
+    }
 }
 
 fn resolve_config(
