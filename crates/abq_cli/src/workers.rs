@@ -175,12 +175,17 @@ async fn do_shutdown(
         .unwrap();
     print!("\n\n");
     match execution_mode {
-        ExecutionMode::WriteNormal => print!(
-            "abq test --run-id {} --worker {} --num {}",
-            run_id,
-            worker_tag.index(),
-            num_runners
-        ),
+        ExecutionMode::WriteNormal => {
+            print!("To replay these tests locally login with `abq login` using a personal access token. Then, run the following command:");
+            print!("\n\n");
+            print!(
+                "abq test --run-id {} --worker {} --num {}",
+                run_id,
+                worker_tag.index(),
+                num_runners
+            );
+            print!("\n\n");
+        }
         _ => {}
     }
 
