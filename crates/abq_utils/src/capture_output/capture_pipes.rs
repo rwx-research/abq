@@ -86,6 +86,7 @@ impl HandleChildOutput for CapturePipes {
         self.stderr.copied_all_output = tokio::spawn(async { Ok(()) });
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn finish(&mut self) -> io::Result<CapturedOutput> {
         let MuxOutput {
             copied_all_output: copied_stdout,

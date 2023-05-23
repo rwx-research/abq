@@ -177,6 +177,7 @@ impl SideChannel {
     ///
     /// It is an error to call `finish` twice. However, `finish` does not take ownership because we
     /// often spawn multiple sidechannels in the same memory location.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn finish(&mut self) -> Result<Vec<u8>, Self> {
         let channel = std::mem::take(&mut self.0);
         let channel = Arc::try_unwrap(channel).map_err(Self)?;

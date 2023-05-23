@@ -2157,7 +2157,7 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues, persist_results))]
+    #[instrument(level = "trace", skip_all, fields(run_id=?run_id, entity=?entity, results=results.len()))]
     async fn handle_worker_results(
         queues: SharedRuns,
         persist_results: SharedPersistResults,

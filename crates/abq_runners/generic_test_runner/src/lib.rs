@@ -45,7 +45,7 @@ use futures::FutureExt;
 use indoc::{formatdoc, indoc};
 use thiserror::Error;
 use tokio::sync::mpsc;
-use tracing::instrument;
+use tracing::{instrument, Instrument};
 
 use crate::message_buffer::RecvMsg;
 
@@ -159,7 +159,7 @@ pub async fn wait_for_manifest(runner_conn: &mut RunnerConnection) -> io::Result
 }
 
 /// Retrieves the test manifest from native test runner.
-#[instrument(level = "trace", skip(native_runner))]
+#[instrument(level = "debug", skip(native_runner))]
 async fn retrieve_manifest<'a>(
     native_runner: &mut NativeRunnerHandle<'a>,
 ) -> Result<(ReportedManifest, ProcessOutput), GenericRunnerError> {
@@ -168,7 +168,13 @@ async fn retrieve_manifest<'a>(
     let (manifest, stdio_output) = {
         let manifest_result = retrieve_manifest_help(native_runner).await;
 
-        let final_stdio_output = try_setup!(native_runner.child_output.finish().await);
+        let final_stdio_output = try_setup!(
+            async { native_runner.child_output.finish().await }
+                .instrument(tracing::debug_span!(
+                    "waiting for manifest-generating process to terminate"
+                ))
+                .await
+        );
 
         match manifest_result {
             Ok(ManifestMessage::Success(manifest)) => (manifest.manifest, final_stdio_output),
@@ -196,14 +202,21 @@ async fn retrieve_manifest<'a>(
     Ok((manifest, stdio_output.combined))
 }
 
+#[instrument(level = "debug", skip(native_runner))]
 async fn retrieve_manifest_help(
     native_runner: &mut NativeRunnerHandle<'_>,
 ) -> Result<ManifestMessage, LocatedError> {
     let manifest_message = wait_for_manifest(&mut native_runner.state.conn)
         .await
         .located(here!())?;
+    let was_manifest_success = matches!(manifest_message, ManifestMessage::Success(_));
+    tracing::debug!(
+        ?was_manifest_success,
+        "retrieved manifest, waiting for child exit"
+    );
 
     let status = native_runner.child.wait().await.located(here!())?;
+    tracing::debug!(?status, "child exited");
     debug_assert!(status.success());
 
     Ok(manifest_message)
@@ -442,6 +455,7 @@ impl<'a> NativeRunnerHandle<'a> {
     //       | <- send Next-Test -   |             |                              |
     //       | -   recv Done    ->   |             |      <close conn>            |
     // Queue |                       | Worker (us) |                              | Native runner
+    #[instrument(level = "debug", skip_all)]
     async fn new_native_runner(
         listener: &mut TcpListener,
         args: NativeRunnerArgs<'a>,
@@ -501,11 +515,15 @@ impl<'a> NativeRunnerHandle<'a> {
         let (runner_info, runner_conn) = match opt_open_connection_err {
             Ok(r) => r,
             Err(error) => {
-                let output = child_output
-                    .finish()
-                    .await
-                    .map(|ct| ct.into())
-                    .unwrap_or_default();
+                let output = async {
+                    child_output
+                        .finish()
+                        .await
+                        .map(|ct| ct.into())
+                        .unwrap_or_default()
+                }
+                .instrument(tracing::debug_span!("capturing final child output"))
+                .await;
                 return Err(GenericRunnerError { error, output });
             }
         };
