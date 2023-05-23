@@ -31,3 +31,13 @@ jobs:
       ref: ${{ github.ref }}
       release_channel: unstable
     secrets: inherit
+
+  release_develop:
+    name: Release new abq to API
+    needs: bigtest
+    if: github.ref == 'refs/heads/debug-abq-worker-05-23'
+    uses: ./.github/workflows/build_and_upload.yml
+    with:
+      ref: ${{ github.ref }}
+      release_channel: develop
+    secrets: inherit
