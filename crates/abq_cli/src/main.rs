@@ -372,7 +372,8 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tls_cert: resolved_tls,
                 rwx_access_token_kind,
                 queue_location,
-            } = resolve_config(token, queue_addr, tls_cert, tls_key, &access_token, &run_id)?;
+            } = resolve_config(token, queue_addr, tls_cert, tls_key, &access_token, &run_id)
+                .await?;
 
             if explicit_run_id_provided && !queue_location.is_remote() {
                 let mut cmd = Cli::command();
@@ -466,7 +467,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tls_cert: resolved_tls,
                 rwx_access_token_kind: _resolved_rwx_access_token_kind,
                 queue_location,
-            } = resolve_config(token, queue_addr, tls_cert, None, &access_token, &run_id)?;
+            } = resolve_config(token, queue_addr, tls_cert, None, &access_token, &run_id).await?;
 
             let client_auth = resolved_token.into();
 
@@ -597,7 +598,7 @@ impl QueueLocation {
     }
 }
 
-fn resolve_config(
+async fn resolve_config(
     token_from_cli: Option<UserToken>,
     queue_addr_from_cli: Option<SocketAddr>,
     tls_cert_from_cli: Option<Vec<u8>>,
@@ -608,7 +609,7 @@ fn resolve_config(
     let (queue_addr_from_api, token_from_api, tls_from_api, rwx_access_token_kind) =
         match access_token.as_ref() {
             Some(access_token) => {
-                let config = get_config_from_api(access_token, run_id)?;
+                let config = get_config_from_api(access_token, run_id).await?;
                 (
                     Some(config.queue_addr),
                     Some(config.token),
@@ -641,7 +642,7 @@ fn get_hosted_api_base_url() -> String {
     std::env::var("ABQ_API").unwrap_or_else(|_| abq_hosted::DEFAULT_RWX_ABQ_API_URL.to_string())
 }
 
-fn get_config_from_api(
+async fn get_config_from_api(
     access_token: &AccessToken,
     run_id: &RunId,
 ) -> anyhow::Result<ConfigFromApi> {
@@ -655,7 +656,7 @@ fn get_config_from_api(
         auth_token,
         tls_public_certificate,
         rwx_access_token_kind,
-    } = HostedQueueConfig::from_api(api_url, access_token, run_id)?;
+    } = HostedQueueConfig::from_api(api_url, access_token, run_id).await?;
 
     Ok(ConfigFromApi {
         queue_addr: addr,
