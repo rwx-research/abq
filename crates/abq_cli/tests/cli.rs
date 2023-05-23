@@ -2539,7 +2539,6 @@ fn out_of_process_retries_smoke() {
     term(queue_proc);
 }
 
-
 use mockito::{Matcher, Server};
 
 fn test_access_token() -> AccessToken {
@@ -2635,9 +2634,8 @@ fn personal_access_token_does_not_mutate_remote_queue() {
             args
         };
 
-        let CmdOutput { exit_status, .. } = Abq::new(format!("{name}_initial"))
-            .args(test_args)
-            .run();
+        let CmdOutput { exit_status, .. } =
+            Abq::new(format!("{name}_initial")).args(test_args).run();
 
         // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
         let report_args = {
@@ -2743,7 +2741,12 @@ fn personal_access_token_does_not_mutate_remote_queue() {
             args
         };
 
-        let CmdOutput { exit_status, stdout, stderr, .. } = Abq::new(format!("{name}_initial"))
+        let CmdOutput {
+            exit_status,
+            stdout,
+            stderr,
+            ..
+        } = Abq::new(format!("{name}_initial"))
             .args(test_args)
             .env([("ABQ_API", server.url())])
             .run();
