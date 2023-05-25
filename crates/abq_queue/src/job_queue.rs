@@ -8,7 +8,7 @@ use abq_utils::{
 use crate::persistence;
 
 #[derive(Default, Debug, Clone, Copy)]
-pub enum Strategy {
+pub enum WorkStrategy {
     #[default]
     Linear,
     ByGroup,
@@ -58,7 +58,7 @@ impl JobQueue {
         &self,
         entity_tag: Tag,
         n: NonZeroUsize,
-        strategy: Strategy,
+        strategy: WorkStrategy,
     ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
         let n = n.get() as usize;
         let queue_len = self.queue.len();
@@ -66,8 +66,8 @@ impl JobQueue {
         let mut start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
 
         let end_idx = match strategy {
-            Strategy::Linear => std::cmp::min(start_idx + n, self.queue.len()),
-            Strategy::ByGroup => {
+            WorkStrategy::Linear => std::cmp::min(start_idx + n, self.queue.len()),
+            WorkStrategy::ByGroup => {
                 let mut end_idx = start_idx;
                 // grab new groups until we satisfy batch num
                 let mut current_group = self.queue[start_idx].spec.group_id;
@@ -210,7 +210,7 @@ mod test {
             let n = NonZeroUsize::try_from(n).unwrap();
             workers.insert(entity.tag, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(entity.tag, n, crate::job_queue::Strategy::Linear);
+                let popped = queue.get_work(entity.tag, n, crate::job_queue::WorkStrategy::Linear);
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -285,7 +285,8 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity.tag, n, crate::job_queue::Strategy::Linear);
+                    let popped =
+                        queue.get_work(entity.tag, n, crate::job_queue::WorkStrategy::Linear);
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
