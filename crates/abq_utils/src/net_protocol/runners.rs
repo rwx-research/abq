@@ -330,7 +330,7 @@ impl Manifest {
         collected.push(TestSpec {
             // Generate a fresh ID for ABQ-internal usage.
             work_id: WorkId::new(),
-            group_id: group_id, // placeholder
+            group_id,
             test_case: self::TestCase(
                 v0_2::TestCase {
                     id,
