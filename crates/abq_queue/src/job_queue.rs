@@ -177,7 +177,7 @@ mod test {
             entity::Entity,
             queue::TestSpec,
             runners::{ProtocolWitness, TestCase},
-            workers::{WorkId, WorkerTest, INIT_RUN_NUMBER},
+            workers::{GroupId, WorkId, WorkerTest, INIT_RUN_NUMBER},
         },
         vec_map::VecMap,
     };
@@ -196,7 +196,7 @@ mod test {
             TestSpec {
                 work_id: WorkId::new(),
                 test_case: TestCase::new(protocol, "test", Default::default()),
-                group_id: None,
+                group_id: GroupId::new(),
             },
             INIT_RUN_NUMBER,
         ))
@@ -271,7 +271,7 @@ mod test {
             TestSpec {
                 work_id: WorkId::new(),
                 test_case: TestCase::new(protocol, "test", Default::default()),
-                group_id: None,
+                group_id: GroupId::new(),
             },
             INIT_RUN_NUMBER,
         ))

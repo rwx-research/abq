@@ -973,7 +973,7 @@ async fn execute_all_tests<'a>(
                         TestSpec {
                             test_case,
                             work_id,
-                            group_id,
+                            group_id: _,
                         },
                     run_number,
                 }) => {

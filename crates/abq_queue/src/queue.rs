@@ -2705,12 +2705,15 @@ use abq_utils::net_protocol::runners::ProtocolWitness;
 
 #[cfg(test)]
 fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
-    use abq_utils::net_protocol::{runners::TestCase, workers::WorkId};
+    use abq_utils::net_protocol::{
+        runners::TestCase,
+        workers::{GroupId, WorkId},
+    };
 
     TestSpec {
         test_case: TestCase::new(proto, "fake-test", Default::default()),
         work_id: WorkId::new(),
-        group_id: None,
+        group_id: GroupId::new(),
     }
 }
 
@@ -2750,7 +2753,7 @@ mod test {
             },
             runners::{NativeRunnerSpecification, TestCase, TestResult},
             work_server,
-            workers::{RunId, WorkId},
+            workers::{GroupId, RunId, WorkId},
         },
         server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -3403,7 +3406,7 @@ mod test {
                 vec![TestSpec {
                     test_case: TestCase::new(proto, "test1", Default::default()),
                     work_id: WorkId::new(),
-                    group_id: None,
+                    group_id: GroupId::new(),
                 }],
                 Default::default(),
                 NativeRunnerInfo {
@@ -3485,7 +3488,7 @@ mod test {
                     vec![TestSpec {
                         test_case: TestCase::new(proto, "test1", Default::default()),
                         work_id: WorkId::new(),
-                        group_id: None,
+                        group_id: GroupId::new(),
                     }],
                     Default::default(),
                     NativeRunnerInfo {
