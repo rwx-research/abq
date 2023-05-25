@@ -3571,6 +3571,7 @@ fn custom_remote_persistence() {
             {
               "run_number": 1,
               "spec": {
+                "group_id": "[redacted]",
                 "test_case": {
                   "id": "test1",
                   "meta": {}
