@@ -1988,7 +1988,17 @@ impl QueueServer {
                     specification: *native_runner_specification,
                 };
 
-                if !flat_manifest.is_empty() {
+                if flat_manifest.is_empty() {
+                    Self::handle_manifest_empty_or_failure(
+                        queues,
+                        persist_results,
+                        entity,
+                        run_id,
+                        Ok(native_runner_info),
+                        stream,
+                    )
+                    .await
+                } else {
                     Self::handle_manifest_success(
                         queues,
                         persist_results,
@@ -1997,16 +2007,6 @@ impl QueueServer {
                         flat_manifest,
                         metadata,
                         native_runner_info,
-                        stream,
-                    )
-                    .await
-                } else {
-                    Self::handle_manifest_empty_or_failure(
-                        queues,
-                        persist_results,
-                        entity,
-                        run_id,
-                        Ok(native_runner_info),
                         stream,
                     )
                     .await
