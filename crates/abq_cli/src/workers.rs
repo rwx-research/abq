@@ -50,6 +50,7 @@ pub async fn start_workers_standalone(
     reporter_kinds: Vec<ReporterKind>,
     stdout_preferences: StdoutPreferences,
     batch_size: NonZeroU64,
+    work_strategy: WorkStrategy,
     test_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
@@ -97,8 +98,7 @@ pub async fn start_workers_standalone(
     let invoke_work = InvokeWork {
         run_id: run_id.clone(),
         batch_size_hint: batch_size,
-        // TODO: use a real value!
-        work_strategy: WorkStrategy::Linear,
+        work_strategy,
     };
 
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(

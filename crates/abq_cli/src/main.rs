@@ -359,6 +359,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             color,
             batch_size,
             startup_timeout_seconds,
+            work_strategy,
             inactivity_timeout_seconds,
         } => {
             let deprecations = DeprecationRecord::default();
@@ -453,6 +454,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 reporters,
                 stdout_preferences,
                 batch_size,
+                work_strategy,
                 tests_timeout,
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
