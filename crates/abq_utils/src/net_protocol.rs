@@ -310,6 +310,31 @@ pub mod workers {
         }
     }
 
+    /// ABQ-internal-ID for a grouping
+    /// In order to do file-based allocation to workers, we need to have a way of
+    /// knowing which tests are in which file. We use this group id as a proxy for that.
+    /// Eventually, these groupings will be assigned to specific workers
+    #[derive(Serialize, Deserialize, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct GroupId(pub [u8; 16]);
+
+    impl GroupId {
+        #[allow(clippy::new_without_default)]
+        pub fn new() -> Self {
+            Self(uuid::Uuid::new_v4().into_bytes())
+        }
+    }
+
+    impl std::fmt::Display for GroupId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+        }
+    }
+    impl std::fmt::Debug for GroupId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
+        }
+    }
+
     /// Runners used only for integration testing.
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum TestLikeRunner {
@@ -471,7 +496,7 @@ pub mod queue {
         meta::DeprecationRecord,
         results::OpaqueLazyAssociatedTestResults,
         runners::{AbqProtocolVersion, NativeRunnerSpecification, TestCase, TestResult},
-        workers::{ManifestResult, RunId, WorkId},
+        workers::{GroupId, ManifestResult, RunId, WorkId},
         LARGE_MESSAGE_SIZE,
     };
     use crate::capture_output::StdioOutput;
@@ -503,6 +528,8 @@ pub mod queue {
     pub struct TestSpec {
         /// ABQ-internal identity of this test.
         pub work_id: WorkId,
+        /// ABQ-internal group identity of this test.
+        pub group_id: Option<GroupId>,
         /// The test case communicated to a native runner.
         pub test_case: TestCase,
     }

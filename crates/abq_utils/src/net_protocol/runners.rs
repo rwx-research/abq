@@ -300,6 +300,7 @@ impl Manifest {
                     let spec = TestSpec {
                         // Generate a fresh ID for ABQ-internal usage.
                         work_id: WorkId::new(),
+                        group_id: None, // placeholder
                         test_case: self::TestCase(
                             TestCase {
                                 id,
