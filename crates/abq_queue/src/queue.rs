@@ -766,8 +766,7 @@ impl AllRuns {
 
         // Pop the next batch.
         // TODO: can we get rid of the clone allocation here?
-        let mut bundle = Vec::with_capacity(batch_size.get() as _);
-        bundle.extend(queue.get_work(entity.tag, batch_size).cloned());
+        let bundle: Vec<WorkerTest> = queue.get_work(entity.tag, batch_size).cloned().collect();
 
         let pulled_tests_status;
 
