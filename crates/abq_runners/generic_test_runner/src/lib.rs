@@ -196,6 +196,7 @@ async fn retrieve_manifest<'a>(
     Ok((manifest, stdio_output.combined))
 }
 
+// fetch manifest and confirm native runner quit
 async fn retrieve_manifest_help(
     native_runner: &mut NativeRunnerHandle<'_>,
 ) -> Result<ManifestMessage, LocatedError> {
@@ -1380,7 +1381,7 @@ where
     Ok(())
 }
 
-/// Executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.
+/// Test harness: executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.
 /// Returns the manifest and all test results.
 pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
@@ -1744,6 +1745,7 @@ fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
     (all_test_run, Box::new(notify_all_tests_run))
 }
 
+// used for testing only
 pub struct StaticManifestCollector {
     manifest: Arc<Mutex<Option<ManifestResult>>>,
 }

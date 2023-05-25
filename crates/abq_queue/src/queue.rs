@@ -766,6 +766,7 @@ impl AllRuns {
 
         // Pop the next batch.
         // TODO: can we get rid of the clone allocation here?
+        // - I guess to do this we need to split up `NextWorkBundle` for the queue (with borrows) and with the worker (with ownership)?
         let bundle: Vec<WorkerTest> = queue.get_work(entity.tag, batch_size).cloned().collect();
 
         let pulled_tests_status;
