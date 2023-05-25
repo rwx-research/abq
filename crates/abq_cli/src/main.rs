@@ -317,6 +317,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             tls_key,
             color,
             batch_size,
+            startup_timeout_seconds,
             inactivity_timeout_seconds,
         } => {
             let deprecations = DeprecationRecord::default();
@@ -369,6 +370,8 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let max_run_number = 1 + retries;
 
+            let startup_timeout = Duration::from_secs(startup_timeout_seconds);
+
             workers::start_workers_standalone(
                 run_id,
                 WorkerTag::new(worker as _),
@@ -382,6 +385,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tests_timeout,
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
+                startup_timeout,
             )
             .await
         }

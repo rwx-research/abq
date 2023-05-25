@@ -42,6 +42,7 @@ pub async fn start_workers_standalone(
     test_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
+    startup_timeout: Duration,
 ) -> ! {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let has_stdout_reporters = reporter_kinds
@@ -68,7 +69,7 @@ pub async fn start_workers_standalone(
         worker_context: context,
         debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
         has_stdout_reporters,
-        protocol_version_timeout: abq_workers::DEFAULT_PROTOCOL_VERSION_TIMEOUT,
+        protocol_version_timeout: startup_timeout,
         test_timeout,
         results_batch_size_hint: batch_size.get(),
         max_run_number,
