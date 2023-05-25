@@ -1,4 +1,6 @@
-use std::{cell::Cell, num::NonZeroUsize, sync::atomic::AtomicUsize};
+use abq_utils::net_protocol::workers::GroupId;
+
+use std::{cell::Cell, collections::HashMap, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
 use abq_utils::{
     atomic,
@@ -18,6 +20,8 @@ pub struct JobQueue {
     assigned_entities: Vec<TagCell>,
     /// The last item popped off the queue.
     ptr: AtomicUsize,
+    // for per-file strategy, this maps group ids to workers
+    assigned_groups: Option<HashMap<GroupId, Tag>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +47,7 @@ impl JobQueue {
             queue: work,
             assigned_entities: vec![TagCell::new(Tag::ExternalClient); work_len],
             ptr: AtomicUsize::new(0),
+            assigned_groups: None,
         }
     }
 
@@ -79,6 +84,7 @@ impl JobQueue {
             self.ptr.store(queue_len, atomic::ORDERING);
         }
 
+        // for retries, mark these tests as owned by this worker
         for entity_cell in self.assigned_entities[start_idx..end_idx].iter() {
             entity_cell.0.set(entity_tag);
         }
@@ -106,6 +112,7 @@ impl JobQueue {
         let Self {
             queue,
             assigned_entities,
+            assigned_groups: _,
             ptr: _,
         } = self;
 
