@@ -9,6 +9,13 @@ use abq_utils::{
 
 use crate::persistence;
 
+#[derive(Default, Debug)]
+pub enum Strategy {
+    #[default]
+    Linear,
+    ByGroup,
+}
+
 /// Concurrently-accessible job queue for a test suite run.
 /// Organized so that concurrent accesses require minimal synchronization, usually
 /// a single atomic exchange in the happy path.
@@ -21,7 +28,7 @@ pub struct JobQueue {
     /// The last item popped off the queue.
     ptr: AtomicUsize,
     // for per-file strategy, this maps group ids to workers
-    assigned_groups: Option<HashMap<GroupId, Tag>>,
+    strategy: Strategy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,7 +54,7 @@ impl JobQueue {
             queue: work,
             assigned_entities: vec![TagCell::new(Tag::ExternalClient); work_len],
             ptr: AtomicUsize::new(0),
-            assigned_groups: None,
+            strategy: Strategy::Linear,
         }
     }
 
@@ -61,7 +68,29 @@ impl JobQueue {
         let queue_len = self.queue.len();
 
         let mut start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
-        let end_idx = std::cmp::min(start_idx + n, self.queue.len());
+
+        let end_idx = match self.strategy {
+            Strategy::Linear => std::cmp::min(start_idx + n, self.queue.len()),
+            Strategy::ByGroup => {
+                let mut end_idx = start_idx;
+                // grab new groups until we satisfy batch num
+                let mut current_group = self.queue[start_idx].spec.group_id;
+                // find idx of the start of the next group
+                for next_spec in self.queue[start_idx..].iter() {
+                    end_idx += 1; // note because end_idx is non-inclusive, it being at the index of `next_spec`
+                                  // means we don't include next_spec in the resulting slice
+                    if next_spec.spec.group_id != current_group {
+                        // only check batch size when we've reached a new group
+                        if end_idx - start_idx > n {
+                            break;
+                        }
+                        // else update the group and iterate
+                        current_group = next_spec.spec.group_id
+                    }
+                }
+                end_idx
+            }
+        };
 
         // If either
         //   - the start index was past the end of the queue, or
@@ -112,7 +141,7 @@ impl JobQueue {
         let Self {
             queue,
             assigned_entities,
-            assigned_groups: _,
+            strategy: _,
             ptr: _,
         } = self;
 
