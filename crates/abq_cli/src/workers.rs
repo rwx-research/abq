@@ -8,7 +8,7 @@ use abq_reporting::CompletedSummary;
 use abq_utils::capture_output::ProcessOutput;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{WorkerRunner, WorkerTag};
-use abq_utils::net_protocol::queue::InvokeWork;
+use abq_utils::net_protocol::queue::{InvokeWork, WorkStrategy};
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
 use abq_utils::whitespace::is_blank;
 use abq_workers::negotiate::{
@@ -83,6 +83,8 @@ pub async fn start_workers_standalone(
     let invoke_work = InvokeWork {
         run_id: run_id.clone(),
         batch_size_hint: batch_size,
+        // TODO: use a real value!
+        work_strategy: WorkStrategy::Linear,
     };
 
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(

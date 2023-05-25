@@ -31,7 +31,7 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::{Entity, RunnerMeta, WorkerTag},
-        queue::{self, AssociatedTestResults, InvokeWork, TestResultsResponse},
+        queue::{self, AssociatedTestResults, InvokeWork, TestResultsResponse, WorkStrategy},
         results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
         runners::{
             InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
@@ -475,6 +475,8 @@ fn action_to_fut(
             let invoke_work = InvokeWork {
                 run_id,
                 batch_size_hint,
+                // TODO: use a real value
+                work_strategy: WorkStrategy::Linear,
             };
 
             let config = WorkersConfig {
