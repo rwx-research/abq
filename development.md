@@ -24,6 +24,21 @@ Tips:
   "rust-analyzer.checkOnSave.extraArgs": ["--target-dir", "/tmp/rust-analyzer-check"],
   ```
 
+## Testing, Linting, Etc
+
+run lints similarly to how they're run in CI:
+
+```bash
+cargo clippy --workspace --tests --profile=release-unstable --all-features -- --deny warnings
+```
+
+run tests similarly to how they're run in CI:
+
+```bash
+cargo test --profile=release-unstable --all-features
+```
+
+
 ## Dev queues
 
 [Automated tests](.github/workflows/bigtest.yml) are run against remote instances of
