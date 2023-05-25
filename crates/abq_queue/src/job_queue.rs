@@ -1,6 +1,4 @@
-use abq_utils::net_protocol::workers::GroupId;
-
-use std::{cell::Cell, collections::HashMap, num::NonZeroUsize, sync::atomic::AtomicUsize};
+use std::{cell::Cell, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
 use abq_utils::{
     atomic,
@@ -9,7 +7,7 @@ use abq_utils::{
 
 use crate::persistence;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 pub enum Strategy {
     #[default]
     Linear,
@@ -27,8 +25,6 @@ pub struct JobQueue {
     assigned_entities: Vec<TagCell>,
     /// The last item popped off the queue.
     ptr: AtomicUsize,
-    // for per-file strategy, this maps group ids to workers
-    strategy: Strategy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +50,6 @@ impl JobQueue {
             queue: work,
             assigned_entities: vec![TagCell::new(Tag::ExternalClient); work_len],
             ptr: AtomicUsize::new(0),
-            strategy: Strategy::Linear,
         }
     }
 
@@ -63,13 +58,14 @@ impl JobQueue {
         &self,
         entity_tag: Tag,
         n: NonZeroUsize,
+        strategy: Strategy,
     ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
         let n = n.get() as usize;
         let queue_len = self.queue.len();
 
         let mut start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
 
-        let end_idx = match self.strategy {
+        let end_idx = match strategy {
             Strategy::Linear => std::cmp::min(start_idx + n, self.queue.len()),
             Strategy::ByGroup => {
                 let mut end_idx = start_idx;
@@ -141,7 +137,6 @@ impl JobQueue {
         let Self {
             queue,
             assigned_entities,
-            strategy: _,
             ptr: _,
         } = self;
 
@@ -215,7 +210,7 @@ mod test {
             let n = NonZeroUsize::try_from(n).unwrap();
             workers.insert(entity.tag, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(entity.tag, n);
+                let popped = queue.get_work(entity.tag, n, crate::job_queue::Strategy::Linear);
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -290,7 +285,7 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity.tag, n);
+                    let popped = queue.get_work(entity.tag, n, crate::job_queue::Strategy::Linear);
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;

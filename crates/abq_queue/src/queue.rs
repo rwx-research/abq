@@ -43,7 +43,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
-use crate::job_queue::JobQueue;
+use crate::job_queue::{JobQueue, Strategy};
 use crate::persistence::manifest::{
     self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
 };
@@ -65,7 +65,13 @@ enum RunState {
         /// manifest being generated.
         worker_connection_times: Mutex<WorkerSet<Instant>>,
 
+        /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
+        // Co-locate this here so that we don't have to index `run_data` when grabbing a
+        // test.
         batch_size_hint: NonZeroUsize,
+
+        //strategy for pulling tests off the queue
+        dequeue_strategy: crate::job_queue::Strategy,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -79,6 +85,9 @@ enum RunState {
         // Co-locate this here so that we don't have to index `run_data` when grabbing a
         // test.
         batch_size_hint: NonZeroUsize,
+
+        //strategy for pulling tests off the queue
+        dequeue_strategy: crate::job_queue::Strategy,
 
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
@@ -315,12 +324,13 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
+        dequeue_strategy: Strategy,
         entity: Entity,
         remote: &RemotePersister,
     ) -> AssignedRunStatus {
         if !self.runs.read().contains_key(run_id) {
             match self
-                .try_create_run(run_id, batch_size_hint, entity, remote)
+                .try_create_run(run_id, batch_size_hint, dequeue_strategy, entity, remote)
                 .await
             {
                 ControlFlow::Break(assigned) => return assigned,
@@ -347,6 +357,7 @@ impl AllRuns {
             RunState::WaitingForManifest {
                 worker_connection_times,
                 batch_size_hint: _,
+                dequeue_strategy: _,
             } => {
                 let mut worker_connection_times = worker_connection_times.lock();
                 let old = worker_connection_times.insert_by_tag(entity, time::Instant::now());
@@ -454,6 +465,7 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
+        dequeu_strategy: Strategy,
         entity: Entity,
         remote: &RemotePersister,
     ) -> ControlFlow<AssignedRunStatus> {
@@ -464,7 +476,12 @@ impl AllRuns {
                 }
                 LoadedRunState::NotFound => {
                     // This run is not present in the remote persister, so we can create a fresh run.
-                    Ok(self.try_create_globally_fresh_run(run_id, batch_size_hint, entity))
+                    Ok(self.try_create_globally_fresh_run(
+                        run_id,
+                        batch_size_hint,
+                        dequeu_strategy,
+                        entity,
+                    ))
                 }
                 LoadedRunState::IncompatibleSchemaVersion { found, expected } => {
                     tracing::info!(
@@ -473,7 +490,12 @@ impl AllRuns {
                         ?expected,
                         "found an existing run, but its state has an incompatible schema version"
                     );
-                    Ok(self.try_create_globally_fresh_run(run_id, batch_size_hint, entity))
+                    Ok(self.try_create_globally_fresh_run(
+                        run_id,
+                        batch_size_hint,
+                        dequeu_strategy,
+                        entity,
+                    ))
                 }
             }
         }
@@ -499,6 +521,7 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
+        dequeue_strategy: Strategy,
         entity: Entity,
     ) -> ControlFlow<AssignedRunStatus> {
         let run = {
@@ -510,6 +533,7 @@ impl AllRuns {
                 state: RunState::WaitingForManifest {
                     worker_connection_times: Mutex::new(worker_timings),
                     batch_size_hint,
+                    dequeue_strategy,
                 },
             }
         };
@@ -604,14 +628,15 @@ impl AllRuns {
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
 
-        let (worker_connection_times, batch_size_hint) = match &mut run.state {
+        let (worker_connection_times, batch_size_hint, dequeue_strategy) = match &mut run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
                 batch_size_hint,
+                dequeue_strategy,
             } => {
                 // expected state, pass through
                 let timings = Mutex::into_inner(std::mem::take(worker_connection_times));
-                (timings, *batch_size_hint)
+                (timings, *batch_size_hint, *dequeue_strategy)
             }
             RunState::Cancelled { .. } => {
                 // If cancelled, do nothing.
@@ -646,6 +671,7 @@ impl AllRuns {
         run.state = RunState::HasWork {
             queue,
             batch_size_hint,
+            dequeue_strategy,
             init_metadata,
             active_workers: Mutex::new(active_workers),
             results_persistence: results_persistence.clone(),
@@ -704,10 +730,12 @@ impl AllRuns {
                 queue,
                 batch_size_hint,
                 active_workers,
+                dequeue_strategy,
                 ..
             } => {
                 active_workers.lock().insert_by_tag_if_missing(entity, None);
-                let (bundle, status) = Self::get_next_work_online(queue, entity, *batch_size_hint);
+                let (bundle, status) =
+                    Self::get_next_work_online(queue, entity, *batch_size_hint, *dequeue_strategy);
                 match status {
                     PulledTestsStatus::MoreTestsRemaining => NextWorkResult {
                         bundle,
@@ -759,6 +787,7 @@ impl AllRuns {
         queue: &JobQueue,
         entity: Entity,
         batch_size_hint: NonZeroUsize,
+        strategy: Strategy,
     ) -> (NextWorkBundle, PulledTestsStatus) {
         // NB: in the future, the batch size is likely to be determined intelligently, i.e.
         // from off-line timing data. But for now, we use the hint the client provided.
@@ -767,7 +796,10 @@ impl AllRuns {
         // Pop the next batch.
         // TODO: can we get rid of the clone allocation here?
         // - I guess to do this we need to split up `NextWorkBundle` for the queue (with borrows) and with the worker (with ownership)?
-        let bundle: Vec<WorkerTest> = queue.get_work(entity.tag, batch_size).cloned().collect();
+        let bundle: Vec<WorkerTest> = queue
+            .get_work(entity.tag, batch_size, strategy)
+            .cloned()
+            .collect();
 
         let pulled_tests_status;
 
@@ -1634,6 +1666,8 @@ impl GetAssignedRun for ChooseRunForWorker {
             run_id,
             batch_size_hint,
         } = invoke_work;
+        // TODO: thread this through, move strategy to net_protocol
+        let dequeue_strategy = crate::job_queue::Strategy::Linear;
 
         let batch_size_hint =
             if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
@@ -1647,7 +1681,13 @@ impl GetAssignedRun for ChooseRunForWorker {
 
         let assigned_run = self
             .queues
-            .find_or_create_run(run_id, batch_size_hint, entity, &self.remote)
+            .find_or_create_run(
+                run_id,
+                batch_size_hint,
+                dequeue_strategy,
+                entity,
+                &self.remote,
+            )
             .await;
 
         // Now that we've found a run for this ID, if the run is fresh, enqueue a job to check
@@ -3077,6 +3117,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3096,6 +3137,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3117,6 +3159,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3144,6 +3187,7 @@ mod test {
                 .find_or_create_run(
                     run_id,
                     one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
                     Entity::runner(0, 1),
                     &remote::NoopPersister::new().into(),
                 )
@@ -3173,6 +3217,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3198,7 +3243,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
         let _ = queues.add_manifest(&run_id, vec![], Default::default());
         let persist_plan = queues.try_mark_reached_end_of_manifest(&run_id, ExitCode::SUCCESS);
@@ -3223,7 +3274,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
 
         let added = queues.add_manifest(&run_id, vec![], Default::default());
@@ -3256,7 +3313,13 @@ mod test {
         // worker0 creates run
         {
             let assigned_lookup = queues
-                .find_or_create_run(&run_id, one_nonzero_usize(), worker0, &remote)
+                .find_or_create_run(
+                    &run_id,
+                    one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
+                    worker0,
+                    &remote,
+                )
                 .await;
             assert_eq!(
                 assigned_lookup,
@@ -3271,7 +3334,13 @@ mod test {
         // worker1 attaches
         {
             let assigned_lookup = queues
-                .find_or_create_run(&run_id, one_nonzero_usize(), worker1, &remote)
+                .find_or_create_run(
+                    &run_id,
+                    one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
+                    worker1,
+                    &remote,
+                )
                 .await;
             assert_eq!(
                 assigned_lookup,
@@ -3294,7 +3363,13 @@ mod test {
         // worker2 attaches
         {
             let assigned_lookup = queues
-                .find_or_create_run(&run_id, one_nonzero_usize(), worker2, &remote)
+                .find_or_create_run(
+                    &run_id,
+                    one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
+                    worker2,
+                    &remote,
+                )
                 .await;
             assert_eq!(
                 assigned_lookup,
@@ -3373,7 +3448,13 @@ mod test {
         let queues = {
             let queues = SharedRuns::default();
             let _ = queues
-                .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+                .find_or_create_run(
+                    &run_id,
+                    one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
+                    Entity::runner(0, 1),
+                    &remote,
+                )
                 .await;
             queues
         };
@@ -3451,7 +3532,13 @@ mod test {
         let queues = {
             let queues = SharedRuns::default();
             let _ = queues
-                .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+                .find_or_create_run(
+                    &run_id,
+                    one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
+                    Entity::runner(0, 1),
+                    &remote,
+                )
                 .await;
             queues
         };
@@ -3527,7 +3614,13 @@ mod test {
         let queues = {
             let queues = SharedRuns::default();
             let _ = queues
-                .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+                .find_or_create_run(
+                    &run_id,
+                    one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
+                    Entity::runner(0, 1),
+                    &remote,
+                )
                 .await;
             let added = queues.add_manifest(&run_id, vec![], Default::default());
             assert!(matches!(added, AddedManifest::Added { .. }));
@@ -3571,7 +3664,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
@@ -3592,7 +3691,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
 
@@ -3614,7 +3719,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
         let _ = queues.next_work(Entity::runner(0, 1), &run_id);
@@ -3637,7 +3748,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
         let _ = queues.next_work(Entity::runner(0, 1), &run_id);
@@ -3655,7 +3772,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
         queues.mark_cancelled(&run_id, Entity::runner(0, 1), CancelReason::User);
 
@@ -3682,7 +3805,13 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
         let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
 
@@ -3757,7 +3886,13 @@ mod test {
         let remote = remote::NoopPersister::new().into();
 
         let assigned = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
@@ -3794,7 +3929,13 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), entity, &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                entity,
+                &remote,
+            )
             .await;
 
         assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
@@ -3824,7 +3965,13 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
 
         assert_eq!(
@@ -3854,7 +4001,13 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
 
         assert_eq!(
@@ -3890,7 +4043,13 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
 
         assert_eq!(
@@ -3920,7 +4079,13 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
 
         assert!(matches!(assigned, AssignedRunStatus::FatalError(_)));
@@ -3966,6 +4131,7 @@ mod test_pull_work {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
+            dequeue_strategy: crate::job_queue::Strategy::Linear,
             active_workers: Default::default(),
             results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
@@ -4076,7 +4242,13 @@ mod persistence_on_end_of_manifest {
         // Create run, add manifest by worker0
         {
             let _ = queues
-                .find_or_create_run(&run_id, one_nonzero_usize(), worker0, &remote)
+                .find_or_create_run(
+                    &run_id,
+                    one_nonzero_usize(),
+                    crate::job_queue::Strategy::Linear,
+                    worker0,
+                    &remote,
+                )
                 .await;
             let _ = queues.add_manifest(
                 &run_id,
@@ -4097,7 +4269,13 @@ mod persistence_on_end_of_manifest {
         // Suppose worker0 sporadically dies. Now worker0_shadow should be told to pull a retry
         // manifest.
         let assigned = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), worker0_shadow, &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                worker0_shadow,
+                &remote,
+            )
             .await;
         assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
     }
@@ -4178,6 +4356,7 @@ mod persistence_on_end_of_manifest {
                 queue,
                 init_metadata: Default::default(),
                 batch_size_hint,
+                dequeue_strategy: crate::job_queue::Strategy::Linear,
                 active_workers: Default::default(),
                 results_persistence: ResultsPersistedCell::new(run_id.clone()),
             };
@@ -4305,7 +4484,13 @@ mod persistence_on_end_of_manifest {
         let entity = Entity::runner(0, 1);
 
         let _ = queues
-            .find_or_create_run(&run_id, one_nonzero_usize(), Entity::runner(0, 1), &remote)
+            .find_or_create_run(
+                &run_id,
+                one_nonzero_usize(),
+                crate::job_queue::Strategy::Linear,
+                Entity::runner(0, 1),
+                &remote,
+            )
             .await;
         let _ = queues.add_manifest(
             &run_id,
@@ -4382,7 +4567,7 @@ mod persist_results {
     use ntest::timeout;
 
     use crate::{
-        job_queue::JobQueue,
+        job_queue::{JobQueue, Strategy},
         persistence::{self, results::ResultsPersistedCell},
         queue::ReadResultsState,
         worker_tracking::WorkerSet,
@@ -4407,6 +4592,7 @@ mod persist_results {
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
                 batch_size_hint: one_nonzero_usize(),
+                dequeue_strategy: Strategy::Linear,
             };
             queues.set_state(run_id.clone(), done);
             queues
@@ -4536,7 +4722,7 @@ mod persist_results {
 
     get_read_results_cell! {
         get_read_results_cell_when_waiting_for_manifest,
-        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize() },
+        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), dequeue_strategy: Strategy::Linear },
         Err(ReadResultsError::WaitingForManifest)
     }
 
@@ -4550,6 +4736,7 @@ mod persist_results {
                 queue: Default::default(),
                 init_metadata: Default::default(),
                 batch_size_hint: one_nonzero_usize(),
+                dequeue_strategy: Strategy::Linear,
                 active_workers: parking_lot::Mutex::new(active_workers),
                 results_persistence: ResultsPersistedCell::new(RunId::unique()),
             }
@@ -4631,6 +4818,7 @@ mod persist_results {
             let has_work = RunState::HasWork {
                 queue: JobQueue::default(),
                 batch_size_hint,
+                dequeue_strategy: Strategy::Linear,
                 init_metadata: Default::default(),
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
