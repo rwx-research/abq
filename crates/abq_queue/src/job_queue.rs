@@ -160,6 +160,7 @@ mod test {
             TestSpec {
                 work_id: WorkId::new(),
                 test_case: TestCase::new(protocol, "test", Default::default()),
+                group_id: None,
             },
             INIT_RUN_NUMBER,
         ))
@@ -234,6 +235,7 @@ mod test {
             TestSpec {
                 work_id: WorkId::new(),
                 test_case: TestCase::new(protocol, "test", Default::default()),
+                group_id: None,
             },
             INIT_RUN_NUMBER,
         ))

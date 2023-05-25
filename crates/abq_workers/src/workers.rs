@@ -656,7 +656,12 @@ async fn test_like_runner_exec_loop(
         };
 
         for WorkerTest {
-            spec: TestSpec { test_case, work_id },
+            spec:
+                TestSpec {
+                    test_case,
+                    work_id,
+                    group_id,
+                },
             run_number,
         } in work
         {
@@ -1064,6 +1069,7 @@ mod test {
             spec: TestSpec {
                 test_case: test,
                 work_id,
+                group_id: None,
             },
             run_number: INIT_RUN_NUMBER,
         }
@@ -1104,6 +1110,7 @@ mod test {
         }
     }
 
+    // used in tokio tests
     async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
         let (write_work, set_done, get_next_tests) = work_writer();
         let (results, results_handler_generator) = results_collector();

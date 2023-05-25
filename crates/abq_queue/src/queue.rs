@@ -2710,6 +2710,7 @@ fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
     TestSpec {
         test_case: TestCase::new(proto, "fake-test", Default::default()),
         work_id: WorkId::new(),
+        group_id: None,
     }
 }
 
@@ -3402,6 +3403,7 @@ mod test {
                 vec![TestSpec {
                     test_case: TestCase::new(proto, "test1", Default::default()),
                     work_id: WorkId::new(),
+                    group_id: None,
                 }],
                 Default::default(),
                 NativeRunnerInfo {
@@ -3483,6 +3485,7 @@ mod test {
                     vec![TestSpec {
                         test_case: TestCase::new(proto, "test1", Default::default()),
                         work_id: WorkId::new(),
+                        group_id: None,
                     }],
                     Default::default(),
                     NativeRunnerInfo {

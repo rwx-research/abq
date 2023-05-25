@@ -667,6 +667,7 @@ mod test {
                                 spec: TestSpec {
                                     test_case: spec.test_case,
                                     work_id: WorkId([i as _; 16]),
+                                    group_id: None,
                                 },
                                 run_number: INIT_RUN_NUMBER,
                             })
