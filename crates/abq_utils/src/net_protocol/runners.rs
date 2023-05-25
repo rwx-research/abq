@@ -290,16 +290,31 @@ impl Manifest {
     /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
     pub fn flatten(self) -> (Vec<TestSpec>, MetadataMap) {
         use v0_2::{Group, TestOrGroup};
-
         let Manifest { members, init_meta } = self;
         let mut collected = Vec::with_capacity(members.len());
-        let mut queue: VecDeque<_> = members.into_iter().collect();
-        while let Some(test_or_group) = queue.pop_front() {
-            match test_or_group {
-                TestOrGroup::Test(test) => Self::add_test_to_collected(test, &mut collected, None),
+
+        // 🙋 Ayaz told me to reuse this Deque but I don't understand the implications of re-creating where we extend it below
+        let mut queue: VecDeque<v0_2::TestOrGroup> = VecDeque::new();
+        for top_level_test_or_group in members {
+            let group_id = Some(GroupId::new());
+            match top_level_test_or_group {
+                TestOrGroup::Test(test) => {
+                    Self::add_test_to_collected(test, &mut collected, group_id)
+                }
                 TestOrGroup::Group(Group { members, .. }) => {
-                    for member in members.into_iter().rev() {
-                        queue.push_front(member);
+                    queue.clear();
+                    queue.extend(members);
+                    while let Some(test_or_group) = queue.pop_front() {
+                        match test_or_group {
+                            TestOrGroup::Test(test) => {
+                                Self::add_test_to_collected(test, &mut collected, group_id)
+                            }
+                            TestOrGroup::Group(Group { members, .. }) => {
+                                for member in members.into_iter().rev() {
+                                    queue.push_front(member);
+                                }
+                            }
+                        }
                     }
                 }
             }
