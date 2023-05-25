@@ -516,6 +516,16 @@ pub mod queue {
         pub cancelled: bool,
     }
 
+    // how strategies for popping work off the queue
+    #[derive(Default, Debug, Clone, Copy)]
+    pub enum WorkStrategy {
+        // just pop them up in order
+        #[default]
+        Linear,
+        // by group aka by file. ensure each top level group gets distributed to a single worker.
+        // should help before / after work only getting run once
+        ByGroup,
+    }
     /// An ask to run some work by an invoker.
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct InvokeWork {

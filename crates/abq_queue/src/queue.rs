@@ -15,7 +15,7 @@ use abq_utils::net_protocol::entity::{Entity, Tag};
 use abq_utils::net_protocol::error::RetryManifestError;
 use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request,
-    TestResultsResponse, TestSpec,
+    TestResultsResponse, TestSpec, WorkStrategy,
 };
 use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
 use abq_utils::net_protocol::runners::{MetadataMap, StdioOutput};
@@ -43,7 +43,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
-use crate::job_queue::{JobQueue, WorkStrategy};
+use crate::job_queue::JobQueue;
 use crate::persistence::manifest::{
     self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
 };
@@ -71,7 +71,7 @@ enum RunState {
         batch_size_hint: NonZeroUsize,
 
         //strategy for pulling tests off the queue
-        work_strategy: crate::job_queue::WorkStrategy,
+        work_strategy: abq_utils::net_protocol::queue::WorkStrategy,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -87,7 +87,7 @@ enum RunState {
         batch_size_hint: NonZeroUsize,
 
         //strategy for pulling tests off the queue
-        work_strategy: crate::job_queue::WorkStrategy,
+        work_strategy: abq_utils::net_protocol::queue::WorkStrategy,
 
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
@@ -1667,7 +1667,7 @@ impl GetAssignedRun for ChooseRunForWorker {
             batch_size_hint,
         } = invoke_work;
         // TODO: thread this through, move strategy to net_protocol
-        let work_strategy = crate::job_queue::WorkStrategy::Linear;
+        let work_strategy = abq_utils::net_protocol::queue::WorkStrategy::Linear;
 
         let batch_size_hint =
             if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
@@ -3111,7 +3111,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3131,7 +3131,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3153,7 +3153,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3181,7 +3181,7 @@ mod test {
                 .find_or_create_run(
                     run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote::NoopPersister::new().into(),
                 )
@@ -3211,7 +3211,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3240,7 +3240,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3271,7 +3271,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3310,7 +3310,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     worker0,
                     &remote,
                 )
@@ -3331,7 +3331,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     worker1,
                     &remote,
                 )
@@ -3360,7 +3360,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     worker2,
                     &remote,
                 )
@@ -3445,7 +3445,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3529,7 +3529,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3611,7 +3611,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3661,7 +3661,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3688,7 +3688,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3716,7 +3716,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3745,7 +3745,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3769,7 +3769,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3802,7 +3802,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3883,7 +3883,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3926,7 +3926,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 entity,
                 &remote,
             )
@@ -3962,7 +3962,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3998,7 +3998,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4040,7 +4040,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4076,7 +4076,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4125,7 +4125,7 @@ mod test_pull_work {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
-            work_strategy: crate::job_queue::WorkStrategy::Linear,
+            work_strategy: abq_utils::net_protocol::queue::WorkStrategy::Linear,
             active_workers: Default::default(),
             results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
@@ -4239,7 +4239,7 @@ mod persistence_on_end_of_manifest {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::WorkStrategy::Linear,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
                     worker0,
                     &remote,
                 )
@@ -4266,7 +4266,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 worker0_shadow,
                 &remote,
             )
@@ -4350,7 +4350,7 @@ mod persistence_on_end_of_manifest {
                 queue,
                 init_metadata: Default::default(),
                 batch_size_hint,
-                work_strategy: crate::job_queue::WorkStrategy::Linear,
+                work_strategy: abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 active_workers: Default::default(),
                 results_persistence: ResultsPersistedCell::new(run_id.clone()),
             };
@@ -4481,7 +4481,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::WorkStrategy::Linear,
+                abq_utils::net_protocol::queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4552,7 +4552,7 @@ mod persist_results {
         net_protocol::{
             self,
             entity::{Entity, Tag},
-            queue::{AssociatedTestResults, CancelReason, TestResultsResponse},
+            queue::{AssociatedTestResults, CancelReason, TestResultsResponse, WorkStrategy},
             results::ResultsLine,
             runners::TestResult,
             workers::RunId,
@@ -4561,7 +4561,7 @@ mod persist_results {
     use ntest::timeout;
 
     use crate::{
-        job_queue::{JobQueue, WorkStrategy},
+        job_queue::JobQueue,
         persistence::{self, results::ResultsPersistedCell},
         queue::ReadResultsState,
         worker_tracking::WorkerSet,
