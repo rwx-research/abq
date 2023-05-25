@@ -71,7 +71,7 @@ enum RunState {
         batch_size_hint: NonZeroUsize,
 
         //strategy for pulling tests off the queue
-        work_strategy: abq_utils::net_protocol::queue::WorkStrategy,
+        work_strategy: WorkStrategy,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -87,7 +87,7 @@ enum RunState {
         batch_size_hint: NonZeroUsize,
 
         //strategy for pulling tests off the queue
-        work_strategy: abq_utils::net_protocol::queue::WorkStrategy,
+        work_strategy: WorkStrategy,
 
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
@@ -2758,6 +2758,7 @@ fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
 
 #[cfg(test)]
 mod test {
+    use abq_utils::net_protocol::queue::WorkStrategy;
     use std::{io, time::Instant};
 
     use crate::{
@@ -3116,7 +3117,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3136,7 +3137,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3158,7 +3159,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3186,7 +3187,7 @@ mod test {
                 .find_or_create_run(
                     run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote::NoopPersister::new().into(),
                 )
@@ -3216,7 +3217,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3245,7 +3246,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3276,7 +3277,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3315,7 +3316,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     worker0,
                     &remote,
                 )
@@ -3336,7 +3337,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     worker1,
                     &remote,
                 )
@@ -3365,7 +3366,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     worker2,
                     &remote,
                 )
@@ -3450,7 +3451,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3534,7 +3535,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3616,7 +3617,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3666,7 +3667,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3693,7 +3694,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3721,7 +3722,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3750,7 +3751,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3774,7 +3775,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3807,7 +3808,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3888,7 +3889,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3931,7 +3932,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 entity,
                 &remote,
             )
@@ -3967,7 +3968,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4003,7 +4004,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4045,7 +4046,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4081,7 +4082,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4096,6 +4097,7 @@ mod test_pull_work {
     use abq_test_utils::one_nonzero_usize;
     use abq_utils::net_protocol::{
         entity::Entity,
+        queue::WorkStrategy,
         workers::{RunId, WorkerTest},
     };
     use abq_with_protocol_version::with_protocol_version;
@@ -4130,7 +4132,7 @@ mod test_pull_work {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
-            work_strategy: abq_utils::net_protocol::queue::WorkStrategy::Linear,
+            work_strategy: WorkStrategy::Linear,
             active_workers: Default::default(),
             results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
@@ -4189,6 +4191,7 @@ mod test_pull_work {
 
 #[cfg(test)]
 mod persistence_on_end_of_manifest {
+    use abq_utils::net_protocol::queue::WorkStrategy;
     use futures::FutureExt;
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -4244,7 +4247,7 @@ mod persistence_on_end_of_manifest {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    WorkStrategy::Linear,
                     worker0,
                     &remote,
                 )
@@ -4271,7 +4274,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 worker0_shadow,
                 &remote,
             )
@@ -4355,7 +4358,7 @@ mod persistence_on_end_of_manifest {
                 queue,
                 init_metadata: Default::default(),
                 batch_size_hint,
-                work_strategy: abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                work_strategy: WorkStrategy::Linear,
                 active_workers: Default::default(),
                 results_persistence: ResultsPersistedCell::new(run_id.clone()),
             };
@@ -4486,7 +4489,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
