@@ -163,7 +163,7 @@ mod test {
         atomic,
         net_protocol::{
             entity::Entity,
-            queue::TestSpec,
+            queue::{TestSpec, WorkStrategy},
             runners::{ProtocolWitness, TestCase},
             workers::{GroupId, WorkId, WorkerTest, INIT_RUN_NUMBER},
         },
@@ -203,11 +203,7 @@ mod test {
             let n = NonZeroUsize::try_from(n).unwrap();
             workers.insert(entity.tag, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(
-                    entity.tag,
-                    n,
-                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
-                );
+                let popped = queue.get_work(entity.tag, n, WorkStrategy::Linear);
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -282,11 +278,7 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(
-                        entity.tag,
-                        n,
-                        abq_utils::net_protocol::queue::WorkStrategy::Linear,
-                    );
+                    let popped = queue.get_work(entity.tag, n, WorkStrategy::Linear);
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
