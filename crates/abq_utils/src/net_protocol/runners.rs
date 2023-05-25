@@ -289,29 +289,14 @@ impl From<RawManifest> for Manifest {
 impl Manifest {
     /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
     pub fn flatten(self) -> (Vec<TestSpec>, MetadataMap) {
-        use v0_2::{Group, Test, TestCase, TestOrGroup};
+        use v0_2::{Group, TestOrGroup};
 
         let Manifest { members, init_meta } = self;
         let mut collected = Vec::with_capacity(members.len());
         let mut queue: VecDeque<_> = members.into_iter().collect();
         while let Some(test_or_group) = queue.pop_front() {
             match test_or_group {
-                TestOrGroup::Test(Test { id, meta, .. }) => {
-                    let spec = TestSpec {
-                        // Generate a fresh ID for ABQ-internal usage.
-                        work_id: WorkId::new(),
-                        group_id: None, // placeholder
-                        test_case: self::TestCase(
-                            TestCase {
-                                id,
-                                meta,
-                                focus: None,
-                            }
-                            .into(),
-                        ),
-                    };
-                    collected.push(spec);
-                }
+                TestOrGroup::Test(test) => Self::add_test_to_collected(test, &mut collected, None),
                 TestOrGroup::Group(Group { members, .. }) => {
                     for member in members.into_iter().rev() {
                         queue.push_front(member);
@@ -320,6 +305,26 @@ impl Manifest {
             }
         }
         (collected, init_meta)
+    }
+
+    fn add_test_to_collected(
+        v0_2::Test { id, meta, .. }: v0_2::Test,
+        collected: &mut Vec<TestSpec>,
+        group_id: Option<GroupId>,
+    ) {
+        collected.push(TestSpec {
+            // Generate a fresh ID for ABQ-internal usage.
+            work_id: WorkId::new(),
+            group_id: group_id, // placeholder
+            test_case: self::TestCase(
+                v0_2::TestCase {
+                    id,
+                    meta,
+                    focus: None,
+                }
+                .into(),
+            ),
+        })
     }
 
     /// Sorts the manifest into a consistent ordering.
@@ -510,7 +515,7 @@ impl std::fmt::Display for Location {
 pub use v0_2::OutOfBandError;
 
 use crate::exit::ExitCode;
-use crate::net_protocol::workers::WorkId;
+use crate::net_protocol::workers::{GroupId, WorkId};
 use crate::time::EpochMillis;
 
 use super::entity::RunnerMeta;
