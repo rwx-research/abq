@@ -2,17 +2,10 @@ use std::{cell::Cell, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
 use abq_utils::{
     atomic,
-    net_protocol::{entity::Tag, workers::WorkerTest},
+    net_protocol::{entity::Tag, queue::WorkStrategy, workers::WorkerTest},
 };
 
 use crate::persistence;
-
-#[derive(Default, Debug, Clone, Copy)]
-pub enum WorkStrategy {
-    #[default]
-    Linear,
-    ByGroup,
-}
 
 /// Concurrently-accessible job queue for a test suite run.
 /// Organized so that concurrent accesses require minimal synchronization, usually
@@ -210,7 +203,11 @@ mod test {
             let n = NonZeroUsize::try_from(n).unwrap();
             workers.insert(entity.tag, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(entity.tag, n, crate::job_queue::WorkStrategy::Linear);
+                let popped = queue.get_work(
+                    entity.tag,
+                    n,
+                    abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                );
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -285,8 +282,11 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped =
-                        queue.get_work(entity.tag, n, crate::job_queue::WorkStrategy::Linear);
+                    let popped = queue.get_work(
+                        entity.tag,
+                        n,
+                        abq_utils::net_protocol::queue::WorkStrategy::Linear,
+                    );
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
