@@ -484,7 +484,7 @@ pub mod workers {
 }
 
 pub mod queue {
-    use std::{io, net::SocketAddr, num::NonZeroU64};
+    use std::{fmt::Display, io, net::SocketAddr, num::NonZeroU64, str::FromStr};
 
     use serde_derive::{Deserialize, Serialize};
 
@@ -522,6 +522,31 @@ pub mod queue {
         // should help before / after work only getting run once
         ByGroup,
     }
+
+    impl Display for WorkStrategy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                WorkStrategy::Linear => write!(f, "default"),
+                WorkStrategy::ByGroup => write!(f, "by-group"),
+            }
+        }
+    }
+
+    impl FromStr for WorkStrategy {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "default" => Ok(Self::Linear),
+                "by-file" => Ok(Self::ByGroup),
+                other => Err(format!(
+                    "Can't parse distribution strategy :'{}', must be default or by-group",
+                    other
+                )),
+            }
+        }
+    }
+
     /// An ask to run some work by an invoker.
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct InvokeWork {
