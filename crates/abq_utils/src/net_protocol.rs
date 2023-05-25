@@ -517,10 +517,9 @@ pub mod queue {
     }
 
     // how strategies for popping work off the queue
-    #[derive(Default, Debug, Clone, Copy)]
+    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
     pub enum WorkStrategy {
         // just pop them up in order
-        #[default]
         Linear,
         // by group aka by file. ensure each top level group gets distributed to a single worker.
         // should help before / after work only getting run once
@@ -531,6 +530,7 @@ pub mod queue {
     pub struct InvokeWork {
         pub run_id: RunId,
         pub batch_size_hint: NonZeroU64,
+        pub work_strategy: WorkStrategy,
     }
 
     /// Specification of a test case to run.

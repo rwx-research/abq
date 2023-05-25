@@ -1665,9 +1665,8 @@ impl GetAssignedRun for ChooseRunForWorker {
         let InvokeWork {
             run_id,
             batch_size_hint,
+            work_strategy,
         } = invoke_work;
-        // TODO: thread this through, move strategy to net_protocol
-        let work_strategy = abq_utils::net_protocol::queue::WorkStrategy::Linear;
 
         let batch_size_hint =
             if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
@@ -1681,7 +1680,13 @@ impl GetAssignedRun for ChooseRunForWorker {
 
         let assigned_run = self
             .queues
-            .find_or_create_run(run_id, batch_size_hint, work_strategy, entity, &self.remote)
+            .find_or_create_run(
+                run_id,
+                batch_size_hint,
+                *work_strategy,
+                entity,
+                &self.remote,
+            )
             .await;
 
         // Now that we've found a run for this ID, if the run is fresh, enqueue a job to check
