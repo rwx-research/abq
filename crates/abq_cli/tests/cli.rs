@@ -3176,6 +3176,7 @@ fn custom_remote_persistence() {
         let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
         insta::assert_json_snapshot!(manifest, {
             ".items[0].spec.work_id" => "[redacted]",
+            ".items[0].spec.group_id" => "[redacted]",
         }, @r###"
         {
           "assigned_entities": [
@@ -3190,6 +3191,7 @@ fn custom_remote_persistence() {
             {
               "run_number": 1,
               "spec": {
+                "group_id": "[redacted]",
                 "test_case": {
                   "id": "test1",
                   "meta": {}
