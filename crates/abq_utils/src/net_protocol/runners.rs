@@ -296,7 +296,7 @@ impl Manifest {
         // 🙋 Ayaz told me to reuse this Deque but I don't understand the implications of re-creating where we extend it below
         let mut queue: VecDeque<v0_2::TestOrGroup> = VecDeque::new();
         for top_level_test_or_group in members {
-            let group_id = Some(GroupId::new());
+            let group_id = GroupId::new();
             match top_level_test_or_group {
                 TestOrGroup::Test(test) => {
                     Self::add_test_to_collected(test, &mut collected, group_id)
@@ -325,7 +325,7 @@ impl Manifest {
     fn add_test_to_collected(
         v0_2::Test { id, meta, .. }: v0_2::Test,
         collected: &mut Vec<TestSpec>,
-        group_id: Option<GroupId>,
+        group_id: GroupId,
     ) {
         collected.push(TestSpec {
             // Generate a fresh ID for ABQ-internal usage.

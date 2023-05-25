@@ -16,7 +16,7 @@ use abq_utils::{
     net_protocol::{
         queue::{AssociatedTestResults, TestSpec},
         runners::{ProtocolWitness, Status, TestCase, TestId, TestResult},
-        workers::WorkId,
+        workers::{GroupId, WorkId},
     },
     time::EpochMillis,
     tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -104,6 +104,10 @@ pub fn wid(id: usize) -> WorkId {
     WorkId([id as u8; 16])
 }
 
+pub fn gid(id: usize) -> GroupId {
+    GroupId([id as u8; 16])
+}
+
 pub fn test(id: usize) -> TestId {
     format!("test{id}")
 }
@@ -113,7 +117,7 @@ pub fn spec(id: usize) -> TestSpec {
     TestSpec {
         test_case: TestCase::new(ProtocolWitness::TEST, test(id), Default::default()),
         work_id: wid(id),
-        group_id: None,
+        group_id: gid(id), // arbitrary
     }
 }
 

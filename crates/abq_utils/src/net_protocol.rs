@@ -529,7 +529,7 @@ pub mod queue {
         /// ABQ-internal identity of this test.
         pub work_id: WorkId,
         /// ABQ-internal group identity of this test.
-        pub group_id: Option<GroupId>,
+        pub group_id: GroupId,
         /// The test case communicated to a native runner.
         pub test_case: TestCase,
     }

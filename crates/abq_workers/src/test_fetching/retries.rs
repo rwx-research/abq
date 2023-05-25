@@ -357,7 +357,7 @@ pub mod test {
     use abq_utils::net_protocol::{
         queue::TestSpec,
         runners::{Status, TestCase},
-        workers::{Eow, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
+        workers::{Eow, GroupId, NextWorkBundle, WorkId, WorkerTest, INIT_RUN_NUMBER},
     };
     use abq_with_protocol_version::with_protocol_version;
     use rand::distributions::{Alphanumeric, DistString};
@@ -374,12 +374,12 @@ pub mod test {
         tracker.hydrate_ordered_manifest_item(TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: WorkId::new(),
-            group_id: None,
+            group_id: GroupId::new(),
         });
         tracker.hydrate_ordered_manifest_item(TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: WorkId::new(),
-            group_id: None,
+            group_id: GroupId::new(),
         });
 
         assert!(failing_subset(&tracker.entries, INIT_RUN_NUMBER)
@@ -397,17 +397,17 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec3 = TestSpec {
             test_case: TestCase::new(proto, "test3", Default::default()),
             work_id: id3,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
@@ -449,27 +449,27 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec3 = TestSpec {
             test_case: TestCase::new(proto, "test3", Default::default()),
             work_id: id3,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec4 = TestSpec {
             test_case: TestCase::new(proto, "test4", Default::default()),
             work_id: id4,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec5 = TestSpec {
             test_case: TestCase::new(proto, "test5", Default::default()),
             work_id: id5,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
@@ -521,7 +521,7 @@ pub mod test {
                     Default::default(),
                 ),
                 work_id: id,
-                group_id: None,
+                group_id: GroupId::new(),
             };
             manifest.push(spec);
         }
@@ -576,17 +576,17 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec3 = TestSpec {
             test_case: TestCase::new(proto, "test3", Default::default()),
             work_id: id3,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
@@ -635,17 +635,17 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec3 = TestSpec {
             test_case: TestCase::new(proto, "test3", Default::default()),
             work_id: id3,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
@@ -688,17 +688,17 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec3 = TestSpec {
             test_case: TestCase::new(proto, "test3", Default::default()),
             work_id: id3,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
@@ -771,17 +771,17 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec3 = TestSpec {
             test_case: TestCase::new(proto, "test3", Default::default()),
             work_id: id3,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
@@ -845,12 +845,12 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
@@ -896,12 +896,12 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
@@ -965,7 +965,7 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 2);
@@ -1078,12 +1078,12 @@ pub mod test {
         let spec1 = TestSpec {
             test_case: TestCase::new(proto, "test1", Default::default()),
             work_id: id1,
-            group_id: None,
+            group_id: GroupId::new(),
         };
         let spec2 = TestSpec {
             test_case: TestCase::new(proto, "test2", Default::default()),
             work_id: id2,
-            group_id: None,
+            group_id: GroupId::new(),
         };
 
         let mut tracker = RetryManifestTracker::new(INIT_RUN_NUMBER + 1);
