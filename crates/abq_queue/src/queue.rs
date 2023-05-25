@@ -43,7 +43,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tracing::instrument;
 
-use crate::job_queue::{JobQueue, Strategy};
+use crate::job_queue::{JobQueue, WorkStrategy};
 use crate::persistence::manifest::{
     self, ManifestPersistedCell, PersistManifestPlan, SharedPersistManifest,
 };
@@ -71,7 +71,7 @@ enum RunState {
         batch_size_hint: NonZeroUsize,
 
         //strategy for pulling tests off the queue
-        dequeue_strategy: crate::job_queue::Strategy,
+        work_strategy: crate::job_queue::WorkStrategy,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -87,7 +87,7 @@ enum RunState {
         batch_size_hint: NonZeroUsize,
 
         //strategy for pulling tests off the queue
-        dequeue_strategy: crate::job_queue::Strategy,
+        work_strategy: crate::job_queue::WorkStrategy,
 
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
@@ -324,13 +324,13 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        dequeue_strategy: Strategy,
+        work_strategy: WorkStrategy,
         entity: Entity,
         remote: &RemotePersister,
     ) -> AssignedRunStatus {
         if !self.runs.read().contains_key(run_id) {
             match self
-                .try_create_run(run_id, batch_size_hint, dequeue_strategy, entity, remote)
+                .try_create_run(run_id, batch_size_hint, work_strategy, entity, remote)
                 .await
             {
                 ControlFlow::Break(assigned) => return assigned,
@@ -357,7 +357,7 @@ impl AllRuns {
             RunState::WaitingForManifest {
                 worker_connection_times,
                 batch_size_hint: _,
-                dequeue_strategy: _,
+                work_strategy: _,
             } => {
                 let mut worker_connection_times = worker_connection_times.lock();
                 let old = worker_connection_times.insert_by_tag(entity, time::Instant::now());
@@ -465,7 +465,7 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        dequeu_strategy: Strategy,
+        dequeu_strategy: WorkStrategy,
         entity: Entity,
         remote: &RemotePersister,
     ) -> ControlFlow<AssignedRunStatus> {
@@ -521,7 +521,7 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        dequeue_strategy: Strategy,
+        work_strategy: WorkStrategy,
         entity: Entity,
     ) -> ControlFlow<AssignedRunStatus> {
         let run = {
@@ -533,7 +533,7 @@ impl AllRuns {
                 state: RunState::WaitingForManifest {
                     worker_connection_times: Mutex::new(worker_timings),
                     batch_size_hint,
-                    dequeue_strategy,
+                    work_strategy,
                 },
             }
         };
@@ -628,15 +628,15 @@ impl AllRuns {
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
 
-        let (worker_connection_times, batch_size_hint, dequeue_strategy) = match &mut run.state {
+        let (worker_connection_times, batch_size_hint, work_strategy) = match &mut run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
                 batch_size_hint,
-                dequeue_strategy,
+                work_strategy,
             } => {
                 // expected state, pass through
                 let timings = Mutex::into_inner(std::mem::take(worker_connection_times));
-                (timings, *batch_size_hint, *dequeue_strategy)
+                (timings, *batch_size_hint, *work_strategy)
             }
             RunState::Cancelled { .. } => {
                 // If cancelled, do nothing.
@@ -671,7 +671,7 @@ impl AllRuns {
         run.state = RunState::HasWork {
             queue,
             batch_size_hint,
-            dequeue_strategy,
+            work_strategy,
             init_metadata,
             active_workers: Mutex::new(active_workers),
             results_persistence: results_persistence.clone(),
@@ -730,12 +730,12 @@ impl AllRuns {
                 queue,
                 batch_size_hint,
                 active_workers,
-                dequeue_strategy,
+                work_strategy,
                 ..
             } => {
                 active_workers.lock().insert_by_tag_if_missing(entity, None);
                 let (bundle, status) =
-                    Self::get_next_work_online(queue, entity, *batch_size_hint, *dequeue_strategy);
+                    Self::get_next_work_online(queue, entity, *batch_size_hint, *work_strategy);
                 match status {
                     PulledTestsStatus::MoreTestsRemaining => NextWorkResult {
                         bundle,
@@ -787,7 +787,7 @@ impl AllRuns {
         queue: &JobQueue,
         entity: Entity,
         batch_size_hint: NonZeroUsize,
-        strategy: Strategy,
+        strategy: WorkStrategy,
     ) -> (NextWorkBundle, PulledTestsStatus) {
         // NB: in the future, the batch size is likely to be determined intelligently, i.e.
         // from off-line timing data. But for now, we use the hint the client provided.
@@ -1667,7 +1667,7 @@ impl GetAssignedRun for ChooseRunForWorker {
             batch_size_hint,
         } = invoke_work;
         // TODO: thread this through, move strategy to net_protocol
-        let dequeue_strategy = crate::job_queue::Strategy::Linear;
+        let work_strategy = crate::job_queue::WorkStrategy::Linear;
 
         let batch_size_hint =
             if batch_size_hint.get() > MAX_BATCH_SIZE.get() as u64 {
@@ -1681,13 +1681,7 @@ impl GetAssignedRun for ChooseRunForWorker {
 
         let assigned_run = self
             .queues
-            .find_or_create_run(
-                run_id,
-                batch_size_hint,
-                dequeue_strategy,
-                entity,
-                &self.remote,
-            )
+            .find_or_create_run(run_id, batch_size_hint, work_strategy, entity, &self.remote)
             .await;
 
         // Now that we've found a run for this ID, if the run is fresh, enqueue a job to check
@@ -3117,7 +3111,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3137,7 +3131,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3159,7 +3153,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3187,7 +3181,7 @@ mod test {
                 .find_or_create_run(
                     run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote::NoopPersister::new().into(),
                 )
@@ -3217,7 +3211,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3246,7 +3240,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3277,7 +3271,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3316,7 +3310,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     worker0,
                     &remote,
                 )
@@ -3337,7 +3331,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     worker1,
                     &remote,
                 )
@@ -3366,7 +3360,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     worker2,
                     &remote,
                 )
@@ -3451,7 +3445,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3535,7 +3529,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3617,7 +3611,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3667,7 +3661,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3694,7 +3688,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3722,7 +3716,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3751,7 +3745,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3775,7 +3769,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3808,7 +3802,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3889,7 +3883,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3932,7 +3926,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 entity,
                 &remote,
             )
@@ -3968,7 +3962,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4004,7 +3998,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4046,7 +4040,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4082,7 +4076,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4131,7 +4125,7 @@ mod test_pull_work {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
-            dequeue_strategy: crate::job_queue::Strategy::Linear,
+            work_strategy: crate::job_queue::WorkStrategy::Linear,
             active_workers: Default::default(),
             results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
@@ -4245,7 +4239,7 @@ mod persistence_on_end_of_manifest {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    crate::job_queue::Strategy::Linear,
+                    crate::job_queue::WorkStrategy::Linear,
                     worker0,
                     &remote,
                 )
@@ -4272,7 +4266,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 worker0_shadow,
                 &remote,
             )
@@ -4356,7 +4350,7 @@ mod persistence_on_end_of_manifest {
                 queue,
                 init_metadata: Default::default(),
                 batch_size_hint,
-                dequeue_strategy: crate::job_queue::Strategy::Linear,
+                work_strategy: crate::job_queue::WorkStrategy::Linear,
                 active_workers: Default::default(),
                 results_persistence: ResultsPersistedCell::new(run_id.clone()),
             };
@@ -4487,7 +4481,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                crate::job_queue::Strategy::Linear,
+                crate::job_queue::WorkStrategy::Linear,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4567,7 +4561,7 @@ mod persist_results {
     use ntest::timeout;
 
     use crate::{
-        job_queue::{JobQueue, Strategy},
+        job_queue::{JobQueue, WorkStrategy},
         persistence::{self, results::ResultsPersistedCell},
         queue::ReadResultsState,
         worker_tracking::WorkerSet,
@@ -4592,7 +4586,7 @@ mod persist_results {
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
                 batch_size_hint: one_nonzero_usize(),
-                dequeue_strategy: Strategy::Linear,
+                work_strategy: WorkStrategy::Linear,
             };
             queues.set_state(run_id.clone(), done);
             queues
@@ -4722,7 +4716,7 @@ mod persist_results {
 
     get_read_results_cell! {
         get_read_results_cell_when_waiting_for_manifest,
-        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), dequeue_strategy: Strategy::Linear },
+        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), work_strategy: WorkStrategy::Linear },
         Err(ReadResultsError::WaitingForManifest)
     }
 
@@ -4736,7 +4730,7 @@ mod persist_results {
                 queue: Default::default(),
                 init_metadata: Default::default(),
                 batch_size_hint: one_nonzero_usize(),
-                dequeue_strategy: Strategy::Linear,
+                work_strategy: WorkStrategy::Linear,
                 active_workers: parking_lot::Mutex::new(active_workers),
                 results_persistence: ResultsPersistedCell::new(RunId::unique()),
             }
@@ -4818,7 +4812,7 @@ mod persist_results {
             let has_work = RunState::HasWork {
                 queue: JobQueue::default(),
                 batch_size_hint,
-                dequeue_strategy: Strategy::Linear,
+                work_strategy: WorkStrategy::Linear,
                 init_metadata: Default::default(),
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
