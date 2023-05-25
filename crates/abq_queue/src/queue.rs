@@ -594,7 +594,7 @@ impl AllRuns {
     }
 
     /// Adds the initial manifest for an ABQ test suite run.
-    pub fn add_manifest(
+    fn add_manifest(
         &self,
         run_id: &RunId,
         flat_manifest: Vec<TestSpec>,
@@ -658,7 +658,7 @@ impl AllRuns {
         }
     }
 
-    pub fn init_metadata(&self, run_id: &RunId, entity: Entity) -> InitMetadata {
+    fn init_metadata(&self, run_id: &RunId, entity: Entity) -> InitMetadata {
         let runs = self.runs.read();
 
         let run = runs.get(run_id).expect("no run recorded").read();
@@ -694,7 +694,7 @@ impl AllRuns {
         }
     }
 
-    pub fn next_work<'a>(&self, entity: Entity, run_id: &'a RunId) -> NextWorkResult<'a> {
+    fn next_work<'a>(&self, entity: Entity, run_id: &'a RunId) -> NextWorkResult<'a> {
         let runs = self.runs.read();
 
         let run = runs.get(run_id).expect("no run recorded").read();
@@ -804,7 +804,7 @@ impl AllRuns {
         (bundle, pulled_tests_status)
     }
 
-    pub fn get_write_results_cell(
+    fn get_write_results_cell(
         &self,
         run_id: &RunId,
     ) -> Result<(ResultsPersistedCell, EligibleForRemoteDump), WriteResultsError> {
@@ -842,10 +842,7 @@ impl AllRuns {
         }
     }
 
-    pub fn get_read_results_cell(
-        &self,
-        run_id: &RunId,
-    ) -> Result<ReadResultsState, ReadResultsError> {
+    fn get_read_results_cell(&self, run_id: &RunId) -> Result<ReadResultsState, ReadResultsError> {
         use ReadResultsError::*;
 
         let runs = self.runs.read();
@@ -900,7 +897,7 @@ impl AllRuns {
         }
     }
 
-    pub fn get_retry_manifest(&self, run_id: &RunId, entity: Entity) -> RetryManifestState {
+    fn get_retry_manifest(&self, run_id: &RunId, entity: Entity) -> RetryManifestState {
         let runs = self.runs.read();
         let run = match runs.get(run_id) {
             Some(run) => run.read(),
@@ -970,7 +967,7 @@ impl AllRuns {
         }
     }
 
-    pub fn mark_worker_complete(&self, run_id: &RunId, entity: Entity, notification_time: Instant) {
+    fn mark_worker_complete(&self, run_id: &RunId, entity: Entity, notification_time: Instant) {
         let runs = self.runs.read();
 
         let run = match runs.get(run_id) {
@@ -1107,7 +1104,7 @@ impl AllRuns {
         })
     }
 
-    pub fn mark_failed_to_receive_manifest(&self, run_id: RunId) {
+    fn mark_failed_to_receive_manifest(&self, run_id: RunId) {
         let runs = self.runs.read();
 
         let mut run = runs.get(&run_id).expect("no run recorded").write();
@@ -1142,7 +1139,7 @@ impl AllRuns {
     }
 
     /// Marks a run as complete because it had the trivial manifest.
-    pub fn mark_empty_manifest_complete(&self, run_id: RunId) -> RecordedEmptyManifest {
+    fn mark_empty_manifest_complete(&self, run_id: RunId) -> RecordedEmptyManifest {
         let runs = self.runs.read();
 
         let mut run = runs.get(&run_id).expect("no run recorded").write();
@@ -1183,7 +1180,7 @@ impl AllRuns {
         }
     }
 
-    pub fn mark_cancelled(&self, run_id: &RunId, entity: Entity, reason: CancelReason) {
+    fn mark_cancelled(&self, run_id: &RunId, entity: Entity, reason: CancelReason) {
         let runs = self.runs.read();
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
@@ -1250,7 +1247,7 @@ impl AllRuns {
     /// made; otherwise, does nothing.
     ///
     /// Returns `None` if the run does not exist.
-    pub fn handle_manifest_progress_timeout(
+    fn handle_manifest_progress_timeout(
         &self,
         run_id: &RunId,
         last_observed_test_index: usize,
