@@ -2260,7 +2260,7 @@ mod test_init_native_runner {
     #[tokio::test]
     async fn handle_failure_of_process_that_breaks_only_when_port_dropped() {
         let js_script = write_to_temp(
-            &"
+            "
             const net = require('net');
 
             async function main() {
