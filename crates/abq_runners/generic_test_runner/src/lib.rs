@@ -500,9 +500,13 @@ impl<'a> NativeRunnerHandle<'a> {
         let (runner_info, runner_conn) = match opt_open_connection_err {
             Ok(r) => r,
             Err(error) => {
-                let output =
-                    Self::handle_native_runner_connection_error(listener, child, child_output)
-                        .await;
+                let output = Self::handle_native_runner_connection_error(
+                    listener,
+                    child,
+                    child_output,
+                    protocol_version_timeout,
+                )
+                .await;
                 return Err(GenericRunnerError { error, output });
             }
         };
@@ -525,6 +529,7 @@ impl<'a> NativeRunnerHandle<'a> {
         listener: TcpListener,
         mut child: process::Child,
         mut child_output: ChildOutputHandler,
+        kill_after_timeout: Duration,
     ) -> StdioOutput {
         // Make sure to drop the port the native runner was supposed to connect to.
         // If the native runner then tries to connect, they should fail.
@@ -537,7 +542,7 @@ impl<'a> NativeRunnerHandle<'a> {
             {
                 ct.map(|ct| ct.into()).unwrap_or_default()
             }
-            () = tokio::time::sleep(Duration::from_secs(5)) => {
+            () = tokio::time::sleep(kill_after_timeout) => {
                 let _ = child.kill().await.located(here!());
                 Default::default()
             }
@@ -2187,5 +2192,121 @@ mod test_invalid_command {
         assert_eq!(test_runner_exit.exit_code, ExitCode::CANCELLED);
 
         assert!(!all_tests_run.load(atomic::ORDERING));
+    }
+}
+
+#[cfg(test)]
+mod test_init_native_runner {
+    use std::{process::Stdio, time::Duration};
+
+    use abq_test_utils::write_to_temp;
+    use abq_utils::capture_output::{CaptureChildOutputStrategy, ChildOutputStrategy};
+    use tokio::{net::TcpListener, process};
+
+    use crate::NativeRunnerHandle;
+
+    #[tokio::test]
+    async fn handle_failure_of_process_that_exits_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut child = process::Command::new("echo")
+            .arg("foo")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = CaptureChildOutputStrategy::new(false).create(
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
+            false,
+        );
+
+        let output = NativeRunnerHandle::handle_native_runner_connection_error(
+            listener,
+            child,
+            output,
+            Duration::MAX,
+        )
+        .await;
+
+        assert!(output.stderr.is_empty());
+        assert_eq!(&output.stdout, b"foo\n");
+    }
+
+    #[tokio::test]
+    async fn handle_failure_of_process_that_hangs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut child = process::Command::new("yes")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = CaptureChildOutputStrategy::new(false).create(
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
+            false,
+        );
+
+        let output = NativeRunnerHandle::handle_native_runner_connection_error(
+            listener,
+            child,
+            output,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(output.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_failure_of_process_that_breaks_only_when_port_dropped() {
+        let js_script = write_to_temp(
+            &"
+            const net = require('net');
+
+            async function main() {
+              await new Promise(resolve => {
+                const sock = new net.Socket();
+                sock.connect({
+                  host: '127.0.0.1',
+                  port: 8080,
+                });
+                sock.on('connect', () => {
+                  console.log('SUCCESSFULLY CONNECTED');
+                  resolve();
+                });
+                sock.on('error', () => {
+                  console.log('FAILED TO CONNECT');
+                  resolve();
+                });
+              });
+            }
+
+            main();
+            ",
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut child = process::Command::new("node")
+            .arg(js_script.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = CaptureChildOutputStrategy::new(false).create(
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
+            false,
+        );
+
+        let output = NativeRunnerHandle::handle_native_runner_connection_error(
+            listener,
+            child,
+            output,
+            Duration::MAX,
+        )
+        .await;
+
+        assert!(output.stderr.is_empty());
+        assert_eq!(&output.stdout, b"FAILED TO CONNECT\n");
     }
 }

@@ -21,6 +21,7 @@ use abq_utils::{
     time::EpochMillis,
     tls::{ClientTlsStrategy, ServerTlsStrategy},
 };
+use tempfile::NamedTempFile;
 
 pub mod color_writer;
 
@@ -230,6 +231,13 @@ pub async fn build_fake_connection() -> (
         tokio::join!(client.connect(server_addr), accept_handshake(&*server));
     let (client_conn, (server_conn, _)) = (client_res.unwrap(), server_res.unwrap());
     (server, server_conn, client_conn)
+}
+
+pub fn write_to_temp(content: &str) -> NamedTempFile {
+    use std::io::Write;
+    let mut fi = NamedTempFile::new().unwrap();
+    fi.write_all(content.as_bytes()).unwrap();
+    fi
 }
 
 #[macro_export]
