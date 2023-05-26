@@ -2259,33 +2259,35 @@ mod test_init_native_runner {
 
     #[tokio::test]
     async fn handle_failure_of_process_that_breaks_only_when_port_dropped() {
-        let js_script = write_to_temp(
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let js_script = write_to_temp(&indoc::formatdoc! {
             "
             const net = require('net');
 
-            async function main() {
-              await new Promise(resolve => {
+            async function main() {{
+              await new Promise(resolve => {{
                 const sock = new net.Socket();
-                sock.connect({
+                sock.connect({{
                   host: '127.0.0.1',
-                  port: 8080,
-                });
-                sock.on('connect', () => {
+                  port: {port},
+                }});
+                sock.on('connect', () => {{
                   console.log('SUCCESSFULLY CONNECTED');
                   resolve();
-                });
-                sock.on('error', () => {
+                }});
+                sock.on('error', () => {{
                   console.log('FAILED TO CONNECT');
                   resolve();
-                });
-              });
-            }
+                }});
+              }});
+            }}
 
             main();
             ",
-        );
+            port=port,
+        });
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut child = process::Command::new("node")
             .arg(js_script.path())
             .stdout(Stdio::piped())
