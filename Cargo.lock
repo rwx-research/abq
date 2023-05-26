@@ -234,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "abq_utils",
  "regex",
+ "tempfile",
  "termcolor",
  "tokio",
  "tracing-test",

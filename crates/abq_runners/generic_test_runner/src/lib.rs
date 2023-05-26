@@ -343,6 +343,9 @@ struct NativeRunnerState {
     child: process::Child,
     child_output: ChildOutputHandler,
     previous_child_output: Option<CapturedOutput>,
+
+    // Needed to keep the port alive.
+    _tcp_listener: TcpListener,
     conn: RunnerConnection,
     runner_info: NativeRunnerInfo,
     runner_meta: RunnerMeta,
@@ -359,7 +362,6 @@ impl NativeRunnerState {
 
 /// Representation of a native runner between one or more test suite runs.
 struct NativeRunnerHandle<'a> {
-    listener: TcpListener,
     protocol_version_timeout: Duration,
     args: NativeRunnerArgs<'a>,
     /// The current test suite run number.
@@ -388,7 +390,6 @@ impl<'a> NativeRunnerHandle<'a> {
     /// Create a new handle to manage one or more native runner instances across one or more
     /// runs of a test suite.
     async fn new(
-        mut listener: TcpListener,
         args: NativeRunnerArgs<'a>,
         should_generate_manifest: bool,
         protocol_version_timeout: Duration,
@@ -398,7 +399,6 @@ impl<'a> NativeRunnerHandle<'a> {
     ) -> Result<NativeRunnerHandle<'a>, GenericRunnerError> {
         let run_number = INIT_RUN_NUMBER;
         let native_runner_state = Self::new_native_runner(
-            &mut listener,
             args,
             should_generate_manifest,
             false, // is not a retry at this point
@@ -409,7 +409,6 @@ impl<'a> NativeRunnerHandle<'a> {
         )
         .await?;
         Ok(Self {
-            listener,
             protocol_version_timeout,
             args,
             run_number,
@@ -443,7 +442,6 @@ impl<'a> NativeRunnerHandle<'a> {
     //       | -   recv Done    ->   |             |      <close conn>            |
     // Queue |                       | Worker (us) |                              | Native runner
     async fn new_native_runner(
-        listener: &mut TcpListener,
         args: NativeRunnerArgs<'a>,
         should_generate_manifest: bool,
         is_retry: bool,
@@ -452,6 +450,7 @@ impl<'a> NativeRunnerHandle<'a> {
         child_output_strategy: &ChildOutputStrategyBox,
         previous_child_output: Option<CapturedOutput>,
     ) -> Result<NativeRunnerState, GenericRunnerError> {
+        let mut listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
         let our_addr = try_setup!(listener.local_addr());
 
         let NativeRunnerArgs {
@@ -486,7 +485,7 @@ impl<'a> NativeRunnerHandle<'a> {
         // exiting silently itself.
         let mut child = try_setup!(native_runner.spawn());
 
-        let mut child_output = child_output_strategy.create(
+        let child_output = child_output_strategy.create(
             child.stdout.take().expect("just spawned"),
             child.stderr.take().expect("just spawned"),
             is_retry,
@@ -494,18 +493,20 @@ impl<'a> NativeRunnerHandle<'a> {
 
         // First, get and validate the protocol version message.
         let opt_open_connection_err =
-            open_native_runner_connection(listener, protocol_version_timeout)
+            open_native_runner_connection(&mut listener, protocol_version_timeout)
                 .await
                 .located(here!());
 
         let (runner_info, runner_conn) = match opt_open_connection_err {
             Ok(r) => r,
             Err(error) => {
-                let output = child_output
-                    .finish()
-                    .await
-                    .map(|ct| ct.into())
-                    .unwrap_or_default();
+                let output = Self::handle_native_runner_connection_error(
+                    listener,
+                    child,
+                    child_output,
+                    protocol_version_timeout,
+                )
+                .await;
                 return Err(GenericRunnerError { error, output });
             }
         };
@@ -514,11 +515,38 @@ impl<'a> NativeRunnerHandle<'a> {
             child,
             child_output,
             conn: runner_conn,
+            _tcp_listener: listener,
             runner_info,
             runner_meta,
             for_manifest_generation: should_generate_manifest,
             previous_child_output,
         })
+    }
+
+    /// Wait for a native runner to exit (or forcefully terminate it) after it fails to connect to
+    /// ABQ, and return any final output that could be captured for it.
+    async fn handle_native_runner_connection_error(
+        listener: TcpListener,
+        mut child: process::Child,
+        mut child_output: ChildOutputHandler,
+        kill_after_timeout: Duration,
+    ) -> StdioOutput {
+        // Make sure to drop the port the native runner was supposed to connect to.
+        // If the native runner then tries to connect, they should fail.
+        drop(listener);
+
+        // The child may decide to hang around even after the communication port is closed,
+        // so time it out if that happens.
+        tokio::select! {
+            ct = child_output.finish()  =>
+            {
+                ct.map(|ct| ct.into()).unwrap_or_default()
+            }
+            () = tokio::time::sleep(kill_after_timeout) => {
+                let _ = child.kill().await.located(here!());
+                Default::default()
+            }
+        }
     }
 
     async fn send_init_message(&mut self, init_context: &InitContext) -> Result<(), LocatedError> {
@@ -568,7 +596,6 @@ impl<'a> NativeRunnerHandle<'a> {
         let runner_meta = self.runner_meta;
 
         self.state = Self::new_native_runner(
-            &mut self.listener,
             self.args,
             false, // don't generate manifest
             false, // this is start-of-run, not a retry
@@ -617,7 +644,6 @@ impl<'a> NativeRunnerHandle<'a> {
         let previous_child_output = self.previous_child_output.take();
 
         self.state = Self::new_native_runner(
-            &mut self.listener,
             self.args,
             should_generate_manifest,
             is_retry,
@@ -688,9 +714,7 @@ pub async fn run_async(
     };
 
     let build_runner_and_run_to_completion = async move {
-        let listener = try_setup!(TcpListener::bind("127.0.0.1:0").await);
         let opt_native_runner_handle = NativeRunnerHandle::new(
-            listener,
             native_runner_args,
             send_manifest.is_some(),
             protocol_version_timeout,
@@ -2168,5 +2192,123 @@ mod test_invalid_command {
         assert_eq!(test_runner_exit.exit_code, ExitCode::CANCELLED);
 
         assert!(!all_tests_run.load(atomic::ORDERING));
+    }
+}
+
+#[cfg(test)]
+mod test_init_native_runner {
+    use std::{process::Stdio, time::Duration};
+
+    use abq_test_utils::write_to_temp;
+    use abq_utils::capture_output::{CaptureChildOutputStrategy, ChildOutputStrategy};
+    use tokio::{net::TcpListener, process};
+
+    use crate::NativeRunnerHandle;
+
+    #[tokio::test]
+    async fn handle_failure_of_process_that_exits_cleanly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut child = process::Command::new("echo")
+            .arg("foo")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = CaptureChildOutputStrategy::new(false).create(
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
+            false,
+        );
+
+        let output = NativeRunnerHandle::handle_native_runner_connection_error(
+            listener,
+            child,
+            output,
+            Duration::MAX,
+        )
+        .await;
+
+        assert!(output.stderr.is_empty());
+        assert_eq!(&output.stdout, b"foo\n");
+    }
+
+    #[tokio::test]
+    async fn handle_failure_of_process_that_hangs() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut child = process::Command::new("yes")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = CaptureChildOutputStrategy::new(false).create(
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
+            false,
+        );
+
+        let output = NativeRunnerHandle::handle_native_runner_connection_error(
+            listener,
+            child,
+            output,
+            Duration::ZERO,
+        )
+        .await;
+
+        assert!(output.stderr.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_failure_of_process_that_breaks_only_when_port_dropped() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let js_script = write_to_temp(&indoc::formatdoc! {
+            "
+            const net = require('net');
+
+            async function main() {{
+              await new Promise(resolve => {{
+                const sock = new net.Socket();
+                sock.connect({{
+                  host: '127.0.0.1',
+                  port: {port},
+                }});
+                sock.on('connect', () => {{
+                  console.log('SUCCESSFULLY CONNECTED');
+                  resolve();
+                }});
+                sock.on('error', () => {{
+                  console.log('FAILED TO CONNECT');
+                  resolve();
+                }});
+              }});
+            }}
+
+            main();
+            ",
+            port=port,
+        });
+
+        let mut child = process::Command::new("node")
+            .arg(js_script.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = CaptureChildOutputStrategy::new(false).create(
+            child.stdout.take().unwrap(),
+            child.stderr.take().unwrap(),
+            false,
+        );
+
+        let output = NativeRunnerHandle::handle_native_runner_connection_error(
+            listener,
+            child,
+            output,
+            Duration::MAX,
+        )
+        .await;
+
+        assert!(output.stderr.is_empty());
+        assert_eq!(&output.stdout, b"FAILED TO CONNECT\n");
     }
 }

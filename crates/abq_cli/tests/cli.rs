@@ -3,7 +3,7 @@
 #![allow(clippy::useless_format)]
 
 use abq_native_runner_simulation::{pack, pack_msgs, pack_msgs_to_disk, Msg::*};
-use abq_test_utils::{artifacts_dir, s, sanitize_output, WORKSPACE};
+use abq_test_utils::{artifacts_dir, s, sanitize_output, write_to_temp, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, RawTestResultMessage,
@@ -3041,13 +3041,6 @@ fn native_runner_fault_followed_by_success_results_in_report_success() {
     }
 
     term(queue_proc);
-}
-
-fn write_to_temp(content: &str) -> NamedTempFile {
-    use std::io::Write;
-    let mut fi = NamedTempFile::new().unwrap();
-    fi.write_all(content.as_bytes()).unwrap();
-    fi
 }
 
 fn heuristic_wait_for_written_path(path: &Path) {
