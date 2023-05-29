@@ -518,16 +518,18 @@ pub mod queue {
     pub enum WorkStrategy {
         // just pop them up in order
         ByTest,
-        // by group aka by file. ensure each top level group gets distributed to a single worker.
-        // should help before / after work only getting run once
-        ByGroup,
+        // by top level group (which should, in most cases, be by-file, and if not, should still exhibit similar before- and after- work characteristsics).
+        // using this strategy ensure each top level group gets distributed to a single worker.
+        // should avoid running expensive before-group / after-group work from being run multiple times at the expense
+        // of uneven test distribution
+        ByTopLevelGroup,
     }
 
     impl Display for WorkStrategy {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                WorkStrategy::ByTest => write!(f, "default"),
-                WorkStrategy::ByGroup => write!(f, "by-group"),
+                WorkStrategy::ByTest => write!(f, "by-test"),
+                WorkStrategy::ByTopLevelGroup => write!(f, "by-file"),
             }
         }
     }
@@ -537,8 +539,8 @@ pub mod queue {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
-                "default" => Ok(Self::ByTest),
-                "by-file" => Ok(Self::ByGroup),
+                "by-test" => Ok(Self::ByTest),
+                "by-file" => Ok(Self::ByTopLevelGroup),
                 other => Err(format!(
                     "Can't parse distribution strategy :'{}', must be default or by-group",
                     other

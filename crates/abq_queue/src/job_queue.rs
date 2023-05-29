@@ -60,7 +60,7 @@ impl JobQueue {
 
         let end_idx = match strategy {
             WorkStrategy::ByTest => std::cmp::min(start_idx + n, self.queue.len()),
-            WorkStrategy::ByGroup => {
+            WorkStrategy::ByTopLevelGroup => {
                 let mut end_idx = start_idx;
                 // grab new groups until we satisfy batch num
                 let mut current_group = self.queue[start_idx].spec.group_id;
