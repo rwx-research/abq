@@ -518,7 +518,7 @@ pub mod queue {
     pub enum WorkStrategy {
         // just pop them up in order
         ByTest,
-        // by top level group (which should, in most cases, be by-file, and if not, should still exhibit similar before- and after- work characteristsics).
+        // by top level group (which should, in most cases, be by-file, and if not, should still exhibit similar before- and after- work characteristics).
         // using this strategy ensure each top level group gets distributed to a single worker.
         // should avoid running expensive before-group / after-group work from being run multiple times at the expense
         // of uneven test distribution
