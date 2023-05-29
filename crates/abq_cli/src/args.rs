@@ -331,7 +331,7 @@ pub enum Command {
         /// The non-default behavior can be helpful if you have very expensive setup or teardowns in a test file
         /// that would, by default, be run multiples times by multiples workers instead of a single time on the worker
         /// responsible for that test file.
-        #[clap(long, default_value = "default")]
+        #[clap(long, default_value = "by-test")]
         test_strategy: WorkStrategy,
 
         /// Whether to report tests with colors.
