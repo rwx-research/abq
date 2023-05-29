@@ -21,9 +21,9 @@
 //!
 //! The sum type is then normalized to one data structure that the rest of ABQ operates over.
 
+use std::ops::Deref;
 use std::ops::DerefMut;
 use std::time::Duration;
-use std::{collections::VecDeque, ops::Deref};
 
 use serde_derive::{Deserialize, Serialize};
 
@@ -294,7 +294,6 @@ impl Manifest {
         let mut collected = Vec::with_capacity(members.len());
 
         // 🙋 Ayaz told me to reuse this Deque but I don't understand the implications of re-creating where we extend it below
-        let mut queue: VecDeque<v0_2::TestOrGroup> = VecDeque::new();
         for top_level_test_or_group in members {
             let group_id = GroupId::new();
             match top_level_test_or_group {
@@ -302,16 +301,15 @@ impl Manifest {
                     Self::add_test_to_collected(test, &mut collected, group_id)
                 }
                 TestOrGroup::Group(Group { members, .. }) => {
-                    queue.clear();
-                    queue.extend(members);
-                    while let Some(test_or_group) = queue.pop_front() {
+                    let mut queue: Vec<v0_2::TestOrGroup> = members;
+                    while let Some(test_or_group) = queue.pop() {
                         match test_or_group {
                             TestOrGroup::Test(test) => {
                                 Self::add_test_to_collected(test, &mut collected, group_id)
                             }
                             TestOrGroup::Group(Group { members, .. }) => {
                                 for member in members.into_iter().rev() {
-                                    queue.push_front(member);
+                                    queue.push(member);
                                 }
                             }
                         }
