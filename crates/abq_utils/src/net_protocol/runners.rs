@@ -322,6 +322,7 @@ impl Manifest {
         (collected, init_meta)
     }
 
+    #[inline]
     fn add_test_to_collected(
         v0_2::Test { id, meta, .. }: v0_2::Test,
         collected: &mut Vec<TestSpec>,
