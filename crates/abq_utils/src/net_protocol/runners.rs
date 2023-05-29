@@ -293,7 +293,6 @@ impl Manifest {
         let Manifest { members, init_meta } = self;
         let mut collected = Vec::with_capacity(members.len());
 
-        // 🙋 Ayaz told me to reuse this Deque but I don't understand the implications of re-creating where we extend it below
         for top_level_test_or_group in members {
             let group_id = GroupId::new();
             match top_level_test_or_group {
