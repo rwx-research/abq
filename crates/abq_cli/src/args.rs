@@ -318,8 +318,6 @@ pub enum Command {
         #[clap(long, default_value = "7")]
         batch_size: NonZeroU64,
 
-        // 🤔 right now this feels like more of a flag than a config option. Should we just make it a flag? `--group-by-file`?
-        // I can imagine expanding on this in the future, but maybe then we can make it an option.
         /// How ABQ will distribute the tests.
         ///
         /// By default, ABQ will distribute the next unassigned test to a worker asking for tests.
@@ -328,7 +326,7 @@ pub enum Command {
         /// that would, by default, be run multiples times by multiples workers instead of a single time on the worker
         /// responsible for that test file.
         #[clap(long, default_value = "default")]
-        work_strategy: WorkStrategy,
+        test_strategy: WorkStrategy,
 
         /// Whether to report tests with colors.
         ///
