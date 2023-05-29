@@ -905,7 +905,7 @@ mod test {
         let invoke_data = InvokeWork {
             run_id,
             batch_size_hint: one_nonzero(),
-            work_strategy: WorkStrategy::Linear,
+            work_strategy: WorkStrategy::ByTest,
         };
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
