@@ -326,7 +326,7 @@ pub enum Command {
 
         // 🤔 right now this feels like more of a flag than a config option. Should we just make it a flag? `--group-by-file`?
         // I can imagine expanding on this in the future, but maybe then we can make it an option.
-        /// How we will traverse the tests
+        /// How ABQ will distribute the tests.
         ///
         /// By default, ABQ will distribute the next unassigned test to a worker asking for tests.
         /// work-strategy=by-file, abq will distribute whole-files-at-a-time to workers asking for tests.
