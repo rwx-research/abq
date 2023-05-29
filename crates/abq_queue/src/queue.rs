@@ -465,7 +465,7 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        dequeu_strategy: WorkStrategy,
+        work_strategy: WorkStrategy,
         entity: Entity,
         remote: &RemotePersister,
     ) -> ControlFlow<AssignedRunStatus> {
@@ -479,7 +479,7 @@ impl AllRuns {
                     Ok(self.try_create_globally_fresh_run(
                         run_id,
                         batch_size_hint,
-                        dequeu_strategy,
+                        work_strategy,
                         entity,
                     ))
                 }
@@ -493,7 +493,7 @@ impl AllRuns {
                     Ok(self.try_create_globally_fresh_run(
                         run_id,
                         batch_size_hint,
-                        dequeu_strategy,
+                        work_strategy,
                         entity,
                     ))
                 }
