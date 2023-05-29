@@ -3117,7 +3117,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3137,7 +3137,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3159,7 +3159,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3187,7 +3187,7 @@ mod test {
                 .find_or_create_run(
                     run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote::NoopPersister::new().into(),
                 )
@@ -3217,7 +3217,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3246,7 +3246,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3277,7 +3277,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3316,7 +3316,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     worker0,
                     &remote,
                 )
@@ -3337,7 +3337,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     worker1,
                     &remote,
                 )
@@ -3366,7 +3366,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     worker2,
                     &remote,
                 )
@@ -3451,7 +3451,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3535,7 +3535,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3617,7 +3617,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3667,7 +3667,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3694,7 +3694,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3722,7 +3722,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3751,7 +3751,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3775,7 +3775,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3808,7 +3808,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3889,7 +3889,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3932,7 +3932,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 entity,
                 &remote,
             )
@@ -3968,7 +3968,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4004,7 +4004,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4046,7 +4046,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4082,7 +4082,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4132,7 +4132,7 @@ mod test_pull_work {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
-            work_strategy: WorkStrategy::Linear,
+            work_strategy: WorkStrategy::ByTest,
             active_workers: Default::default(),
             results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
@@ -4247,7 +4247,7 @@ mod persistence_on_end_of_manifest {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::Linear,
+                    WorkStrategy::ByTest,
                     worker0,
                     &remote,
                 )
@@ -4274,7 +4274,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 worker0_shadow,
                 &remote,
             )
@@ -4358,7 +4358,7 @@ mod persistence_on_end_of_manifest {
                 queue,
                 init_metadata: Default::default(),
                 batch_size_hint,
-                work_strategy: WorkStrategy::Linear,
+                work_strategy: WorkStrategy::ByTest,
                 active_workers: Default::default(),
                 results_persistence: ResultsPersistedCell::new(run_id.clone()),
             };
@@ -4489,7 +4489,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::Linear,
+                WorkStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4594,7 +4594,7 @@ mod persist_results {
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
                 batch_size_hint: one_nonzero_usize(),
-                work_strategy: WorkStrategy::Linear,
+                work_strategy: WorkStrategy::ByTest,
             };
             queues.set_state(run_id.clone(), done);
             queues
@@ -4724,7 +4724,7 @@ mod persist_results {
 
     get_read_results_cell! {
         get_read_results_cell_when_waiting_for_manifest,
-        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), work_strategy: WorkStrategy::Linear },
+        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), work_strategy: WorkStrategy::ByTest },
         Err(ReadResultsError::WaitingForManifest)
     }
 
@@ -4738,7 +4738,7 @@ mod persist_results {
                 queue: Default::default(),
                 init_metadata: Default::default(),
                 batch_size_hint: one_nonzero_usize(),
-                work_strategy: WorkStrategy::Linear,
+                work_strategy: WorkStrategy::ByTest,
                 active_workers: parking_lot::Mutex::new(active_workers),
                 results_persistence: ResultsPersistedCell::new(RunId::unique()),
             }
@@ -4820,7 +4820,7 @@ mod persist_results {
             let has_work = RunState::HasWork {
                 queue: JobQueue::default(),
                 batch_size_hint,
-                work_strategy: WorkStrategy::Linear,
+                work_strategy: WorkStrategy::ByTest,
                 init_metadata: Default::default(),
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),

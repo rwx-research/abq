@@ -59,7 +59,7 @@ impl JobQueue {
         let mut start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
 
         let end_idx = match strategy {
-            WorkStrategy::Linear => std::cmp::min(start_idx + n, self.queue.len()),
+            WorkStrategy::ByTest => std::cmp::min(start_idx + n, self.queue.len()),
             WorkStrategy::ByGroup => {
                 let mut end_idx = start_idx;
                 // grab new groups until we satisfy batch num
@@ -203,7 +203,7 @@ mod test {
             let n = NonZeroUsize::try_from(n).unwrap();
             workers.insert(entity.tag, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(entity.tag, n, WorkStrategy::Linear);
+                let popped = queue.get_work(entity.tag, n, WorkStrategy::ByTest);
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -278,7 +278,7 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity.tag, n, WorkStrategy::Linear);
+                    let popped = queue.get_work(entity.tag, n, WorkStrategy::ByTest);
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;

@@ -477,7 +477,7 @@ fn action_to_fut(
                 run_id,
                 batch_size_hint,
                 // TODO: use a real value
-                work_strategy: WorkStrategy::Linear,
+                work_strategy: WorkStrategy::ByTest,
             };
 
             let config = WorkersConfig {

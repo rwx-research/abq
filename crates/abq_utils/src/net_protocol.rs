@@ -520,7 +520,7 @@ pub mod queue {
     #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
     pub enum WorkStrategy {
         // just pop them up in order
-        Linear,
+        ByTest,
         // by group aka by file. ensure each top level group gets distributed to a single worker.
         // should help before / after work only getting run once
         ByGroup,
@@ -529,7 +529,7 @@ pub mod queue {
     impl Display for WorkStrategy {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                WorkStrategy::Linear => write!(f, "default"),
+                WorkStrategy::ByTest => write!(f, "default"),
                 WorkStrategy::ByGroup => write!(f, "by-group"),
             }
         }
@@ -540,7 +540,7 @@ pub mod queue {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
-                "default" => Ok(Self::Linear),
+                "default" => Ok(Self::ByTest),
                 "by-file" => Ok(Self::ByGroup),
                 other => Err(format!(
                     "Can't parse distribution strategy :'{}', must be default or by-group",
