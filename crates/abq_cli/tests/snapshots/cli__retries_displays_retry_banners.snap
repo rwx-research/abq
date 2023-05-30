@@ -37,3 +37,9 @@ Failures:
     runner N:
        64   a/b/x.file
 
+
+Run the following command to replay these tests locally:
+
+abq test --run-id test-run-id --worker 0 --num 1
+
+
