@@ -94,6 +94,7 @@ struct Abq {
     env: Vec<(String, String)>,
     always_capture_stderr: bool,
     working_dir: Option<PathBuf>,
+    config_file: Option<String>,
     inherit: bool,
 }
 
@@ -135,6 +136,7 @@ impl Abq {
             env: Default::default(),
             always_capture_stderr: false,
             working_dir: None,
+            config_file: None,
             inherit: false,
         }
     }
@@ -165,6 +167,11 @@ impl Abq {
 
     fn working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    fn config_file(mut self, file: impl Into<String>) -> Self {
+        self.config_file = Some(file.into());
         self
     }
 
@@ -199,6 +206,7 @@ impl Abq {
             env,
             always_capture_stderr,
             working_dir,
+            config_file,
             inherit,
         } = self;
         let working_dir = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
@@ -229,6 +237,12 @@ impl Abq {
         if debug_log_for_ci() && !always_capture_stderr {
             cmd.env("ABQ_LOGCI_WITH_PREFIX", name);
             cmd.env("ABQ_LOG", "abq=debug");
+        }
+
+        if let Some(config_filepath) = config_file {
+            cmd.env("ABQ_CONFIG_FILE", config_filepath);
+        } else {
+            cmd.env("ABQ_CONFIG_FILE", "");
         }
 
         let child = cmd
@@ -2623,10 +2637,7 @@ fn personal_access_token_does_not_mutate_remote_queue() {
             args
         };
 
-        let CmdOutput { .. } = Abq::new(format!("{name}_initial"))
-            .args(test_args)
-            .env([("ABQ_CONFIG_FILE", "")])
-            .run();
+        let CmdOutput { .. } = Abq::new(format!("{name}_initial")).args(test_args).run();
 
         // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
         let report_args = {
@@ -3043,8 +3054,8 @@ fn login_saves_access_token_custom() {
         exit_status,
     } = Abq::new(name.to_string() + "_login")
         .args(vec!["login", "--access-token=testy"])
-        .env([("ABQ_CONFIG_FILE", tempfile.path().to_str().unwrap())])
         .always_capture_stderr(true)
+        .config_file(tempfile.path().to_str().unwrap())
         .run();
 
     assert!(
@@ -3072,7 +3083,6 @@ fn login_saves_access_token_noop() {
         exit_status,
     } = Abq::new(name.to_string() + "_login")
         .args(vec!["login", "--access-token=testy"])
-        .env([("ABQ_CONFIG_FILE", "")])
         .always_capture_stderr(true)
         .run();
 
