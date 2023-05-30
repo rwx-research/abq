@@ -153,6 +153,11 @@ impl Abq {
         self
     }
 
+    fn working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
     // For debugging, pipe stdout/stderr to parent.
     #[allow(unused)]
     fn inherit(mut self) -> Self {
@@ -2557,14 +2562,12 @@ fn personal_access_token_does_not_mutate_remote_queue() {
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
-    let manifest = vec![
-        TestOrGroup::test(Test::new(
-            proto,
-            "some_test",
-            [],
-            Default::default(),
-        )),
-    ];
+    let manifest = vec![TestOrGroup::test(Test::new(
+        proto,
+        "some_test",
+        [],
+        Default::default(),
+    ))];
 
     let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
 
@@ -2622,8 +2625,7 @@ fn personal_access_token_does_not_mutate_remote_queue() {
             args
         };
 
-        let CmdOutput { .. } =
-            Abq::new(format!("{name}_initial")).args(test_args).run();
+        let CmdOutput { .. } = Abq::new(format!("{name}_initial")).args(test_args).run();
 
         // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
         let report_args = {
@@ -2659,11 +2661,11 @@ fn personal_access_token_does_not_mutate_remote_queue() {
     // mock personal access token usage
     let mut server = Server::new();
     let in_run_id = RunId("test-run-id".to_string());
-    let access_token = test_auth_token();
+    let access_token = test_access_token();
     let _m = server.mock("GET", "/queue")
         .match_header(
             "Authorization",
-            format!("Bearer {}", test_access_token()).as_str(),
+            format!("Bearer {}", access_token).as_str(),
         )
         .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
         .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
@@ -2732,13 +2734,9 @@ fn personal_access_token_does_not_mutate_remote_queue() {
 
         let CmdOutput {
             exit_status,
-            stdout,
             stderr,
-            ..
-        } = Abq::new(format!("{name}_initial"))
-            .args(test_args)
-            .env([("ABQ_API", server.url())])
-            .run();
+            stdout,
+        } = Abq::new(format!("{name}_initial")).args(test_args).run();
 
         assert!(
             exit_status.success(),
