@@ -90,6 +90,12 @@ mod tests {
     }
 
     #[test]
+    fn test_abq_config_file_missing_returns_none() {
+        let read_config = read_abq_config(Some("/derp/does_not_exist/config.toml".into()));
+        assert!(read_config.is_none());
+    }
+
+    #[test]
     fn test_abq_config_operations() {
         let access_token = AccessToken::from_str("testy_mctesterson").unwrap();
         // Create a temporary directory to store the config file
