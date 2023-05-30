@@ -2623,7 +2623,10 @@ fn personal_access_token_does_not_mutate_remote_queue() {
             args
         };
 
-        let CmdOutput { .. } = Abq::new(format!("{name}_initial")).args(test_args).run();
+        let CmdOutput { .. } = Abq::new(format!("{name}_initial"))
+            .args(test_args)
+            .env([("ABQ_CONFIG_FILE", "")])
+            .run();
 
         // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
         let report_args = {

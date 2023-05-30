@@ -7,6 +7,7 @@ mod reporting;
 mod statefile;
 mod workers;
 
+use std::env::VarError;
 use std::io;
 use std::str::FromStr;
 use std::{
@@ -246,13 +247,16 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let new_config = abq_config::AbqConfig {
                 rwx_access_token: AccessToken::from_str(&input)?,
             };
-            let abq_filepath =
-                abq_config::write_abq_config(new_config, abq_config::abq_config_filepath())?;
-
-            println!(
-                "Your access token is now stored at {}",
-                abq_filepath.display()
-            );
+            match get_abq_config_filepath() {
+                Some(config_path) => {
+                    abq_config::write_abq_config(new_config, Ok(config_path.clone()))?;
+                    println!(
+                        "Your access token is now stored at: {}",
+                        config_path.display()
+                    );
+                }
+                None => println!("Nothing was written.")
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Start {
@@ -364,8 +368,10 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_key = read_opt_path_bytes(tls_key)?;
 
             let access_token = access_token.or_else(|| {
-                let config = abq_config::read_abq_config(abq_config::abq_config_filepath()).ok()?;
-                Some(config.rwx_access_token)
+                match abq_config::read_abq_config(get_abq_config_filepath()) {
+                    Some(abq_config) => Some(abq_config.rwx_access_token),
+                    None => None
+                }
             });
 
             let ResolvedConfig {
@@ -645,6 +651,10 @@ async fn resolve_config(
         rwx_access_token_kind,
         queue_location,
     })
+}
+
+fn get_abq_config_filepath() -> Option<PathBuf> {
+    abq_config::abq_config_filepath(std::env::var("ABQ_CONFIG_FILE"))
 }
 
 fn get_hosted_api_base_url() -> String {
