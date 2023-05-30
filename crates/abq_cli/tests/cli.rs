@@ -5,6 +5,7 @@
 use abq_native_runner_simulation::{pack, pack_msgs, pack_msgs_to_disk, Msg::*};
 use abq_test_utils::{artifacts_dir, s, sanitize_output, write_to_temp, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
+use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::runners::{
     AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, RawTestResultMessage,
     Status, Test, TestOrGroup,
@@ -3906,4 +3907,63 @@ fn persisted_runs_between_queue_instances() {
     );
     assert_eq!(init_manifest_size, next_manifest_size);
     assert_eq!(init_run_state_size, next_run_state_size);
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn kill_on_early_startup_timeout_seconds() {
+    let name = "kill_on_early_startup_timeout_seconds";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let (_queue_proc, queue_addr) = setup_queue!(name, conf);
+
+    let simulation = [
+        Connect,
+        //
+        Sleep(Duration::MAX),
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // We should be killed by now
+        Exit(0),
+    ];
+
+    let packed = pack_msgs_to_disk(simulation);
+
+    let test_args = {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = packed.path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("--startup-timeout-seconds=0"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let CmdOutput {
+        exit_status,
+        stdout,
+        stderr,
+        ..
+    } = Abq::new(format!("{name}_worker0"))
+        .args(test_args)
+        .always_capture_stderr(true)
+        .run();
+
+    assert_eq!(exit_status.code().unwrap(), ExitCode::ABQ_ERROR.get());
+    assert!(
+        stderr.contains("Timeout while waiting for protocol version"),
+        "STDOUT:\n{}\nSTDERR:\n{}\n",
+        stdout,
+        stderr
+    );
 }

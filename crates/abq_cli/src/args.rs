@@ -326,6 +326,13 @@ pub enum Command {
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
+        /// The maximum number of seconds to wait for a test command to start up.
+        ///
+        /// ABQ waits for the test executable to start up before starting a test run.
+        /// If the test command does not start up within the timeout, the test run will be cancelled.
+        #[clap(long, default_value_t = abq_workers::DEFAULT_PROTOCOL_VERSION_TIMEOUT.as_secs(), env = "ABQ_STARTUP_TIMEOUT_SECONDS")]
+        startup_timeout_seconds: u64,
+
         /// A broad measure of inactivity timeout seconds, after which a test run is cancelled.
         ///
         /// The inactivity timeout is applied in the following cases:
