@@ -57,35 +57,43 @@ impl JobQueue {
         let n = n.get() as usize;
         let queue_len = self.queue.len();
 
-        let start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
-
         // If the start index was past the end of the queue, return fast
-        if start_idx > queue_len {
-            return [].iter();
-        }
 
-        let end_idx = match self.work_strategy {
-            WorkStrategy::ByTest => std::cmp::min(start_idx + n, queue_len),
+        let (start_idx, end_idx) = match self.work_strategy {
+            WorkStrategy::ByTest => {
+                let start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
+                (start_idx, std::cmp::min(start_idx + n, queue_len))
+            }
             WorkStrategy::ByTopLevelGroup => {
-                let mut end_idx = start_idx; // slice initialized to size 0
-                                             // grab new groups until we satisfy batch num
-                let mut current_group = self.queue[start_idx].spec.group_id;
-                // find idx of the start of the next group
-                for next_spec in self.queue[start_idx..].iter() {
-                    // if we've walked into a new group...
-                    if next_spec.spec.group_id != current_group {
-                        // if the current slice is big enough, break
-                        if end_idx - start_idx >= n {
-                            break;
+                let end_idx_cell = Cell::new(0);
+                let start_idx = self
+                    .ptr
+                    .fetch_update(atomic::ORDERING, atomic::ORDERING, |start_idx| {
+                        let mut end_idx = start_idx;
+                        let mut current_group = self.queue[start_idx].spec.group_id;
+                        // find idx of the start of the next group
+                        for next_spec in self.queue[start_idx..].iter() {
+                            // if we've walked into a new group...
+                            if next_spec.spec.group_id != current_group {
+                                // if the current slice is big enough, break
+                                if end_idx - start_idx >= n {
+                                    break;
+                                }
+                                // else start pulling from the next group
+                                current_group = next_spec.spec.group_id
+                            }
+                            end_idx += 1; // include next_spec in the slice
                         }
-                        // else start pulling from the next group
-                        current_group = next_spec.spec.group_id
-                    }
-                    end_idx += 1; // include next_spec in the slice
-                }
-                end_idx
+                        end_idx_cell.set(end_idx);
+                        Some(end_idx)
+                    })
+                    .unwrap();
+                (start_idx, end_idx_cell.get())
             }
         };
+        if start_idx >= queue_len {
+            return [].iter();
+        }
 
         // for retries, mark these tests as owned by this worker
         for entity_cell in self.assigned_entities[start_idx..end_idx].iter() {
