@@ -4800,7 +4800,6 @@ mod persist_results {
         let results_cell = ResultsPersistedCell::new(run_id.clone());
         let queues = {
             let queues = SharedRuns::default();
-            let batch_size_hint = one_nonzero_usize();
             // Pretend that worker 1, runner 1 has already finished.
             let mut active_workers = WorkerSet::with_capacity(1);
             active_workers.insert_by_tag(Entity::runner(1, 1), Some(Instant::now()));
