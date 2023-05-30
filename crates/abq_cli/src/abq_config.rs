@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use std::{fs, path::{PathBuf}, env::VarError};
+use std::{env::VarError, fs, path::PathBuf};
 
 use abq_hosted::AccessToken;
 use etcetera::{app_strategy, AppStrategy, AppStrategyArgs};
@@ -13,10 +13,10 @@ pub struct AbqConfig {
 pub fn abq_config_filepath(explicit_config_file: Result<String, VarError>) -> Option<PathBuf> {
     match explicit_config_file {
         Ok(val) => {
-            if val == "" {
+            if val.is_empty() {
                 return None;
             }
-            return Some(PathBuf::from(val));
+            Some(PathBuf::from(val))
         }
         Err(_e) => {
             let strategy = app_strategy::Unix::new(AppStrategyArgs {
@@ -24,7 +24,9 @@ pub fn abq_config_filepath(explicit_config_file: Result<String, VarError>) -> Op
                 author: "rwx".to_string(),
                 app_name: "abq".to_string(),
             });
-            let config_dir = Result::expect(strategy, "failed to build conventional abq config filepath").config_dir();
+            let config_dir =
+                Result::expect(strategy, "failed to build conventional abq config filepath")
+                    .config_dir();
             Some(config_dir.join("config.toml"))
         }
     }
@@ -69,7 +71,10 @@ mod tests {
 
     #[test]
     fn test_abq_filepath_explicit_some() {
-        assert_eq!(abq_config_filepath(Ok("~/my/custom/path".to_string())), Some(PathBuf::from("~/my/custom/path")));
+        assert_eq!(
+            abq_config_filepath(Ok("~/my/custom/path".to_string())),
+            Some(PathBuf::from("~/my/custom/path"))
+        );
     }
 
     #[test]

@@ -7,7 +7,6 @@ mod reporting;
 mod statefile;
 mod workers;
 
-use std::env::VarError;
 use std::io;
 use std::str::FromStr;
 use std::{
@@ -255,7 +254,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                         config_path.display()
                     );
                 }
-                None => println!("Nothing was written.")
+                None => println!("Nothing was written."),
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -370,7 +369,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let access_token = access_token.or_else(|| {
                 match abq_config::read_abq_config(get_abq_config_filepath()) {
                     Some(abq_config) => Some(abq_config.rwx_access_token),
-                    None => None
+                    None => None,
                 }
             });
 
