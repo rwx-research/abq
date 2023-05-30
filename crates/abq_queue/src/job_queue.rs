@@ -60,7 +60,7 @@ impl JobQueue {
         let mut start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
 
         let end_idx = match self.work_strategy {
-            WorkStrategy::ByTest => std::cmp::min(start_idx + n, self.queue.len()),
+            WorkStrategy::ByTest => std::cmp::min(start_idx + n, queue_len),
             WorkStrategy::ByTopLevelGroup => {
                 let mut end_idx = start_idx;
                 // grab new groups until we satisfy batch num
@@ -94,7 +94,7 @@ impl JobQueue {
         // NB there is a chance for overflow here, but that would require a test suite with at
         // least 2^32 tests! We would fail far before this section in that case.
         let mut clamp = false;
-        if start_idx > self.queue.len() {
+        if start_idx > queue_len {
             clamp = true;
             start_idx = queue_len;
         }
