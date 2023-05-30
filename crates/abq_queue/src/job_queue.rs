@@ -57,51 +57,35 @@ impl JobQueue {
         let n = n.get() as usize;
         let queue_len = self.queue.len();
 
-        let mut start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
+        let start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
+
+        // If the start index was past the end of the queue, return fast
+        if start_idx > queue_len {
+            return [].iter();
+        }
 
         let end_idx = match self.work_strategy {
             WorkStrategy::ByTest => std::cmp::min(start_idx + n, queue_len),
             WorkStrategy::ByTopLevelGroup => {
-                let mut end_idx = start_idx;
-                // grab new groups until we satisfy batch num
+                let mut end_idx = start_idx; // slice initialized to size 0
+                                             // grab new groups until we satisfy batch num
                 let mut current_group = self.queue[start_idx].spec.group_id;
                 // find idx of the start of the next group
                 for next_spec in self.queue[start_idx..].iter() {
-                    end_idx += 1; // note because end_idx is non-inclusive, it being at the index of `next_spec`
-                                  // means we don't include next_spec in the resulting slice
+                    // if we've walked into a new group...
                     if next_spec.spec.group_id != current_group {
-                        // only check batch size when we've reached a new group
-                        if end_idx - start_idx > n {
+                        // if the current slice is big enough, break
+                        if end_idx - start_idx >= n {
                             break;
                         }
-                        // else update the group and iterate
+                        // else start pulling from the next group
                         current_group = next_spec.spec.group_id
                     }
+                    end_idx += 1; // include next_spec in the slice
                 }
                 end_idx
             }
         };
-
-        // If either
-        //   - the start index was past the end of the queue, or
-        //   - the end index is now past the end of the queue
-        // clamp them down, and do an additional atomic store to clamp the pointer to the end of
-        // the queue.
-        //
-        // Note that the secondary store is always safe, because if either the start or end index
-        // is past the queue, this popping already synchronized reaching the end.
-        //
-        // NB there is a chance for overflow here, but that would require a test suite with at
-        // least 2^32 tests! We would fail far before this section in that case.
-        let mut clamp = false;
-        if start_idx > queue_len {
-            clamp = true;
-            start_idx = queue_len;
-        }
-        clamp = clamp || end_idx > queue_len;
-        if clamp {
-            self.ptr.store(queue_len, atomic::ORDERING);
-        }
 
         // for retries, mark these tests as owned by this worker
         for entity_cell in self.assigned_entities[start_idx..end_idx].iter() {
