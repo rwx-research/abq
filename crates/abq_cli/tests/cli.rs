@@ -2991,49 +2991,8 @@ fn report_explicit_run_id_against_ephemeral_queue() {
         tls: true,
     };
     let (queue_proc, ..) = setup_queue!(name, conf);
-    let manifest = vec![TestOrGroup::test(Test::new(
-        proto,
-        "some_test",
-        [],
-        Default::default(),
-    ))];
-    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
-    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
 
     {
-        let simulation = [
-            Connect,
-            //
-            // Write spawn message
-            OpaqueWrite(pack(legal_spawned_message(proto))),
-            //
-            // Write the manifest if we need to.
-            // Otherwise handle the one test.
-            IfGenerateManifest {
-                then_do: vec![OpaqueWrite(pack(&manifest))],
-                else_do: {
-                    let mut run_tests = vec![
-                        //
-                        // Read init context message + write ACK
-                        OpaqueRead,
-                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
-                    ];
-
-                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
-                    // faux result.
-                    // Otherwise assume we ran out of tests on our node and exit.
-                    run_tests.push(IfAliveReadAndWriteFake(Status::Failure {
-                        exception: None,
-                        backtrace: None,
-                    }));
-                    run_tests
-                },
-            },
-            //
-            // Finish
-            Exit(0),
-        ];
-
         let report_args = {
             let args = vec![
                 format!("report"),
