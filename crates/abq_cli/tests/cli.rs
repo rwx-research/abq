@@ -3924,7 +3924,7 @@ fn kill_on_early_startup_timeout_seconds() {
     let simulation = [
         Connect,
         //
-        Sleep(Duration::from_millis(100)),
+        Sleep(Duration::MAX),
         //
         // Write spawn message
         OpaqueWrite(pack(legal_spawned_message(proto))),
@@ -3951,6 +3951,7 @@ fn kill_on_early_startup_timeout_seconds() {
 
     let CmdOutput {
         exit_status,
+        stdout,
         stderr,
         ..
     } = Abq::new(format!("{name}_worker0"))
@@ -3959,5 +3960,10 @@ fn kill_on_early_startup_timeout_seconds() {
         .run();
 
     assert_eq!(exit_status.code().unwrap(), ExitCode::ABQ_ERROR.get());
-    assert!(stderr.contains("Timeout while waiting for protocol version"));
+    assert!(
+        stderr.contains("Timeout while waiting for protocol version"),
+        "STDOUT:\n{}\nSTDERR:\n{}\n",
+        stdout,
+        stderr
+    );
 }
