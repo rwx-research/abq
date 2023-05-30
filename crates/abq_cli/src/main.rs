@@ -378,8 +378,12 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             if explicit_run_id_provided && !queue_location.is_remote() {
                 let mut cmd = Cli::command();
                 Err(cmd.error(
-                    ErrorKind::MissingRequiredArgument,
-                    "`abq test` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
+                    ErrorKind::InvalidValue,
+                    "`abq test` was provided a run id, but we've detected an ephemeral queue.
+
+                    If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
+                    If you intended to run against an ephemeral queue, please remove the run id argument.
+                    ",
                 ))?;
             }
 
@@ -474,8 +478,12 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             if explicit_run_id_provided && !queue_location.is_remote() {
                 let mut cmd = Cli::command();
                 Err(cmd.error(
-                    ErrorKind::MissingRequiredArgument,
-                    "`abq report` was not given an access token and could not infer one. Consider passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.",
+                    ErrorKind::InvalidValue,
+                    "`abq report` was provided a run id, but we've detected an ephemeral queue.
+
+                    If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
+                    If you intended to run against an ephemeral queue, please remove the run id argument.
+                    ",
                 ))?;
             }
 
@@ -649,6 +657,10 @@ async fn get_config_from_api(
     use abq_hosted::HostedQueueConfig;
 
     let api_url = get_hosted_api_base_url();
+
+    println!("api_url: {}", api_url);
+    println!("access_token: {}", access_token);
+    println!("run_id: {}", run_id);
 
     let HostedQueueConfig {
         addr,
