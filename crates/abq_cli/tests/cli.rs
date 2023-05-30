@@ -17,6 +17,7 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_with_protocol_version::with_protocol_version;
 use indoc::formatdoc;
+use mockito::{Matcher, Server};
 use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
@@ -41,6 +42,10 @@ const TLS_CERT_STRING: &str = include_str!(std::concat!(
     "testdata/certs/server.crt"
 ));
 const TLS_KEY: &str = std::concat!(std::env!("ABQ_WORKSPACE_DIR"), "testdata/certs/server.key");
+
+fn test_access_token() -> AccessToken {
+    AccessToken::from_str("abqapi_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
+}
 
 fn var_flag_set(var: &str) -> bool {
     match std::env::var(var) {
@@ -2541,16 +2546,6 @@ fn out_of_process_retries_smoke() {
     );
 
     term(queue_proc);
-}
-
-use mockito::{Matcher, Server};
-
-fn test_access_token() -> AccessToken {
-    AccessToken::from_str("abqapi_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
-}
-
-fn test_auth_token() -> UserToken {
-    UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
 }
 
 #[test]
