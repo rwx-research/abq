@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use std::{env::VarError, fs, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use abq_hosted::AccessToken;
 use etcetera::{app_strategy, AppStrategy, AppStrategyArgs};
@@ -10,15 +10,20 @@ pub struct AbqConfig {
     pub rwx_access_token: AccessToken,
 }
 
-pub fn abq_config_filepath(explicit_config_file: Result<String, VarError>) -> Option<PathBuf> {
-    match explicit_config_file {
-        Ok(val) => {
-            if val.is_empty() {
-                return None;
-            }
-            Some(PathBuf::from(val))
-        }
-        Err(_e) => {
+pub enum AbqConfigFileMode {
+    // Conventional unix location (e.g ~/.config/abq/config.toml)
+    Conventional,
+    // Non-standard location (e.g. ~/my/custom/path/config.toml)
+    Override(String),
+    // Ignore any located config file (For instance, if the host machine happens to have a config file)
+    Ignore,
+}
+
+pub fn abq_config_filepath(mode: AbqConfigFileMode) -> Option<PathBuf> {
+    match mode {
+        AbqConfigFileMode::Ignore => None,
+        AbqConfigFileMode::Override(path) => Some(PathBuf::from(path)),
+        AbqConfigFileMode::Conventional => {
             let strategy = app_strategy::Unix::new(AppStrategyArgs {
                 top_level_domain: "org".to_string(),
                 author: "rwx".to_string(),
@@ -66,20 +71,20 @@ mod tests {
 
     #[test]
     fn test_abq_filepath_explicit_none() {
-        assert_eq!(abq_config_filepath(Ok("".to_string())), None);
+        assert_eq!(abq_config_filepath(AbqConfigFileMode::Ignore), None);
     }
 
     #[test]
     fn test_abq_filepath_explicit_some() {
         assert_eq!(
-            abq_config_filepath(Ok("~/my/custom/path".to_string())),
+            abq_config_filepath(AbqConfigFileMode::Override("~/my/custom/path".to_string())),
             Some(PathBuf::from("~/my/custom/path"))
         );
     }
 
     #[test]
     fn test_abq_filepath_implicit_none() {
-        let config_path = abq_config_filepath(Err(VarError::NotPresent)).unwrap();
+        let config_path = abq_config_filepath(AbqConfigFileMode::Conventional).unwrap();
         let suffix = ".abq/config.toml";
         assert!(config_path.as_path().ends_with(suffix));
     }

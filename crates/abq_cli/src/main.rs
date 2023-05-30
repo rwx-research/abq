@@ -653,7 +653,17 @@ async fn resolve_config(
 }
 
 fn get_abq_config_filepath() -> Option<PathBuf> {
-    abq_config::abq_config_filepath(std::env::var("ABQ_CONFIG_FILE"))
+    let config_file_mode = match std::env::var("ABQ_CONFIG_FILE") {
+        Ok(path) => {
+            if path.is_empty() {
+                abq_config::AbqConfigFileMode::Ignore
+            } else {
+                abq_config::AbqConfigFileMode::Override(path)
+            }
+        }
+        Err(_) => abq_config::AbqConfigFileMode::Conventional,
+    };
+    abq_config::abq_config_filepath(config_file_mode)
 }
 
 fn get_hosted_api_base_url() -> String {
