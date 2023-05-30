@@ -1,11 +1,11 @@
 use anyhow::anyhow;
-use std::{fs, path::{PathBuf, Path}};
+use std::{fs, path::PathBuf};
 
 use abq_hosted::AccessToken;
 use etcetera::{app_strategy, AppStrategy, AppStrategyArgs};
 use serde_derive::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize, Debug, PartialEq)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub struct AbqConfig {
     pub rwx_access_token: AccessToken,
 }
@@ -20,7 +20,10 @@ pub fn abq_config_filepath() -> anyhow::Result<PathBuf> {
     Ok(config_dir.join("config.toml"))
 }
 
-pub fn write_abq_config(config: AbqConfig, config_path: anyhow::Result<PathBuf>) -> anyhow::Result<PathBuf> {
+pub fn write_abq_config(
+    config: AbqConfig,
+    config_path: anyhow::Result<PathBuf>,
+) -> anyhow::Result<PathBuf> {
     let abq_config_filepath = config_path?;
     let config_dir = abq_config_filepath
         .parent()
@@ -62,6 +65,9 @@ mod tests {
         let read_config = read_abq_config(config_path);
         assert!(read_config.is_ok());
 
-        assert_eq!(read_config.unwrap().rwx_access_token.to_string(), "testy_mctesterson");
+        assert_eq!(
+            read_config.unwrap().rwx_access_token.to_string(),
+            "testy_mctesterson"
+        );
     }
 }
