@@ -448,7 +448,7 @@ mod test_manifest {
             test("f"),
         ]
         .into_iter()
-        .map(|test| to_test_case(test))
+        .map(to_test_case)
         .collect();
 
         assert_eq!(three_group_test_cases, expected_test_cases);
