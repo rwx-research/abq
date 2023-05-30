@@ -153,11 +153,6 @@ impl Abq {
         self
     }
 
-    fn working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
-        self.working_dir = Some(working_dir.into());
-        self
-    }
-
     // For debugging, pipe stdout/stderr to parent.
     #[allow(unused)]
     fn inherit(mut self) -> Self {
@@ -2550,15 +2545,6 @@ fn test_auth_token() -> UserToken {
     UserToken::from_str("abqs_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
 }
 
-fn test_mock_cert() -> String {
-    "\
-    -----BEGIN CERTIFICATE-----\
-    FAKEFAKEFAKEFAKEFAKEFAKEFAKE\
-    -----END CERTIFICATE-----\
-    "
-    .to_string()
-}
-
 #[test]
 #[with_protocol_version]
 #[serial]
@@ -2571,19 +2557,20 @@ fn personal_access_token_does_not_mutate_remote_queue() {
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
-    let mut manifest = vec![];
-
-    manifest.push(TestOrGroup::test(Test::new(
-        proto,
-        "some_test",
-        [],
-        Default::default(),
-    )));
+    let manifest = vec![
+        TestOrGroup::test(Test::new(
+            proto,
+            "some_test",
+            [],
+            Default::default(),
+        )),
+    ];
 
     let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
 
     let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
 
+    // simulation 1 - observe failures reported
     {
         let simulation = [
             Connect,
@@ -2635,7 +2622,7 @@ fn personal_access_token_does_not_mutate_remote_queue() {
             args
         };
 
-        let CmdOutput { exit_status, .. } =
+        let CmdOutput { .. } =
             Abq::new(format!("{name}_initial")).args(test_args).run();
 
         // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
@@ -2669,6 +2656,7 @@ fn personal_access_token_does_not_mutate_remote_queue() {
         );
     }
 
+    // mock personal access token usage
     let mut server = Server::new();
     let in_run_id = RunId("test-run-id".to_string());
     let access_token = test_auth_token();
@@ -2693,7 +2681,7 @@ fn personal_access_token_does_not_mutate_remote_queue() {
         ))
         .create();
 
-    // simulation 2
+    // simulation 2 - observe passing locally, but still reported as failure remotely
     {
         let simulation = [
             Connect,
