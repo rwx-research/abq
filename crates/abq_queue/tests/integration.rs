@@ -475,8 +475,7 @@ fn action_to_fut(
             let invoke_work = InvokeWork {
                 run_id,
                 batch_size_hint,
-                // TODO: use a real value
-                work_strategy: WorkStrategy::ByTest,
+                work_strategy: Default::default(),
             };
 
             let config = WorkersConfig {
