@@ -231,24 +231,30 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
     let Cli { command } = Cli::parse();
 
     match command {
-        Command::Login {} => {
-            let mut input = String::new();
-            println!("Generate a Personal Access Token at https://account.rwx.com/_/personal_access_tokens");
-            println!("\n\n");
-            println!("Enter your RWX Personal Access Token:");
+        Command::Login { access_token } => {
+            let abq_config = match access_token {
+                Some(token) => abq_config::AbqConfig {
+                    rwx_access_token: token,
+                },
+                None => {
+                    let mut input = String::new();
+                    println!("Generate a Personal Access Token at https://account.rwx.com/_/personal_access_tokens");
+                    println!("\n\n");
+                    println!("Enter your RWX Personal Access Token:");
 
-            io::stdin()
-                .read_line(&mut input)
-                .expect("Failed to read line");
+                    io::stdin()
+                        .read_line(&mut input)
+                        .expect("Failed to read line");
 
-            input = input.trim().to_string();
-
-            let new_config = abq_config::AbqConfig {
-                rwx_access_token: AccessToken::from_str(&input)?,
+                    abq_config::AbqConfig {
+                        rwx_access_token: AccessToken::from_str(input.trim())?,
+                    }
+                }
             };
+
             match get_abq_config_filepath() {
                 Some(config_path) => {
-                    abq_config::write_abq_config(new_config, Ok(config_path.clone()))?;
+                    abq_config::write_abq_config(abq_config, Ok(config_path.clone()))?;
                     println!(
                         "Your access token is now stored at: {}",
                         config_path.display()

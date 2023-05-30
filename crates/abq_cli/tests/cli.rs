@@ -3031,6 +3031,62 @@ fn report_explicit_run_id_against_ephemeral_queue() {
 }
 
 #[test]
+#[with_protocol_version]
+#[serial]
+fn login_saves_access_token_custom() {
+    let name = "login_saves_access_token_custom";
+    let tempfile = NamedTempFile::new().expect("Failed to create tempfile");
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_login")
+        .args(vec!["login", "--access-token=testy"])
+        .env([("ABQ_CONFIG_FILE", tempfile.path().to_str().unwrap())])
+        .always_capture_stderr(true)
+        .run();
+
+    assert!(
+        exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "Your access token is now stored at: {}",
+            tempfile.path().display()
+        )),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn login_saves_access_token_noop() {
+    let name = "login_saves_access_token_noop";
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_login")
+        .args(vec!["login", "--access-token=testy"])
+        .env([("ABQ_CONFIG_FILE", "")])
+        .always_capture_stderr(true)
+        .run();
+
+    assert!(
+        exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("Nothing was written.")),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+}
+
+#[test]
 #[serial]
 fn report_while_run_is_out_of_process_retried_is_error() {
     let name = "report_while_run_is_out_of_process_retried_is_error";
