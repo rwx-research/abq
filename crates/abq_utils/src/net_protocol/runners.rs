@@ -365,6 +365,112 @@ impl Manifest {
     }
 }
 
+#[cfg(test)]
+mod test_manifest {
+    use crate::net_protocol::{
+        queue::TestSpec,
+        runners::v0_2::{Group, Manifest, Test, TestOrGroup},
+        workers::GroupId,
+    };
+    use serde_json::Map;
+
+    fn flattened(members: Vec<TestOrGroup>) -> Vec<TestSpec> {
+        Manifest {
+            members,
+            init_meta: Map::new(),
+        }
+        .flatten()
+        .0
+    }
+
+    fn test(name: &'static str) -> TestOrGroup {
+        TestOrGroup::Test(Test {
+            id: name.to_string(),
+            tags: vec![],
+            meta: Map::new(),
+        })
+    }
+
+    fn group(members: Vec<TestOrGroup>) -> TestOrGroup {
+        TestOrGroup::Group(Group {
+            name: String::new(),
+            members,
+            tags: vec![],
+            meta: Map::new(),
+        })
+    }
+
+    fn to_test_case(test_or_group: TestOrGroup) -> super::TestCase {
+        match test_or_group {
+            TestOrGroup::Test(Test { id, meta, .. }) => super::TestCase(
+                super::v0_2::TestCase {
+                    id,
+                    meta,
+                    focus: None,
+                }
+                .into(),
+            ),
+            TestOrGroup::Group(_) => panic!("expected a test"),
+        }
+    }
+
+    #[test]
+    fn flatten_empty_manifest() {
+        assert_eq!(flattened(vec![]), vec![]);
+    }
+
+    #[test]
+    fn flatten_simple_manifest() {
+        let a_test = test("foo");
+        let one_element_manifest = flattened(vec![a_test.clone()]);
+        assert_eq!(one_element_manifest.len(), 1);
+        assert_eq!(one_element_manifest[0].test_case, to_test_case(a_test));
+    }
+
+    #[test]
+    fn flatten_manifest_group_ids() {
+        let three_group_manifest = flattened(vec![
+            group(vec![test("a"), test("b")]),
+            group(vec![test("c"), test("d")]),
+            group(vec![test("e"), test("f")]),
+        ]);
+        let three_group_test_cases: Vec<super::TestCase> = three_group_manifest
+            .clone()
+            .into_iter()
+            .map(|test_spec| test_spec.test_case)
+            .collect();
+        let expected_test_cases: Vec<super::TestCase> = vec![
+            test("a"),
+            test("b"),
+            test("c"),
+            test("d"),
+            test("e"),
+            test("f"),
+        ]
+        .into_iter()
+        .map(|test| to_test_case(test))
+        .collect();
+
+        assert_eq!(three_group_test_cases, expected_test_cases);
+
+        let three_group_groups: Vec<GroupId> = three_group_manifest
+            .into_iter()
+            .map(|test_spec| test_spec.group_id)
+            .collect();
+        assert_eq!(
+            three_group_groups,
+            vec![
+                three_group_groups[0],
+                three_group_groups[0],
+                three_group_groups[2],
+                three_group_groups[2],
+                three_group_groups[4],
+                three_group_groups[4],
+            ]
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RawManifestMessage(PrivManifestMessage);
 #[derive(Serialize, Deserialize, Debug, Clone, derive_more::From)]
