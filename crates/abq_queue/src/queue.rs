@@ -86,9 +86,6 @@ enum RunState {
         // test.
         batch_size_hint: NonZeroUsize,
 
-        //strategy for pulling tests off the queue
-        work_strategy: WorkStrategy,
-
         /// Workers that have connected to execute tests, and whether they are still executing
         /// tests.
         /// Some(time) if they have already completed, None if they are still active.
@@ -657,7 +654,7 @@ impl AllRuns {
             run_number: INIT_RUN_NUMBER,
         });
 
-        let queue = JobQueue::new(work_from_manifest.collect());
+        let queue = JobQueue::new(work_from_manifest.collect(), work_strategy);
 
         let mut active_workers = WorkerSet::with_capacity(worker_connection_times.len());
         let mut worker_conn_times = VecMap::with_capacity(worker_connection_times.len());
@@ -671,7 +668,6 @@ impl AllRuns {
         run.state = RunState::HasWork {
             queue,
             batch_size_hint,
-            work_strategy,
             init_metadata,
             active_workers: Mutex::new(active_workers),
             results_persistence: results_persistence.clone(),
@@ -730,12 +726,10 @@ impl AllRuns {
                 queue,
                 batch_size_hint,
                 active_workers,
-                work_strategy,
                 ..
             } => {
                 active_workers.lock().insert_by_tag_if_missing(entity, None);
-                let (bundle, status) =
-                    Self::get_next_work_online(queue, entity, *batch_size_hint, *work_strategy);
+                let (bundle, status) = Self::get_next_work_online(queue, entity, *batch_size_hint);
                 match status {
                     PulledTestsStatus::MoreTestsRemaining => NextWorkResult {
                         bundle,
@@ -787,17 +781,13 @@ impl AllRuns {
         queue: &JobQueue,
         entity: Entity,
         batch_size_hint: NonZeroUsize,
-        strategy: WorkStrategy,
     ) -> (NextWorkBundle, PulledTestsStatus) {
         // NB: in the future, the batch size is likely to be determined intelligently, i.e.
         // from off-line timing data. But for now, we use the hint the client provided.
         let batch_size = batch_size_hint;
 
         // Pop the next batch.
-        let bundle: Vec<WorkerTest> = queue
-            .get_work(entity.tag, batch_size, strategy)
-            .cloned()
-            .collect();
+        let bundle: Vec<WorkerTest> = queue.get_work(entity.tag, batch_size).cloned().collect();
 
         let pulled_tests_status;
 
@@ -4112,16 +4102,19 @@ mod test_pull_work {
     #[with_protocol_version]
     fn pull_last_tests_for_final_test_run_attempt_shows_tests_complete() {
         // Set up the queue so only one test is pulled, and there are a total of two attempts.
-        let queue = JobQueue::new(vec![
-            WorkerTest {
-                spec: fake_test_spec(proto),
-                run_number: 1,
-            },
-            WorkerTest {
-                spec: fake_test_spec(proto),
-                run_number: 2,
-            },
-        ]);
+        let queue = JobQueue::new(
+            vec![
+                WorkerTest {
+                    spec: fake_test_spec(proto),
+                    run_number: 1,
+                },
+                WorkerTest {
+                    spec: fake_test_spec(proto),
+                    run_number: 2,
+                },
+            ],
+            WorkStrategy::ByTest,
+        );
 
         let batch_size_hint = one_nonzero_usize();
         let run_id = RunId::unique();
@@ -4130,7 +4123,6 @@ mod test_pull_work {
             queue,
             init_metadata: Default::default(),
             batch_size_hint,
-            work_strategy: WorkStrategy::ByTest,
             active_workers: Default::default(),
             results_persistence: ResultsPersistedCell::new(run_id.clone()),
         };
@@ -4348,7 +4340,7 @@ mod persistence_on_end_of_manifest {
         let run_id = RunId::unique();
 
         let queues = {
-            let queue = JobQueue::new(manifest);
+            let queue = JobQueue::new(manifest, WorkStrategy::ByTest);
 
             let batch_size_hint = 2.try_into().unwrap();
 
@@ -4356,7 +4348,6 @@ mod persistence_on_end_of_manifest {
                 queue,
                 init_metadata: Default::default(),
                 batch_size_hint,
-                work_strategy: WorkStrategy::ByTest,
                 active_workers: Default::default(),
                 results_persistence: ResultsPersistedCell::new(run_id.clone()),
             };
@@ -4592,7 +4583,6 @@ mod persist_results {
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
                 batch_size_hint: one_nonzero_usize(),
-                work_strategy: WorkStrategy::ByTest,
             };
             queues.set_state(run_id.clone(), done);
             queues
@@ -4736,7 +4726,6 @@ mod persist_results {
                 queue: Default::default(),
                 init_metadata: Default::default(),
                 batch_size_hint: one_nonzero_usize(),
-                work_strategy: WorkStrategy::ByTest,
                 active_workers: parking_lot::Mutex::new(active_workers),
                 results_persistence: ResultsPersistedCell::new(RunId::unique()),
             }
@@ -4818,7 +4807,6 @@ mod persist_results {
             let has_work = RunState::HasWork {
                 queue: JobQueue::default(),
                 batch_size_hint,
-                work_strategy: WorkStrategy::ByTest,
                 init_metadata: Default::default(),
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),

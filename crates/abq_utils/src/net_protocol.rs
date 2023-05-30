@@ -514,8 +514,9 @@ pub mod queue {
     }
 
     // how strategies for popping work off the queue
-    #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+    #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy)]
     pub enum WorkStrategy {
+        #[default]
         // just pop them up in order
         ByTest,
         // by top level group (which should, in most cases, be by-file, and if not, should still exhibit similar before- and after- work characteristics).

@@ -18,6 +18,7 @@ pub struct JobQueue {
     assigned_entities: Vec<TagCell>,
     /// The last item popped off the queue.
     ptr: AtomicUsize,
+    work_strategy: WorkStrategy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,12 +38,13 @@ impl TagCell {
 unsafe impl Sync for TagCell {}
 
 impl JobQueue {
-    pub fn new(work: Vec<WorkerTest>) -> Self {
+    pub fn new(work: Vec<WorkerTest>, work_strategy: WorkStrategy) -> Self {
         let work_len = work.len();
         Self {
             queue: work,
             assigned_entities: vec![TagCell::new(Tag::ExternalClient); work_len],
             ptr: AtomicUsize::new(0),
+            work_strategy,
         }
     }
 
@@ -51,14 +53,13 @@ impl JobQueue {
         &self,
         entity_tag: Tag,
         n: NonZeroUsize,
-        strategy: WorkStrategy,
     ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
         let n = n.get() as usize;
         let queue_len = self.queue.len();
 
         let mut start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
 
-        let end_idx = match strategy {
+        let end_idx = match self.work_strategy {
             WorkStrategy::ByTest => std::cmp::min(start_idx + n, self.queue.len()),
             WorkStrategy::ByTopLevelGroup => {
                 let mut end_idx = start_idx;
@@ -131,6 +132,7 @@ impl JobQueue {
             queue,
             assigned_entities,
             ptr: _,
+            work_strategy: _,
         } = self;
 
         // Try to convince the compiler that we can simply transmute the list of TagCells to Tags,
@@ -191,7 +193,7 @@ mod test {
         .take(10_000)
         .collect();
 
-        let queue = Arc::new(JobQueue::new(manifest));
+        let queue = Arc::new(JobQueue::new(manifest, WorkStrategy::ByTest));
 
         let mut threads = Vec::with_capacity(num_threads);
         let mut workers = VecMap::with_capacity(num_threads);
@@ -203,7 +205,7 @@ mod test {
             let n = NonZeroUsize::try_from(n).unwrap();
             workers.insert(entity.tag, n);
             let handle = std::thread::spawn(move || loop {
-                let popped = queue.get_work(entity.tag, n, WorkStrategy::ByTest);
+                let popped = queue.get_work(entity.tag, n);
                 num_popped.fetch_add(popped.len(), atomic::ORDERING);
                 if popped.len() == 0 {
                     break;
@@ -266,7 +268,7 @@ mod test {
         .take(10_000)
         .collect();
 
-        let queue = Arc::new(JobQueue::new(manifest));
+        let queue = Arc::new(JobQueue::new(manifest, WorkStrategy::ByTest));
 
         let mut threads = Vec::with_capacity(num_threads);
 
@@ -278,7 +280,7 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity.tag, n, WorkStrategy::ByTest);
+                    let popped = queue.get_work(entity.tag, n);
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
