@@ -246,7 +246,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let new_config = abq_config::AbqConfig {
                 rwx_access_token: AccessToken::from_str(&input)?,
             };
-            let abq_filepath = abq_config::write_abq_config(new_config)?;
+            let abq_filepath = abq_config::write_abq_config(new_config, abq_config::abq_config_filepath())?;
 
             println!(
                 "Your access token is now stored at {}",
@@ -363,7 +363,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_key = read_opt_path_bytes(tls_key)?;
 
             let access_token = access_token.or_else(|| {
-                let config = abq_config::read_abq_config().ok()?;
+                let config = abq_config::read_abq_config(abq_config::abq_config_filepath()).ok()?;
                 Some(config.rwx_access_token)
             });
 
