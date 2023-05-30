@@ -382,11 +382,9 @@ fn wait_for_live_queue(queue_stdout: &mut ChildStdout) {
 fn wait_for_live_worker(worker_stderr: &mut ChildStderr) {
     let mut worker_reader = BufReader::new(worker_stderr).lines();
     // Spin until we know the worker0 is UP
-    eprintln!("HI");
     loop {
         if let Some(line) = worker_reader.next() {
             let line = line.expect("line is not a string");
-            eprintln!("{}", line);
             if line.contains("Generic test runner for") {
                 break;
             }
