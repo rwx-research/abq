@@ -90,15 +90,14 @@ impl JobQueue {
     #[inline]
     fn get_bounds_by_top_level_group(&self, suggested_batch_size: usize) -> (usize, usize) {
         let queue_len = self.queue.len();
-        let end_idx_cell = Cell::new(0);
+        let mut end_idx = 0;
         let start_idx = self
             .ptr
             .fetch_update(atomic::ORDERING, atomic::ORDERING, |start_idx| {
+                end_idx = start_idx;
                 if start_idx >= queue_len {
-                    end_idx_cell.set(queue_len);
                     return None;
                 }
-                let mut end_idx = start_idx;
                 let mut current_group = self.queue[start_idx].spec.group_id;
                 // find idx of the start of the next group
                 for next_spec in self.queue[start_idx..].iter() {
@@ -113,11 +112,10 @@ impl JobQueue {
                     }
                     end_idx += 1; // include next_spec in the slice
                 }
-                end_idx_cell.set(end_idx);
                 Some(end_idx)
             })
             .unwrap_or(queue_len);
-        (start_idx, end_idx_cell.get())
+        (start_idx, end_idx)
     }
 
     pub fn is_at_end(&self) -> bool {
