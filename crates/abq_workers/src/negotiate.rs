@@ -114,6 +114,7 @@ pub struct WorkersConfig {
     pub results_batch_size_hint: u64,
     /// Max number of test suite run attempts
     pub max_run_number: u32,
+    pub should_send_results: bool,
 }
 
 #[derive(Debug, Error)]
@@ -227,6 +228,7 @@ impl WorkersNegotiator {
             max_run_number,
             protocol_version_timeout,
             test_timeout,
+            should_send_results,
         } = workers_config;
 
         let some_runner_should_generate_manifest = match assigned {
@@ -244,6 +246,7 @@ impl WorkersNegotiator {
             local_results_handler,
             max_run_number,
             assigned,
+            should_send_results,
         );
 
         let pool_config = WorkerPoolConfig {
@@ -899,6 +902,7 @@ mod test {
             max_run_number: INIT_RUN_NUMBER,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
+            should_send_results: true,
         };
 
         let invoke_data = InvokeWork {

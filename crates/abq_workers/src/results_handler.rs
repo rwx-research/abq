@@ -16,14 +16,14 @@ use crate::test_fetching;
 
 /// A results handler that dispatches results to the remote queue, and also any local handlers.
 pub(crate) struct MultiplexingResultsHandler {
-    remote_handler: QueueResultsSender,
+    remote_handler: Option<QueueResultsSender>,
     local_handler: SharedResultsHandler,
     results_retry_tracker: test_fetching::ResultsTracker,
 }
 
 impl MultiplexingResultsHandler {
     pub fn new(
-        remote_handler: QueueResultsSender,
+        remote_handler: Option<QueueResultsSender>,
         local_handler: SharedResultsHandler,
         results_retry_tracker: test_fetching::ResultsTracker,
     ) -> Self {
@@ -40,10 +40,14 @@ impl NotifyResults for MultiplexingResultsHandler {
     #[instrument(level="trace", skip_all, fields(results=results.len()))]
     async fn send_results(&mut self, results: Vec<AssociatedTestResults>) {
         self.results_retry_tracker.account_results(results.iter());
-        let ((), ()) = tokio::join!(
-            self.remote_handler.send_results(results.clone()),
-            self.local_handler.send_results(results)
-        );
+        if let Some(remote_handler) = self.remote_handler.as_mut() {
+            let ((), ()) = tokio::join!(
+                remote_handler.send_results(results.clone()),
+                self.local_handler.send_results(results)
+            );
+        } else {
+            self.local_handler.send_results(results).await;
+        }
     }
 }
 

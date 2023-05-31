@@ -50,6 +50,7 @@ pub struct RunnerStrategyGenerator {
     local_results_handler: SharedResultsHandler,
     max_run_number: u32,
     assigned: AssignedRun,
+    should_send_results: bool,
 }
 
 impl RunnerStrategyGenerator {
@@ -61,6 +62,7 @@ impl RunnerStrategyGenerator {
         local_results_handler: SharedResultsHandler,
         max_run_number: u32,
         assigned: AssignedRun,
+        should_send_results: bool,
     ) -> Self {
         Self {
             client,
@@ -70,6 +72,7 @@ impl RunnerStrategyGenerator {
             local_results_handler,
             max_run_number,
             assigned,
+            should_send_results,
         }
     }
 }
@@ -84,6 +87,7 @@ impl StrategyGenerator for RunnerStrategyGenerator {
             local_results_handler,
             max_run_number,
             assigned,
+            should_send_results,
         } = &self;
 
         let sourcing_strategy = match assigned {
@@ -123,12 +127,15 @@ impl StrategyGenerator for RunnerStrategyGenerator {
         };
 
         let results_handler: ResultsHandler = {
-            let queue_handler = QueueResultsSender::new(
-                client.boxed_clone(),
-                *queue_results_addr,
-                runner_entity,
-                run_id.clone(),
-            );
+            let queue_handler = match should_send_results {
+                true => Some(QueueResultsSender::new(
+                    client.boxed_clone(),
+                    *queue_results_addr,
+                    runner_entity,
+                    run_id.clone(),
+                )),
+                false => None,
+            };
             let notifier = MultiplexingResultsHandler::new(
                 queue_handler,
                 local_results_handler.boxed_clone(),

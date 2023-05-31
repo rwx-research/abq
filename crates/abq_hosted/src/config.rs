@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use abq_utils::auth::UserToken;
 use abq_utils::net_protocol::workers::RunId;
-use reqwest::{blocking::RequestBuilder, StatusCode, Url};
+use reqwest::{RequestBuilder, StatusCode, Url};
 use serde::Deserialize;
+use serde::Serialize;
 
 use crate::{error::Error, AccessToken};
 
@@ -18,16 +19,26 @@ pub struct HostedQueueConfig {
     pub auth_token: UserToken,
     /// `Some` is TLS should be used, `None` otherwise.
     pub tls_public_certificate: Option<Vec<u8>>,
+    pub rwx_access_token_kind: AccessTokenKind,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AccessTokenKind {
+    #[serde(rename = "personal_access_token")]
+    Personal,
+    #[serde(rename = "organization_access_token")]
+    Organization,
 }
 
 #[derive(Deserialize, Debug)]
 struct HostedQueueResponse {
     queue_url: Url,
     tls_public_certificate: Option<String>,
+    rwx_access_token_kind: AccessTokenKind,
 }
 
 impl HostedQueueConfig {
-    pub fn from_api<U>(
+    pub async fn from_api<U>(
         api_url: U,
         access_token: &AccessToken,
         run_id: &RunId,
@@ -47,7 +58,7 @@ impl HostedQueueConfig {
                 Ok(api)
             })?;
 
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::Client::new();
         let build_request = move || {
             client
                 .get(queue_api.clone())
@@ -55,13 +66,16 @@ impl HostedQueueConfig {
                 .header("User-Agent", format!("abq/{}", abq_utils::VERSION))
                 .query(&[("run_id", run_id.to_string())])
         };
-        let resp: HostedQueueResponse = send_request_with_decay(build_request)?
+        let resp: HostedQueueResponse = send_request_with_decay(build_request)
+            .await?
             .error_for_status()?
-            .json()?;
+            .json()
+            .await?;
 
         let HostedQueueResponse {
             queue_url,
             tls_public_certificate,
+            rwx_access_token_kind,
         } = resp;
 
         let addr = match queue_url.socket_addrs(|| None).as_deref() {
@@ -100,6 +114,7 @@ impl HostedQueueConfig {
             run_id: resolved_run_id,
             auth_token,
             tls_public_certificate: tls_public_certificate.map(String::into_bytes),
+            rwx_access_token_kind,
         })
     }
 }
@@ -126,9 +141,9 @@ fn build_retrier(
 
 /// Attempts a request a number of times, retrying with an exponential decay if the server was
 /// determined to have errored or notified a rate-limit.
-fn send_request_with_decay(
+async fn send_request_with_decay(
     build_request: impl Fn() -> RequestBuilder,
-) -> reqwest::Result<reqwest::blocking::Response> {
+) -> reqwest::Result<reqwest::Response> {
     send_request_with_decay_help(
         build_request,
         build_retrier(
@@ -137,17 +152,18 @@ fn send_request_with_decay(
             DEFAULT_REQUEST_DECAY_MUL,
         ),
     )
+    .await
 }
 
-fn send_request_with_decay_help(
+async fn send_request_with_decay_help(
     build_request: impl Fn() -> RequestBuilder,
     mut wait_for_retry: impl FnMut(usize) -> bool,
-) -> reqwest::Result<reqwest::blocking::Response> {
+) -> reqwest::Result<reqwest::Response> {
     let mut last_attempt = 0;
     loop {
         last_attempt += 1;
 
-        let response = build_request().send()?;
+        let response = build_request().send().await?;
 
         let status = response.status();
         if status.is_success() {
@@ -177,6 +193,8 @@ mod test {
     use abq_utils::{auth::UserToken, net_protocol::workers::RunId};
     use reqwest::StatusCode;
 
+    use crate::AccessTokenKind;
+
     use super::{send_request_with_decay_help, AccessToken};
 
     use super::{Error, HostedQueueConfig};
@@ -200,8 +218,8 @@ mod test {
         .to_string()
     }
 
-    #[test]
-    fn get_hosted_queue_config_with_tls() {
+    #[tokio::test]
+    async fn get_hosted_queue_config_with_tls() {
         let mut server = Server::new();
 
         let in_run_id = RunId("1234".to_string());
@@ -219,7 +237,7 @@ mod test {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
-                r#"{{"queue_url":"abqs://168.220.85.45:8080?run_id=1234\u0026token={}","tls_public_certificate":"{}"}}"#,
+                r#"{{"queue_url":"abqs://168.220.85.45:8080?run_id=1234\u0026token={}","tls_public_certificate":"{}","rwx_access_token_kind":"organization_access_token"}}"#,
                 test_auth_token(),
                 test_mock_cert()
             ))
@@ -230,16 +248,20 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
+            rwx_access_token_kind,
+        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+            .await
+            .unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
         assert_eq!(auth_token, test_auth_token());
         assert_eq!(tls_public_certificate.unwrap(), test_mock_cert().as_bytes());
+        assert_eq!(rwx_access_token_kind, AccessTokenKind::Organization)
     }
 
-    #[test]
-    fn get_hosted_queue_config_without_tls() {
+    #[tokio::test]
+    async fn get_hosted_queue_config_without_tls() {
         let mut server = Server::new();
 
         let in_run_id = RunId("1234".to_string());
@@ -258,7 +280,7 @@ mod test {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
-                r#"{{"queue_url":"abq://168.220.85.45:8080?run_id=1234\u0026token={}"}}"#,
+                r#"{{"queue_url":"abq://168.220.85.45:8080?run_id=1234\u0026token={}","rwx_access_token_kind":"personal_access_token"}}"#,
                 test_auth_token()
             ))
             .create();
@@ -268,16 +290,20 @@ mod test {
             run_id,
             auth_token,
             tls_public_certificate,
-        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id).unwrap();
+            rwx_access_token_kind,
+        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+            .await
+            .unwrap();
 
         assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
         assert_eq!(run_id, in_run_id);
         assert_eq!(auth_token, test_auth_token());
         assert!(tls_public_certificate.is_none());
+        assert_eq!(rwx_access_token_kind, AccessTokenKind::Personal)
     }
 
-    #[test]
-    fn get_hosted_queue_config_wrong_authn() {
+    #[tokio::test]
+    async fn get_hosted_queue_config_wrong_authn() {
         let mut server = Server::new();
 
         let _m = server
@@ -288,13 +314,14 @@ mod test {
 
         let err =
             HostedQueueConfig::from_api(server.url(), &test_access_token(), &RunId("".to_owned()))
+                .await
                 .unwrap_err();
 
         assert!(matches!(err, Error::Unauthenticated));
     }
 
-    #[test]
-    fn get_hosted_queue_config_wrong_authz() {
+    #[tokio::test]
+    async fn get_hosted_queue_config_wrong_authz() {
         let mut server = Server::new();
 
         let _m = server
@@ -305,13 +332,14 @@ mod test {
 
         let err =
             HostedQueueConfig::from_api(server.url(), &test_access_token(), &RunId("".to_owned()))
+                .await
                 .unwrap_err();
 
         assert!(matches!(err, Error::Unauthorized));
     }
 
-    #[test]
-    fn get_hosted_queue_config_unexpected_response() {
+    #[tokio::test]
+    async fn get_hosted_queue_config_unexpected_response() {
         let mut server = Server::new();
 
         let in_run_id = RunId("1234".to_string());
@@ -329,29 +357,31 @@ mod test {
             )]))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"queue_url":"tcp://168.220.85.45:8080"}"#)
+            .with_body(r#"{"queue_url":"tcp://168.220.85.45:8080","rwx_access_token_kind":"organization_access_token"}"#)
             .create();
 
         let err = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+            .await
             .unwrap_err();
 
         assert!(matches!(err, Error::SchemaError(..)));
     }
 
-    #[test]
-    fn get_hosted_queue_config_bad_api_url() {
+    #[tokio::test]
+    async fn get_hosted_queue_config_bad_api_url() {
         let err = HostedQueueConfig::from_api(
             "definitely not a url",
             &test_access_token(),
             &RunId("".to_owned()),
         )
+        .await
         .unwrap_err();
 
         assert!(matches!(err, Error::InvalidUrl(..)));
     }
 
-    #[test]
-    fn retry_request_on_429() {
+    #[tokio::test]
+    async fn retry_request_on_429() {
         let mut server = Server::new();
 
         let mut m = server
@@ -378,16 +408,17 @@ mod test {
             }
         };
 
-        let client = reqwest::blocking::Client::new();
-        let resp =
-            send_request_with_decay_help(|| client.get(server_url.clone()), retrier).unwrap();
+        let client = reqwest::Client::new();
+        let resp = send_request_with_decay_help(|| client.get(server_url.clone()), retrier)
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(last_seen_attempt, 1);
     }
 
-    #[test]
-    fn retry_request_on_500() {
+    #[tokio::test]
+    async fn retry_request_on_500() {
         let mut server = Server::new();
 
         let mut m = server
@@ -414,16 +445,17 @@ mod test {
             }
         };
 
-        let client = reqwest::blocking::Client::new();
-        let resp =
-            send_request_with_decay_help(|| client.get(server_url.clone()), retrier).unwrap();
+        let client = reqwest::Client::new();
+        let resp = send_request_with_decay_help(|| client.get(server_url.clone()), retrier)
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(last_seen_attempt, 1);
     }
 
-    #[test]
-    fn do_not_retry_request_on_400_level() {
+    #[tokio::test]
+    async fn do_not_retry_request_on_400_level() {
         let mut server = Server::new();
 
         let mut m = server
@@ -450,16 +482,17 @@ mod test {
             }
         };
 
-        let client = reqwest::blocking::Client::new();
-        let resp =
-            send_request_with_decay_help(|| client.get(server_url.clone()), retrier).unwrap();
+        let client = reqwest::Client::new();
+        let resp = send_request_with_decay_help(|| client.get(server_url.clone()), retrier)
+            .await
+            .unwrap();
 
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(last_seen_attempt, 0);
     }
 
-    #[test]
-    fn do_not_retry_request_when_retrier_is_done() {
+    #[tokio::test]
+    async fn do_not_retry_request_when_retrier_is_done() {
         let mut server = Server::new();
 
         let _m = server
@@ -475,8 +508,10 @@ mod test {
             last_attempt < 3
         };
 
-        let client = reqwest::blocking::Client::new();
-        let resp = send_request_with_decay_help(|| client.get(server.url()), retrier).unwrap();
+        let client = reqwest::Client::new();
+        let resp = send_request_with_decay_help(|| client.get(server.url()), retrier)
+            .await
+            .unwrap();
 
         assert_eq!(resp.status().as_u16(), 500);
         assert_eq!(last_seen_attempt, 3);

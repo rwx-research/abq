@@ -1,10 +1,11 @@
 //! Utilities for interacting with the queue config API
 
 use core::fmt;
+use serde_derive::{Deserialize, Serialize};
 use std::str::FromStr;
 use thiserror::Error;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct AccessToken(String);
 
 #[derive(Debug, Error)]

@@ -266,6 +266,7 @@ impl WorkersConfigBuilder {
             results_batch_size_hint: 1,
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
+            should_send_results: true,
         };
         Self {
             config,

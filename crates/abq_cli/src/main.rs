@@ -1,3 +1,4 @@
+mod abq_config;
 mod args;
 mod health;
 mod instance;
@@ -6,11 +7,14 @@ mod reporting;
 mod statefile;
 mod workers;
 
+use std::io;
+use std::str::FromStr;
 use std::{
     collections::HashMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, time::Duration,
 };
 
 use abq_hosted::AccessToken;
+use abq_hosted::AccessTokenKind;
 use abq_utils::{
     auth::{ClientAuthStrategy, ServerAuthStrategy, User, UserToken},
     exit::ExitCode,
@@ -33,6 +37,7 @@ use clap::Parser;
 use instance::AbqInstance;
 use tracing::{metadata::LevelFilter, Subscriber};
 use tracing_subscriber::{fmt, prelude::*, registry, EnvFilter, Registry};
+use workers::ExecutionMode;
 
 use crate::{
     args::Token,
@@ -63,6 +68,7 @@ struct ConfigFromApi {
     queue_addr: SocketAddr,
     token: UserToken,
     tls_public_certificate: Option<Vec<u8>>,
+    rwx_access_token_kind: AccessTokenKind,
 }
 
 struct RunIdEnvironment {
@@ -225,6 +231,40 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
     let Cli { command } = Cli::parse();
 
     match command {
+        Command::Login { access_token } => {
+            let abq_config = match access_token {
+                Some(token) => abq_config::AbqConfig {
+                    rwx_access_token: token,
+                },
+                None => {
+                    let mut input = String::new();
+                    println!("Generate a Personal Access Token at https://account.rwx.com/_/personal_access_tokens");
+                    println!("\n");
+                    println!("Enter your RWX Personal Access Token:");
+
+                    io::stdin()
+                        .read_line(&mut input)
+                        .expect("Failed to read line");
+
+                    abq_config::AbqConfig {
+                        rwx_access_token: AccessToken::from_str(input.trim())?,
+                    }
+                }
+            };
+
+            if let Some(config_path) = get_abq_config_filepath() {
+                abq_config::write_abq_config(abq_config, Ok(config_path.clone()))?;
+                println!("\n");
+                println!(
+                    "Your access token is now stored at: {}",
+                    config_path.display()
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let mut cmd = Cli::command();
+            Err(cmd.error(ErrorKind::InvalidValue, "Failed to locate ABQ config file."))?
+        }
         Command::Start {
             bind: bind_ip,
             public_ip,
@@ -324,6 +364,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let stdout_preferences = StdoutPreferences::new(color);
 
             let external_run_id = run_id.or(inferred_run_id);
+            let explicit_run_id_provided = external_run_id.is_some();
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
 
             let working_dir =
@@ -332,15 +373,33 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
 
+            let access_token = access_token.or_else(|| {
+                let config = abq_config::read_abq_config(get_abq_config_filepath())?;
+                Some(config.rwx_access_token)
+            });
+
             let ResolvedConfig {
-                queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
-            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
+                rwx_access_token_kind,
+                queue_location,
+            } = resolve_config(token, queue_addr, tls_cert, tls_key, &access_token, &run_id)
+                .await?;
+
+            if explicit_run_id_provided && !queue_location.is_remote() {
+                let mut cmd = Cli::command();
+                Err(cmd.error(
+                    ErrorKind::InvalidValue,
+                    indoc::indoc!("
+                    `abq test` was provided a run id, but we've detected an ephemeral queue.
+
+                    If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
+                    If you intended to run against an ephemeral queue, please remove the run id argument.
+                    ")
+                ))?;
+            }
 
             let client_auth = resolved_token.into();
-
-            let queue_addr_or_opt_tls_key = resolved_queue_addr.ok_or(tls_key);
 
             let runner_params = validate_abq_test_args(args)?;
 
@@ -348,7 +407,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let abq = find_or_create_abq(
                 entity,
                 run_id.clone(),
-                queue_addr_or_opt_tls_key,
+                queue_location,
                 resolved_token,
                 client_auth,
                 resolved_tls,
@@ -362,6 +421,11 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                     NonZeroUsize::new(std::cmp::Ord::max(num_cpus::get_physical() - 1, 1)).unwrap()
                 }
                 Fixed(num) => num,
+            };
+
+            let execution_mode = match rwx_access_token_kind.as_ref() {
+                Some(AccessTokenKind::Personal) => ExecutionMode::Readonly,
+                _ => ExecutionMode::WriteNormal,
             };
 
             statefile::optional_write_worker_statefile(&run_id)?;
@@ -386,6 +450,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 abq.negotiator_handle(),
                 abq.client_options().clone(),
                 startup_timeout,
+                execution_mode,
             )
             .await
         }
@@ -402,6 +467,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let deprecations = DeprecationRecord::default();
             let stdout_preferences = StdoutPreferences::new(color);
 
+            let explicit_run_id_provided = run_id.is_some();
             let run_id = run_id.or(inferred_run_id).ok_or_else (|| {
                 let mut cmd = Cli::command();
                 cmd.error(
@@ -412,27 +478,38 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let tls_cert = read_opt_path_bytes(tls_cert)?;
 
+            let access_token = access_token.or_else(|| {
+                let config = abq_config::read_abq_config(get_abq_config_filepath())?;
+                Some(config.rwx_access_token)
+            });
+
             let ResolvedConfig {
-                queue_addr: resolved_queue_addr,
                 token: resolved_token,
                 tls_cert: resolved_tls,
-            } = resolve_config(token, queue_addr, tls_cert, &access_token, &run_id)?;
+                rwx_access_token_kind: _resolved_rwx_access_token_kind,
+                queue_location,
+            } = resolve_config(token, queue_addr, tls_cert, None, &access_token, &run_id).await?;
 
             let client_auth = resolved_token.into();
 
-            let queue_addr = resolved_queue_addr.ok_or_else(|| {
+            if explicit_run_id_provided && !queue_location.is_remote() {
                 let mut cmd = Cli::command();
-                cmd.error(
+                Err(cmd.error(
                     ErrorKind::InvalidValue,
-                    "`abq report` could not detect the queue to connect to. Consider setting `--access-token` or the `RWX_ACCESS_TOKEN` environment variable.",
-                )
-            })?;
+                    indoc::indoc!("
+                    `abq report` was provided a run id, but we've detected an ephemeral queue.
+
+                    If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
+                    If you intended to run against an ephemeral queue, please remove the run id argument.
+                    ")
+                ))?;
+            }
 
             let entity = Entity::local_client();
             let abq = find_or_create_abq(
                 entity,
                 run_id.clone(),
-                Ok(queue_addr),
+                queue_location,
                 resolved_token,
                 client_auth,
                 resolved_tls,
@@ -527,46 +604,85 @@ fn read_path_bytes(p: PathBuf) -> anyhow::Result<Vec<u8>> {
 }
 
 struct ResolvedConfig {
-    queue_addr: Option<SocketAddr>,
     token: Option<UserToken>,
     tls_cert: Option<Vec<u8>>,
+    rwx_access_token_kind: Option<AccessTokenKind>,
+    queue_location: QueueLocation,
 }
 
-fn resolve_config(
+enum QueueLocation {
+    Remote(SocketAddr),
+    Ephemeral { opt_tls_key: Option<Vec<u8>> },
+}
+
+impl QueueLocation {
+    fn is_remote(&self) -> bool {
+        match self {
+            QueueLocation::Remote(_) => true,
+            QueueLocation::Ephemeral { .. } => false,
+        }
+    }
+}
+
+async fn resolve_config(
     token_from_cli: Option<UserToken>,
     queue_addr_from_cli: Option<SocketAddr>,
     tls_cert_from_cli: Option<Vec<u8>>,
+    tls_key: Option<Vec<u8>>,
     access_token: &Option<AccessToken>,
     run_id: &RunId,
 ) -> anyhow::Result<ResolvedConfig> {
-    let (queue_addr_from_api, token_from_api, tls_from_api) = match access_token.as_ref() {
-        Some(access_token) => {
-            let config = get_config_from_api(access_token, run_id)?;
-            (
-                Some(config.queue_addr),
-                Some(config.token),
-                config.tls_public_certificate,
-            )
-        }
-        None => (None, None, None),
-    };
+    let (queue_addr_from_api, token_from_api, tls_from_api, rwx_access_token_kind) =
+        match access_token.as_ref() {
+            Some(access_token) => {
+                let config = get_config_from_api(access_token, run_id).await?;
+                (
+                    Some(config.queue_addr),
+                    Some(config.token),
+                    config.tls_public_certificate,
+                    Some(config.rwx_access_token_kind),
+                )
+            }
+            None => (None, None, None, None),
+        };
 
     let token = token_from_api.or(token_from_cli);
     let queue_addr = queue_addr_from_api.or(queue_addr_from_cli);
     let tls_cert = tls_from_api.or(tls_cert_from_cli);
+    let queue_location = match queue_addr {
+        Some(queue_addr) => QueueLocation::Remote(queue_addr),
+        None => QueueLocation::Ephemeral {
+            opt_tls_key: tls_key,
+        },
+    };
 
     Ok(ResolvedConfig {
-        queue_addr,
         token,
         tls_cert,
+        rwx_access_token_kind,
+        queue_location,
     })
+}
+
+fn get_abq_config_filepath() -> Option<PathBuf> {
+    let config_file_mode = match std::env::var("ABQ_CONFIG_FILE") {
+        Ok(path) => {
+            if path.is_empty() {
+                abq_config::AbqConfigFileMode::Ignore
+            } else {
+                abq_config::AbqConfigFileMode::Override(path)
+            }
+        }
+        Err(_) => abq_config::AbqConfigFileMode::Conventional,
+    };
+    abq_config::abq_config_filepath(config_file_mode)
 }
 
 fn get_hosted_api_base_url() -> String {
     std::env::var("ABQ_API").unwrap_or_else(|_| abq_hosted::DEFAULT_RWX_ABQ_API_URL.to_string())
 }
 
-fn get_config_from_api(
+async fn get_config_from_api(
     access_token: &AccessToken,
     run_id: &RunId,
 ) -> anyhow::Result<ConfigFromApi> {
@@ -579,12 +695,14 @@ fn get_config_from_api(
         run_id: _,
         auth_token,
         tls_public_certificate,
-    } = HostedQueueConfig::from_api(api_url, access_token, run_id)?;
+        rwx_access_token_kind,
+    } = HostedQueueConfig::from_api(api_url, access_token, run_id).await?;
 
     Ok(ConfigFromApi {
         queue_addr: addr,
         token: auth_token,
         tls_public_certificate,
+        rwx_access_token_kind,
     })
 }
 
@@ -613,7 +731,7 @@ fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParam
 async fn find_or_create_abq(
     entity: Entity,
     run_id: RunId,
-    queue_addr_or_opt_tls: Result<SocketAddr, Option<Vec<u8>>>,
+    queue_location: QueueLocation,
     opt_user_token: Option<UserToken>,
     client_auth: ClientAuthStrategy<User>,
     client_tls_cert: Option<Vec<u8>>,
@@ -624,8 +742,8 @@ async fn find_or_create_abq(
         None => ClientTlsStrategy::no_tls(),
     };
 
-    match queue_addr_or_opt_tls {
-        Ok(queue_addr) => {
+    match queue_location {
+        QueueLocation::Remote(queue_addr) => {
             let instance = AbqInstance::from_remote(
                 entity,
                 run_id,
@@ -636,7 +754,7 @@ async fn find_or_create_abq(
             )?;
             Ok(instance)
         }
-        Err(opt_tls_key) => {
+        QueueLocation::Ephemeral { opt_tls_key } => {
             let server_tls = match (client_tls_cert, opt_tls_key) {
                 (Some(cert), Some(key)) => ServerTlsStrategy::from_cert(&cert, &key)?,
                 (None, None) => ServerTlsStrategy::no_tls(),
@@ -644,7 +762,6 @@ async fn find_or_create_abq(
                     "any other configuration would have been caught during arg parsing"
                 ),
             };
-
             Ok(
                 AbqInstance::new_ephemeral(opt_user_token, client_auth, server_tls, client_tls)
                     .await,
