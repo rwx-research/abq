@@ -307,6 +307,7 @@ mod test {
     #[test]
     #[n_times(100)]
     fn fuzz_grouped_partitions() {
+        use std::collections::HashMap;
         // first create the manifest
         let min_group_size = 1;
         let max_group_size = 24; // group batch sums cleanly to 300
@@ -343,6 +344,7 @@ mod test {
         for n in 1..=num_threads {
             let queue = queue.clone();
             let num_popped = num_popped.clone();
+            let mut entity_by_group_id: HashMap<GroupId, Entity> = HashMap::new();
             let entity = Entity::runner(n as u32, n as u32);
             let batch_size = NonZeroUsize::try_from(n).unwrap();
             let handle = std::thread::spawn(move || {
@@ -353,7 +355,19 @@ mod test {
                     if popped.len() == 0 {
                         break;
                     }
-                    local_manifest.extend(popped.cloned());
+
+                    let popped: Vec<WorkerTest> = popped.cloned().collect();
+
+                    //assert every group is only assigned to one entity
+                    for test in popped.clone() {
+                        if let Some(previous_entity) =
+                            entity_by_group_id.insert(test.spec.group_id, entity)
+                        {
+                            assert_eq!(previous_entity, entity);
+                        }
+                    }
+
+                    local_manifest.extend(popped)
                 }
                 local_manifest
             });
