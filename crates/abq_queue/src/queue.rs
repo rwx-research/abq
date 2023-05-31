@@ -4805,7 +4805,7 @@ mod persist_results {
             active_workers.insert_by_tag(Entity::runner(1, 1), Some(Instant::now()));
             let has_work = RunState::HasWork {
                 queue: JobQueue::default(),
-                batch_size_hint,
+                batch_size_hint: one_nonzero_usize(),
                 init_metadata: Default::default(),
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
