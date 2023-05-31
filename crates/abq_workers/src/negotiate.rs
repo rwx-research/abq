@@ -607,7 +607,7 @@ mod test {
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::entity::{Entity, WorkerTag};
-    use abq_utils::net_protocol::queue::{InvokeWork, TestSpec, WorkStrategy};
+    use abq_utils::net_protocol::queue::{InvokeWork, TestSpec, TestStrategy};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
     };
@@ -905,7 +905,7 @@ mod test {
         let invoke_data = InvokeWork {
             run_id,
             batch_size_hint: one_nonzero(),
-            work_strategy: WorkStrategy::ByTest,
+            test_strategy: TestStrategy::ByTest,
         };
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
