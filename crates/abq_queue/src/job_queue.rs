@@ -213,9 +213,8 @@ mod test {
         assert_eq!(num_popped.load(atomic::ORDERING), num_tests);
         assert!(queue.is_at_end());
 
-        // Now, go through the queue's assigned entities and make sure everything looks okay.
-        // There should be no holes, and the runs of assignments should align with how many tests
-        // each worker popped off.
+        // convert assigned_entities into a series of chunks of (entity, num_popped)
+        // if an entity pulled more than once, add two chunks
         let assigned = &queue.assigned_entities;
         let mut chunks = vec![(assigned.first().unwrap(), 0)];
         for entity in assigned {
@@ -231,12 +230,16 @@ mod test {
                 chunks.push((entity, 1));
             }
         }
+
+        // Now, go through the queue's assigned entities and make sure everything looks okay.
+        // There should be no holes, and the runs of assignments should align with how many tests
+        // each worker popped off.
         let mut chunks_it = chunks.into_iter().peekable();
         while let Some((entity, run)) = chunks_it.next() {
             let entity_batch = workers.get(entity.0.get()).unwrap();
             match chunks_it.peek() {
-                Some(_) => assert_eq!(run, entity_batch.get()),
-                None => assert!(run <= entity_batch.get()),
+                Some(_) => assert_eq!(run, entity_batch.get()), // if there are more chunks, batch size should be full
+                None => assert!(run <= entity_batch.get()), // else, the run should be less than or equal to the batch size
             }
         }
     }
