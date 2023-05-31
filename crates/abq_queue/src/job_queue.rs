@@ -77,14 +77,28 @@ impl JobQueue {
     #[inline]
     fn get_bounds_by_test(&self, suggested_batch_size: usize, queue_len: usize) -> (usize, usize) {
         let start_idx = self.ptr.fetch_add(suggested_batch_size, atomic::ORDERING);
-        if start_idx >= queue_len {
+        let end_idx = start_idx + suggested_batch_size;
+        // If either
+        //   - the start index was past the end of the queue (this happens if we fetched after the last occurrence added but before they clamped)
+        //   - the end index is now past the end of the queue (this is the current pointer location)
+        // clamp them down, and do an additional atomic store to clamp the pointer to the end of
+        // the queue.
+        //
+        // Note that the secondary store is always safe, because if either the start or end index
+        // is past the queue, this popping already synchronized reaching the end.
+        //
+        // NB there is a chance for overflow here, but that would require a test suite with at
+        // least 2^32 tests! We would fail far before this section in that case.
+        if start_idx > queue_len {
+            // we reach this branch if we `fetch_add` AFTER another thread added but BEFORE that thread `store`d the clamped value
             self.ptr.store(queue_len, atomic::ORDERING);
             (queue_len, queue_len)
+        } else if end_idx > queue_len {
+            // we reach this branch if start_idx + suggested_batch_size > queue_len. The ptr is currently pointing beyond the end of the queue
+            self.ptr.store(queue_len, atomic::ORDERING);
+            (start_idx, queue_len)
         } else {
-            (
-                start_idx,
-                std::cmp::min(start_idx + suggested_batch_size, queue_len),
-            )
+            (start_idx, end_idx)
         }
     }
 
