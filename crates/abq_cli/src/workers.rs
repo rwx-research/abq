@@ -216,7 +216,8 @@ async fn do_shutdown(
                 &test_run_metadata.access_token,
                 &test_run_metadata.run_id,
                 &native_runner_info.specification,
-            ).await;
+            )
+            .await;
         }
     }
 
