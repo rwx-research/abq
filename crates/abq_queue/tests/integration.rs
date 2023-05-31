@@ -6,7 +6,7 @@ use std::{
     path::Path,
     pin::Pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use abq_native_runner_simulation::{legal_spawned_message, pack, pack_msgs_to_disk};
@@ -718,22 +718,45 @@ async fn run_test(server: Server, steps: Steps<'_>) {
 
                 RemoteManifest(n, check) => {
                     let run_id = run_ids.get(&n).unwrap().clone();
-                    let remote = remote.0.lock().await;
-                    let manifest = remote.manifests.get(&run_id).unwrap();
-                    check(manifest)
+                    let manifest = sleep_until_or_fail(
+                        || async { remote.0.lock().await.manifests.get(&run_id).cloned() },
+                        Duration::from_secs(1),
+                    )
+                    .await;
+                    check(&manifest);
                 }
 
                 RemoteResults(n, check) => {
                     let run_id = run_ids.get(&n).unwrap().clone();
-                    let remote = remote.0.lock().await;
-                    let results = remote.results.get(&run_id).unwrap();
-                    check(results)
+                    let results = sleep_until_or_fail(
+                        || async { remote.0.lock().await.results.get(&run_id).cloned() },
+                        Duration::from_secs(1),
+                    )
+                    .await;
+                    check(&results)
                 }
             }
         }
     }
 
     queue.shutdown().await.unwrap();
+}
+
+async fn sleep_until_or_fail<T, F, Fut>(f: F, max: Duration) -> T
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let now = Instant::now();
+    loop {
+        if now.elapsed() > max {
+            panic!("timed out");
+        }
+        if let Some(t) = f().await {
+            return t;
+        }
+        tokio::time::sleep(Duration::from_micros(100)).await;
+    }
 }
 
 #[tokio::test]
