@@ -517,11 +517,13 @@ pub mod queue {
     #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy)]
     pub enum TestStrategy {
         #[default]
-        // just pop them up in order
+        /// Traverse tests in order
         ByTest,
-        /// By top level group (which should, in most cases, be by-file, and if not, should still exhibit similar before- and after- work characteristics).
+
+        /// Traverse tests grouped by top level group (which should, in most cases, be by-file, and if not, should still exhibit similar before- and after- work characteristics).
         /// using this strategy ensure each top level group gets distributed to a single worker.
-        // should avoid running expensive before-group / after-group work from being run multiple times at the expense
+        ///
+        /// This should avoid running expensive before-group / after-group work from being run multiple times at the expense
         /// of uneven test distribution
         ByTopLevelGroup,
     }
