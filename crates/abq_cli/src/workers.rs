@@ -173,18 +173,18 @@ async fn do_shutdown(
     suite_result
         .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)
         .unwrap();
-    print!("\n\n");
+    println!("\n");
     if execution_mode == ExecutionMode::WriteNormal {
-        print!("Run the following command to replay these tests locally:");
-        print!("\n\n");
-        print!(
-            "abq test --run-id {} --worker {} --num {}",
+        println!("Run the following command to replay these tests locally:");
+        println!("\n");
+        println!(
+            "\tabq test --run-id {} --worker {} --num {} -- <your-test-command>",
             run_id,
             worker_tag.index(),
-            num_runners
+            num_runners,
         );
-        print!("\n\n");
-        print!("Specify your Access Token with the RWX_ACCESS_TOKEN env variable, passing --access-token, or running `abq login`.");
+        println!("\n");
+        println!("Specify your Access Token with the RWX_ACCESS_TOKEN env variable, passing --access-token, or running `abq login`.");
     }
 
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,

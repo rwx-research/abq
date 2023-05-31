@@ -239,7 +239,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 None => {
                     let mut input = String::new();
                     println!("Generate a Personal Access Token at https://account.rwx.com/_/personal_access_tokens");
-                    println!("\n\n");
+                    println!("\n");
                     println!("Enter your RWX Personal Access Token:");
 
                     io::stdin()
@@ -254,6 +254,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             if let Some(config_path) = get_abq_config_filepath() {
                 abq_config::write_abq_config(abq_config, Ok(config_path.clone()))?;
+                println!("\n");
                 println!(
                     "Your access token is now stored at: {}",
                     config_path.display()
@@ -391,6 +392,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                     ErrorKind::InvalidValue,
                     indoc::indoc!("
                     `abq test` was provided a run id, but we've detected an ephemeral queue.
+
                     If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
                     If you intended to run against an ephemeral queue, please remove the run id argument.
                     ")
@@ -476,6 +478,11 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let tls_cert = read_opt_path_bytes(tls_cert)?;
 
+            let access_token = access_token.or_else(|| {
+                let config = abq_config::read_abq_config(get_abq_config_filepath())?;
+                Some(config.rwx_access_token)
+            });
+
             let ResolvedConfig {
                 token: resolved_token,
                 tls_cert: resolved_tls,
@@ -491,6 +498,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                     ErrorKind::InvalidValue,
                     indoc::indoc!("
                     `abq report` was provided a run id, but we've detected an ephemeral queue.
+
                     If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
                     If you intended to run against an ephemeral queue, please remove the run id argument.
                     ")
@@ -681,10 +689,6 @@ async fn get_config_from_api(
     use abq_hosted::HostedQueueConfig;
 
     let api_url = get_hosted_api_base_url();
-
-    println!("api_url: {}", api_url);
-    println!("access_token: {}", access_token);
-    println!("run_id: {}", run_id);
 
     let HostedQueueConfig {
         addr,

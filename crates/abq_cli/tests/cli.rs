@@ -2992,8 +2992,8 @@ fn login_saves_access_token_custom() {
 #[test]
 #[with_protocol_version]
 #[serial]
-fn login_saves_access_token_noop() {
-    let name = "login_saves_access_token_noop";
+fn login_saves_access_token_err() {
+    let name = "login_saves_access_token_err";
 
     let CmdOutput {
         stdout,
