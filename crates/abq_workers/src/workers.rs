@@ -1064,7 +1064,6 @@ mod test {
         }
     }
 
-    // only used in tests
     fn local_work(test: TestCase, work_id: WorkId) -> WorkerTest {
         WorkerTest {
             spec: TestSpec {
