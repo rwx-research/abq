@@ -112,7 +112,6 @@ pub fn test(id: usize) -> TestId {
     format!("test{id}")
 }
 
-// only used in tests
 pub fn spec(id: usize) -> TestSpec {
     TestSpec {
         test_case: TestCase::new(ProtocolWitness::TEST, test(id), Default::default()),
