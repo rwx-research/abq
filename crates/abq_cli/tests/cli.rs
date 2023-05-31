@@ -2565,7 +2565,6 @@ fn out_of_process_retries_smoke() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn personal_access_token_does_not_mutate_remote_queue() {
     let name = "personal_access_token_does_not_mutate_remote_queue";
     let conf = CSConfigOptions {
