@@ -7,7 +7,7 @@ use std::{
 use abq_hosted::AccessToken;
 use abq_utils::{
     auth::{AdminToken, UserToken},
-    net_protocol::{queue::WorkStrategy, workers::RunId},
+    net_protocol::{queue::TestStrategy, workers::RunId},
 };
 
 use clap::{ArgGroup, Parser, Subcommand};
@@ -332,7 +332,7 @@ pub enum Command {
         /// that would, by default, be run multiples times by multiples workers instead of a single time on the worker
         /// responsible for that test file.
         #[clap(long, default_value = "by-test")]
-        test_strategy: WorkStrategy,
+        test_strategy: TestStrategy,
 
         /// Whether to report tests with colors.
         ///

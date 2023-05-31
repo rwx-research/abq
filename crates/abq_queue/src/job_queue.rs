@@ -2,7 +2,7 @@ use std::{cell::Cell, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
 use abq_utils::{
     atomic,
-    net_protocol::{entity::Tag, queue::WorkStrategy, workers::WorkerTest},
+    net_protocol::{entity::Tag, queue::TestStrategy, workers::WorkerTest},
 };
 
 use crate::persistence;
@@ -18,7 +18,7 @@ pub struct JobQueue {
     assigned_entities: Vec<TagCell>,
     /// The last item popped off the queue.
     ptr: AtomicUsize,
-    work_strategy: WorkStrategy,
+    test_strategy: TestStrategy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,13 +38,13 @@ impl TagCell {
 unsafe impl Sync for TagCell {}
 
 impl JobQueue {
-    pub fn new(work: Vec<WorkerTest>, work_strategy: WorkStrategy) -> Self {
+    pub fn new(work: Vec<WorkerTest>, test_strategy: TestStrategy) -> Self {
         let work_len = work.len();
         Self {
             queue: work,
             assigned_entities: vec![TagCell::new(Tag::ExternalClient); work_len],
             ptr: AtomicUsize::new(0),
-            work_strategy,
+            test_strategy,
         }
     }
 
@@ -59,12 +59,12 @@ impl JobQueue {
 
         // If the start index was past the end of the queue, return fast
 
-        let (start_idx, end_idx) = match self.work_strategy {
-            WorkStrategy::ByTest => {
+        let (start_idx, end_idx) = match self.test_strategy {
+            TestStrategy::ByTest => {
                 let start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
                 (start_idx, std::cmp::min(start_idx + n, queue_len))
             }
-            WorkStrategy::ByTopLevelGroup => {
+            TestStrategy::ByTopLevelGroup => {
                 let end_idx_cell = Cell::new(0);
                 let start_idx = self
                     .ptr
@@ -129,7 +129,7 @@ impl JobQueue {
             queue,
             assigned_entities,
             ptr: _,
-            work_strategy: _,
+            test_strategy: _,
         } = self;
 
         // Try to convince the compiler that we can simply transmute the list of TagCells to Tags,
@@ -162,7 +162,7 @@ mod test {
         atomic,
         net_protocol::{
             entity::{Entity, Tag},
-            queue::{TestSpec, WorkStrategy},
+            queue::{TestSpec, TestStrategy},
             runners::{ProtocolWitness, TestCase},
             workers::{GroupId, WorkId, WorkerTest, INIT_RUN_NUMBER},
         },
@@ -190,7 +190,7 @@ mod test {
         .take(10_000)
         .collect();
 
-        let queue = Arc::new(JobQueue::new(manifest, WorkStrategy::ByTest));
+        let queue = Arc::new(JobQueue::new(manifest, TestStrategy::ByTest));
 
         let mut threads = Vec::with_capacity(num_threads);
         let mut workers = VecMap::with_capacity(num_threads);
@@ -268,7 +268,7 @@ mod test {
         .take(10_000)
         .collect();
 
-        let queue = Arc::new(JobQueue::new(manifest, WorkStrategy::ByTest));
+        let queue = Arc::new(JobQueue::new(manifest, TestStrategy::ByTest));
 
         let mut threads = Vec::with_capacity(num_threads);
 
@@ -338,7 +338,7 @@ mod test {
             }
         }
 
-        let queue = Arc::new(JobQueue::new(manifest, WorkStrategy::ByTopLevelGroup));
+        let queue = Arc::new(JobQueue::new(manifest, TestStrategy::ByTopLevelGroup));
 
         let mut threads = Vec::with_capacity(num_threads);
 

@@ -518,7 +518,7 @@ pub mod queue {
 
     // strategies for popping work off the queue
     #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy)]
-    pub enum WorkStrategy {
+    pub enum TestStrategy {
         #[default]
         // just pop them up in order
         ByTest,
@@ -529,16 +529,16 @@ pub mod queue {
         ByTopLevelGroup,
     }
 
-    impl Display for WorkStrategy {
+    impl Display for TestStrategy {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                WorkStrategy::ByTest => write!(f, "by-test"),
-                WorkStrategy::ByTopLevelGroup => write!(f, "by-file"),
+                TestStrategy::ByTest => write!(f, "by-test"),
+                TestStrategy::ByTopLevelGroup => write!(f, "by-file"),
             }
         }
     }
 
-    impl FromStr for WorkStrategy {
+    impl FromStr for TestStrategy {
         type Err = String;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -558,7 +558,7 @@ pub mod queue {
     pub struct InvokeWork {
         pub run_id: RunId,
         pub batch_size_hint: NonZeroU64,
-        pub work_strategy: WorkStrategy,
+        pub test_strategy: TestStrategy,
     }
 
     /// Specification of a test case to run.

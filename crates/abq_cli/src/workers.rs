@@ -8,7 +8,7 @@ use abq_reporting::CompletedSummary;
 use abq_utils::capture_output::ProcessOutput;
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{WorkerRunner, WorkerTag};
-use abq_utils::net_protocol::queue::{InvokeWork, WorkStrategy};
+use abq_utils::net_protocol::queue::{InvokeWork, TestStrategy};
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
 use abq_utils::whitespace::is_blank;
 use abq_workers::negotiate::{
@@ -50,7 +50,7 @@ pub async fn start_workers_standalone(
     reporter_kinds: Vec<ReporterKind>,
     stdout_preferences: StdoutPreferences,
     batch_size: NonZeroU64,
-    work_strategy: WorkStrategy,
+    test_strategy: TestStrategy,
     test_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
@@ -98,7 +98,7 @@ pub async fn start_workers_standalone(
     let invoke_work = InvokeWork {
         run_id: run_id.clone(),
         batch_size_hint: batch_size,
-        work_strategy,
+        test_strategy,
     };
 
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(

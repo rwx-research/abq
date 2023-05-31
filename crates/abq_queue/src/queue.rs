@@ -15,7 +15,7 @@ use abq_utils::net_protocol::entity::{Entity, Tag};
 use abq_utils::net_protocol::error::RetryManifestError;
 use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request,
-    TestResultsResponse, TestSpec, WorkStrategy,
+    TestResultsResponse, TestSpec, TestStrategy,
 };
 use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
 use abq_utils::net_protocol::runners::{MetadataMap, StdioOutput};
@@ -71,7 +71,7 @@ enum RunState {
 
         ///strategy for pulling tests off the queue
         // used to instantiate the JobQueue
-        work_strategy: WorkStrategy,
+        test_strategy: TestStrategy,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -319,13 +319,13 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        work_strategy: WorkStrategy,
+        test_strategy: TestStrategy,
         entity: Entity,
         remote: &RemotePersister,
     ) -> AssignedRunStatus {
         if !self.runs.read().contains_key(run_id) {
             match self
-                .try_create_run(run_id, batch_size_hint, work_strategy, entity, remote)
+                .try_create_run(run_id, batch_size_hint, test_strategy, entity, remote)
                 .await
             {
                 ControlFlow::Break(assigned) => return assigned,
@@ -352,7 +352,7 @@ impl AllRuns {
             RunState::WaitingForManifest {
                 worker_connection_times,
                 batch_size_hint: _,
-                work_strategy: _,
+                test_strategy: _,
             } => {
                 let mut worker_connection_times = worker_connection_times.lock();
                 let old = worker_connection_times.insert_by_tag(entity, time::Instant::now());
@@ -460,7 +460,7 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        work_strategy: WorkStrategy,
+        test_strategy: TestStrategy,
         entity: Entity,
         remote: &RemotePersister,
     ) -> ControlFlow<AssignedRunStatus> {
@@ -474,7 +474,7 @@ impl AllRuns {
                     Ok(self.try_create_globally_fresh_run(
                         run_id,
                         batch_size_hint,
-                        work_strategy,
+                        test_strategy,
                         entity,
                     ))
                 }
@@ -488,7 +488,7 @@ impl AllRuns {
                     Ok(self.try_create_globally_fresh_run(
                         run_id,
                         batch_size_hint,
-                        work_strategy,
+                        test_strategy,
                         entity,
                     ))
                 }
@@ -516,7 +516,7 @@ impl AllRuns {
         &self,
         run_id: &RunId,
         batch_size_hint: NonZeroUsize,
-        work_strategy: WorkStrategy,
+        test_strategy: TestStrategy,
         entity: Entity,
     ) -> ControlFlow<AssignedRunStatus> {
         let run = {
@@ -528,7 +528,7 @@ impl AllRuns {
                 state: RunState::WaitingForManifest {
                     worker_connection_times: Mutex::new(worker_timings),
                     batch_size_hint,
-                    work_strategy,
+                    test_strategy,
                 },
             }
         };
@@ -623,15 +623,15 @@ impl AllRuns {
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
 
-        let (worker_connection_times, batch_size_hint, work_strategy) = match &mut run.state {
+        let (worker_connection_times, batch_size_hint, test_strategy) = match &mut run.state {
             RunState::WaitingForManifest {
                 worker_connection_times,
                 batch_size_hint,
-                work_strategy,
+                test_strategy,
             } => {
                 // expected state, pass through
                 let timings = Mutex::into_inner(std::mem::take(worker_connection_times));
-                (timings, *batch_size_hint, *work_strategy)
+                (timings, *batch_size_hint, *test_strategy)
             }
             RunState::Cancelled { .. } => {
                 // If cancelled, do nothing.
@@ -652,7 +652,7 @@ impl AllRuns {
             run_number: INIT_RUN_NUMBER,
         });
 
-        let queue = JobQueue::new(work_from_manifest.collect(), work_strategy);
+        let queue = JobQueue::new(work_from_manifest.collect(), test_strategy);
 
         let mut active_workers = WorkerSet::with_capacity(worker_connection_times.len());
         let mut worker_conn_times = VecMap::with_capacity(worker_connection_times.len());
@@ -1651,7 +1651,7 @@ impl GetAssignedRun for ChooseRunForWorker {
         let InvokeWork {
             run_id,
             batch_size_hint,
-            work_strategy,
+            test_strategy,
         } = invoke_work;
 
         let batch_size_hint =
@@ -1669,7 +1669,7 @@ impl GetAssignedRun for ChooseRunForWorker {
             .find_or_create_run(
                 run_id,
                 batch_size_hint,
-                *work_strategy,
+                *test_strategy,
                 entity,
                 &self.remote,
             )
@@ -2744,7 +2744,7 @@ fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::queue::WorkStrategy;
+    use abq_utils::net_protocol::queue::TestStrategy;
     use std::{io, time::Instant};
 
     use crate::{
@@ -3103,7 +3103,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3123,7 +3123,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3145,7 +3145,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3173,7 +3173,7 @@ mod test {
                 .find_or_create_run(
                     run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote::NoopPersister::new().into(),
                 )
@@ -3203,7 +3203,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote::NoopPersister::new().into(),
             )
@@ -3232,7 +3232,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3263,7 +3263,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3302,7 +3302,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     worker0,
                     &remote,
                 )
@@ -3323,7 +3323,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     worker1,
                     &remote,
                 )
@@ -3352,7 +3352,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     worker2,
                     &remote,
                 )
@@ -3437,7 +3437,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3521,7 +3521,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3603,7 +3603,7 @@ mod test {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     Entity::runner(0, 1),
                     &remote,
                 )
@@ -3653,7 +3653,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3680,7 +3680,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3708,7 +3708,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3737,7 +3737,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3761,7 +3761,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3794,7 +3794,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3875,7 +3875,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3918,7 +3918,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 entity,
                 &remote,
             )
@@ -3954,7 +3954,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -3990,7 +3990,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4032,7 +4032,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4068,7 +4068,7 @@ mod test {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4083,7 +4083,7 @@ mod test_pull_work {
     use abq_test_utils::one_nonzero_usize;
     use abq_utils::net_protocol::{
         entity::Entity,
-        queue::WorkStrategy,
+        queue::TestStrategy,
         workers::{RunId, WorkerTest},
     };
     use abq_with_protocol_version::with_protocol_version;
@@ -4111,7 +4111,7 @@ mod test_pull_work {
                     run_number: 2,
                 },
             ],
-            WorkStrategy::ByTest,
+            TestStrategy::ByTest,
         );
 
         let batch_size_hint = one_nonzero_usize();
@@ -4179,7 +4179,7 @@ mod test_pull_work {
 
 #[cfg(test)]
 mod persistence_on_end_of_manifest {
-    use abq_utils::net_protocol::queue::WorkStrategy;
+    use abq_utils::net_protocol::queue::TestStrategy;
     use futures::FutureExt;
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -4235,7 +4235,7 @@ mod persistence_on_end_of_manifest {
                 .find_or_create_run(
                     &run_id,
                     one_nonzero_usize(),
-                    WorkStrategy::ByTest,
+                    TestStrategy::ByTest,
                     worker0,
                     &remote,
                 )
@@ -4262,7 +4262,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 worker0_shadow,
                 &remote,
             )
@@ -4338,7 +4338,7 @@ mod persistence_on_end_of_manifest {
         let run_id = RunId::unique();
 
         let queues = {
-            let queue = JobQueue::new(manifest, WorkStrategy::ByTest);
+            let queue = JobQueue::new(manifest, TestStrategy::ByTest);
 
             let batch_size_hint = 2.try_into().unwrap();
 
@@ -4476,7 +4476,7 @@ mod persistence_on_end_of_manifest {
             .find_or_create_run(
                 &run_id,
                 one_nonzero_usize(),
-                WorkStrategy::ByTest,
+                TestStrategy::ByTest,
                 Entity::runner(0, 1),
                 &remote,
             )
@@ -4547,7 +4547,7 @@ mod persist_results {
         net_protocol::{
             self,
             entity::{Entity, Tag},
-            queue::{AssociatedTestResults, CancelReason, TestResultsResponse, WorkStrategy},
+            queue::{AssociatedTestResults, CancelReason, TestResultsResponse, TestStrategy},
             results::ResultsLine,
             runners::TestResult,
             workers::RunId,
@@ -4710,7 +4710,7 @@ mod persist_results {
 
     get_read_results_cell! {
         get_read_results_cell_when_waiting_for_manifest,
-        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), work_strategy: WorkStrategy::ByTest },
+        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), test_strategy: TestStrategy::ByTest },
         Err(ReadResultsError::WaitingForManifest)
     }
 

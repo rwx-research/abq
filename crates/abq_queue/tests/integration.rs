@@ -476,7 +476,7 @@ fn action_to_fut(
             let invoke_work = InvokeWork {
                 run_id,
                 batch_size_hint,
-                work_strategy: Default::default(),
+                test_strategy: Default::default(),
             };
 
             let config = WorkersConfig {
@@ -2578,13 +2578,13 @@ async fn many_retries_of_many_out_of_process_workers() {
 
         let remote_asserts = [
             RemoteManifest(
-                Run(1),
+                run,
                 Box::new(move |manifest| {
                     assert_eq!(manifest.len(), num_tests as usize);
                 }),
             ),
             RemoteResults(
-                Run(1),
+                run,
                 Box::new(move |results| {
                     let (results, summary) = flatten_queue_results(results);
                     assert_eq!(results, expected_queue_results);
