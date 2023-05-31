@@ -291,10 +291,10 @@ mod test {
                 let mut local_manifest = vec![];
                 loop {
                     let popped = queue.get_work(entity.tag, n);
-                    num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
                     }
+                    num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     local_manifest.extend(popped.cloned());
                 }
                 local_manifest
@@ -355,36 +355,25 @@ mod test {
         for n in 1..=num_threads {
             let queue = queue.clone();
             let num_popped = num_popped.clone();
-            let mut entity_by_group_id: HashMap<GroupId, Entity> = HashMap::new();
             let entity = Entity::runner(n as u32, n as u32);
             let batch_size = NonZeroUsize::try_from(n).unwrap();
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
                     let popped = queue.get_work(entity.tag, batch_size);
-                    num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
                     }
 
-                    let popped: Vec<WorkerTest> = popped.cloned().collect();
-
-                    // assert every group is only assigned to one entity
-                    for test in popped.clone() {
-                        if let Some(previous_entity) =
-                            entity_by_group_id.insert(test.spec.group_id, entity)
-                        {
-                            assert_eq!(previous_entity, entity);
-                        }
-                    }
-
-                    local_manifest.extend(popped)
+                    num_popped.fetch_add(popped.len(), atomic::ORDERING);
+                    local_manifest.extend(popped.cloned())
                 }
                 local_manifest
             });
             threads.push((entity, handle));
         }
 
+        let mut entity_by_group_id = HashMap::new();
         for (entity, handle) in threads {
             let local_manifest = handle.join().unwrap();
             let queue_seen_manifest: Vec<_> = queue
@@ -392,6 +381,13 @@ mod test {
                 .cloned()
                 .collect();
             assert_eq!(local_manifest, queue_seen_manifest);
+
+            for test in local_manifest {
+                if let Some(previous_entity) = entity_by_group_id.insert(test.spec.group_id, entity)
+                {
+                    assert_eq!(previous_entity, entity);
+                }
+            }
         }
 
         assert_eq!(num_popped.load(atomic::ORDERING), num_tests);
