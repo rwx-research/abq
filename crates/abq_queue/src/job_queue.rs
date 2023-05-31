@@ -62,7 +62,7 @@ impl JobQueue {
         let (start_idx, end_idx) = match self.test_strategy {
             TestStrategy::ByTest => self.get_bounds_by_test(suggested_batch_size),
             TestStrategy::ByTopLevelGroup => {
-                self.get_bounds_by_top_level_group(suggested_batch_size)
+                self.get_bounds_by_top_level_group(suggested_batch_size, queue_len)
             }
         };
         if start_idx >= queue_len {
@@ -88,8 +88,11 @@ impl JobQueue {
     }
 
     #[inline]
-    fn get_bounds_by_top_level_group(&self, suggested_batch_size: usize) -> (usize, usize) {
-        let queue_len = self.queue.len();
+    fn get_bounds_by_top_level_group(
+        &self,
+        suggested_batch_size: usize,
+        queue_len: usize,
+    ) -> (usize, usize) {
         let mut end_idx = 0;
         let start_idx = self
             .ptr
