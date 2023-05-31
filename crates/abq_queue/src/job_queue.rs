@@ -52,47 +52,17 @@ impl JobQueue {
     pub fn get_work(
         &self,
         entity_tag: Tag,
-        n: NonZeroUsize,
+        suggested_batch_size: NonZeroUsize,
     ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
-        let n = n.get() as usize;
+        let suggested_batch_size = suggested_batch_size.get() as usize;
         let queue_len = self.queue.len();
 
         // If the start index was past the end of the queue, return fast
 
         let (start_idx, end_idx) = match self.test_strategy {
-            TestStrategy::ByTest => {
-                let start_idx = self.ptr.fetch_add(n, atomic::ORDERING);
-                (start_idx, std::cmp::min(start_idx + n, queue_len))
-            }
+            TestStrategy::ByTest => self.get_bounds_by_test(suggested_batch_size),
             TestStrategy::ByTopLevelGroup => {
-                let end_idx_cell = Cell::new(0);
-                let start_idx = self
-                    .ptr
-                    .fetch_update(atomic::ORDERING, atomic::ORDERING, |start_idx| {
-                        if start_idx >= queue_len {
-                            end_idx_cell.set(queue_len);
-                            return None;
-                        }
-                        let mut end_idx = start_idx;
-                        let mut current_group = self.queue[start_idx].spec.group_id;
-                        // find idx of the start of the next group
-                        for next_spec in self.queue[start_idx..].iter() {
-                            // if we've walked into a new group...
-                            if next_spec.spec.group_id != current_group {
-                                // if the current slice is big enough, break
-                                if end_idx - start_idx >= n {
-                                    break;
-                                }
-                                // else start pulling from the next group
-                                current_group = next_spec.spec.group_id
-                            }
-                            end_idx += 1; // include next_spec in the slice
-                        }
-                        end_idx_cell.set(end_idx);
-                        Some(end_idx)
-                    })
-                    .unwrap_or(queue_len);
-                (start_idx, end_idx_cell.get())
+                self.get_bounds_by_top_level_group(suggested_batch_size)
             }
         };
         if start_idx >= queue_len {
@@ -106,6 +76,48 @@ impl JobQueue {
         }
 
         self.queue[start_idx..end_idx].iter()
+    }
+
+    #[inline]
+    fn get_bounds_by_test(&self, suggested_batch_size: usize) -> (usize, usize) {
+        let start_idx = self.ptr.fetch_add(suggested_batch_size, atomic::ORDERING);
+        (
+            start_idx,
+            std::cmp::min(start_idx + suggested_batch_size, self.queue.len()),
+        )
+    }
+
+    #[inline]
+    fn get_bounds_by_top_level_group(&self, suggested_batch_size: usize) -> (usize, usize) {
+        let queue_len = self.queue.len();
+        let end_idx_cell = Cell::new(0);
+        let start_idx = self
+            .ptr
+            .fetch_update(atomic::ORDERING, atomic::ORDERING, |start_idx| {
+                if start_idx >= queue_len {
+                    end_idx_cell.set(queue_len);
+                    return None;
+                }
+                let mut end_idx = start_idx;
+                let mut current_group = self.queue[start_idx].spec.group_id;
+                // find idx of the start of the next group
+                for next_spec in self.queue[start_idx..].iter() {
+                    // if we've walked into a new group...
+                    if next_spec.spec.group_id != current_group {
+                        // if the current slice is big enough, break
+                        if end_idx - start_idx >= suggested_batch_size {
+                            break;
+                        }
+                        // else start pulling from the next group
+                        current_group = next_spec.spec.group_id
+                    }
+                    end_idx += 1; // include next_spec in the slice
+                }
+                end_idx_cell.set(end_idx);
+                Some(end_idx)
+            })
+            .unwrap_or(queue_len);
+        (start_idx, end_idx_cell.get())
     }
 
     pub fn is_at_end(&self) -> bool {
