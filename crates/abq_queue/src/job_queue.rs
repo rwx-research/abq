@@ -160,7 +160,7 @@ mod test {
     use abq_utils::{
         atomic,
         net_protocol::{
-            entity::Entity,
+            entity::{Entity, Tag},
             queue::{TestSpec, WorkStrategy},
             runners::{ProtocolWitness, TestCase},
             workers::{GroupId, WorkId, WorkerTest, INIT_RUN_NUMBER},
@@ -371,5 +371,13 @@ mod test {
 
         assert_eq!(num_popped.load(atomic::ORDERING), num_tests);
         assert!(queue.is_at_end());
+
+        for entity in &queue.assigned_entities {
+            // entities are all initialized to Tag::ExternalClient then assigned worker tags as they are popped
+
+            // here we ensure all entities have been assigned to workers
+            let tag = entity.0.get();
+            assert_ne!(tag, Tag::ExternalClient)
+        }
     }
 }
