@@ -34,6 +34,11 @@ pub enum ExecutionMode {
     WriteNormal,
     Readonly,
 }
+pub struct TestRunMetadata {
+    pub api_url: String,
+    pub access_token: abq_hosted::AccessToken,
+    pub run_id: RunId,
+}
 
 pub async fn start_workers_standalone(
     run_id: RunId,
@@ -50,6 +55,7 @@ pub async fn start_workers_standalone(
     client_opts: ClientOptions,
     startup_timeout: Duration,
     execution_mode: ExecutionMode,
+    test_run_metadata: Option<TestRunMetadata>,
 ) -> ! {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let has_stdout_reporters = reporter_kinds
@@ -110,7 +116,7 @@ pub async fn start_workers_standalone(
     loop {
         tokio::select! {
             () = worker_pool.wait() => {
-                do_shutdown(worker_pool, reporting_handle, stdout_preferences, execution_mode, run_id, tag, num_workers).await;
+                do_shutdown(worker_pool, reporting_handle, stdout_preferences, execution_mode, run_id, tag, num_workers, test_run_metadata).await;
             }
             _ = term_signals.next() => {
                 do_cancellation_shutdown(worker_pool).await;
@@ -131,6 +137,7 @@ async fn do_shutdown(
     run_id: RunId,
     worker_tag: WorkerTag,
     num_runners: NonZeroUsize,
+    test_run_metadata: Option<TestRunMetadata>,
 ) -> ! {
     let WorkersExit {
         status,
@@ -161,6 +168,7 @@ async fn do_shutdown(
         stdout.write_all(&process_output).unwrap();
     }
 
+    let native_runner_info = native_runner_info.clone();
     let completed_summary = CompletedSummary { native_runner_info };
 
     let (suite_result, errors) = finalized_reporters.finish(&completed_summary);
@@ -200,6 +208,17 @@ async fn do_shutdown(
             ExitCode::ABQ_ERROR
         }
     };
+
+    if let Some(test_run_metadata) = test_run_metadata {
+        if let Some(native_runner_info) = completed_summary.native_runner_info {
+            abq_hosted::record_test_run_metadata(
+                test_run_metadata.api_url,
+                &test_run_metadata.access_token,
+                &test_run_metadata.run_id,
+                &native_runner_info.specification,
+            ).await;
+        }
+    }
 
     std::process::exit(exit_code.get());
 }
