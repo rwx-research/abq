@@ -299,4 +299,73 @@ mod test {
         assert_eq!(num_popped.load(atomic::ORDERING), num_tests);
         assert!(queue.is_at_end());
     }
+
+    #[test]
+    #[n_times(100)]
+    fn fuzz_grouped_partitions() {
+        // first create the manifest
+        let min_group_size = 1;
+        let max_group_size = 24; // group batch sums cleanly to 300
+        let num_batches = 33; // close to 10k tests, like the othere tsts
+        let num_tests = num_batches * (min_group_size..=max_group_size).sum::<usize>();
+        let num_threads = 20;
+        let num_popped = Arc::new(AtomicUsize::new(0));
+
+        let protocol = ProtocolWitness::iter_all().next().unwrap();
+
+        // build the manifest
+        let mut manifest = Vec::with_capacity(num_tests);
+        for _ in 0..num_batches {
+            for num_tests_in_group in min_group_size..=max_group_size {
+                let group_id = GroupId::new();
+                manifest.extend(
+                    std::iter::repeat(WorkerTest::new(
+                        TestSpec {
+                            work_id: WorkId::new(),
+                            test_case: TestCase::new(protocol, "test", Default::default()),
+                            group_id,
+                        },
+                        INIT_RUN_NUMBER,
+                    ))
+                    .take(num_tests_in_group),
+                );
+            }
+        }
+
+        let queue = Arc::new(JobQueue::new(manifest, WorkStrategy::ByTopLevelGroup));
+
+        let mut threads = Vec::with_capacity(num_threads);
+
+        for n in 1..=num_threads {
+            let queue = queue.clone();
+            let num_popped = num_popped.clone();
+            let entity = Entity::runner(n as u32, n as u32);
+            let n = NonZeroUsize::try_from(n).unwrap();
+            let handle = std::thread::spawn(move || {
+                let mut local_manifest = vec![];
+                loop {
+                    let popped = queue.get_work(entity.tag, n);
+                    num_popped.fetch_add(popped.len(), atomic::ORDERING);
+                    if popped.len() == 0 {
+                        break;
+                    }
+                    local_manifest.extend(popped.cloned());
+                }
+                local_manifest
+            });
+            threads.push((entity, handle));
+        }
+
+        for (entity, handle) in threads {
+            let local_manifest = handle.join().unwrap();
+            let queue_seen_manifest: Vec<_> = queue
+                .get_partition_for_entity(entity.tag)
+                .cloned()
+                .collect();
+            assert_eq!(local_manifest, queue_seen_manifest);
+        }
+
+        assert_eq!(num_popped.load(atomic::ORDERING), num_tests);
+        assert!(queue.is_at_end());
+    }
 }
