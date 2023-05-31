@@ -96,6 +96,7 @@ impl JobQueue {
             }
         };
         if start_idx >= queue_len {
+            self.ptr.store(queue_len, atomic::ORDERING);
             return [].iter();
         }
 
