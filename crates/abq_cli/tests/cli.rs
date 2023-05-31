@@ -2910,13 +2910,20 @@ fn report_while_run_in_progress_is_error() {
 #[serial]
 fn test_explicit_run_id_against_ephemeral_queue() {
     let name = "test_explicit_run_id_against_ephemeral_queue";
+    let args = vec![
+        format!("test"),
+        format!("--worker=1"),
+        format!("--run-id=test-run-id"),
+        format!("-n=1"),
+        s!("--"),
+        format!("some_test_command"),
+    ];
+
     let CmdOutput {
         exit_status,
         stderr,
         stdout,
-    } = Abq::new(format!("{name}_initial"))
-        .args(["--run-id", "test-run-id", "--", "false"])
-        .run();
+    } = Abq::new(format!("{name}_initial")).args(args).run();
     assert!(
         !exit_status.success(),
         "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
