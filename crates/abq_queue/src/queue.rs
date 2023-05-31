@@ -69,7 +69,7 @@ enum RunState {
         // needed to pass through to HasWork
         batch_size_hint: NonZeroUsize,
 
-        ///strategy for pulling tests off the queue
+        /// Strategy for pulling tests off the queue
         // used to instantiate the JobQueue
         test_strategy: TestStrategy,
     },
