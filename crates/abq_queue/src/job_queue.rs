@@ -311,7 +311,7 @@ mod test {
         // first create the manifest
         let min_group_size = 1;
         let max_group_size = 24; // group batch sums cleanly to 300
-        let num_batches = 33; // close to 10k tests, like the othere tsts
+        let num_batches = 33; // close to 10k tests, like the other tests
         let num_tests = num_batches * (min_group_size..=max_group_size).sum::<usize>();
         let num_threads = 20;
         let num_popped = Arc::new(AtomicUsize::new(0));
