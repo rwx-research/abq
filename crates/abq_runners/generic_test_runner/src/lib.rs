@@ -196,7 +196,7 @@ async fn retrieve_manifest<'a>(
     Ok((manifest, stdio_output.combined))
 }
 
-// fetch manifest and confirm native runner quit
+/// Fetch manifest and confirm native runner quit.
 async fn retrieve_manifest_help(
     native_runner: &mut NativeRunnerHandle<'_>,
 ) -> Result<ManifestMessage, LocatedError> {
