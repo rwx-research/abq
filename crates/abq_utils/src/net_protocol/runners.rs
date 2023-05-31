@@ -391,10 +391,10 @@ mod test_manifest {
         })
     }
 
-    fn group(members: Vec<TestOrGroup>) -> TestOrGroup {
+    fn group(members: impl Into<Vec<TestOrGroup>>) -> TestOrGroup {
         TestOrGroup::Group(Group {
             name: String::new(),
-            members,
+            members: members.into(),
             tags: vec![],
             meta: Map::new(),
         })
@@ -430,9 +430,9 @@ mod test_manifest {
     #[test]
     fn flatten_manifest_group_ids() {
         let three_group_manifest = flattened(vec![
-            group(vec![test("a"), test("b")]),
-            group(vec![test("c"), test("d")]),
-            group(vec![test("e"), test("f")]),
+            group([test("a"), test("b")]),
+            group([test("c"), test("d")]),
+            group([test("e"), test("f")]),
         ]);
         let three_group_test_cases: Vec<super::TestCase> = three_group_manifest
             .clone()
