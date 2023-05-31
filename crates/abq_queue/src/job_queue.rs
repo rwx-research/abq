@@ -69,6 +69,10 @@ impl JobQueue {
                 let start_idx = self
                     .ptr
                     .fetch_update(atomic::ORDERING, atomic::ORDERING, |start_idx| {
+                        if start_idx >= queue_len {
+                            end_idx_cell.set(queue_len);
+                            return None;
+                        }
                         let mut end_idx = start_idx;
                         let mut current_group = self.queue[start_idx].spec.group_id;
                         // find idx of the start of the next group
@@ -87,7 +91,7 @@ impl JobQueue {
                         end_idx_cell.set(end_idx);
                         Some(end_idx)
                     })
-                    .unwrap();
+                    .unwrap_or(queue_len);
                 (start_idx, end_idx_cell.get())
             }
         };
