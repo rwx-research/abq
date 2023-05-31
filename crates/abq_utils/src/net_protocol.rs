@@ -529,11 +529,14 @@ pub mod queue {
         ByTopLevelGroup,
     }
 
+    const STRATEGY_BY_TEST: &str = "by-test";
+    const STRATEGY_BY_FILE: &str = "by-file";
+
     impl Display for TestStrategy {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                TestStrategy::ByTest => write!(f, "by-test"),
-                TestStrategy::ByTopLevelGroup => write!(f, "by-file"),
+                TestStrategy::ByTest => write!(f, "{}", STRATEGY_BY_TEST),
+                TestStrategy::ByTopLevelGroup => write!(f, "{}", STRATEGY_BY_FILE),
             }
         }
     }
@@ -543,8 +546,8 @@ pub mod queue {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
-                "by-test" => Ok(Self::ByTest),
-                "by-file" => Ok(Self::ByTopLevelGroup),
+                STRATEGY_BY_TEST => Ok(Self::ByTest),
+                STRATEGY_BY_FILE => Ok(Self::ByTopLevelGroup),
                 other => Err(format!(
                     "Can't parse distribution strategy :'{}', must be default or by-group",
                     other
