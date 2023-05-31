@@ -302,17 +302,14 @@ impl Manifest {
                     Self::add_test_to_collected(test, &mut collected, group_id)
                 }
                 TestOrGroup::Group(Group { members, .. }) => {
-                    queue.clear();
-                    queue.extend(members);
+                    queue.extend(members.into_iter().rev());
                     while let Some(test_or_group) = queue.pop() {
                         match test_or_group {
                             TestOrGroup::Test(test) => {
                                 Self::add_test_to_collected(test, &mut collected, group_id)
                             }
                             TestOrGroup::Group(Group { members, .. }) => {
-                                for member in members.into_iter().rev() {
-                                    queue.push(member);
-                                }
+                                queue.extend(members.into_iter().rev())
                             }
                         }
                     }
@@ -430,8 +427,7 @@ mod test_manifest {
     #[test]
     fn flatten_manifest_group_ids() {
         let three_group_manifest = flattened(vec![
-            group([test("a"), test("b")]),
-            group([test("c"), test("d")]),
+            group([test("a"), test("b"), group([test("c"), test("d")])]),
             group([test("e"), test("f")]),
         ]);
         let three_group_test_cases: Vec<super::TestCase> = three_group_manifest
@@ -462,8 +458,8 @@ mod test_manifest {
             vec![
                 three_group_groups[0],
                 three_group_groups[0],
-                three_group_groups[2],
-                three_group_groups[2],
+                three_group_groups[0],
+                three_group_groups[0],
                 three_group_groups[4],
                 three_group_groups[4],
             ]
