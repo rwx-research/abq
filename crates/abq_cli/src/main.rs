@@ -252,17 +252,17 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 }
             };
 
-            match get_abq_config_filepath() {
-                Some(config_path) => {
-                    abq_config::write_abq_config(abq_config, Ok(config_path.clone()))?;
-                    println!(
-                        "Your access token is now stored at: {}",
-                        config_path.display()
-                    );
-                }
-                None => println!("Nothing was written."),
+            if let Some(config_path) = get_abq_config_filepath() {
+                abq_config::write_abq_config(abq_config, Ok(config_path.clone()))?;
+                println!(
+                    "Your access token is now stored at: {}",
+                    config_path.display()
+                );
+                return Ok(ExitCode::SUCCESS);
             }
-            Ok(ExitCode::SUCCESS)
+
+            let mut cmd = Cli::command();
+            Err(cmd.error(ErrorKind::InvalidValue, "Failed to locate ABQ config file."))?
         }
         Command::Start {
             bind: bind_ip,
@@ -373,10 +373,8 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_key = read_opt_path_bytes(tls_key)?;
 
             let access_token = access_token.or_else(|| {
-                match abq_config::read_abq_config(get_abq_config_filepath()) {
-                    Some(abq_config) => Some(abq_config.rwx_access_token),
-                    None => None,
-                }
+                let config = abq_config::read_abq_config(get_abq_config_filepath())?;
+                Some(config.rwx_access_token)
             });
 
             let ResolvedConfig {
@@ -391,11 +389,11 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 let mut cmd = Cli::command();
                 Err(cmd.error(
                     ErrorKind::InvalidValue,
-                    "`abq test` was provided a run id, but we've detected an ephemeral queue.
-
+                    indoc::indoc!("
+                    `abq test` was provided a run id, but we've detected an ephemeral queue.
                     If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
                     If you intended to run against an ephemeral queue, please remove the run id argument.
-                    ",
+                    ")
                 ))?;
             }
 
@@ -491,11 +489,11 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 let mut cmd = Cli::command();
                 Err(cmd.error(
                     ErrorKind::InvalidValue,
-                    "`abq report` was provided a run id, but we've detected an ephemeral queue.
-
+                    indoc::indoc!("
+                    `abq report` was provided a run id, but we've detected an ephemeral queue.
                     If you intended to run against a remote queue, please provide an access token by passing `--access-token`, setting `RWX_ACCESS_TOKEN`, or running `abq login`.
                     If you intended to run against an ephemeral queue, please remove the run id argument.
-                    ",
+                    ")
                 ))?;
             }
 

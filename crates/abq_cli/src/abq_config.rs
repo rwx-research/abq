@@ -11,11 +11,11 @@ pub struct AbqConfig {
 }
 
 pub enum AbqConfigFileMode {
-    // Conventional unix location (e.g ~/.config/abq/config.toml)
+    /// Conventional unix location (e.g ~/.config/abq/config.toml)
     Conventional,
-    // Non-standard location (e.g. ~/my/custom/path/config.toml)
+    /// Non-standard location (e.g. ~/my/custom/path/config.toml)
     Override(String),
-    // Ignore any located config file (For instance, if the host machine happens to have a config file)
+    /// Ignore any located config file (For instance, if the host machine happens to have a config file)
     Ignore,
 }
 
@@ -52,14 +52,9 @@ pub fn write_abq_config(
 }
 
 pub fn read_abq_config(path: Option<PathBuf>) -> Option<AbqConfig> {
-    match path {
-        Some(config_path) => {
-            let toml_str = fs::read_to_string(config_path);
-            let config = toml::from_str(&toml_str.ok()?).ok();
-            Some(config?)
-        }
-        None => None,
-    }
+    let path = path?;
+    let toml_str = fs::read_to_string(path).ok()?;
+    toml::from_str(&toml_str).ok()
 }
 
 #[cfg(test)]

@@ -2910,89 +2910,21 @@ fn report_while_run_in_progress_is_error() {
 #[serial]
 fn test_explicit_run_id_against_ephemeral_queue() {
     let name = "test_explicit_run_id_against_ephemeral_queue";
-    let conf = CSConfigOptions {
-        use_auth_token: true,
-        tls: true,
-    };
-    let (queue_proc, ..) = setup_queue!(name, conf);
-    let manifest = vec![TestOrGroup::test(Test::new(
-        proto,
-        "some_test",
-        [],
-        Default::default(),
-    ))];
-    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
-    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
-
-    {
-        let simulation = [
-            Connect,
-            //
-            // Write spawn message
-            OpaqueWrite(pack(legal_spawned_message(proto))),
-            //
-            // Write the manifest if we need to.
-            // Otherwise handle the one test.
-            IfGenerateManifest {
-                then_do: vec![OpaqueWrite(pack(&manifest))],
-                else_do: {
-                    let mut run_tests = vec![
-                        //
-                        // Read init context message + write ACK
-                        OpaqueRead,
-                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
-                    ];
-
-                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
-                    // faux result.
-                    // Otherwise assume we ran out of tests on our node and exit.
-                    run_tests.push(IfAliveReadAndWriteFake(Status::Failure {
-                        exception: None,
-                        backtrace: None,
-                    }));
-                    run_tests
-                },
-            },
-            //
-            // Finish
-            Exit(0),
-        ];
-
-        let packed = pack_msgs_to_disk(simulation);
-
-        let test_args = {
-            let simulator = native_runner_simulation_bin();
-            let simfile_path = packed.path.display().to_string();
-            let args = vec![
-                format!("test"),
-                format!("--worker=1"),
-                format!("--run-id=test-run-id"),
-                format!("-n=1"),
-            ];
-            let mut args = conf.extend_args_for_client(args);
-            args.extend([s!("--"), simulator, simfile_path]);
-            args
-        };
-
-        let CmdOutput {
-            exit_status,
-            stderr,
-            stdout,
-        } = Abq::new(format!("{name}_initial")).args(test_args).run();
-
-        assert!(
-            !exit_status.success(),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-        assert!(
-            stderr.contains(
-                "`abq test` was provided a run id, but we've detected an ephemeral queue."
-            ),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-    }
-
-    term(queue_proc);
+    let CmdOutput {
+        exit_status,
+        stderr,
+        stdout,
+    } = Abq::new(format!("{name}_initial"))
+        .args(["--run-id", "test-run-id", "--", "false"])
+        .run();
+    assert!(
+        !exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`abq test` was provided a run id, but we've detected an ephemeral queue."),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
 }
 
 #[test]
@@ -3000,45 +2932,31 @@ fn test_explicit_run_id_against_ephemeral_queue() {
 #[serial]
 fn report_explicit_run_id_against_ephemeral_queue() {
     let name = "report_explicit_run_id_against_ephemeral_queue";
-    let conf = CSConfigOptions {
-        use_auth_token: true,
-        tls: true,
-    };
-    let (queue_proc, ..) = setup_queue!(name, conf);
+    let args = vec![
+        format!("report"),
+        format!("--reporter=dot"),
+        format!("--run-id=some-run-id"),
+        format!("--color=never"),
+    ];
 
-    {
-        let report_args = {
-            let args = vec![
-                format!("report"),
-                format!("--reporter=dot"),
-                format!("--run-id=some-run-id"),
-                format!("--color=never"),
-            ];
-            conf.extend_args_for_client(args)
-        };
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(name.to_string() + "_report")
+        .args(args)
+        .always_capture_stderr(true)
+        .run();
 
-        let CmdOutput {
-            stdout,
-            stderr,
-            exit_status,
-        } = Abq::new(name.to_string() + "_report")
-            .args(report_args)
-            .always_capture_stderr(true)
-            .run();
-
-        assert!(
-            !exit_status.success(),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-        assert!(
-            stderr.contains(
-                "`abq report` was provided a run id, but we've detected an ephemeral queue."
-            ),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-    }
-
-    term(queue_proc);
+    assert!(
+        !exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr
+            .contains("`abq report` was provided a run id, but we've detected an ephemeral queue."),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
 }
 
 #[test]
@@ -3087,11 +3005,11 @@ fn login_saves_access_token_noop() {
         .run();
 
     assert!(
-        exit_status.success(),
+        !exit_status.success(),
         "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
     assert!(
-        stdout.contains(&format!("Nothing was written.")),
+        stderr.contains(&format!("Failed to locate ABQ config file.")),
         "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
     );
 }

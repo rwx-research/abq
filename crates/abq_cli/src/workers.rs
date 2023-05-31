@@ -184,6 +184,7 @@ async fn do_shutdown(
             num_runners
         );
         print!("\n\n");
+        print!("Specify your Access Token with the RWX_ACCESS_TOKEN env variable, passing --access-token, or running `abq login`.");
     }
 
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,

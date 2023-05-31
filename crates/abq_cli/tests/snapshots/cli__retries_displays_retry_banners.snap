@@ -42,4 +42,4 @@ Run the following command to replay these tests locally:
 
 abq test --run-id test-run-id --worker 0 --num 1
 
-
+Specify your Access Token with the RWX_ACCESS_TOKEN env variable, passing --access-token, or running `abq login`.
