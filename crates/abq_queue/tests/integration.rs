@@ -31,7 +31,7 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::{Entity, RunnerMeta, WorkerTag},
-        queue::{self, AssociatedTestResults, InvokeWork, TestResultsResponse, WorkStrategy},
+        queue::{self, AssociatedTestResults, InvokeWork, TestResultsResponse},
         results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
         runners::{
             InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,

@@ -21,9 +21,9 @@
 //!
 //! The sum type is then normalized to one data structure that the rest of ABQ operates over.
 
+use std::ops::Deref;
 use std::ops::DerefMut;
 use std::time::Duration;
-use std::{collections::VecDeque, ops::Deref};
 
 use serde_derive::{Deserialize, Serialize};
 
