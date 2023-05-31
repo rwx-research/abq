@@ -369,7 +369,7 @@ mod test {
 
                     let popped: Vec<WorkerTest> = popped.cloned().collect();
 
-                    //assert every group is only assigned to one entity
+                    // assert every group is only assigned to one entity
                     for test in popped.clone() {
                         if let Some(previous_entity) =
                             entity_by_group_id.insert(test.spec.group_id, entity)
