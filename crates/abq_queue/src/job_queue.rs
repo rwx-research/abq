@@ -60,15 +60,11 @@ impl JobQueue {
         // If the start index was past the end of the queue, return fast
 
         let (start_idx, end_idx) = match self.test_strategy {
-            TestStrategy::ByTest => self.get_bounds_by_test(suggested_batch_size),
+            TestStrategy::ByTest => self.get_bounds_by_test(suggested_batch_size, queue_len),
             TestStrategy::ByTopLevelGroup => {
                 self.get_bounds_by_top_level_group(suggested_batch_size, queue_len)
             }
         };
-        if start_idx >= queue_len {
-            self.ptr.store(queue_len, atomic::ORDERING);
-            return [].iter();
-        }
 
         // for retries, mark these tests as owned by this worker
         for entity_cell in self.assigned_entities[start_idx..end_idx].iter() {
@@ -79,12 +75,17 @@ impl JobQueue {
     }
 
     #[inline]
-    fn get_bounds_by_test(&self, suggested_batch_size: usize) -> (usize, usize) {
+    fn get_bounds_by_test(&self, suggested_batch_size: usize, queue_len: usize) -> (usize, usize) {
         let start_idx = self.ptr.fetch_add(suggested_batch_size, atomic::ORDERING);
-        (
-            start_idx,
-            std::cmp::min(start_idx + suggested_batch_size, self.queue.len()),
-        )
+        if start_idx >= queue_len {
+            self.ptr.store(queue_len, atomic::ORDERING);
+            (queue_len, queue_len)
+        } else {
+            (
+                start_idx,
+                std::cmp::min(start_idx + suggested_batch_size, queue_len),
+            )
+        }
     }
 
     #[inline]
