@@ -719,7 +719,6 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                 RemoteManifest(n, check) => {
                     let run_id = run_ids.get(&n).unwrap().clone();
                     let remote = remote.0.lock().await;
-                    println!("run_id: {}", run_id);
                     let manifest = remote.manifests.get(&run_id).unwrap();
                     check(manifest)
                 }
@@ -2015,7 +2014,6 @@ async fn many_retries_many_workers_complete() {
     end_workers_asserts.push(WorkerTestResults(
         Run(1),
         Box::new(move |results| {
-            println!("UNREACHABLE after work");
             let mut results = results.to_vec();
             let results = sort_results_owned(&mut results);
             results == expected_workers_results
@@ -2476,8 +2474,6 @@ async fn many_retries_of_many_out_of_process_workers() {
         expected_results_one_pass.push((INIT_RUN_NUMBER, format!("echo{t}")));
     }
 
-    println!("1");
-
     let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
     let empty_manifest = ManifestMessage::new(Manifest::new(vec![], Default::default()));
 
@@ -2486,7 +2482,6 @@ async fn many_retries_of_many_out_of_process_workers() {
 
     let mut builder = TestBuilder::default();
     let run = Run(1);
-    println!("2");
     for retry in 1..=num_out_of_process_retries {
         let mut start_actions = vec![];
         // Steps that the workers should take
@@ -2581,10 +2576,8 @@ async fn many_retries_of_many_out_of_process_workers() {
             .step(end_run_actions, end_run_asserts)
             .assert(remote_asserts);
     }
-    println!("before builder");
 
     builder.test().await;
-    println!("last");
 }
 
 #[tokio::test]
