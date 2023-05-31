@@ -219,7 +219,7 @@ mod test {
         assert!(queue.is_at_end());
 
         // convert assigned_entities into a series of chunks of (entity, num_popped)
-        // if an entity pulled more than once, add two chunks
+        // if the same entity pulled twice in a row, add two chunks back-to-back
         let assigned = &queue.assigned_entities;
         let mut chunks = vec![(assigned.first().unwrap(), 0)];
         for entity in assigned {
