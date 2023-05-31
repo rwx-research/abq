@@ -66,11 +66,11 @@ enum RunState {
         worker_connection_times: Mutex<WorkerSet<Instant>>,
 
         /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
-        // Co-locate this here so that we don't have to index `run_data` when grabbing a
-        // test.
+        // needed to pass through to HasWork
         batch_size_hint: NonZeroUsize,
 
-        //strategy for pulling tests off the queue
+        ///strategy for pulling tests off the queue
+        // used to instantiate the JobQueue
         work_strategy: WorkStrategy,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
@@ -82,8 +82,6 @@ enum RunState {
         init_metadata: MetadataMap,
 
         /// The number of tests to batch to a worker at a time, as hinted by an invoker of the work.
-        // Co-locate this here so that we don't have to index `run_data` when grabbing a
-        // test.
         batch_size_hint: NonZeroUsize,
 
         /// Workers that have connected to execute tests, and whether they are still executing

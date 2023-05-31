@@ -513,7 +513,7 @@ pub mod queue {
         pub cancelled: bool,
     }
 
-    // how strategies for popping work off the queue
+    // strategies for popping work off the queue
     #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy)]
     pub enum WorkStrategy {
         #[default]
