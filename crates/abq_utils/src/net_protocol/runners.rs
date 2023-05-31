@@ -294,7 +294,7 @@ impl Manifest {
         let mut collected = Vec::with_capacity(members.len());
 
         // share a top-level vector so we can reuse the largest queue allocated
-        let mut queue: Vec<v0_2::TestOrGroup> = Vec::new();
+        let mut queue: Vec<TestOrGroup> = Vec::new();
         for top_level_test_or_group in members {
             let group_id = GroupId::new();
             match top_level_test_or_group {
