@@ -344,11 +344,11 @@ mod test {
             let queue = queue.clone();
             let num_popped = num_popped.clone();
             let entity = Entity::runner(n as u32, n as u32);
-            let n = NonZeroUsize::try_from(n).unwrap();
+            let batch_size = NonZeroUsize::try_from(n).unwrap();
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity.tag, n);
+                    let popped = queue.get_work(entity.tag, batch_size);
                     num_popped.fetch_add(popped.len(), atomic::ORDERING);
                     if popped.len() == 0 {
                         break;
