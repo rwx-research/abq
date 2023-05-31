@@ -253,8 +253,8 @@ mod test {
         while let Some((entity, run)) = chunks_it.next() {
             let entity_batch = workers.get(entity.0.get()).unwrap();
             match chunks_it.peek() {
-                Some(_) => assert_eq!(run, entity_batch.get()), // if there are more chunks, batch size should be full
-                None => assert!(run <= entity_batch.get()), // else, the run should be less than or equal to the batch size
+                Some(_) => assert_eq!(run, entity_batch.get(), "if there are more chunks, batch size should be full"),
+                None => assert!(run <= entity_batch.get(), "if there are no more chunks, the run should be less than or equal to the batch size"),
             }
         }
     }
