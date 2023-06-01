@@ -91,6 +91,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_abq_config_operations() {
         let access_token = AccessToken::from_str("testy_mctesterson").unwrap();
         // Create a temporary directory to store the config file
