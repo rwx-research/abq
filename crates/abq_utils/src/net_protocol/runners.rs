@@ -235,6 +235,14 @@ impl TestOrGroup {
             V0_2(test) => Self(v0_2::TestOrGroup::Test(test).into()),
         }
     }
+
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn group(group: Group) -> Self {
+        use PrivGroup::*;
+        match group.0 {
+            V0_2(group) => Self(v0_2::TestOrGroup::Group(group).into()),
+        }
+    }
 }
 
 pub struct Test(PrivTest);
@@ -262,6 +270,47 @@ impl Test {
                 }
                 .into(),
             ),
+        }
+    }
+}
+pub struct Group(PrivGroup);
+#[derive(derive_more::From)]
+enum PrivGroup {
+    V0_2(v0_2::Group),
+}
+impl Group {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(
+        protocol: ProtocolWitness,
+        name: impl Into<String>,
+        members: impl Into<Vec<TestOrGroup>>,
+        tags: impl Into<Vec<String>>,
+        meta: MetadataMap,
+    ) -> Self {
+        use PrivProtocolWitness::*;
+
+        match protocol.0 {
+            V0_2 => {
+                let members = members
+                    .into()
+                    .into_iter()
+                    .map(|test_or_group| {
+                        use PrivTestOrGroup::*;
+                        match test_or_group.0 {
+                            V0_2(test_or_group) => test_or_group,
+                        }
+                    })
+                    .collect();
+                Self(
+                    v0_2::Group {
+                        name: name.into(),
+                        tags: tags.into(),
+                        members,
+                        meta,
+                    }
+                    .into(),
+                )
+            }
         }
     }
 }

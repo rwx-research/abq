@@ -31,12 +31,12 @@ use abq_utils::{
     net_protocol::{
         self,
         entity::{Entity, RunnerMeta, WorkerTag},
-        queue::{self, AssociatedTestResults, InvokeWork, TestResultsResponse},
+        queue::{self, AssociatedTestResults, InvokeWork, TestResultsResponse, TestStrategy},
         results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
         runners::{
-            InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap, OutOfBandError,
-            ProtocolWitness, RawTestResultMessage, Status, Test, TestOrGroup, TestResult,
-            TestResultSpec,
+            Group, InitSuccessMessage, Location, Manifest, ManifestMessage, MetadataMap,
+            OutOfBandError, ProtocolWitness, RawTestResultMessage, Status, Test, TestOrGroup,
+            TestResult, TestResultSpec,
         },
         work_server::{InitContext, InitContextResponse},
         workers::{
@@ -243,12 +243,17 @@ fn echo_test(proto: ProtocolWitness, echo_msg: String) -> TestOrGroup {
     TestOrGroup::test(Test::new(proto, echo_msg, [], Default::default()))
 }
 
+fn group(proto: ProtocolWitness, members: impl Into<Vec<TestOrGroup>>) -> TestOrGroup {
+    TestOrGroup::group(Group::new(proto, "", members, [], Default::default()))
+}
+
 fn empty_manifest_msg() -> Box<ManifestMessage> {
     Box::new(ManifestMessage::new(Manifest::new([], Default::default())))
 }
 
 struct WorkersConfigBuilder {
     config: WorkersConfig,
+    test_strategy: TestStrategy,
 }
 
 impl WorkersConfigBuilder {
@@ -266,11 +271,19 @@ impl WorkersConfigBuilder {
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
         };
-        Self { config }
+        Self {
+            config,
+            test_strategy: Default::default(),
+        }
     }
 
     fn with_max_run_number(mut self, max_run_number: u32) -> Self {
         self.config.max_run_number = max_run_number;
+        self
+    }
+
+    fn with_test_strategy(mut self, test_strategy: TestStrategy) -> Self {
+        self.test_strategy = test_strategy;
         self
     }
 
@@ -463,12 +476,15 @@ fn action_to_fut(
             let run_results = get_run_results!(n);
             let negotiator = queue.get_negotiator_handle();
 
-            let WorkersConfigBuilder { config } = workers_config_builder;
+            let WorkersConfigBuilder {
+                config,
+                test_strategy,
+            } = workers_config_builder;
 
             let invoke_work = InvokeWork {
                 run_id,
                 batch_size_hint: one_nonzero(),
-                test_strategy: Default::default(),
+                test_strategy,
             };
 
             let config = WorkersConfig {
@@ -2497,7 +2513,6 @@ async fn many_retries_of_many_out_of_process_workers() {
     let runner_after_0 = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(empty_manifest));
 
     let mut builder = TestBuilder::default();
-    let run = Run(1);
     for retry in 1..=num_out_of_process_retries {
         let mut start_actions = vec![];
         // Steps that the workers should take
@@ -2520,7 +2535,7 @@ async fn many_retries_of_many_out_of_process_workers() {
 
             let worker_uuid = retry * num_workers + i;
 
-            start_actions.push(StartWorkers(run, Wid(worker_uuid), workers_config));
+            start_actions.push(StartWorkers(Run(1), Wid(worker_uuid), workers_config));
 
             end_workers_actions.push(StopWorkers(Wid(worker_uuid)));
             end_workers_asserts.push(WorkerExitStatus(
@@ -2528,7 +2543,7 @@ async fn many_retries_of_many_out_of_process_workers() {
                 Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
             ));
         }
-        end_run_actions.extend([WaitForCompletedRun(run), WaitForNoPendingResults(run)]);
+        end_run_actions.extend([WaitForCompletedRun(Run(1)), WaitForNoPendingResults(Run(1))]);
 
         // The number of expected results is now the results * how many retries we had
         let mut expected_results: Vec<_> = std::iter::repeat(expected_results_one_pass.clone())
@@ -2542,7 +2557,7 @@ async fn many_retries_of_many_out_of_process_workers() {
 
         end_run_asserts.extend([
             WorkerTestResults(
-                run,
+                Run(1),
                 Box::new(move |results| {
                     let mut results = results.to_vec();
                     let results = sort_results_owned(&mut results);
@@ -2552,7 +2567,7 @@ async fn many_retries_of_many_out_of_process_workers() {
             {
                 let expected_queue_results = expected_queue_results.clone();
                 QueueTestResults(
-                    run,
+                    Run(1),
                     Box::new(move |resp| match resp {
                         TestResultsResponse::Results {
                             chunk,
@@ -2570,13 +2585,13 @@ async fn many_retries_of_many_out_of_process_workers() {
 
         let remote_asserts = [
             RemoteManifest(
-                run,
+                Run(1),
                 Box::new(move |manifest| {
                     assert_eq!(manifest.len(), num_tests as usize);
                 }),
             ),
             RemoteResults(
-                run,
+                Run(1),
                 Box::new(move |results| {
                     let (results, summary) = flatten_queue_results(results);
                     assert_eq!(results, expected_queue_results);
@@ -2856,4 +2871,143 @@ async fn cancel_test_run_if_no_manifest_progress() {
         "abq_queue::queue",
         "run cancelled because manifest made no progress",
     );
+}
+
+#[tokio::test]
+#[traced_test]
+#[with_protocol_version]
+#[timeout(1000)] // 1 vnd
+async fn grouped_by_top_level_completes() {
+    let manifest = ManifestMessage::new(Manifest::new(
+        [
+            group(
+                proto,
+                [
+                    echo_test(proto, "echo1".to_string()),
+                    echo_test(proto, "echo2".to_string()),
+                    group(
+                        proto,
+                        [
+                            echo_test(proto, "echo3".to_string()),
+                            echo_test(proto, "echo4".to_string()),
+                        ],
+                    ),
+                ],
+            ),
+            group(
+                proto,
+                [
+                    echo_test(proto, "echo5".to_string()),
+                    echo_test(proto, "echo6".to_string()),
+                ],
+            ),
+        ],
+        Default::default(),
+    ));
+
+    let runner = RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest));
+
+    TestBuilder::default()
+        .act([StartWorkers(
+            Run(1),
+            Wid(1),
+            WorkersConfigBuilder::new(1, runner.clone())
+                .with_test_strategy(TestStrategy::ByTopLevelGroup),
+        )])
+        .act([StopWorkers(Wid(1)), WaitForCompletedRun(Run(1))])
+        .step(
+            [WaitForNoPendingResults(Run(1))],
+            [
+                WorkerTestResults(
+                    Run(1),
+                    Box::new(|results| {
+                        let mut results: Vec<(u32, &str)> = results
+                            .iter()
+                            .map(|(_, _, result)| {
+                                (
+                                    result.source.runner.runner(),
+                                    result.output.as_ref().unwrap().as_str(),
+                                )
+                            })
+                            .collect();
+                        results.sort_unstable();
+                        results
+                            == [
+                                (1, "echo1"),
+                                (1, "echo2"),
+                                (1, "echo3"),
+                                (1, "echo4"),
+                                (2, "echo5"),
+                                (2, "echo6"),
+                            ]
+                            || results
+                                == [
+                                    (1, "echo5"),
+                                    (1, "echo6"),
+                                    (2, "echo1"),
+                                    (2, "echo2"),
+                                    (2, "echo3"),
+                                    (2, "echo4"),
+                                ]
+                    }),
+                ),
+                WorkerExitStatus(
+                    Wid(1),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::SUCCESS)),
+                ),
+                QueueTestResults(
+                    Run(1),
+                    Box::new(|resp| match resp {
+                        TestResultsResponse::Results {
+                            chunk,
+                            final_chunk: true,
+                        } => {
+                            let (results, summary) = flatten_queue_results(chunk);
+                            assert_eq!(
+                                results,
+                                vec![
+                                    (1, s!("echo1")),
+                                    (1, s!("echo2")),
+                                    (1, s!("echo3")),
+                                    (1, s!("echo4")),
+                                    (1, s!("echo5")),
+                                    (1, s!("echo6"))
+                                ]
+                            );
+                            assert_eq!(summary.manifest_size_nonce, 6);
+                        }
+                        _ => unreachable!("{resp:?}"),
+                    }),
+                ),
+            ],
+        )
+        // Check the remote
+        .assert([
+            RemoteManifest(
+                Run(1),
+                Box::new(|manifest| {
+                    assert_eq!(manifest.len(), 6);
+                }),
+            ),
+            RemoteResults(
+                Run(1),
+                Box::new(|results| {
+                    let (results, summary) = flatten_queue_results(results);
+                    assert_eq!(
+                        results,
+                        vec![
+                            (1, s!("echo1")),
+                            (1, s!("echo2")),
+                            (1, s!("echo3")),
+                            (1, s!("echo4")),
+                            (1, s!("echo5")),
+                            (1, s!("echo6"))
+                        ]
+                    );
+                    assert_eq!(summary.manifest_size_nonce, 6);
+                }),
+            ),
+        ])
+        .test()
+        .await;
 }
