@@ -311,7 +311,7 @@ pub mod workers {
     /// In order to do file-based allocation to workers, we need to have a way of
     /// knowing which tests are in which file. We use this group id as a proxy for that.
     /// Eventually, these groupings will be assigned to specific workers
-    #[derive(Serialize, Deserialize, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
     pub struct GroupId(pub [u8; 16]);
 
     impl GroupId {
