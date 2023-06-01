@@ -21,7 +21,7 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_utils::net_protocol::work_server::InitContext;
 use abq_utils::net_protocol::workers::{
-    Eow, GroupId, ManifestResult, NativeTestRunnerParams, NextWorkBundle, WorkId, WorkerTest,
+    Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle, WorkId, WorkerTest,
     INIT_RUN_NUMBER,
 };
 use abq_utils::oneshot_notify::OneshotTx;
@@ -289,7 +289,6 @@ fn capture_output_before_and_during_tests() {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "test1", Default::default()),
                         work_id: WorkId([1; 16]),
-                        group_id: GroupId([1; 16]),
                     },
                     run_number: INIT_RUN_NUMBER,
                 },
@@ -297,7 +296,6 @@ fn capture_output_before_and_during_tests() {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "test2", Default::default()),
                         work_id: WorkId([2; 16]),
-                        group_id: GroupId([1; 16]),
                     },
                     run_number: INIT_RUN_NUMBER,
                 },
@@ -535,7 +533,6 @@ fn native_runner_respawn_for_higher_run_numbers() {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "test1", Default::default()),
                         work_id: WorkId([1; 16]),
-                        group_id: GroupId([1; 16]),
                     },
                     run_number: INIT_RUN_NUMBER,
                 },
@@ -543,7 +540,6 @@ fn native_runner_respawn_for_higher_run_numbers() {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "test2", Default::default()),
                         work_id: WorkId([2; 16]),
-                        group_id: GroupId([1; 16]),
                     },
                     run_number: INIT_RUN_NUMBER + 1,
                 },
@@ -551,7 +547,6 @@ fn native_runner_respawn_for_higher_run_numbers() {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "test3", Default::default()),
                         work_id: WorkId([3; 16]),
-                        group_id: GroupId([1; 16]),
                     },
                     run_number: INIT_RUN_NUMBER + 2,
                 },
@@ -623,7 +618,6 @@ fn native_runner_fails_while_executing_tests() {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "test1", Default::default()),
                         work_id: WorkId([1; 16]),
-                        group_id: GroupId([1; 16]),
                     },
                     run_number: INIT_RUN_NUMBER,
                 },
@@ -631,7 +625,6 @@ fn native_runner_fails_while_executing_tests() {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "test2", Default::default()),
                         work_id: WorkId([2; 16]),
-                        group_id: GroupId([1; 16]),
                     },
                     run_number: INIT_RUN_NUMBER,
                 },
@@ -725,7 +718,6 @@ async fn cancellation_of_native_runner_succeeds() {
                 spec: TestSpec {
                     test_case: TestCase::new(proto, "test1", Default::default()),
                     work_id: WorkId([1; 16]),
-                    group_id: GroupId([1; 16]),
                 },
                 run_number: INIT_RUN_NUMBER,
             }],

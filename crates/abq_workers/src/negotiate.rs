@@ -666,11 +666,10 @@ mod test {
                             .0
                             .into_iter()
                             .enumerate()
-                            .map(|(i, (spec, group_id))| WorkerTest {
+                            .map(|(i, (spec, ..))| WorkerTest {
                                 spec: TestSpec {
                                     test_case: spec.test_case,
                                     work_id: WorkId([i as _; 16]),
-                                    group_id,
                                 },
                                 run_number: INIT_RUN_NUMBER,
                             })

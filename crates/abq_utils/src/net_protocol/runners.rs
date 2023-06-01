@@ -377,7 +377,6 @@ impl Manifest {
             TestSpec {
                 // Generate a fresh ID for ABQ-internal usage.
                 work_id: WorkId::new(),
-                group_id,
                 test_case: TestCase(
                     v0_2::TestCase {
                         id,
@@ -422,16 +421,13 @@ mod test_manifest {
     };
     use serde_json::Map;
 
-    fn flattened(members: Vec<TestOrGroup>) -> Vec<TestSpec> {
+    fn flattened(members: Vec<TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
         Manifest {
             members,
             init_meta: Map::new(),
         }
         .flatten()
         .0
-        .into_iter()
-        .map(|(test_spec, _)| test_spec)
-        .collect()
     }
 
     fn test(name: &'static str) -> TestOrGroup {
@@ -475,7 +471,7 @@ mod test_manifest {
         let a_test = test("foo");
         let one_element_manifest = flattened(vec![a_test.clone()]);
         assert_eq!(one_element_manifest.len(), 1);
-        assert_eq!(one_element_manifest[0].test_case, to_test_case(a_test));
+        assert_eq!(one_element_manifest[0].0.test_case, to_test_case(a_test));
     }
 
     #[test]
@@ -487,7 +483,7 @@ mod test_manifest {
         let three_group_test_cases: Vec<super::TestCase> = three_group_manifest
             .clone()
             .into_iter()
-            .map(|test_spec| test_spec.test_case)
+            .map(|test_spec| test_spec.0.test_case)
             .collect();
         let expected_test_cases: Vec<super::TestCase> = vec![
             test("a"),
@@ -505,7 +501,7 @@ mod test_manifest {
 
         let three_group_groups: Vec<GroupId> = three_group_manifest
             .into_iter()
-            .map(|test_spec| test_spec.group_id)
+            .map(|test_spec| test_spec.1)
             .collect();
         assert_eq!(
             three_group_groups,

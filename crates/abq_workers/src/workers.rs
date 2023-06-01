@@ -656,12 +656,7 @@ async fn test_like_runner_exec_loop(
         };
 
         for WorkerTest {
-            spec:
-                TestSpec {
-                    test_case,
-                    work_id,
-                    group_id: _,
-                },
+            spec: TestSpec { test_case, work_id },
             run_number,
         } in work
         {
@@ -887,7 +882,7 @@ mod test {
     use crate::runner_strategy::{self, RunnerStrategy};
     use crate::workers::{WorkerPoolConfig, WorkersExitStatus};
     use crate::DEFAULT_RUNNER_TEST_TIMEOUT;
-    use abq_utils::net_protocol::workers::{GroupId, RunId, RunnerKind, WorkId};
+    use abq_utils::net_protocol::workers::{RunId, RunnerKind, WorkId};
 
     type ResultsCollector = Arc<Mutex<HashMap<WorkId, Vec<TestResult>>>>;
     type ManifestCollector = Arc<Mutex<Option<ManifestResult>>>;
@@ -1069,7 +1064,6 @@ mod test {
             spec: TestSpec {
                 test_case: test,
                 work_id,
-                group_id: GroupId([1; 16]),
             },
             run_number: INIT_RUN_NUMBER,
         }

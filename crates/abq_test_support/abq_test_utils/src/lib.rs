@@ -116,7 +116,6 @@ pub fn spec(id: usize) -> TestSpec {
     TestSpec {
         test_case: TestCase::new(ProtocolWitness::TEST, test(id), Default::default()),
         work_id: wid(id),
-        group_id: gid(id), // arbitrary
     }
 }
 

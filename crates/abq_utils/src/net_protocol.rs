@@ -496,7 +496,7 @@ pub mod queue {
         meta::DeprecationRecord,
         results::OpaqueLazyAssociatedTestResults,
         runners::{AbqProtocolVersion, NativeRunnerSpecification, TestCase, TestResult},
-        workers::{GroupId, ManifestResult, RunId, WorkId},
+        workers::{ManifestResult, RunId, WorkId},
         LARGE_MESSAGE_SIZE,
     };
     use crate::capture_output::StdioOutput;
@@ -571,8 +571,6 @@ pub mod queue {
     pub struct TestSpec {
         /// ABQ-internal identity of this test.
         pub work_id: WorkId,
-        /// ABQ-internal group identity of this test.
-        pub group_id: GroupId,
         /// The test case communicated to a native runner.
         pub test_case: TestCase,
     }

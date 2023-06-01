@@ -788,7 +788,11 @@ impl AllRuns {
         let batch_size = batch_size_hint;
 
         // Pop the next batch.
-        let bundle: Vec<WorkerTest> = queue.get_work(entity.tag, batch_size).cloned().collect();
+        let bundle: Vec<WorkerTest> = queue
+            .get_work(entity.tag, batch_size)
+            .cloned()
+            .map(|(spec, _)| spec)
+            .collect();
 
         let pulled_tests_status;
 
@@ -946,6 +950,7 @@ impl AllRuns {
                 let manifest: Vec<_> = queue
                     .get_partition_for_entity(entity.tag)
                     .cloned()
+                    .map(|(spec, _)| spec)
                     .collect();
                 let eow = Eow(true);
 
@@ -2738,7 +2743,6 @@ fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
     TestSpec {
         test_case: TestCase::new(proto, "fake-test", Default::default()),
         work_id: WorkId::new(),
-        group_id: GroupId::new(),
     }
 }
 
@@ -3474,7 +3478,6 @@ mod test {
                     TestSpec {
                         test_case: TestCase::new(proto, "test1", Default::default()),
                         work_id: WorkId::new(),
-                        group_id: GroupId::new(),
                     },
                     GroupId::new(),
                 )],
@@ -3565,7 +3568,6 @@ mod test {
                         TestSpec {
                             test_case: TestCase::new(proto, "test1", Default::default()),
                             work_id: WorkId::new(),
-                            group_id: GroupId::new(),
                         },
                         GroupId::new(),
                     )],
