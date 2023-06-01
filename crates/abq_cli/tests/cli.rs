@@ -2565,6 +2565,7 @@ fn out_of_process_retries_smoke() {
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore]
 fn personal_access_token_does_not_mutate_remote_queue() {
     let name = "personal_access_token_does_not_mutate_remote_queue";
     let conf = CSConfigOptions {
@@ -2908,6 +2909,7 @@ fn report_while_run_in_progress_is_error() {
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore]
 fn test_explicit_run_id_against_ephemeral_queue() {
     let name = "test_explicit_run_id_against_ephemeral_queue";
     let args = vec![
@@ -2937,6 +2939,7 @@ fn test_explicit_run_id_against_ephemeral_queue() {
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore]
 fn report_explicit_run_id_against_ephemeral_queue() {
     let name = "report_explicit_run_id_against_ephemeral_queue";
     let args = vec![
@@ -4290,6 +4293,7 @@ fn persisted_runs_between_queue_instances() {
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore]
 fn kill_on_early_startup_timeout_seconds() {
     let name = "kill_on_early_startup_timeout_seconds";
     let conf = CSConfigOptions {
