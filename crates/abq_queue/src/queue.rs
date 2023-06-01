@@ -21,7 +21,7 @@ use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
 use abq_utils::net_protocol::runners::{MetadataMap, StdioOutput};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
-    Eow, ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
+    Eow, GroupId, ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
 };
 use abq_utils::net_protocol::{
     self,
@@ -614,7 +614,7 @@ impl AllRuns {
     fn add_manifest(
         &self,
         run_id: &RunId,
-        flat_manifest: Vec<TestSpec>,
+        flat_manifest: Vec<(TestSpec, GroupId)>,
         init_metadata: MetadataMap,
     ) -> AddedManifest {
         let runs = self.runs.read();
@@ -645,9 +645,14 @@ impl AllRuns {
         };
 
         let manifest_size_nonce = flat_manifest.len() as u64;
-        let work_from_manifest = flat_manifest.into_iter().map(|spec| WorkerTest {
-            spec,
-            run_number: INIT_RUN_NUMBER,
+        let work_from_manifest = flat_manifest.into_iter().map(|(spec, group_id)| {
+            (
+                WorkerTest {
+                    spec,
+                    run_number: INIT_RUN_NUMBER,
+                },
+                group_id,
+            )
         });
 
         let queue = JobQueue::new(work_from_manifest.collect(), test_strategy);
@@ -2052,7 +2057,7 @@ impl QueueServer {
         persist_results: SharedPersistResults,
         entity: Entity,
         run_id: RunId,
-        flat_manifest: Vec<TestSpec>,
+        flat_manifest: Vec<(TestSpec, GroupId)>,
         init_metadata: MetadataMap,
         native_runner_info: NativeRunnerInfo,
         mut stream: Box<dyn net_async::ServerStream>,
@@ -2728,10 +2733,7 @@ use abq_utils::net_protocol::runners::ProtocolWitness;
 
 #[cfg(test)]
 fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
-    use abq_utils::net_protocol::{
-        runners::TestCase,
-        workers::{GroupId, WorkId},
-    };
+    use abq_utils::net_protocol::{runners::TestCase, workers::WorkId};
 
     TestSpec {
         test_case: TestCase::new(proto, "fake-test", Default::default()),
@@ -3468,11 +3470,14 @@ mod test {
                 persistence::results::InMemoryPersistor::new_shared(),
                 entity,
                 run_id.clone(),
-                vec![TestSpec {
-                    test_case: TestCase::new(proto, "test1", Default::default()),
-                    work_id: WorkId::new(),
-                    group_id: GroupId::new(),
-                }],
+                vec![(
+                    TestSpec {
+                        test_case: TestCase::new(proto, "test1", Default::default()),
+                        work_id: WorkId::new(),
+                        group_id: GroupId::new(),
+                    },
+                    GroupId::new(),
+                )],
                 Default::default(),
                 NativeRunnerInfo {
                     protocol_version: proto.get_version(),
@@ -3556,11 +3561,14 @@ mod test {
                     persistence::results::InMemoryPersistor::new_shared(),
                     entity,
                     run_id,
-                    vec![TestSpec {
-                        test_case: TestCase::new(proto, "test1", Default::default()),
-                        work_id: WorkId::new(),
-                        group_id: GroupId::new(),
-                    }],
+                    vec![(
+                        TestSpec {
+                            test_case: TestCase::new(proto, "test1", Default::default()),
+                            work_id: WorkId::new(),
+                            group_id: GroupId::new(),
+                        },
+                        GroupId::new(),
+                    )],
                     Default::default(),
                     NativeRunnerInfo {
                         protocol_version: proto.get_version(),
@@ -3683,7 +3691,7 @@ mod test {
                 &remote,
             )
             .await;
-        let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
+        let _ = queues.add_manifest(&run_id, vec![(spec(1), GroupId::new())], Default::default());
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
         assert_eq!(
@@ -3711,7 +3719,11 @@ mod test {
                 &remote,
             )
             .await;
-        let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
+        let _ = queues.add_manifest(
+            &run_id,
+            vec![(spec(1), GroupId::new()), (spec(2), GroupId::new())],
+            Default::default(),
+        );
         let _ = queues.next_work(Entity::runner(0, 1), &run_id);
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
@@ -3740,7 +3752,7 @@ mod test {
                 &remote,
             )
             .await;
-        let _ = queues.add_manifest(&run_id, vec![spec(1)], Default::default());
+        let _ = queues.add_manifest(&run_id, vec![(spec(1), GroupId::new())], Default::default());
         let _ = queues.next_work(Entity::runner(0, 1), &run_id);
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
@@ -3797,7 +3809,11 @@ mod test {
                 &remote,
             )
             .await;
-        let _ = queues.add_manifest(&run_id, vec![spec(1), spec(2)], Default::default());
+        let _ = queues.add_manifest(
+            &run_id,
+            vec![(spec(1), GroupId::new()), (spec(2), GroupId::new())],
+            Default::default(),
+        );
 
         // Race popping an item off the manifest, and handling the no-progress timeout.
         // If the no-progress handler wins, the run should be cancelled and getting next work
@@ -4082,7 +4098,7 @@ mod test_pull_work {
     use abq_utils::net_protocol::{
         entity::Entity,
         queue::TestStrategy,
-        workers::{RunId, WorkerTest},
+        workers::{GroupId, RunId, WorkerTest},
     };
     use abq_with_protocol_version::with_protocol_version;
 
@@ -4100,14 +4116,20 @@ mod test_pull_work {
         // Set up the queue so only one test is pulled, and there are a total of two attempts.
         let queue = JobQueue::new(
             vec![
-                WorkerTest {
-                    spec: fake_test_spec(proto),
-                    run_number: 1,
-                },
-                WorkerTest {
-                    spec: fake_test_spec(proto),
-                    run_number: 2,
-                },
+                (
+                    WorkerTest {
+                        spec: fake_test_spec(proto),
+                        run_number: 1,
+                    },
+                    GroupId::new(),
+                ),
+                (
+                    WorkerTest {
+                        spec: fake_test_spec(proto),
+                        run_number: 2,
+                    },
+                    GroupId::new(),
+                ),
             ],
             TestStrategy::ByTest,
         );
@@ -4199,7 +4221,7 @@ mod persistence_on_end_of_manifest {
             self,
             entity::Entity,
             work_server,
-            workers::{NextWorkBundle, RunId, WorkerTest, INIT_RUN_NUMBER},
+            workers::{GroupId, NextWorkBundle, RunId, WorkerTest, INIT_RUN_NUMBER},
         },
         server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -4240,7 +4262,11 @@ mod persistence_on_end_of_manifest {
                 .await;
             let _ = queues.add_manifest(
                 &run_id,
-                vec![test1.clone(), test2, test3],
+                vec![
+                    (test1.clone(), GroupId::new()),
+                    (test2, GroupId::new()),
+                    (test3, GroupId::new()),
+                ],
                 Default::default(),
             );
         }
@@ -4329,8 +4355,8 @@ mod persistence_on_end_of_manifest {
         let spec2 = spec(2);
 
         let manifest = vec![
-            WorkerTest::new(spec1.clone(), 1),
-            WorkerTest::new(spec2.clone(), 1),
+            (WorkerTest::new(spec1.clone(), 1), GroupId::new()),
+            (WorkerTest::new(spec2.clone(), 1), GroupId::new()),
         ];
 
         let run_id = RunId::unique();
@@ -4481,7 +4507,11 @@ mod persistence_on_end_of_manifest {
             .await;
         let _ = queues.add_manifest(
             &run_id,
-            vec![test1.clone(), test2.clone(), test3],
+            vec![
+                (test1.clone(), GroupId::new()),
+                (test2.clone(), GroupId::new()),
+                (test3, GroupId::new()),
+            ],
             Default::default(),
         );
 
