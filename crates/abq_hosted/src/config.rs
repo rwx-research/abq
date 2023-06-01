@@ -20,9 +20,10 @@ pub struct HostedQueueConfig {
     /// `Some` is TLS should be used, `None` otherwise.
     pub tls_public_certificate: Option<Vec<u8>>,
     pub rwx_access_token_kind: AccessTokenKind,
+    pub usage_error: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Copy, Clone)]
 pub enum AccessTokenKind {
     #[serde(rename = "personal_access_token")]
     Personal,
@@ -35,6 +36,7 @@ struct HostedQueueResponse {
     queue_url: Url,
     tls_public_certificate: Option<String>,
     rwx_access_token_kind: AccessTokenKind,
+    usage_error: Option<String>,
 }
 
 impl HostedQueueConfig {
@@ -76,6 +78,7 @@ impl HostedQueueConfig {
             queue_url,
             tls_public_certificate,
             rwx_access_token_kind,
+            usage_error,
         } = resp;
 
         let addr = match queue_url.socket_addrs(|| None).as_deref() {
@@ -115,6 +118,7 @@ impl HostedQueueConfig {
             auth_token,
             tls_public_certificate: tls_public_certificate.map(String::into_bytes),
             rwx_access_token_kind,
+            usage_error,
         })
     }
 }
@@ -249,6 +253,7 @@ mod test {
             auth_token,
             tls_public_certificate,
             rwx_access_token_kind,
+            usage_error: _,
         } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
             .await
             .unwrap();
@@ -291,6 +296,7 @@ mod test {
             auth_token,
             tls_public_certificate,
             rwx_access_token_kind,
+            usage_error: _,
         } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
             .await
             .unwrap();

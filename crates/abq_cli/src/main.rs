@@ -70,6 +70,7 @@ struct ConfigFromApi {
     token: UserToken,
     tls_public_certificate: Option<Vec<u8>>,
     rwx_access_token_kind: AccessTokenKind,
+    usage_error: Option<String>,
 }
 
 struct RunIdEnvironment {
@@ -385,8 +386,21 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tls_cert: resolved_tls,
                 rwx_access_token_kind,
                 queue_location,
-            } = resolve_config(token, queue_addr, tls_cert, tls_key, &access_token, &run_id)
-                .await?;
+            } = resolve_config(
+                token,
+                queue_addr,
+                tls_cert,
+                tls_key,
+                &access_token,
+                &run_id,
+                explicit_run_id_provided,
+            )
+            .await?;
+
+            if queue_location.is_unsupported() {
+                let mut cmd = Cli::command();
+                Err(cmd.error(ErrorKind::InvalidValue, "`abq test` failed improve this errormessage."))?;
+            }
 
             if explicit_run_id_provided && !queue_location.is_remote() {
                 let mut cmd = Cli::command();
@@ -499,9 +513,23 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tls_cert: resolved_tls,
                 rwx_access_token_kind: _resolved_rwx_access_token_kind,
                 queue_location,
-            } = resolve_config(token, queue_addr, tls_cert, None, &access_token, &run_id).await?;
+            } = resolve_config(
+                token,
+                queue_addr,
+                tls_cert,
+                None,
+                &access_token,
+                &run_id,
+                explicit_run_id_provided,
+            )
+            .await?;
 
             let client_auth = resolved_token.into();
+
+            if queue_location.is_unsupported() {
+                let mut cmd = Cli::command();
+                Err(cmd.error(ErrorKind::InvalidValue, "`abq test` failed improve this errormessage."))?;
+            }
 
             if explicit_run_id_provided && !queue_location.is_remote() {
                 let mut cmd = Cli::command();
@@ -625,14 +653,44 @@ struct ResolvedConfig {
 enum QueueLocation {
     Remote(SocketAddr),
     Ephemeral { opt_tls_key: Option<Vec<u8>> },
+    Unsupported(String),
 }
 
 impl QueueLocation {
     fn is_remote(&self) -> bool {
-        match self {
-            QueueLocation::Remote(_) => true,
-            QueueLocation::Ephemeral { .. } => false,
+        matches!(self, QueueLocation::Remote(_))
+    }
+    fn is_unsupported(&self) -> bool {
+        matches!(self, QueueLocation::Unsupported(_))
+    }
+}
+
+fn determine_queue_location(
+    access_token_kind: Option<AccessTokenKind>,
+    run_id_provided: bool,
+    queue_addr: Option<SocketAddr>,
+    usage_error_from_api: Option<String>,
+    tls_key: Option<Vec<u8>>,
+) -> QueueLocation {
+    match access_token_kind {
+        Some(AccessTokenKind::Personal) => {
+            match (run_id_provided, usage_error_from_api, queue_addr) {
+                (false, _, _) => QueueLocation::Ephemeral {
+                    opt_tls_key: tls_key,
+                },
+                (_, Some(usage_error), _) => QueueLocation::Unsupported(usage_error),
+                (_, None, Some(queue_addr)) => QueueLocation::Remote(queue_addr),
+                (_, None, None) => QueueLocation::Ephemeral {
+                    opt_tls_key: tls_key,
+                },
+            }
         }
+        _ => match queue_addr {
+            Some(queue_addr) => QueueLocation::Remote(queue_addr),
+            None => QueueLocation::Ephemeral {
+                opt_tls_key: tls_key,
+            },
+        },
     }
 }
 
@@ -643,30 +701,39 @@ async fn resolve_config(
     tls_key: Option<Vec<u8>>,
     access_token: &Option<AccessToken>,
     run_id: &RunId,
+    explicit_run_id_provided: bool,
 ) -> anyhow::Result<ResolvedConfig> {
-    let (queue_addr_from_api, token_from_api, tls_from_api, rwx_access_token_kind) =
-        match access_token.as_ref() {
-            Some(access_token) => {
-                let config = get_config_from_api(access_token, run_id).await?;
-                (
-                    Some(config.queue_addr),
-                    Some(config.token),
-                    config.tls_public_certificate,
-                    Some(config.rwx_access_token_kind),
-                )
-            }
-            None => (None, None, None, None),
-        };
+    let (
+        queue_addr_from_api,
+        token_from_api,
+        tls_from_api,
+        usage_error_from_api,
+        rwx_access_token_kind,
+    ) = match access_token.as_ref() {
+        Some(access_token) => {
+            let config = get_config_from_api(access_token, run_id).await?;
+            (
+                Some(config.queue_addr),
+                Some(config.token),
+                config.tls_public_certificate,
+                config.usage_error,
+                Some(config.rwx_access_token_kind),
+            )
+        }
+        None => (None, None, None, None, None),
+    };
 
     let token = token_from_api.or(token_from_cli);
     let queue_addr = queue_addr_from_api.or(queue_addr_from_cli);
     let tls_cert = tls_from_api.or(tls_cert_from_cli);
-    let queue_location = match queue_addr {
-        Some(queue_addr) => QueueLocation::Remote(queue_addr),
-        None => QueueLocation::Ephemeral {
-            opt_tls_key: tls_key,
-        },
-    };
+
+    let queue_location = determine_queue_location(
+        rwx_access_token_kind,
+        explicit_run_id_provided,
+        queue_addr,
+        usage_error_from_api,
+        tls_key,
+    );
 
     Ok(ResolvedConfig {
         token,
@@ -708,6 +775,7 @@ async fn get_config_from_api(
         auth_token,
         tls_public_certificate,
         rwx_access_token_kind,
+        usage_error,
     } = HostedQueueConfig::from_api(api_url, access_token, run_id).await?;
 
     Ok(ConfigFromApi {
@@ -715,6 +783,7 @@ async fn get_config_from_api(
         token: auth_token,
         tls_public_certificate,
         rwx_access_token_kind,
+        usage_error,
     })
 }
 
@@ -778,6 +847,9 @@ async fn find_or_create_abq(
                 AbqInstance::new_ephemeral(opt_user_token, client_auth, server_tls, client_tls)
                     .await,
             )
+        }
+        QueueLocation::Unsupported(_) => {
+            unreachable!("any other configuration would have been caught during arg parsing")
         }
     }
 }
