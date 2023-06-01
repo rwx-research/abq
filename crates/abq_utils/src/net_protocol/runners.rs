@@ -337,14 +337,13 @@ impl From<RawManifest> for Manifest {
 
 impl Manifest {
     /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
-    pub fn flatten(self) -> (Vec<TestSpec>, MetadataMap) {
+    pub fn flatten(self) -> (Vec<(TestSpec, GroupId)>, MetadataMap) {
         use v0_2::{Group, TestOrGroup};
-        let Manifest { members, init_meta } = self;
-        let mut collected = Vec::with_capacity(members.len());
+        let mut collected = Vec::with_capacity(self.members.len());
 
         // share a top-level vector so we can reuse the largest queue allocated
         let mut queue: Vec<TestOrGroup> = Vec::new();
-        for top_level_test_or_group in members {
+        for top_level_test_or_group in self.members {
             let group_id = GroupId::new();
             match top_level_test_or_group {
                 TestOrGroup::Test(test) => {
@@ -365,28 +364,31 @@ impl Manifest {
                 }
             }
         }
-        (collected, init_meta)
+        (collected, self.init_meta)
     }
 
     #[inline]
     fn add_test_to_collected(
         v0_2::Test { id, meta, .. }: v0_2::Test,
-        collected: &mut Vec<TestSpec>,
+        collected: &mut Vec<(TestSpec, GroupId)>,
         group_id: GroupId,
     ) {
-        collected.push(TestSpec {
-            // Generate a fresh ID for ABQ-internal usage.
-            work_id: WorkId::new(),
+        collected.push((
+            TestSpec {
+                // Generate a fresh ID for ABQ-internal usage.
+                work_id: WorkId::new(),
+                group_id,
+                test_case: TestCase(
+                    v0_2::TestCase {
+                        id,
+                        meta,
+                        focus: None,
+                    }
+                    .into(),
+                ),
+            },
             group_id,
-            test_case: self::TestCase(
-                v0_2::TestCase {
-                    id,
-                    meta,
-                    focus: None,
-                }
-                .into(),
-            ),
-        })
+        ))
     }
 
     /// Sorts the manifest into a consistent ordering.
@@ -427,6 +429,9 @@ mod test_manifest {
         }
         .flatten()
         .0
+        .into_iter()
+        .map(|(test_spec, _)| test_spec)
+        .collect()
     }
 
     fn test(name: &'static str) -> TestOrGroup {

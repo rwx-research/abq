@@ -615,8 +615,8 @@ mod test {
         self, InitContext, InitContextResponse, NextTestRequest, NextTestResponse,
     };
     use abq_utils::net_protocol::workers::{
-        Eow, GroupId, ManifestResult, NextWorkBundle, ReportedManifest, RunId, RunnerKind,
-        TestLikeRunner, WorkId, WorkerTest, INIT_RUN_NUMBER,
+        Eow, ManifestResult, NextWorkBundle, ReportedManifest, RunId, RunnerKind, TestLikeRunner,
+        WorkId, WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::NoopResultsHandler;
     use abq_utils::server_shutdown::ShutdownManager;
@@ -663,11 +663,11 @@ mod test {
                             .0
                             .into_iter()
                             .enumerate()
-                            .map(|(i, spec)| WorkerTest {
+                            .map(|(i, (spec, group_id))| WorkerTest {
                                 spec: TestSpec {
                                     test_case: spec.test_case,
                                     work_id: WorkId([i as _; 16]),
-                                    group_id: GroupId([i as _; 16]),
+                                    group_id,
                                 },
                                 run_number: INIT_RUN_NUMBER,
                             })

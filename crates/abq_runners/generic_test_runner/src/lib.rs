@@ -1429,7 +1429,11 @@ pub fn execute_wrapped_runner(
                     }
 
                     *manifest_message = Some(real_manifest.clone());
-                    *flat_manifest = Some(real_manifest.manifest.flatten());
+                    let flattened = real_manifest.manifest.flatten();
+                    *flat_manifest = Some((
+                        flattened.0.into_iter().map(|(spec, _)| spec).collect(),
+                        flattened.1,
+                    ));
                 }
                 ManifestResult::TestRunnerError { error, output: _ } => {
                     *opt_error_cell.lock() = Some(error);

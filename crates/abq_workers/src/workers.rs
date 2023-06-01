@@ -1083,7 +1083,15 @@ mod test {
         loop {
             let man = { manifest.lock().take() };
             match man {
-                Some(ManifestResult::Manifest(manifest)) => return manifest.manifest.flatten().0,
+                Some(ManifestResult::Manifest(manifest)) => {
+                    return manifest
+                        .manifest
+                        .flatten()
+                        .0
+                        .into_iter()
+                        .map(|(spec, _)| spec)
+                        .collect();
+                }
                 Some(ManifestResult::TestRunnerError { .. }) => unreachable!(),
                 None => {
                     tokio::time::sleep(Duration::from_micros(100)).await;

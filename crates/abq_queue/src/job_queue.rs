@@ -2,7 +2,11 @@ use std::{cell::Cell, num::NonZeroUsize, sync::atomic::AtomicUsize};
 
 use abq_utils::{
     atomic,
-    net_protocol::{entity::Tag, queue::TestStrategy, workers::WorkerTest},
+    net_protocol::{
+        entity::Tag,
+        queue::TestStrategy,
+        workers::{GroupId, WorkerTest},
+    },
 };
 
 use crate::persistence;
@@ -12,7 +16,7 @@ use crate::persistence;
 /// a single atomic exchange in the happy path.
 #[derive(Default, Debug)]
 pub struct JobQueue {
-    queue: Vec<WorkerTest>,
+    queue: Vec<(WorkerTest, GroupId)>,
     /// To which worker has each entry in the manifest been assigned to?
     /// Modified as a run progresses, by popping off [Self::get_work]
     assigned_entities: Vec<TagCell>,
@@ -38,7 +42,7 @@ impl TagCell {
 unsafe impl Sync for TagCell {}
 
 impl JobQueue {
-    pub fn new(work: Vec<WorkerTest>, test_strategy: TestStrategy) -> Self {
+    pub fn new(work: Vec<(WorkerTest, GroupId)>, test_strategy: TestStrategy) -> Self {
         let work_len = work.len();
         Self {
             queue: work,
@@ -71,7 +75,7 @@ impl JobQueue {
             entity_cell.0.set(entity_tag);
         }
 
-        self.queue[start_idx..end_idx].iter()
+        self.queue[start_idx..end_idx].iter().map(|(test, _)| test)
     }
 
     #[inline]
@@ -116,17 +120,17 @@ impl JobQueue {
                 if start_idx >= queue_len {
                     return None;
                 }
-                let mut current_group = self.queue[start_idx].spec.group_id;
+                let mut current_group_id = self.queue[start_idx].1;
                 // find idx of the start of the next group
-                for next_spec in self.queue[start_idx..].iter() {
+                for (next_spec, next_group_id) in self.queue[start_idx..].iter() {
                     // if we've walked into a new group...
-                    if next_spec.spec.group_id != current_group {
+                    if *next_group_id != current_group_id {
                         // if the current slice is big enough, break
                         if end_idx - start_idx >= suggested_batch_size {
                             break;
                         }
                         // else start pulling from the next group
-                        current_group = next_spec.spec.group_id
+                        current_group_id = next_spec.spec.group_id
                     }
                     end_idx += 1; // include next_spec in the slice
                 }
@@ -150,6 +154,7 @@ impl JobQueue {
             .enumerate()
             .filter(move |(_, cell)| cell.0.get() == entity_tag)
             .map(|(i, _)| &self.queue[i])
+            .map(|(test, _)| test)
     }
 
     pub fn into_manifest_view(self) -> persistence::manifest::ManifestView {
@@ -168,6 +173,7 @@ impl JobQueue {
             .into_iter()
             .map(|t| t.0.into_inner())
             .collect();
+        let queue = queue.into_iter().map(|(t, _)| t).collect();
 
         persistence::manifest::ManifestView::new(queue, assigned_entities)
     }
@@ -207,13 +213,16 @@ mod test {
         let num_popped = Arc::new(AtomicUsize::new(0));
 
         let protocol = ProtocolWitness::iter_all().next().unwrap();
-        let manifest = std::iter::repeat(WorkerTest::new(
-            TestSpec {
-                work_id: WorkId::new(),
-                test_case: TestCase::new(protocol, "test", Default::default()),
-                group_id: GroupId::new(),
-            },
-            INIT_RUN_NUMBER,
+        let manifest = std::iter::repeat((
+            WorkerTest::new(
+                TestSpec {
+                    work_id: WorkId::new(),
+                    test_case: TestCase::new(protocol, "test", Default::default()),
+                    group_id: GroupId::new(),
+                },
+                INIT_RUN_NUMBER,
+            ),
+            GroupId::new(),
         ))
         .take(10_000)
         .collect();
@@ -285,13 +294,16 @@ mod test {
         let num_popped = Arc::new(AtomicUsize::new(0));
 
         let protocol = ProtocolWitness::iter_all().next().unwrap();
-        let manifest = std::iter::repeat(WorkerTest::new(
-            TestSpec {
-                work_id: WorkId::new(),
-                test_case: TestCase::new(protocol, "test", Default::default()),
-                group_id: GroupId::new(),
-            },
-            INIT_RUN_NUMBER,
+        let manifest = std::iter::repeat((
+            WorkerTest::new(
+                TestSpec {
+                    work_id: WorkId::new(),
+                    test_case: TestCase::new(protocol, "test", Default::default()),
+                    group_id: GroupId::new(),
+                },
+                INIT_RUN_NUMBER,
+            ),
+            GroupId::new(),
         ))
         .take(10_000)
         .collect();
@@ -353,16 +365,19 @@ mod test {
             for num_tests_in_group in min_group_size..=max_group_size {
                 let group_id = GroupId::new();
                 manifest.extend(
-                    std::iter::repeat(WorkerTest::new(
-                        TestSpec {
-                            work_id: WorkId::new(),
-                            test_case: TestCase::new(protocol, "test", Default::default()),
-                            group_id,
-                        },
-                        INIT_RUN_NUMBER,
+                    std::iter::repeat((
+                        WorkerTest::new(
+                            TestSpec {
+                                work_id: WorkId::new(),
+                                test_case: TestCase::new(protocol, "test", Default::default()),
+                                group_id,
+                            },
+                            INIT_RUN_NUMBER,
+                        ),
+                        group_id,
                     ))
                     .take(num_tests_in_group),
-                );
+                )
             }
         }
 
