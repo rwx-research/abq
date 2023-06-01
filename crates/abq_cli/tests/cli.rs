@@ -2,8 +2,6 @@
 // For convenience in tests.
 #![allow(clippy::useless_format)]
 
-use crate::json::json;
-use abq_hosted::AccessToken;
 use abq_native_runner_simulation::{pack, pack_msgs, pack_msgs_to_disk, Msg::*};
 use abq_test_utils::{artifacts_dir, s, sanitize_output, write_to_temp, WORKSPACE};
 use abq_utils::auth::{AdminToken, UserToken};
@@ -17,14 +15,12 @@ use abq_utils::net_protocol::runners::{
 };
 use abq_with_protocol_version::with_protocol_version;
 use indoc::formatdoc;
-use mockito::{Matcher, Server};
 use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
 use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
-use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 use std::{
@@ -37,15 +33,7 @@ use tempfile::{NamedTempFile, TempDir};
 use abq_utils::net_protocol::workers::RunId;
 
 const TLS_CERT: &str = std::concat!(std::env!("ABQ_WORKSPACE_DIR"), "testdata/certs/server.crt");
-const TLS_CERT_STRING: &str = include_str!(std::concat!(
-    std::env!("ABQ_WORKSPACE_DIR"),
-    "testdata/certs/server.crt"
-));
 const TLS_KEY: &str = std::concat!(std::env!("ABQ_WORKSPACE_DIR"), "testdata/certs/server.key");
-
-fn test_access_token() -> AccessToken {
-    AccessToken::from_str("abqapi_MD2QPKH2VZU2krvOa2mN54Q4qwzNxF").unwrap()
-}
 
 fn var_flag_set(var: &str) -> bool {
     match std::env::var(var) {
@@ -94,7 +82,6 @@ struct Abq {
     env: Vec<(String, String)>,
     always_capture_stderr: bool,
     working_dir: Option<PathBuf>,
-    config_file: Option<String>,
     inherit: bool,
 }
 
@@ -136,7 +123,6 @@ impl Abq {
             env: Default::default(),
             always_capture_stderr: false,
             working_dir: None,
-            config_file: None,
             inherit: false,
         }
     }
@@ -167,11 +153,6 @@ impl Abq {
 
     fn working_dir(mut self, working_dir: impl Into<PathBuf>) -> Self {
         self.working_dir = Some(working_dir.into());
-        self
-    }
-
-    fn config_file(mut self, file: impl Into<String>) -> Self {
-        self.config_file = Some(file.into());
         self
     }
 
@@ -206,7 +187,6 @@ impl Abq {
             env,
             always_capture_stderr,
             working_dir,
-            config_file,
             inherit,
         } = self;
         let working_dir = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
@@ -237,12 +217,6 @@ impl Abq {
         if debug_log_for_ci() && !always_capture_stderr {
             cmd.env("ABQ_LOGCI_WITH_PREFIX", name);
             cmd.env("ABQ_LOG", "abq=debug");
-        }
-
-        if let Some(config_filepath) = config_file {
-            cmd.env("ABQ_CONFIG_FILE", config_filepath);
-        } else {
-            cmd.env("ABQ_CONFIG_FILE", "");
         }
 
         let child = cmd
@@ -2563,240 +2537,6 @@ fn out_of_process_retries_smoke() {
 }
 
 #[test]
-#[with_protocol_version]
-#[serial]
-fn personal_access_token_does_not_mutate_remote_queue() {
-    let name = "personal_access_token_does_not_mutate_remote_queue";
-    let conf = CSConfigOptions {
-        use_auth_token: true,
-        tls: true,
-    };
-
-    let (queue_proc, queue_addr) = setup_queue!(name, conf);
-
-    let manifest = vec![TestOrGroup::test(Test::new(
-        proto,
-        "some_test",
-        [],
-        Default::default(),
-    ))];
-
-    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
-
-    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
-
-    // simulation 1 - observe failures reported
-    {
-        let simulation = [
-            Connect,
-            //
-            // Write spawn message
-            OpaqueWrite(pack(legal_spawned_message(proto))),
-            //
-            // Write the manifest if we need to.
-            // Otherwise handle the one test.
-            IfGenerateManifest {
-                then_do: vec![OpaqueWrite(pack(&manifest))],
-                else_do: {
-                    let mut run_tests = vec![
-                        //
-                        // Read init context message + write ACK
-                        OpaqueRead,
-                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
-                    ];
-
-                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
-                    // faux result.
-                    // Otherwise assume we ran out of tests on our node and exit.
-                    run_tests.push(IfAliveReadAndWriteFake(Status::Failure {
-                        exception: None,
-                        backtrace: None,
-                    }));
-                    run_tests
-                },
-            },
-            //
-            // Finish
-            Exit(0),
-        ];
-
-        let packed = pack_msgs_to_disk(simulation);
-
-        let test_args = {
-            let simulator = native_runner_simulation_bin();
-            let simfile_path = packed.path.display().to_string();
-            let args = vec![
-                format!("test"),
-                format!("--worker=1"),
-                format!("--queue-addr={queue_addr}"),
-                format!("--run-id=test-run-id"),
-                format!("-n=1"),
-            ];
-            let mut args = conf.extend_args_for_client(args);
-            args.extend([s!("--"), simulator, simfile_path]);
-            args
-        };
-
-        let CmdOutput { .. } = Abq::new(format!("{name}_initial")).args(test_args).run();
-
-        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
-        let report_args = {
-            let args = vec![
-                format!("report"),
-                format!("--reporter=dot"),
-                format!("--queue-addr={queue_addr}"),
-                format!("--run-id=test-run-id"),
-                format!("--color=never"),
-            ];
-            conf.extend_args_for_client(args)
-        };
-
-        let CmdOutput {
-            stdout,
-            stderr,
-            exit_status,
-        } = Abq::new(name.to_string() + "_report")
-            .args(report_args)
-            .always_capture_stderr(true)
-            .run();
-
-        assert!(
-            !exit_status.success(),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-        assert!(
-            stdout.contains("1 tests, 1 failures"),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-    }
-
-    // mock personal access token usage
-    let mut server = Server::new();
-    let in_run_id = RunId("test-run-id".to_string());
-    let access_token = test_access_token();
-    let _m = server.mock("GET", "/queue")
-        .match_header(
-            "Authorization",
-            format!("Bearer {}", access_token).as_str(),
-        )
-        .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
-        .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
-            "run_id".to_string(),
-            in_run_id.to_string(),
-        )]))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            json!({
-                "queue_url": format!("abqs://{}?run_id={}&token={}", queue_addr, in_run_id, TEST_USER_AUTH_TOKEN),
-                "tls_public_certificate": TLS_CERT_STRING,
-                "rwx_access_token_kind": "personal_access_token",
-            }).to_string()
-        )
-        .create();
-
-    // simulation 2 - observe passing locally, but still reported as failure remotely
-    {
-        let simulation = [
-            Connect,
-            //
-            // Write spawn message
-            OpaqueWrite(pack(legal_spawned_message(proto))),
-            //
-            // Write the manifest if we need to.
-            // Otherwise handle the one test.
-            IfGenerateManifest {
-                then_do: vec![OpaqueWrite(pack(&manifest))],
-                else_do: {
-                    let mut run_tests = vec![
-                        //
-                        // Read init context message + write ACK
-                        OpaqueRead,
-                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
-                    ];
-
-                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
-                    // faux result.
-                    // Otherwise assume we ran out of tests on our node and exit.
-                    run_tests.push(IfAliveReadAndWriteFake(Status::Success));
-                    run_tests
-                },
-            },
-            //
-            // Finish
-            Exit(0),
-        ];
-
-        let packed = pack_msgs_to_disk(simulation);
-
-        let test_args = {
-            let simulator = native_runner_simulation_bin();
-            let simfile_path = packed.path.display().to_string();
-            let args = vec![
-                format!("test"),
-                format!("--worker=1"),
-                format!("--run-id=test-run-id"),
-                format!("--access-token={access_token}"),
-                format!("-n=1"),
-            ];
-            let mut args = conf.extend_args_for_client(args);
-            args.extend([s!("--"), simulator, simfile_path]);
-            args
-        };
-
-        let CmdOutput {
-            exit_status,
-            stderr,
-            stdout,
-        } = Abq::new(format!("{name}_initial"))
-            .args(test_args)
-            .env([("ABQ_API", server.url())])
-            .run();
-
-        assert!(
-            exit_status.success(),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-        assert!(
-            stdout.contains("1 tests, 0 failures"),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-
-        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
-        let report_args = {
-            let args = vec![
-                format!("report"),
-                format!("--reporter=dot"),
-                format!("--queue-addr={queue_addr}"),
-                format!("--run-id=test-run-id"),
-                format!("--color=never"),
-            ];
-            conf.extend_args_for_client(args)
-        };
-
-        let CmdOutput {
-            stdout,
-            stderr,
-            exit_status,
-        } = Abq::new(name.to_string() + "_report")
-            .args(report_args)
-            .always_capture_stderr(true)
-            .run();
-
-        assert!(
-            !exit_status.success(),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-        assert!(
-            stdout.contains("1 tests, 1 failures"),
-            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-        );
-    }
-
-    term(queue_proc);
-}
-
-#[test]
 #[serial]
 fn report_while_run_in_progress_is_error() {
     let name = "report_while_run_in_progress_is_error";
@@ -2903,122 +2643,6 @@ fn report_while_run_in_progress_is_error() {
 
     term(worker0);
     term(queue_proc);
-}
-
-#[test]
-#[with_protocol_version]
-#[serial]
-fn test_explicit_run_id_against_ephemeral_queue() {
-    let name = "test_explicit_run_id_against_ephemeral_queue";
-    let args = vec![
-        format!("test"),
-        format!("--worker=1"),
-        format!("--run-id=test-run-id"),
-        format!("-n=1"),
-        s!("--"),
-        format!("some_test_command"),
-    ];
-
-    let CmdOutput {
-        exit_status,
-        stderr,
-        stdout,
-    } = Abq::new(format!("{name}_initial")).args(args).run();
-    assert!(
-        !exit_status.success(),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("`abq test` was provided a run id, but we've detected an ephemeral queue."),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-}
-
-#[test]
-#[with_protocol_version]
-#[serial]
-fn report_explicit_run_id_against_ephemeral_queue() {
-    let name = "report_explicit_run_id_against_ephemeral_queue";
-    let args = vec![
-        format!("report"),
-        format!("--reporter=dot"),
-        format!("--run-id=some-run-id"),
-        format!("--color=never"),
-    ];
-
-    let CmdOutput {
-        stdout,
-        stderr,
-        exit_status,
-    } = Abq::new(name.to_string() + "_report")
-        .args(args)
-        .always_capture_stderr(true)
-        .run();
-
-    assert!(
-        !exit_status.success(),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-    assert!(
-        stderr
-            .contains("`abq report` was provided a run id, but we've detected an ephemeral queue."),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-}
-
-#[test]
-#[with_protocol_version]
-#[serial]
-fn login_saves_access_token_custom() {
-    let name = "login_saves_access_token_custom";
-    let tempfile = NamedTempFile::new().expect("Failed to create tempfile");
-
-    let CmdOutput {
-        stdout,
-        stderr,
-        exit_status,
-    } = Abq::new(name.to_string() + "_login")
-        .args(vec!["login", "--access-token=testy"])
-        .always_capture_stderr(true)
-        .config_file(tempfile.path().to_str().unwrap())
-        .run();
-
-    assert!(
-        exit_status.success(),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-    assert!(
-        stdout.contains(&format!(
-            "Your access token is now stored at: {}",
-            tempfile.path().display()
-        )),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-}
-
-#[test]
-#[with_protocol_version]
-#[serial]
-fn login_saves_access_token_err() {
-    let name = "login_saves_access_token_err";
-
-    let CmdOutput {
-        stdout,
-        stderr,
-        exit_status,
-    } = Abq::new(name.to_string() + "_login")
-        .args(vec!["login", "--access-token=testy"])
-        .always_capture_stderr(true)
-        .run();
-
-    assert!(
-        !exit_status.success(),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
-    assert!(
-        stderr.contains(&format!("Failed to locate ABQ config file.")),
-        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
-    );
 }
 
 #[test]

@@ -29,12 +29,6 @@ use self::reporting::ReportingTaskHandle;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    WriteNormal,
-    Readonly,
-}
-
 pub async fn start_workers_standalone(
     run_id: RunId,
     tag: WorkerTag,
@@ -49,7 +43,6 @@ pub async fn start_workers_standalone(
     queue_negotiator: QueueNegotiatorHandle,
     client_opts: ClientOptions,
     startup_timeout: Duration,
-    execution_mode: ExecutionMode,
 ) -> ! {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let has_stdout_reporters = reporter_kinds
@@ -80,7 +73,6 @@ pub async fn start_workers_standalone(
         test_timeout,
         results_batch_size_hint: batch_size.get(),
         max_run_number,
-        should_send_results: execution_mode == ExecutionMode::WriteNormal,
     };
 
     tracing::debug!(
@@ -110,7 +102,7 @@ pub async fn start_workers_standalone(
     loop {
         tokio::select! {
             () = worker_pool.wait() => {
-                do_shutdown(worker_pool, reporting_handle, stdout_preferences, execution_mode, run_id, tag, num_workers).await;
+                do_shutdown(worker_pool, reporting_handle, stdout_preferences).await;
             }
             _ = term_signals.next() => {
                 do_cancellation_shutdown(worker_pool).await;
@@ -127,10 +119,6 @@ async fn do_shutdown(
     mut worker_pool: NegotiatedWorkers,
     reporting_handle: ReportingTaskHandle,
     stdout_preferences: StdoutPreferences,
-    execution_mode: ExecutionMode,
-    run_id: RunId,
-    worker_tag: WorkerTag,
-    num_runners: NonZeroUsize,
 ) -> ! {
     let WorkersExit {
         status,
@@ -173,19 +161,6 @@ async fn do_shutdown(
     suite_result
         .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)
         .unwrap();
-    println!("\n");
-    if execution_mode == ExecutionMode::WriteNormal {
-        println!("Run the following command to replay these tests locally:");
-        println!("\n");
-        println!(
-            "\tabq test --run-id {} --worker {} --num {} -- <your-test-command>",
-            run_id,
-            worker_tag.index(),
-            num_runners,
-        );
-        println!("\n");
-        println!("Specify your Access Token with the RWX_ACCESS_TOKEN env variable, passing --access-token, or running `abq login`.");
-    }
 
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,
     // indicate the worker fault.

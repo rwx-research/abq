@@ -27,8 +27,6 @@ serde = "1.0.158"
 serde_derive = "1.0.158"
 serde_json = { version = "1.0.94", features = ["raw_value"] }
 
-etcetera = "0.8.0"
-toml = "0.7.4"
 rustls = "0.20.8"
 rustls-pemfile = "1.0.2"
 
@@ -85,7 +83,6 @@ derive_more = "0.99.17"
 
 insta = { version = "1.29.0", features = ["json", "redactions"] }
 paste = "1.0.12"
-mockito = "1.0.1"
 
 tempfile = "3.4.0"
 tracing-test = { version = "0.2.4", features = ["no-env-filter"] }

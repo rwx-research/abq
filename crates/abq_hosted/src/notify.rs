@@ -1,5 +1,5 @@
 use abq_utils::net_protocol::{runners::NativeRunnerSpecification, workers::RunId};
-use reqwest::RequestBuilder;
+use reqwest::blocking::RequestBuilder;
 use reqwest::Url;
 use serde::Serialize;
 
@@ -18,7 +18,7 @@ struct RecordTestRunRequest<'a> {
     native_runner_specification: RecordTestRunNativeRunnerSpecification<'a>,
 }
 
-pub async fn record_test_run_metadata<U>(
+pub fn record_test_run_metadata<U>(
     api_url: U,
     access_token: &AccessToken,
     run_id: &RunId,
@@ -31,14 +31,13 @@ pub async fn record_test_run_metadata<U>(
     // Swallow the error if we repeatedly fail to send the test run data, because there's not much
     // we can do to recover from that.
     let opt_error =
-        record_test_run_metadata_help(api_url, access_token, run_id, native_runner_spec, ATTEMPTS)
-            .await;
+        record_test_run_metadata_help(api_url, access_token, run_id, native_runner_spec, ATTEMPTS);
     if let Err(error) = opt_error {
         tracing::error!(attempts=?ATTEMPTS, ?error, "failed to send home test run metadata");
     }
 }
 
-async fn record_test_run_metadata_help<U>(
+fn record_test_run_metadata_help<U>(
     api_url: U,
     access_token: &AccessToken,
     run_id: &RunId,
@@ -69,7 +68,7 @@ where
         },
     };
 
-    let client = reqwest::Client::new();
+    let client = reqwest::blocking::Client::new();
     let request = client
         .post(queue_api)
         .bearer_auth(access_token)
@@ -77,22 +76,22 @@ where
         .json(&data);
 
     // Try sending the result at most twice.
-    try_n_times(request, send_attempts)
-        .await?
-        .error_for_status()?;
+    try_n_times(request, send_attempts)?.error_for_status()?;
 
     Ok(())
 }
 
-async fn try_n_times(request: RequestBuilder, tries: usize) -> reqwest::Result<reqwest::Response> {
+fn try_n_times(
+    request: RequestBuilder,
+    tries: usize,
+) -> reqwest::Result<reqwest::blocking::Response> {
     let mut i = 0;
     loop {
         i += 1;
         let response = request
             .try_clone()
             .expect("bodies provided in the hosted API should never be streams")
-            .send()
-            .await?;
+            .send()?;
 
         let status = response.status();
         if status.is_success() || i == tries {
@@ -129,8 +128,8 @@ mod test {
         }
     }
 
-    #[tokio::test]
-    async fn send_success() {
+    #[test]
+    fn send_success() {
         let run_id = RunId("1234".to_string());
         let mut server = Server::new();
 
@@ -152,13 +151,12 @@ mod test {
             &run_id,
             &test_native_runner_spec(),
             1,
-        )
-        .await;
+        );
         assert!(result.is_ok(), "{result:?}");
     }
 
-    #[tokio::test]
-    async fn get_hosted_queue_config_wrong_authn() {
+    #[test]
+    fn get_hosted_queue_config_wrong_authn() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/record_test_run")
@@ -173,14 +171,13 @@ mod test {
             &test_native_runner_spec(),
             1,
         )
-        .await
         .unwrap_err();
 
         assert!(matches!(err, Error::Unauthenticated));
     }
 
-    #[tokio::test]
-    async fn get_hosted_queue_config_wrong_authz() {
+    #[test]
+    fn get_hosted_queue_config_wrong_authz() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/record_test_run")
@@ -195,14 +192,13 @@ mod test {
             &test_native_runner_spec(),
             1,
         )
-        .await
         .unwrap_err();
 
         assert!(matches!(err, Error::Unauthorized));
     }
 
-    #[tokio::test]
-    async fn get_hosted_queue_config_bad_api_url() {
+    #[test]
+    fn get_hosted_queue_config_bad_api_url() {
         let err = record_test_run_metadata_help(
             "definitely not a url",
             &test_access_token(),
@@ -210,7 +206,6 @@ mod test {
             &test_native_runner_spec(),
             1,
         )
-        .await
         .unwrap_err();
 
         assert!(matches!(err, Error::InvalidUrl(..)));
