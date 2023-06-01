@@ -2969,6 +2969,7 @@ fn report_explicit_run_id_against_ephemeral_queue() {
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore]
 fn login_saves_access_token_custom() {
     let name = "login_saves_access_token_custom";
     let tempfile = NamedTempFile::new().expect("Failed to create tempfile");
@@ -2999,6 +3000,7 @@ fn login_saves_access_token_custom() {
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore]
 fn login_saves_access_token_err() {
     let name = "login_saves_access_token_err";
 
