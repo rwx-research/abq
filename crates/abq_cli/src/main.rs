@@ -47,6 +47,7 @@ use crate::{
         remote_persistence::{OffloadToRemoteConfig, RemotePersistenceConfig},
     },
     reporting::StdoutPreferences,
+    workers::TestRunMetadata,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -436,6 +437,12 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let startup_timeout = Duration::from_secs(startup_timeout_seconds);
 
+            let test_run_metadata = access_token.map(|token| TestRunMetadata {
+                api_url: get_hosted_api_base_url(),
+                access_token: token,
+                run_id: run_id.clone(),
+            });
+
             workers::start_workers_standalone(
                 run_id,
                 WorkerTag::new(worker as _),
@@ -451,6 +458,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 abq.client_options().clone(),
                 startup_timeout,
                 execution_mode,
+                test_run_metadata,
             )
             .await
         }
