@@ -57,7 +57,7 @@ impl JobQueue {
         &self,
         entity_tag: Tag,
         suggested_batch_size: NonZeroUsize,
-    ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
+    ) -> impl ExactSizeIterator<Item = &(WorkerTest, GroupId)> + '_ {
         let suggested_batch_size = suggested_batch_size.get() as usize;
         let queue_len = self.queue.len();
 
@@ -75,7 +75,7 @@ impl JobQueue {
             entity_cell.0.set(entity_tag);
         }
 
-        self.queue[start_idx..end_idx].iter().map(|(test, _)| test)
+        self.queue[start_idx..end_idx].iter()
     }
 
     #[inline]
@@ -122,7 +122,7 @@ impl JobQueue {
                 }
                 let mut current_group_id = self.queue[start_idx].1;
                 // find idx of the start of the next group
-                for (next_spec, next_group_id) in self.queue[start_idx..].iter() {
+                for (_next_spec, next_group_id) in self.queue[start_idx..].iter() {
                     // if we've walked into a new group...
                     if *next_group_id != current_group_id {
                         // if the current slice is big enough, break
@@ -130,7 +130,7 @@ impl JobQueue {
                             break;
                         }
                         // else start pulling from the next group
-                        current_group_id = next_spec.spec.group_id
+                        current_group_id = *next_group_id;
                     }
                     end_idx += 1; // include next_spec in the slice
                 }
@@ -148,13 +148,12 @@ impl JobQueue {
     pub fn get_partition_for_entity(
         &self,
         entity_tag: Tag,
-    ) -> impl Iterator<Item = &WorkerTest> + '_ {
+    ) -> impl Iterator<Item = &(WorkerTest, GroupId)> + '_ {
         self.assigned_entities
             .iter()
             .enumerate()
             .filter(move |(_, cell)| cell.0.get() == entity_tag)
             .map(|(i, _)| &self.queue[i])
-            .map(|(test, _)| test)
     }
 
     pub fn into_manifest_view(self) -> persistence::manifest::ManifestView {
@@ -218,7 +217,6 @@ mod test {
                 TestSpec {
                     work_id: WorkId::new(),
                     test_case: TestCase::new(protocol, "test", Default::default()),
-                    group_id: GroupId::new(),
                 },
                 INIT_RUN_NUMBER,
             ),
@@ -299,7 +297,6 @@ mod test {
                 TestSpec {
                     work_id: WorkId::new(),
                     test_case: TestCase::new(protocol, "test", Default::default()),
-                    group_id: GroupId::new(),
                 },
                 INIT_RUN_NUMBER,
             ),
@@ -370,7 +367,6 @@ mod test {
                             TestSpec {
                                 work_id: WorkId::new(),
                                 test_case: TestCase::new(protocol, "test", Default::default()),
-                                group_id,
                             },
                             INIT_RUN_NUMBER,
                         ),
@@ -415,9 +411,8 @@ mod test {
                 .collect();
             assert_eq!(local_manifest, queue_seen_manifest);
 
-            for test in local_manifest {
-                if let Some(previous_entity) = entity_by_group_id.insert(test.spec.group_id, entity)
-                {
+            for (_, group_id) in local_manifest {
+                if let Some(previous_entity) = entity_by_group_id.insert(group_id, entity) {
                     assert_eq!(previous_entity, entity);
                 }
             }

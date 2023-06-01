@@ -969,12 +969,7 @@ async fn execute_all_tests<'a>(
         while let Some(msg) = tests_rx.recv().await {
             match msg {
                 RecvMsg::Item(WorkerTest {
-                    spec:
-                        TestSpec {
-                            test_case,
-                            work_id,
-                            group_id: _,
-                        },
+                    spec: TestSpec { test_case, work_id },
                     run_number,
                 }) => {
                     native_runner_handle
@@ -1812,8 +1807,8 @@ mod test_abq_jest {
     use abq_utils::net_protocol::runners::{AbqProtocolVersion, Status, TestCase, TestResultSpec};
     use abq_utils::net_protocol::work_server::InitContext;
     use abq_utils::net_protocol::workers::{
-        Eow, GroupId, ManifestResult, NativeTestRunnerParams, NextWorkBundle, ReportedManifest,
-        WorkId, WorkerTest, INIT_RUN_NUMBER,
+        Eow, ManifestResult, NativeTestRunnerParams, NextWorkBundle, ReportedManifest, WorkId,
+        WorkerTest, INIT_RUN_NUMBER,
     };
     use abq_utils::results_handler::{NoopResultsHandler, StaticResultsHandler};
     use abq_utils::{atomic, oneshot_notify};
@@ -2025,7 +2020,6 @@ mod test_abq_jest {
                     spec: TestSpec {
                         test_case: TestCase::new(proto, "unreachable", Default::default()),
                         work_id: WorkId::new(),
-                        group_id: GroupId::new(),
                     },
                     run_number: INIT_RUN_NUMBER,
                 }],
