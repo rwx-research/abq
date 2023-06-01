@@ -249,7 +249,6 @@ fn empty_manifest_msg() -> Box<ManifestMessage> {
 
 struct WorkersConfigBuilder {
     config: WorkersConfig,
-    batch_size_hint: NonZeroU64,
 }
 
 impl WorkersConfigBuilder {
@@ -268,10 +267,7 @@ impl WorkersConfigBuilder {
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
             should_send_results: true,
         };
-        Self {
-            config,
-            batch_size_hint: one_nonzero(),
-        }
+        Self { config }
     }
 
     fn with_max_run_number(mut self, max_run_number: u32) -> Self {
@@ -468,14 +464,11 @@ fn action_to_fut(
             let run_results = get_run_results!(n);
             let negotiator = queue.get_negotiator_handle();
 
-            let WorkersConfigBuilder {
-                config,
-                batch_size_hint,
-            } = workers_config_builder;
+            let WorkersConfigBuilder { config } = workers_config_builder;
 
             let invoke_work = InvokeWork {
                 run_id,
-                batch_size_hint,
+                batch_size_hint: one_nonzero(),
                 test_strategy: Default::default(),
             };
 
