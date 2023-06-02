@@ -429,7 +429,7 @@ fn big_manifest() {
         ManifestResult::Manifest(man) => man.manifest,
         ManifestResult::TestRunnerError { .. } => unreachable!(),
     };
-    assert_eq!(manifest.flatten().len(), 10_000);
+    assert_eq!(Manifest::flatten(manifest.members).len(), 10_000);
 }
 
 #[test]
@@ -513,7 +513,7 @@ fn capture_output_during_manifest_gen() {
         ManifestResult::Manifest(man) => man.manifest,
         ManifestResult::TestRunnerError { .. } => unreachable!(),
     };
-    assert_eq!(manifest.flatten().len(), 10);
+    assert_eq!(Manifest::flatten(manifest.members).len(), 10);
 }
 
 #[test]

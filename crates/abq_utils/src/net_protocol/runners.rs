@@ -337,13 +337,13 @@ impl From<RawManifest> for Manifest {
 
 impl Manifest {
     /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
-    pub fn flatten(self) -> Vec<(TestSpec, GroupId)> {
+    pub fn flatten(members: Vec<v0_2::TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
         use v0_2::{Group, TestOrGroup};
-        let mut collected = Vec::with_capacity(self.members.len());
+        let mut collected = Vec::with_capacity(members.len());
 
         // share a top-level vector so we can reuse the largest queue allocated
         let mut queue: Vec<TestOrGroup> = Vec::new();
-        for top_level_test_or_group in self.members {
+        for top_level_test_or_group in members {
             let group_id = GroupId::new();
             match top_level_test_or_group {
                 TestOrGroup::Test(test) => {
@@ -422,11 +422,7 @@ mod test_manifest {
     use serde_json::Map;
 
     fn flattened(members: Vec<TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
-        Manifest {
-            members,
-            init_meta: Map::new(),
-        }
-        .flatten()
+        Manifest::flatten(members)
     }
 
     fn test(name: &'static str) -> TestOrGroup {

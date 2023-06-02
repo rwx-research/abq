@@ -660,9 +660,7 @@ mod test {
                 let manifest_result = { manifest_collector.lock().take() };
                 match manifest_result {
                     Some(man) => {
-                        let work: Vec<_> = man
-                            .manifest
-                            .flatten()
+                        let work: Vec<_> = Manifest::flatten(man.manifest.members)
                             .into_iter()
                             .enumerate()
                             .map(|(i, (spec, ..))| WorkerTest {

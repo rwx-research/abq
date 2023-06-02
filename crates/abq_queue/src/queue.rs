@@ -18,7 +18,7 @@ use abq_utils::net_protocol::queue::{
     TestResultsResponse, TestSpec, TestStrategy,
 };
 use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
-use abq_utils::net_protocol::runners::{MetadataMap, StdioOutput};
+use abq_utils::net_protocol::runners::{Manifest, MetadataMap, StdioOutput};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
     Eow, GroupId, ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
@@ -2012,7 +2012,7 @@ impl QueueServer {
 
                 // Record the manifest for this run in its appropriate queue.
                 let metadata = manifest.init_meta.clone();
-                let flat_manifest = manifest.flatten();
+                let flat_manifest = Manifest::flatten(manifest.members);
 
                 let native_runner_info = NativeRunnerInfo {
                     protocol_version: native_runner_protocol,

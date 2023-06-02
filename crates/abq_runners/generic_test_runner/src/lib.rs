@@ -28,7 +28,7 @@ use tokio::process;
 use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{self, AssociatedTestResults, RunAlreadyCompleted, TestSpec};
 use abq_utils::net_protocol::runners::{
-    CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
+    CapturedOutput, FastExit, InitSuccessMessage, Manifest, ManifestMessage, MetadataMap,
     NativeRunnerSpawnedMessage, NativeRunnerSpecification, OutOfBandError, ProtocolWitness,
     RawNativeRunnerSpawnedMessage, RawTestResultMessage, Status, StdioOutput, TestCase,
     TestCaseMessage, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
@@ -1425,7 +1425,7 @@ pub fn execute_wrapped_runner(
 
                     *manifest_message = Some(real_manifest.clone());
                     let init_meta = real_manifest.manifest.init_meta.clone();
-                    let flattened = real_manifest.manifest.flatten();
+                    let flattened = Manifest::flatten(real_manifest.manifest.members);
                     *flat_manifest = Some((
                         flattened.into_iter().map(|(spec, _)| spec).collect(),
                         init_meta,
