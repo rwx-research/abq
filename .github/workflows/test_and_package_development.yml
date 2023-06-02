@@ -12,8 +12,8 @@ on:
         description: "Released ABQ version"
         value: ${{ jobs.release.outputs.abq_version }}
     secrets:
-      RWX_ACCESS_TOKEN:
-        required: true
+      # RWX_ACCESS_TOKEN:
+      #   required: true
       RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
       AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
@@ -129,7 +129,7 @@ jobs:
           captain run test
         env:
           CI: false
-          RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+          # RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
 
       - name: Run retried tests with cargo, including debug output
         timeout-minutes: 5
@@ -140,7 +140,7 @@ jobs:
           captain run test-with-debug
         env:
           CI: false
-          RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+          # RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
 
       - name: Prepare release environment
         run: |
