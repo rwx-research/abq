@@ -121,7 +121,7 @@ jobs:
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          cargo nextest r --all-features --cargo-profile=release-unstable --target="$RUST_TARGET"
+          cargo nextest r --profile ci --all-features --cargo-profile=release-unstable --target="$RUST_TARGET"
         env:
           CI: false
 
@@ -131,7 +131,7 @@ jobs:
         run: |
           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
 
-          cargo nextest r --all-features --cargo-profile=release-unstable --target="$RUST_TARGET" -- --nocapture
+          cargo nextest r --profile ci --all-features --cargo-profile=release-unstable --target="$RUST_TARGET" -- --nocapture
         env:
           CI: false
 
