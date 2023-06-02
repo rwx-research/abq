@@ -337,7 +337,7 @@ impl From<RawManifest> for Manifest {
 
 impl Manifest {
     /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
-    pub fn flatten(members: Vec<v0_2::TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
+    pub fn flatten_manifest(members: Vec<v0_2::TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
         use v0_2::{Group, TestOrGroup};
         let mut collected = Vec::with_capacity(members.len());
 
@@ -422,7 +422,7 @@ mod test_manifest {
     use serde_json::Map;
 
     fn flattened(members: Vec<TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
-        Manifest::flatten(members)
+        Manifest::flatten_manifest(members)
     }
 
     fn test(name: &'static str) -> TestOrGroup {

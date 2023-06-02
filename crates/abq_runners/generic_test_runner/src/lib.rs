@@ -1425,7 +1425,7 @@ pub fn execute_wrapped_runner(
 
                     *manifest_message = Some(real_manifest.clone());
                     let init_meta = real_manifest.manifest.init_meta.clone();
-                    let flattened = Manifest::flatten(real_manifest.manifest.members);
+                    let flattened = Manifest::flatten_manifest(real_manifest.manifest.members);
                     *flat_manifest = Some((
                         flattened.into_iter().map(|(spec, _)| spec).collect(),
                         init_meta,

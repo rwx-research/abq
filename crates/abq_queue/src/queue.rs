@@ -2012,7 +2012,7 @@ impl QueueServer {
 
                 // Record the manifest for this run in its appropriate queue.
                 let metadata = manifest.init_meta.clone();
-                let flat_manifest = Manifest::flatten(manifest.members);
+                let flat_manifest = Manifest::flatten_manifest(manifest.members);
 
                 let native_runner_info = NativeRunnerInfo {
                     protocol_version: native_runner_protocol,

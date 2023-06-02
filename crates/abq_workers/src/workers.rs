@@ -1078,7 +1078,7 @@ mod test {
             let man = { manifest.lock().take() };
             match man {
                 Some(ManifestResult::Manifest(manifest)) => {
-                    return Manifest::flatten(manifest.manifest.members)
+                    return Manifest::flatten_manifest(manifest.manifest.members)
                         .into_iter()
                         .map(|(spec, _)| spec)
                         .collect();
