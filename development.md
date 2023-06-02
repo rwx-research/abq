@@ -9,6 +9,12 @@ Then install cargo-insta for testing
 cargo install cargo-insta
 ```
 
+and set up the test data for some integration tests:
+
+```bash
+scripts/init_testdata
+```
+
 For development in an editor, you'll likely want a version of
 [rust-analyzer](https://rust-analyzer.github.io/manual.html#installation).
 
