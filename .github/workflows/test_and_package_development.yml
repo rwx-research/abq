@@ -126,7 +126,7 @@ jobs:
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          captain run test
+          captain run test-abq
         env:
           CI: false
           RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
@@ -137,7 +137,7 @@ jobs:
         run: |
           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
 
-          captain run test-with-debug
+          captain run test-abq -- --nocapture
         env:
           CI: false
           RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
