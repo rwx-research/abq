@@ -12,6 +12,8 @@ on:
         description: "Released ABQ version"
         value: ${{ jobs.release.outputs.abq_version }}
     secrets:
+      RWX_ACCESS_TOKEN:
+        required: true
       RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
       AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
@@ -114,22 +116,31 @@ jobs:
         run: |
           cargo build --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: install captain
+        uses: rwx-research/setup-captain@v1
+
       - name: Run tests with cargo
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
+          captain run test-abq
         env:
           CI: false
+          RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
 
       - name: Run retried tests with cargo, including debug output
         timeout-minutes: 5
         if: github.run_attempt > 1
         run: |
           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
+
+          captain run test-abq -- --nocapture
         env:
           CI: false
+          RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
 
       - name: Prepare release environment
         run: |
