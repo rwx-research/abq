@@ -14,7 +14,7 @@ use abq_utils::{
     net_async,
     net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
-        queue::{AssociatedTestResults, GroupId, TestSpec},
+        queue::{AssociatedTestResults, TestSpec},
         runners::{ProtocolWitness, Status, TestCase, TestId, TestResult},
         workers::WorkId,
     },
@@ -102,10 +102,6 @@ pub fn sanitize_output(s: &str) -> String {
 
 pub fn wid(id: usize) -> WorkId {
     WorkId([id as u8; 16])
-}
-
-pub fn gid(id: usize) -> GroupId {
-    GroupId([id as u8; 16])
 }
 
 pub fn test(id: usize) -> TestId {
