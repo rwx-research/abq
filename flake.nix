@@ -2,7 +2,7 @@
   description = "abq";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.05";
 
     crane = {
       url = "github:ipetkov/crane";
@@ -37,7 +37,7 @@
             (assertVersion "11.0.0" pkgs.darwin.apple_sdk.frameworks.Security)
           ] else [ ];
 
-        nativeBuildInputs = [ (assertVersion "2.38.1" pkgs.git) ];
+        nativeBuildInputs = [ (assertVersion "2.40.1" pkgs.git) ];
 
         abq =
           craneLib.buildPackage
@@ -78,9 +78,9 @@
 
           # Extra inputs can be added here
           nativeBuildInputs = with pkgs; [
-            (assertVersion "1.65.0" cargo)
-            (assertVersion "1.65.0" rustc)
-            (assertVersion "2022-12-05" rust-analyzer)
+            (assertVersion "1.69.0" cargo)
+            (assertVersion "1.69.0" rustc)
+            (assertVersion "2023-05-15" rust-analyzer)
           ] ++ nativeBuildInputs ++ buildInputs;
         };
 
