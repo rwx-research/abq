@@ -42,7 +42,10 @@ pub enum AccessTokenKind {
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
-enum HostedQueueResponse {Success(HostedQueueSuccessResponseConfig), Unsupported(HostedQueueUnsupportedResponseConfig)}
+enum HostedQueueResponse {
+    Success(HostedQueueSuccessResponseConfig),
+    Unsupported(HostedQueueUnsupportedResponseConfig),
+}
 #[derive(Deserialize, Debug)]
 struct HostedQueueSuccessResponseConfig {
     queue_url: Url,
@@ -137,12 +140,12 @@ impl HostedQueueConfig {
                     rwx_access_token_kind,
                 }))
             }
-            HostedQueueResponse::Unsupported(response) => {
-                Ok(HostedQueueConfig::Unsupported(HostedQueueUnsupportedConfig {
+            HostedQueueResponse::Unsupported(response) => Ok(HostedQueueConfig::Unsupported(
+                HostedQueueUnsupportedConfig {
                     rwx_access_token_kind: response.rwx_access_token_kind,
                     usage_error: response.usage_error,
-                }))
-            }
+                },
+            )),
         }
     }
 }
@@ -271,18 +274,22 @@ mod test {
             ))
             .create();
 
-        if let HostedQueueConfig::Success(config) = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
-            .await
-            .unwrap() {
-                assert_eq!(config.addr, "168.220.85.45:8080".parse().unwrap());
-                assert_eq!(config.run_id, in_run_id);
-                assert_eq!(config.auth_token, test_auth_token());
-                assert_eq!(config.tls_public_certificate.unwrap(), test_mock_cert().as_bytes());
-                assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Organization)
-            } else {
-                unreachable!("expected success config")
-            }
-
+        if let HostedQueueConfig::Success(config) =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+                .await
+                .unwrap()
+        {
+            assert_eq!(config.addr, "168.220.85.45:8080".parse().unwrap());
+            assert_eq!(config.run_id, in_run_id);
+            assert_eq!(config.auth_token, test_auth_token());
+            assert_eq!(
+                config.tls_public_certificate.unwrap(),
+                test_mock_cert().as_bytes()
+            );
+            assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Organization)
+        } else {
+            unreachable!("expected success config")
+        }
     }
 
     #[tokio::test]
@@ -310,18 +317,19 @@ mod test {
             ))
             .create();
 
-        if let HostedQueueConfig::Success(config) = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
-            .await
-            .unwrap() {
-                assert_eq!(config.addr, "168.220.85.45:8080".parse().unwrap());
-                assert_eq!(config.run_id, in_run_id);
-                assert_eq!(config.auth_token, test_auth_token());
-                assert!(config.tls_public_certificate.is_none());
-                assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Personal)
-            } else {
-                unreachable!("expected success config")
-            }
-
+        if let HostedQueueConfig::Success(config) =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+                .await
+                .unwrap()
+        {
+            assert_eq!(config.addr, "168.220.85.45:8080".parse().unwrap());
+            assert_eq!(config.run_id, in_run_id);
+            assert_eq!(config.auth_token, test_auth_token());
+            assert!(config.tls_public_certificate.is_none());
+            assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Personal)
+        } else {
+            unreachable!("expected success config")
+        }
     }
 
     #[tokio::test]
@@ -348,14 +356,19 @@ mod test {
             )
             .create();
 
-        if let HostedQueueConfig::Unsupported(config) = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
-            .await
-            .unwrap() {
-                assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Personal);
-                assert_eq!(config.usage_error, "This usage is not supported".to_string())
-            } else {
-                unreachable!("expected unsupported config")
-            }
+        if let HostedQueueConfig::Unsupported(config) =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+                .await
+                .unwrap()
+        {
+            assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Personal);
+            assert_eq!(
+                config.usage_error,
+                "This usage is not supported".to_string()
+            )
+        } else {
+            unreachable!("expected unsupported config")
+        }
     }
 
     #[tokio::test]
