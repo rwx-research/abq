@@ -2565,7 +2565,6 @@ fn out_of_process_retries_smoke() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn personal_access_token_does_not_mutate_remote_queue() {
     let name = "personal_access_token_does_not_mutate_remote_queue";
     let conf = CSConfigOptions {
@@ -2909,7 +2908,6 @@ fn report_while_run_in_progress_is_error() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn test_explicit_run_id_against_ephemeral_queue() {
     let name = "test_explicit_run_id_against_ephemeral_queue";
     let args = vec![
@@ -2939,7 +2937,6 @@ fn test_explicit_run_id_against_ephemeral_queue() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn report_explicit_run_id_against_ephemeral_queue() {
     let name = "report_explicit_run_id_against_ephemeral_queue";
     let args = vec![
@@ -2972,7 +2969,6 @@ fn report_explicit_run_id_against_ephemeral_queue() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn login_saves_access_token_custom() {
     let name = "login_saves_access_token_custom";
     let tempfile = NamedTempFile::new().expect("Failed to create tempfile");
@@ -3003,7 +2999,6 @@ fn login_saves_access_token_custom() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn login_saves_access_token_err() {
     let name = "login_saves_access_token_err";
 
@@ -4293,7 +4288,6 @@ fn persisted_runs_between_queue_instances() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn kill_on_early_startup_timeout_seconds() {
     let name = "kill_on_early_startup_timeout_seconds";
     let conf = CSConfigOptions {
@@ -4304,9 +4298,10 @@ fn kill_on_early_startup_timeout_seconds() {
     let (_queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let simulation = [
-        Connect,
         //
         Sleep(Duration::MAX),
+        //
+        Connect,
         //
         // Write spawn message
         OpaqueWrite(pack(legal_spawned_message(proto))),
