@@ -57,6 +57,17 @@ impl JobQueue {
         &self,
         entity_tag: Tag,
         suggested_batch_size: NonZeroUsize,
+    ) -> impl ExactSizeIterator<Item = &WorkerTest> + '_ {
+        self.get_work_with_group_ids(entity_tag, suggested_batch_size)
+            .map(|(test, _group_id)| test)
+    }
+
+    /// Pops up to the next `n` items in the queue and assigns them to the given `entity`.
+    // in tests we want to assert against group ids, which is why this func is private and get_work without group ids is public
+    fn get_work_with_group_ids(
+        &self,
+        entity_tag: Tag,
+        suggested_batch_size: NonZeroUsize,
     ) -> impl ExactSizeIterator<Item = &(WorkerTest, GroupId)> + '_ {
         let suggested_batch_size = suggested_batch_size.get() as usize;
         let queue_len = self.queue.len();
@@ -146,6 +157,16 @@ impl JobQueue {
 
     /// Gets the subset of the manifest assigned to a given worker.
     pub fn get_partition_for_entity(
+        &self,
+        entity_tag: Tag,
+    ) -> impl Iterator<Item = &WorkerTest> + '_ {
+        self.get_partition_for_entity_with_group_ids(entity_tag)
+            .map(|(test, _group_id)| test)
+    }
+
+    /// Gets the subset of the manifest assigned to a given worker.
+    // in tests we want to assert against group ids, which is why this func is private and get_work without group ids is public
+    fn get_partition_for_entity_with_group_ids(
         &self,
         entity_tag: Tag,
     ) -> impl Iterator<Item = &(WorkerTest, GroupId)> + '_ {
@@ -317,7 +338,7 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity.tag, n);
+                    let popped = queue.get_work_with_group_ids(entity.tag, n);
                     if popped.len() == 0 {
                         break;
                     }
@@ -332,7 +353,7 @@ mod test {
         for (entity, handle) in threads {
             let local_manifest = handle.join().unwrap();
             let queue_seen_manifest: Vec<_> = queue
-                .get_partition_for_entity(entity.tag)
+                .get_partition_for_entity_with_group_ids(entity.tag)
                 .cloned()
                 .collect();
             assert_eq!(local_manifest, queue_seen_manifest);
@@ -389,7 +410,7 @@ mod test {
             let handle = std::thread::spawn(move || {
                 let mut local_manifest = vec![];
                 loop {
-                    let popped = queue.get_work(entity.tag, batch_size);
+                    let popped = queue.get_work_with_group_ids(entity.tag, batch_size);
                     if popped.len() == 0 {
                         break;
                     }
@@ -406,7 +427,7 @@ mod test {
         for (entity, handle) in threads {
             let local_manifest = handle.join().unwrap();
             let queue_seen_manifest: Vec<_> = queue
-                .get_partition_for_entity(entity.tag)
+                .get_partition_for_entity_with_group_ids(entity.tag)
                 .cloned()
                 .collect();
             assert_eq!(local_manifest, queue_seen_manifest);

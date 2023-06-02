@@ -788,11 +788,7 @@ impl AllRuns {
         let batch_size = batch_size_hint;
 
         // Pop the next batch.
-        let bundle: Vec<WorkerTest> = queue
-            .get_work(entity.tag, batch_size)
-            .cloned()
-            .map(|(spec, _)| spec)
-            .collect();
+        let bundle: Vec<WorkerTest> = queue.get_work(entity.tag, batch_size).cloned().collect();
 
         let pulled_tests_status;
 
@@ -950,7 +946,6 @@ impl AllRuns {
                 let manifest: Vec<_> = queue
                     .get_partition_for_entity(entity.tag)
                     .cloned()
-                    .map(|(spec, _)| spec)
                     .collect();
                 let eow = Eow(true);
 
