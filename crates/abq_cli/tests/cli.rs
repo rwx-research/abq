@@ -2567,10 +2567,6 @@ fn out_of_process_retries_smoke() {
 #[with_protocol_version]
 #[serial]
 fn personal_access_token_does_not_mutate_remote_queue() {
-    eprintln!("STARTING personal_access_token_does_not_mutate_remote_queue");
-    std::io::stdout().flush().unwrap();
-    std::io::stderr().flush().unwrap();
-
     let name = "personal_access_token_does_not_mutate_remote_queue";
     let conf = CSConfigOptions {
         use_auth_token: true,
@@ -2914,10 +2910,6 @@ fn report_while_run_in_progress_is_error() {
 #[with_protocol_version]
 #[serial]
 fn test_explicit_run_id_against_ephemeral_queue() {
-    eprintln!("STARTING test_explicit_run_id_against_ephemeral_queue");
-    std::io::stdout().flush().unwrap();
-    std::io::stderr().flush().unwrap();
-
     let name = "test_explicit_run_id_against_ephemeral_queue";
     let args = vec![
         format!("test"),
@@ -2947,10 +2939,6 @@ fn test_explicit_run_id_against_ephemeral_queue() {
 #[with_protocol_version]
 #[serial]
 fn report_explicit_run_id_against_ephemeral_queue() {
-    eprintln!("STARTING report_explicit_run_id_against_ephemeral_queue");
-    std::io::stdout().flush().unwrap();
-    std::io::stderr().flush().unwrap();
-
     let name = "report_explicit_run_id_against_ephemeral_queue";
     let args = vec![
         format!("report"),
@@ -2983,10 +2971,6 @@ fn report_explicit_run_id_against_ephemeral_queue() {
 #[with_protocol_version]
 #[serial]
 fn login_saves_access_token_custom() {
-    eprintln!("STARTING login_saves_access_token_custom");
-    std::io::stdout().flush().unwrap();
-    std::io::stderr().flush().unwrap();
-
     let name = "login_saves_access_token_custom";
     let tempfile = NamedTempFile::new().expect("Failed to create tempfile");
 
@@ -3017,10 +3001,6 @@ fn login_saves_access_token_custom() {
 #[with_protocol_version]
 #[serial]
 fn login_saves_access_token_err() {
-    eprintln!("STARTING login_saves_access_token_err");
-    std::io::stdout().flush().unwrap();
-    std::io::stderr().flush().unwrap();
-
     let name = "login_saves_access_token_err";
 
     let CmdOutput {
@@ -4310,10 +4290,6 @@ fn persisted_runs_between_queue_instances() {
 #[with_protocol_version]
 #[serial]
 fn kill_on_early_startup_timeout_seconds() {
-    eprintln!("STARTING kill_on_early_startup_timeout_seconds");
-    std::io::stdout().flush().unwrap();
-    std::io::stderr().flush().unwrap();
-
     let name = "kill_on_early_startup_timeout_seconds";
     let conf = CSConfigOptions {
         use_auth_token: true,
@@ -4323,9 +4299,10 @@ fn kill_on_early_startup_timeout_seconds() {
     let (_queue_proc, queue_addr) = setup_queue!(name, conf);
 
     let simulation = [
-        Connect,
         //
         Sleep(Duration::MAX),
+        //
+        Connect,
         //
         // Write spawn message
         OpaqueWrite(pack(legal_spawned_message(proto))),
