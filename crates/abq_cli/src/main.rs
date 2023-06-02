@@ -65,12 +65,20 @@ struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
     prefix: String,
 }
 
-struct ConfigFromApi {
-    queue_addr: Option<SocketAddr>,
-    token: Option<UserToken>,
+enum ConfigFromApi {
+    Success(SuccessConfigFromApi),
+    Unsupported(UnsupportedConfigFromApi),
+}
+
+struct SuccessConfigFromApi {
+    queue_addr: SocketAddr,
+    token: UserToken,
     tls_public_certificate: Option<Vec<u8>>,
     rwx_access_token_kind: AccessTokenKind,
-    usage_error: Option<String>,
+}
+struct UnsupportedConfigFromApi {
+    usage_error: String,
+    rwx_access_token_kind: AccessTokenKind,
 }
 
 struct RunIdEnvironment {
@@ -681,16 +689,22 @@ async fn resolve_config(
         usage_error_from_api,
         rwx_access_token_kind,
     ) = match access_token.as_ref() {
-        Some(access_token) => {
-            let config = get_config_from_api(access_token, run_id).await?;
-            (
-                config.queue_addr,
-                config.token,
+        Some(access_token) => match get_config_from_api(access_token, run_id).await? {
+            ConfigFromApi::Success(config) => (
+                Some(config.queue_addr),
+                Some(config.token),
                 config.tls_public_certificate,
-                config.usage_error,
+                None,
                 Some(config.rwx_access_token_kind),
-            )
-        }
+            ),
+            ConfigFromApi::Unsupported(config) => (
+                None,
+                None,
+                None,
+                Some(config.usage_error),
+                Some(config.rwx_access_token_kind),
+            ),
+        },
         None => (None, None, None, None, None),
     };
 
@@ -740,23 +754,22 @@ async fn get_config_from_api(
     use abq_hosted::HostedQueueConfig;
 
     let api_url = get_hosted_api_base_url();
+    let hosted_queue_config = HostedQueueConfig::from_api(api_url, access_token, run_id).await?;
 
-    let HostedQueueConfig {
-        addr,
-        run_id: _,
-        auth_token,
-        tls_public_certificate,
-        rwx_access_token_kind,
-        usage_error,
-    } = HostedQueueConfig::from_api(api_url, access_token, run_id).await?;
-
-    Ok(ConfigFromApi {
-        queue_addr: addr,
-        token: auth_token,
-        tls_public_certificate,
-        rwx_access_token_kind,
-        usage_error,
-    })
+    match hosted_queue_config {
+        HostedQueueConfig::Success(config) => Ok(ConfigFromApi::Success(SuccessConfigFromApi {
+            queue_addr: config.addr,
+            token: config.auth_token,
+            tls_public_certificate: config.tls_public_certificate,
+            rwx_access_token_kind: config.rwx_access_token_kind,
+        })),
+        HostedQueueConfig::Unsupported(config) => {
+            Ok(ConfigFromApi::Unsupported(UnsupportedConfigFromApi {
+                usage_error: config.usage_error,
+                rwx_access_token_kind: config.rwx_access_token_kind,
+            }))
+        }
+    }
 }
 
 fn validate_abq_test_args(mut args: Vec<String>) -> Result<NativeTestRunnerParams, clap::Error> {

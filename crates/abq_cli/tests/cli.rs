@@ -4575,7 +4575,7 @@ fn test_run_with_pat_and_run_id_that_doesnt_exist() {
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
         assert!(
-            stderr.contains("`abq test` failed to run. Cannot use personal access token with run ID that doesn't exist"),
+            stderr.contains("ABQ was unable to find a queue to run against. Cannot use personal access token with run ID that doesn't exist"),
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
 
@@ -4606,7 +4606,7 @@ fn test_run_with_pat_and_run_id_that_doesnt_exist() {
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
         assert!(
-            stderr.contains("`abq report` failed to run. Cannot use personal access token with run ID that doesn't exist"),
+            stderr.contains("ABQ was unable to find a queue to run against. Cannot use personal access token with run ID that doesn't exist"),
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
 
