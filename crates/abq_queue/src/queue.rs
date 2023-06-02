@@ -3079,6 +3079,11 @@ mod test {
             .await
             .unwrap();
 
+        // Wait for the connection to be closed by the server.
+        net_protocol::async_read::<_, ()>(&mut conn)
+            .await
+            .unwrap_err();
+
         shutdown_tx.shutdown_immediately().unwrap();
         server_task.await.unwrap().unwrap();
 
