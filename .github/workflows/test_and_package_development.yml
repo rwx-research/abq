@@ -118,7 +118,7 @@ jobs:
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
+          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
         env:
           CI: false
 
