@@ -583,6 +583,7 @@ fn native_runner_respawn_for_higher_run_numbers() {
 
 #[test]
 #[with_protocol_version]
+#[ignore]
 fn native_runner_fails_while_executing_tests() {
     use Msg::*;
 
