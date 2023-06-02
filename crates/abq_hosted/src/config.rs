@@ -356,7 +356,8 @@ mod test {
                 json!({
                     "usage_error":"This usage is not supported",
                     "rwx_access_token_kind":"personal_access_token",
-                }).to_string()
+                })
+                .to_string(),
             )
             .create();
 
