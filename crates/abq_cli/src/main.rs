@@ -409,7 +409,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let abq = find_or_create_abq(
                 entity,
                 run_id.clone(),
-                queue_location,
+                queue_location.clone(),
                 resolved_token,
                 client_auth,
                 resolved_tls,
@@ -438,11 +438,12 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let startup_timeout = Duration::from_secs(startup_timeout_seconds);
 
-            let test_run_metadata = access_token.map(|token| TestRunMetadata {
+            let test_run_metadata = TestRunMetadata {
                 api_url: get_hosted_api_base_url(),
-                access_token: token,
+                access_token,
                 run_id: run_id.clone(),
-            });
+                record_telemetry: queue_location.is_remote(),
+            };
 
             workers::start_workers_standalone(
                 run_id,
@@ -620,6 +621,7 @@ struct ResolvedConfig {
     queue_location: QueueLocation,
 }
 
+#[derive(Clone)]
 enum QueueLocation {
     Remote(SocketAddr),
     Ephemeral { opt_tls_key: Option<Vec<u8>> },

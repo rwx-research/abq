@@ -36,8 +36,9 @@ pub enum ExecutionMode {
 }
 pub struct TestRunMetadata {
     pub api_url: String,
-    pub access_token: abq_hosted::AccessToken,
+    pub access_token: Option<abq_hosted::AccessToken>,
     pub run_id: RunId,
+    pub record_telemetry: bool,
 }
 
 pub async fn start_workers_standalone(
@@ -56,7 +57,7 @@ pub async fn start_workers_standalone(
     client_opts: ClientOptions,
     startup_timeout: Duration,
     execution_mode: ExecutionMode,
-    test_run_metadata: Option<TestRunMetadata>,
+    test_run_metadata: TestRunMetadata,
 ) -> ! {
     let test_suite_name = "suite"; // TODO: determine this correctly
     let has_stdout_reporters = reporter_kinds
@@ -139,7 +140,7 @@ async fn do_shutdown(
     run_id: RunId,
     worker_tag: WorkerTag,
     num_runners: NonZeroUsize,
-    test_run_metadata: Option<TestRunMetadata>,
+    test_run_metadata: TestRunMetadata,
 ) -> ! {
     let WorkersExit {
         status,
@@ -211,15 +212,17 @@ async fn do_shutdown(
         }
     };
 
-    if let Some(test_run_metadata) = test_run_metadata {
-        if let Some(native_runner_info) = completed_summary.native_runner_info {
-            abq_hosted::record_test_run_metadata(
-                test_run_metadata.api_url,
-                &test_run_metadata.access_token,
-                &test_run_metadata.run_id,
-                &native_runner_info.specification,
-            )
-            .await;
+    if test_run_metadata.record_telemetry {
+        if let Some(access_token) = test_run_metadata.access_token {
+            if let Some(native_runner_info) = completed_summary.native_runner_info {
+                abq_hosted::record_test_run_metadata(
+                    test_run_metadata.api_url,
+                    &access_token,
+                    &test_run_metadata.run_id,
+                    &native_runner_info.specification,
+                )
+                .await;
+            }
         }
     }
 
