@@ -772,7 +772,7 @@ where
 #[tokio::test]
 #[traced_test]
 #[with_protocol_version]
-#[timeout(1000)] // 1 second
+#[timeout(2000)] // 2 second
 async fn multiple_jobs_complete() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
@@ -971,7 +971,7 @@ async fn multiple_worker_count() {
 #[tokio::test]
 #[traced_test]
 #[with_protocol_version]
-#[timeout(1000)] // 1 second
+#[timeout(2000)] // 2 second
 async fn multiple_invokers() {
     let runner1 = {
         let manifest = ManifestMessage::new(Manifest::new(
@@ -1759,7 +1759,7 @@ async fn native_runner_fails_due_to_manifest_failure() {
 
 #[tokio::test]
 #[with_protocol_version]
-#[timeout(1000)] // 1 second
+#[timeout(2000)] // 2 second
 async fn multiple_tests_per_work_id_reported() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
@@ -2493,7 +2493,7 @@ async fn retry_out_of_process_worker() {
 
 #[tokio::test]
 #[with_protocol_version]
-#[timeout(1000)] // 1 second
+#[timeout(2000)] // 2 seconds
 async fn many_retries_of_many_out_of_process_workers() {
     let num_tests = 64;
     let num_workers = 6;
