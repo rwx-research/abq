@@ -1,0 +1,22 @@
+cloud:
+  disabled: true
+
+test-suites:
+  test:
+    command: bash -c 'cargo nextest r --profile ci --all-features --cargo-profile=release-unstable --target="$RUST_TARGET"'
+    fail-on-upload-error: true
+    results:
+      path: target/nextest/ci/junit.xml
+    output:
+      print-summary: true
+      reporters:
+        github-step-summary:
+  test-with-debug:
+    command: bash -c 'cargo nextest r --profile ci --all-features --cargo-profile=release-unstable --target="$RUST_TARGET" -- --nocapture'
+    fail-on-upload-error: true
+    results:
+      path: target/nextest/ci/junit.xml
+    output:
+      print-summary: true
+      reporters:
+        github-step-summary:
