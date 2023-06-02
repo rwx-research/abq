@@ -1,6 +1,10 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 2 }
-
+# Without limiting the number of active threads or sequencing tests, we can
+# easily hit the number of open FDs (especially on MacOS) during our tests.
+# Revisit this when we've made everything async on the worker side.
+# Additionally, some of our tests try to use identical files. If we want to parallelize tests, we have to fix the suite.
+test-threads = 1
 
 [profile.ci]
 # Print out output for failing tests as soon as they fail, and also at the end
