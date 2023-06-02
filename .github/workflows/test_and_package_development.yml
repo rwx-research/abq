@@ -114,11 +114,14 @@ jobs:
         run: |
           cargo build --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
 
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Run tests with cargo
         timeout-minutes: 4
         if: github.run_attempt == 1
         run: |
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET"
+          cargo nextest r --all-features --cargo-profile=release-unstable --target="$RUST_TARGET"
         env:
           CI: false
 
@@ -127,7 +130,8 @@ jobs:
         if: github.run_attempt > 1
         run: |
           export ABQ_DEBUG_CLI_TESTS_FOR_CI=1
-          cargo test --profile=release-unstable --all-features --target="$RUST_TARGET" -- --nocapture
+
+          cargo nextest r --all-features --cargo-profile=release-unstable --target="$RUST_TARGET" -- --nocapture
         env:
           CI: false
 
