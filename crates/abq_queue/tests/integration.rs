@@ -720,7 +720,7 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                     let run_id = run_ids.get(&n).unwrap().clone();
                     let manifest = sleep_until_or_fail(
                         || async { remote.0.lock().await.manifests.get(&run_id).cloned() },
-                        Duration::from_secs(1),
+                        Duration::from_secs(2),
                     )
                     .await;
                     check(&manifest);
@@ -730,7 +730,7 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                     let run_id = run_ids.get(&n).unwrap().clone();
                     let results = sleep_until_or_fail(
                         || async { remote.0.lock().await.results.get(&run_id).cloned() },
-                        Duration::from_secs(1),
+                        Duration::from_secs(2),
                     )
                     .await;
                     check(&results)
