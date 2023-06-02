@@ -1,0 +1,10 @@
+test-suites:
+  test-abq:
+    command: bash -c 'unset RWX_ACCESS_TOKEN && cargo nextest r --profile ci --all-features --cargo-profile=release-unstable --target="$RUST_TARGET" $@'
+    fail-on-upload-error: true
+    results:
+      path: target/nextest/ci/junit.xml
+    output:
+      print-summary: true
+      reporters:
+        github-step-summary:

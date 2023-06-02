@@ -1962,7 +1962,10 @@ mod test_abq_jest {
 
         {
             assert!(matches!(test_results[0].status, Status::Failure { .. }));
-            assert_eq!(test_results[0].id, "add.test.js#0:0");
+            assert_eq!(
+                test_results[0].id, "add.test.js#0:0",
+                "if this test fails locally, try running scripts/init_testdata"
+            );
             assert!(
                 matches!(&test_results[0].stderr, Some(s) if s.is_empty()),
                 "{:?}",
