@@ -708,7 +708,7 @@ pub mod queue {
     /// In order to do file-based allocation to workers, we need to have a way of
     /// knowing which tests are in which file. We use this group id as a proxy for that.
     /// Eventually, these groupings will be assigned to specific workers
-    #[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Clone, Copy, Hash, PartialEq, Eq)]
     pub struct GroupId(pub [u8; 16]);
 
     impl GroupId {
@@ -718,11 +718,7 @@ pub mod queue {
         }
     }
 
-    impl std::fmt::Display for GroupId {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
-        }
-    }
+    // needed for test assertions
     impl std::fmt::Debug for GroupId {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
