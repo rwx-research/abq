@@ -2,7 +2,7 @@
   description = "abq";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.05";
 
     crane = {
       url = "github:ipetkov/crane";
@@ -25,8 +25,19 @@
         certOrCargo = path: type:
           (certFilter path type) || (craneLib.filterCargoSources path type);
 
-        buildInputs = if pkgs.stdenv.isDarwin then [ pkgs.libiconv pkgs.darwin.apple_sdk.frameworks.Security ] else [ ];
-        nativeBuildInputs = [ pkgs.git ];
+        assertVersion = version: pkg: (
+          assert (pkgs.lib.assertMsg (builtins.toString pkg.version == version) ''
+            Expecting version of ${pkg.name} to be ${version} but got ${pkg.version};
+          '');
+          pkg
+        );
+        buildInputs =
+          if pkgs.stdenv.isDarwin then [
+            (assertVersion "50" pkgs.libiconv)
+            (assertVersion "11.0.0" pkgs.darwin.apple_sdk.frameworks.Security)
+          ] else [ ];
+
+        nativeBuildInputs = [ (assertVersion "2.40.1" pkgs.git) ];
 
         abq =
           craneLib.buildPackage
@@ -41,6 +52,9 @@
               doCheck = false;
               NIX_ABQ_VERSION = "0.${self.lastModifiedDate}.0+g${self.shortRev or "dirty"}";
             };
+
+
+
       in
       {
         checks = {
@@ -64,9 +78,9 @@
 
           # Extra inputs can be added here
           nativeBuildInputs = with pkgs; [
-            cargo
-            rustc
-            rust-analyzer
+            (assertVersion "1.69.0" cargo)
+            (assertVersion "1.69.0" rustc)
+            (assertVersion "2023-05-15" rust-analyzer)
           ] ++ nativeBuildInputs ++ buildInputs;
         };
 
