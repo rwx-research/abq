@@ -219,6 +219,7 @@ async fn send_request_with_decay_help(
 
 #[cfg(test)]
 mod test {
+    use serde_json::json;
     use std::str::FromStr;
 
     use abq_utils::{auth::UserToken, net_protocol::workers::RunId};
@@ -352,7 +353,10 @@ mod test {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                r#"{{"usage_error":"This usage is not supported","rwx_access_token_kind":"personal_access_token"}}"#,
+                json!({
+                    "usage_error":"This usage is not supported",
+                    "rwx_access_token_kind":"personal_access_token",
+                }).to_string()
             )
             .create();
 
