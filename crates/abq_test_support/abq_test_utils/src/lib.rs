@@ -14,9 +14,9 @@ use abq_utils::{
     net_async,
     net_opt::{ClientOptions, ServerOptions},
     net_protocol::{
-        queue::{AssociatedTestResults, TestSpec},
+        queue::{AssociatedTestResults, GroupId, TestSpec},
         runners::{ProtocolWitness, Status, TestCase, TestId, TestResult},
-        workers::{GroupId, WorkId},
+        workers::WorkId,
     },
     time::EpochMillis,
     tls::{ClientTlsStrategy, ServerTlsStrategy},

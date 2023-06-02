@@ -14,14 +14,14 @@ use abq_utils::net_opt::ServerOptions;
 use abq_utils::net_protocol::entity::{Entity, Tag};
 use abq_utils::net_protocol::error::RetryManifestError;
 use abq_utils::net_protocol::queue::{
-    AssociatedTestResults, CancelReason, NativeRunnerInfo, NegotiatorInfo, Request,
+    AssociatedTestResults, CancelReason, GroupId, NativeRunnerInfo, NegotiatorInfo, Request,
     TestResultsResponse, TestSpec, TestStrategy,
 };
 use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
 use abq_utils::net_protocol::runners::{Manifest, MetadataMap, StdioOutput};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
-    Eow, GroupId, ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
+    Eow, ManifestResult, NextWorkBundle, ReportedManifest, WorkerTest, INIT_RUN_NUMBER,
 };
 use abq_utils::net_protocol::{
     self,
@@ -2779,11 +2779,12 @@ mod test {
             self,
             entity::Entity,
             queue::{
-                AckManifest, AssociatedTestResults, NativeRunnerInfo, NegotiatorInfo, TestSpec,
+                AckManifest, AssociatedTestResults, GroupId, NativeRunnerInfo, NegotiatorInfo,
+                TestSpec,
             },
             runners::{NativeRunnerSpecification, TestCase, TestResult},
             work_server,
-            workers::{GroupId, RunId, WorkId},
+            workers::{RunId, WorkId},
         },
         server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
@@ -4099,8 +4100,8 @@ mod test_pull_work {
     use abq_test_utils::one_nonzero_usize;
     use abq_utils::net_protocol::{
         entity::Entity,
-        queue::TestStrategy,
-        workers::{GroupId, RunId, WorkerTest},
+        queue::{GroupId, TestStrategy},
+        workers::{RunId, WorkerTest},
     };
     use abq_with_protocol_version::with_protocol_version;
 
@@ -4222,8 +4223,9 @@ mod persistence_on_end_of_manifest {
         net_protocol::{
             self,
             entity::Entity,
+            queue::GroupId,
             work_server,
-            workers::{GroupId, NextWorkBundle, RunId, WorkerTest, INIT_RUN_NUMBER},
+            workers::{NextWorkBundle, RunId, WorkerTest, INIT_RUN_NUMBER},
         },
         server_shutdown::ShutdownManager,
         tls::{ClientTlsStrategy, ServerTlsStrategy},

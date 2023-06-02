@@ -4,8 +4,8 @@ use abq_utils::{
     atomic,
     net_protocol::{
         entity::Tag,
-        queue::TestStrategy,
-        workers::{GroupId, WorkerTest},
+        queue::{GroupId, TestStrategy},
+        workers::WorkerTest,
     },
 };
 
@@ -195,9 +195,9 @@ mod test {
         atomic,
         net_protocol::{
             entity::{Entity, Tag},
-            queue::{TestSpec, TestStrategy},
+            queue::{GroupId, TestSpec, TestStrategy},
             runners::{ProtocolWitness, TestCase},
-            workers::{GroupId, WorkId, WorkerTest, INIT_RUN_NUMBER},
+            workers::{WorkId, WorkerTest, INIT_RUN_NUMBER},
         },
         vec_map::VecMap,
     };

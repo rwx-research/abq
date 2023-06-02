@@ -415,9 +415,8 @@ impl Manifest {
 #[cfg(test)]
 mod test_manifest {
     use crate::net_protocol::{
-        queue::TestSpec,
+        queue::{GroupId, TestSpec},
         runners::v0_2::{Group, Manifest, Test, TestOrGroup},
-        workers::GroupId,
     };
     use serde_json::Map;
 
@@ -678,7 +677,7 @@ impl std::fmt::Display for Location {
 pub use v0_2::OutOfBandError;
 
 use crate::exit::ExitCode;
-use crate::net_protocol::workers::{GroupId, WorkId};
+use crate::net_protocol::{queue::GroupId, workers::WorkId};
 use crate::time::EpochMillis;
 
 use super::entity::RunnerMeta;
