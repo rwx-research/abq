@@ -7,7 +7,7 @@ use std::{
 use abq_hosted::AccessToken;
 use abq_utils::{
     auth::{AdminToken, UserToken},
-    net_protocol::workers::RunId,
+    net_protocol::{queue::TestStrategy, workers::RunId},
 };
 
 use clap::{ArgGroup, Parser, Subcommand};
@@ -323,6 +323,16 @@ pub enum Command {
         /// How many tests to send to a worker a time.
         #[clap(long, default_value = "7")]
         batch_size: NonZeroU64,
+
+        /// How ABQ will distribute the tests.
+        ///
+        /// By default, ABQ will distribute the next unassigned test to a worker asking for tests.
+        /// work-strategy=by-file, abq will distribute whole-files-at-a-time to workers asking for tests.
+        /// The non-default behavior can be helpful if you have very expensive setup or teardowns in a test file
+        /// that would, by default, be run multiples times by multiples workers instead of a single time on the worker
+        /// responsible for that test file.
+        #[clap(long, default_value = "by-test")]
+        test_strategy: TestStrategy,
 
         /// Whether to report tests with colors.
         ///

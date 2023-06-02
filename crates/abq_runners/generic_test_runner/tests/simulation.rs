@@ -429,9 +429,7 @@ fn big_manifest() {
         ManifestResult::Manifest(man) => man.manifest,
         ManifestResult::TestRunnerError { .. } => unreachable!(),
     };
-    let (tests, meta) = manifest.flatten();
-    assert_eq!(tests.len(), 10_000);
-    assert!(meta.is_empty());
+    assert_eq!(Manifest::flatten_manifest(manifest.members).len(), 10_000);
 }
 
 #[test]
@@ -515,9 +513,7 @@ fn capture_output_during_manifest_gen() {
         ManifestResult::Manifest(man) => man.manifest,
         ManifestResult::TestRunnerError { .. } => unreachable!(),
     };
-    let (tests, meta) = manifest.flatten();
-    assert_eq!(tests.len(), 10);
-    assert!(meta.is_empty());
+    assert_eq!(Manifest::flatten_manifest(manifest.members).len(), 10);
 }
 
 #[test]

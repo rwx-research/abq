@@ -28,7 +28,7 @@ use tokio::process;
 use abq_utils::net_protocol::entity::RunnerMeta;
 use abq_utils::net_protocol::queue::{self, AssociatedTestResults, RunAlreadyCompleted, TestSpec};
 use abq_utils::net_protocol::runners::{
-    CapturedOutput, FastExit, InitSuccessMessage, ManifestMessage, MetadataMap,
+    CapturedOutput, FastExit, InitSuccessMessage, Manifest, ManifestMessage, MetadataMap,
     NativeRunnerSpawnedMessage, NativeRunnerSpecification, OutOfBandError, ProtocolWitness,
     RawNativeRunnerSpawnedMessage, RawTestResultMessage, Status, StdioOutput, TestCase,
     TestCaseMessage, TestResult, TestResultSpec, TestRunnerExit, TestRuntime,
@@ -196,6 +196,7 @@ async fn retrieve_manifest<'a>(
     Ok((manifest, stdio_output.combined))
 }
 
+/// Fetch manifest and confirm native runner quit.
 async fn retrieve_manifest_help(
     native_runner: &mut NativeRunnerHandle<'_>,
 ) -> Result<ManifestMessage, LocatedError> {
@@ -1380,7 +1381,7 @@ where
     Ok(())
 }
 
-/// Executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.
+/// Test harness: executes a native test runner in an end-to-end fashion from the perspective of an ABQ worker.
 /// Returns the manifest and all test results.
 pub fn execute_wrapped_runner(
     native_runner_params: NativeTestRunnerParams,
@@ -1423,7 +1424,12 @@ pub fn execute_wrapped_runner(
                     }
 
                     *manifest_message = Some(real_manifest.clone());
-                    *flat_manifest = Some(real_manifest.manifest.flatten());
+                    let init_meta = real_manifest.manifest.init_meta.clone();
+                    let flattened = Manifest::flatten_manifest(real_manifest.manifest.members);
+                    *flat_manifest = Some((
+                        flattened.into_iter().map(|(spec, _)| spec).collect(),
+                        init_meta,
+                    ));
                 }
                 ManifestResult::TestRunnerError { error, output: _ } => {
                     *opt_error_cell.lock() = Some(error);
@@ -1744,6 +1750,7 @@ fn notify_all_tests_run() -> (Arc<AtomicBool>, NotifyMaterialTestsAllRun) {
     (all_test_run, Box::new(notify_all_tests_run))
 }
 
+// used for testing only
 pub struct StaticManifestCollector {
     manifest: Arc<Mutex<Option<ManifestResult>>>,
 }

@@ -462,7 +462,7 @@ pub mod workers {
 }
 
 pub mod queue {
-    use std::{io, net::SocketAddr, num::NonZeroU64};
+    use std::{fmt::Display, io, net::SocketAddr, num::NonZeroU64, str::FromStr};
 
     use serde_derive::{Deserialize, Serialize};
 
@@ -491,11 +491,54 @@ pub mod queue {
         pub cancelled: bool,
     }
 
+    // strategies for popping work off the queue
+    #[derive(Default, Serialize, Deserialize, Debug, Clone, Copy)]
+    pub enum TestStrategy {
+        #[default]
+        /// Traverse tests in order
+        ByTest,
+
+        /// Traverse tests grouped by top level group (which should, in most cases, be by-file, and if not, should still exhibit similar before- and after- work characteristics).
+        /// using this strategy ensure each top level group gets distributed to a single worker.
+        ///
+        /// This should avoid running expensive before-group / after-group work from being run multiple times at the expense
+        /// of uneven test distribution
+        ByTopLevelGroup,
+    }
+
+    const STRATEGY_BY_TEST: &str = "by-test";
+    const STRATEGY_BY_FILE: &str = "by-file";
+
+    impl Display for TestStrategy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                TestStrategy::ByTest => write!(f, "{}", STRATEGY_BY_TEST),
+                TestStrategy::ByTopLevelGroup => write!(f, "{}", STRATEGY_BY_FILE),
+            }
+        }
+    }
+
+    impl FromStr for TestStrategy {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                STRATEGY_BY_TEST => Ok(Self::ByTest),
+                STRATEGY_BY_FILE => Ok(Self::ByTopLevelGroup),
+                other => Err(format!(
+                    "Can't parse distribution strategy :'{}', must be default or by-group",
+                    other
+                )),
+            }
+        }
+    }
+
     /// An ask to run some work by an invoker.
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub struct InvokeWork {
         pub run_id: RunId,
         pub batch_size_hint: NonZeroU64,
+        pub test_strategy: TestStrategy,
     }
 
     /// Specification of a test case to run.
@@ -658,6 +701,27 @@ pub mod queue {
             results.into_network_safe_chunks(
                 LARGE_MESSAGE_SIZE - Self::MAX_OVERHEAD_OF_RESPONSE_FOR_RESULTS,
             )
+        }
+    }
+
+    /// ABQ-internal-ID for a grouping
+    /// In order to do file-based allocation to workers, we need to have a way of
+    /// knowing which tests are in which file. We use this group id as a proxy for that.
+    /// Eventually, these groupings will be assigned to specific workers
+    #[derive(Clone, Copy, Hash, PartialEq, Eq)]
+    pub struct GroupId(pub [u8; 16]);
+
+    impl GroupId {
+        #[allow(clippy::new_without_default)]
+        pub fn new() -> Self {
+            Self(uuid::Uuid::new_v4().into_bytes())
+        }
+    }
+
+    // needed for test assertions
+    impl std::fmt::Debug for GroupId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
         }
     }
 

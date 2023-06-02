@@ -610,7 +610,7 @@ mod test {
     use abq_utils::exit::ExitCode;
     use abq_utils::net_opt::{ClientOptions, ServerOptions};
     use abq_utils::net_protocol::entity::{Entity, WorkerTag};
-    use abq_utils::net_protocol::queue::{InvokeWork, TestSpec};
+    use abq_utils::net_protocol::queue::{InvokeWork, TestSpec, TestStrategy};
     use abq_utils::net_protocol::runners::{
         Manifest, ManifestMessage, ProtocolWitness, Status, Test, TestOrGroup, TestResult,
     };
@@ -660,13 +660,10 @@ mod test {
                 let manifest_result = { manifest_collector.lock().take() };
                 match manifest_result {
                     Some(man) => {
-                        let work: Vec<_> = man
-                            .manifest
-                            .flatten()
-                            .0
+                        let work: Vec<_> = Manifest::flatten_manifest(man.manifest.members)
                             .into_iter()
                             .enumerate()
-                            .map(|(i, spec)| WorkerTest {
+                            .map(|(i, (spec, ..))| WorkerTest {
                                 spec: TestSpec {
                                     test_case: spec.test_case,
                                     work_id: WorkId([i as _; 16]),
@@ -908,6 +905,7 @@ mod test {
         let invoke_data = InvokeWork {
             run_id,
             batch_size_hint: one_nonzero(),
+            test_strategy: TestStrategy::ByTest,
         };
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(

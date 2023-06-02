@@ -21,9 +21,9 @@
 //!
 //! The sum type is then normalized to one data structure that the rest of ABQ operates over.
 
+use std::ops::Deref;
 use std::ops::DerefMut;
 use std::time::Duration;
-use std::{collections::VecDeque, ops::Deref};
 
 use serde_derive::{Deserialize, Serialize};
 
@@ -235,6 +235,14 @@ impl TestOrGroup {
             V0_2(test) => Self(v0_2::TestOrGroup::Test(test).into()),
         }
     }
+
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn group(group: Group) -> Self {
+        use PrivGroup::*;
+        match group.0 {
+            V0_2(group) => Self(v0_2::TestOrGroup::Group(group).into()),
+        }
+    }
 }
 
 pub struct Test(PrivTest);
@@ -265,6 +273,47 @@ impl Test {
         }
     }
 }
+pub struct Group(PrivGroup);
+#[derive(derive_more::From)]
+enum PrivGroup {
+    V0_2(v0_2::Group),
+}
+impl Group {
+    #[cfg(feature = "expose-native-protocols")]
+    pub fn new(
+        protocol: ProtocolWitness,
+        name: impl Into<String>,
+        members: impl Into<Vec<TestOrGroup>>,
+        tags: impl Into<Vec<String>>,
+        meta: MetadataMap,
+    ) -> Self {
+        use PrivProtocolWitness::*;
+
+        match protocol.0 {
+            V0_2 => {
+                let members = members
+                    .into()
+                    .into_iter()
+                    .map(|test_or_group| {
+                        use PrivTestOrGroup::*;
+                        match test_or_group.0 {
+                            V0_2(test_or_group) => test_or_group,
+                        }
+                    })
+                    .collect();
+                Self(
+                    v0_2::Group {
+                        name: name.into(),
+                        tags: tags.into(),
+                        members,
+                        meta,
+                    }
+                    .into(),
+                )
+            }
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RawManifest(PrivManifest);
@@ -288,37 +337,57 @@ impl From<RawManifest> for Manifest {
 
 impl Manifest {
     /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
-    pub fn flatten(self) -> (Vec<TestSpec>, MetadataMap) {
-        use v0_2::{Group, Test, TestCase, TestOrGroup};
-
-        let Manifest { members, init_meta } = self;
+    pub fn flatten_manifest(members: Vec<v0_2::TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
+        use v0_2::{Group, TestOrGroup};
         let mut collected = Vec::with_capacity(members.len());
-        let mut queue: VecDeque<_> = members.into_iter().collect();
-        while let Some(test_or_group) = queue.pop_front() {
-            match test_or_group {
-                TestOrGroup::Test(Test { id, meta, .. }) => {
-                    let spec = TestSpec {
-                        // Generate a fresh ID for ABQ-internal usage.
-                        work_id: WorkId::new(),
-                        test_case: self::TestCase(
-                            TestCase {
-                                id,
-                                meta,
-                                focus: None,
-                            }
-                            .into(),
-                        ),
-                    };
-                    collected.push(spec);
+
+        // share a top-level vector so we can reuse the largest queue allocated
+        let mut queue: Vec<TestOrGroup> = Vec::new();
+        for top_level_test_or_group in members {
+            let group_id = GroupId::new();
+            match top_level_test_or_group {
+                TestOrGroup::Test(test) => {
+                    Self::add_test_to_collected(test, &mut collected, group_id)
                 }
                 TestOrGroup::Group(Group { members, .. }) => {
-                    for member in members.into_iter().rev() {
-                        queue.push_front(member);
+                    queue.extend(members.into_iter().rev());
+                    while let Some(test_or_group) = queue.pop() {
+                        match test_or_group {
+                            TestOrGroup::Test(test) => {
+                                Self::add_test_to_collected(test, &mut collected, group_id)
+                            }
+                            TestOrGroup::Group(Group { members, .. }) => {
+                                queue.extend(members.into_iter().rev())
+                            }
+                        }
                     }
                 }
             }
         }
-        (collected, init_meta)
+        collected
+    }
+
+    #[inline]
+    fn add_test_to_collected(
+        v0_2::Test { id, meta, .. }: v0_2::Test,
+        collected: &mut Vec<(TestSpec, GroupId)>,
+        group_id: GroupId,
+    ) {
+        collected.push((
+            TestSpec {
+                // Generate a fresh ID for ABQ-internal usage.
+                work_id: WorkId::new(),
+                test_case: TestCase(
+                    v0_2::TestCase {
+                        id,
+                        meta,
+                        focus: None,
+                    }
+                    .into(),
+                ),
+            },
+            group_id,
+        ))
     }
 
     /// Sorts the manifest into a consistent ordering.
@@ -340,6 +409,105 @@ impl Manifest {
             })
             .collect();
         Self { members, init_meta }
+    }
+}
+
+#[cfg(test)]
+mod test_manifest {
+    use crate::net_protocol::{
+        queue::{GroupId, TestSpec},
+        runners::v0_2::{Group, Manifest, Test, TestOrGroup},
+    };
+    use serde_json::Map;
+
+    fn flattened(members: Vec<TestOrGroup>) -> Vec<(TestSpec, GroupId)> {
+        Manifest::flatten_manifest(members)
+    }
+
+    fn test(name: &'static str) -> TestOrGroup {
+        TestOrGroup::Test(Test {
+            id: name.to_string(),
+            tags: vec![],
+            meta: Map::new(),
+        })
+    }
+
+    fn group(members: impl Into<Vec<TestOrGroup>>) -> TestOrGroup {
+        TestOrGroup::Group(Group {
+            name: String::new(),
+            members: members.into(),
+            tags: vec![],
+            meta: Map::new(),
+        })
+    }
+
+    fn to_test_case(test_or_group: TestOrGroup) -> super::TestCase {
+        match test_or_group {
+            TestOrGroup::Test(Test { id, meta, .. }) => super::TestCase(
+                super::v0_2::TestCase {
+                    id,
+                    meta,
+                    focus: None,
+                }
+                .into(),
+            ),
+            TestOrGroup::Group(_) => panic!("expected a test"),
+        }
+    }
+
+    #[test]
+    fn flatten_empty_manifest() {
+        assert_eq!(flattened(vec![]), vec![]);
+    }
+
+    #[test]
+    fn flatten_simple_manifest() {
+        let a_test = test("foo");
+        let one_element_manifest = flattened(vec![a_test.clone()]);
+        assert_eq!(one_element_manifest.len(), 1);
+        assert_eq!(one_element_manifest[0].0.test_case, to_test_case(a_test));
+    }
+
+    #[test]
+    fn flatten_manifest_group_ids() {
+        let three_group_manifest = flattened(vec![
+            group([test("a"), test("b"), group([test("c"), test("d")])]),
+            group([test("e"), test("f")]),
+        ]);
+        let three_group_test_cases: Vec<super::TestCase> = three_group_manifest
+            .clone()
+            .into_iter()
+            .map(|test_spec| test_spec.0.test_case)
+            .collect();
+        let expected_test_cases: Vec<super::TestCase> = vec![
+            test("a"),
+            test("b"),
+            test("c"),
+            test("d"),
+            test("e"),
+            test("f"),
+        ]
+        .into_iter()
+        .map(to_test_case)
+        .collect();
+
+        assert_eq!(three_group_test_cases, expected_test_cases);
+
+        let three_group_groups: Vec<GroupId> = three_group_manifest
+            .into_iter()
+            .map(|test_spec| test_spec.1)
+            .collect();
+        assert_eq!(
+            three_group_groups,
+            vec![
+                three_group_groups[0],
+                three_group_groups[0],
+                three_group_groups[0],
+                three_group_groups[0],
+                three_group_groups[4],
+                three_group_groups[4],
+            ]
+        )
     }
 }
 
@@ -509,7 +677,7 @@ impl std::fmt::Display for Location {
 pub use v0_2::OutOfBandError;
 
 use crate::exit::ExitCode;
-use crate::net_protocol::workers::WorkId;
+use crate::net_protocol::{queue::GroupId, workers::WorkId};
 use crate::time::EpochMillis;
 
 use super::entity::RunnerMeta;
