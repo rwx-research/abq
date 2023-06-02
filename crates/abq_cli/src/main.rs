@@ -399,7 +399,10 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             if queue_location.is_unsupported() {
                 let mut cmd = Cli::command();
-                Err(cmd.error(ErrorKind::InvalidValue, "`abq test` failed improve this errormessage."))?;
+                Err(cmd.error(
+                    ErrorKind::InvalidValue,
+                    "`abq test` failed improve this errormessage.",
+                ))?;
             }
 
             if explicit_run_id_provided && !queue_location.is_remote() {
@@ -528,7 +531,10 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             if queue_location.is_unsupported() {
                 let mut cmd = Cli::command();
-                Err(cmd.error(ErrorKind::InvalidValue, "`abq test` failed improve this errormessage."))?;
+                Err(cmd.error(
+                    ErrorKind::InvalidValue,
+                    "`abq test` failed improve this errormessage.",
+                ))?;
             }
 
             if explicit_run_id_provided && !queue_location.is_remote() {
@@ -649,7 +655,7 @@ struct ResolvedConfig {
     queue_location: QueueLocation,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum QueueLocation {
     Remote(SocketAddr),
     Ephemeral { opt_tls_key: Option<Vec<u8>> },
@@ -858,6 +864,7 @@ async fn find_or_create_abq(
 mod test {
     use std::{env::VarError, str::FromStr};
 
+    use abq_hosted::AccessTokenKind;
     use abq_utils::net_protocol::workers::{NativeTestRunnerParams, RunId};
     use clap::error::ErrorKind;
 
@@ -980,5 +987,125 @@ mod test {
         });
 
         assert_eq!(run_id, None);
+    }
+
+    #[test]
+    fn determine_queue_location_pat_no_run_id_provided_uses_ephemeral() {
+        let queue_location = super::determine_queue_location(
+            Some(AccessTokenKind::Personal),
+            false,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            queue_location,
+            super::QueueLocation::Ephemeral { opt_tls_key: None }
+        );
+    }
+
+    #[test]
+    fn determine_queue_location_pat_nonexistent_run_id_unsupported() {
+        let queue_location = super::determine_queue_location(
+            Some(AccessTokenKind::Personal),
+            true,
+            None,
+            Some("nonexistent-run-id".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            queue_location,
+            super::QueueLocation::Unsupported("nonexistent-run-id".to_string())
+        );
+    }
+
+    #[test]
+    fn determine_queue_location_pat_existing_run_id_remote() {
+        let queue_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        );
+        let queue_location = super::determine_queue_location(
+            Some(AccessTokenKind::Personal),
+            true,
+            Some(queue_addr),
+            None,
+            None,
+        );
+
+        assert_eq!(queue_location, super::QueueLocation::Remote(queue_addr))
+    }
+
+    #[test]
+    fn determine_queue_location_pat_existing_run_id_no_queue_addr_ephemeral() {
+        let queue_location = super::determine_queue_location(
+            Some(AccessTokenKind::Personal),
+            true,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            queue_location,
+            super::QueueLocation::Ephemeral { opt_tls_key: None }
+        );
+    }
+
+    #[test]
+    fn determine_queue_location_org_existing_queue_addr_remote() {
+        let queue_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        );
+        let queue_location = super::determine_queue_location(
+            Some(AccessTokenKind::Organization),
+            true,
+            Some(queue_addr),
+            None,
+            None,
+        );
+
+        assert_eq!(queue_location, super::QueueLocation::Remote(queue_addr))
+    }
+
+    #[test]
+    fn determine_queue_location_org_no_queue_addr_ephemeral() {
+        let queue_location = super::determine_queue_location(
+            Some(AccessTokenKind::Organization),
+            true,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            queue_location,
+            super::QueueLocation::Ephemeral { opt_tls_key: None }
+        );
+    }
+
+    #[test]
+    fn determine_queue_location_noauthtoken_existing_no_queue_addr_ephemeral() {
+        let queue_location = super::determine_queue_location(None, true, None, None, None);
+
+        assert_eq!(
+            queue_location,
+            super::QueueLocation::Ephemeral { opt_tls_key: None }
+        );
+    }
+
+    #[test]
+    fn determine_queue_location_noauthtoken_existing_queue_addr_remote() {
+        let queue_addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            8080,
+        );
+        let queue_location =
+            super::determine_queue_location(None, true, Some(queue_addr), None, None);
+
+        assert_eq!(queue_location, super::QueueLocation::Remote(queue_addr))
     }
 }
