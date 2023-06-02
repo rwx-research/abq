@@ -22,7 +22,6 @@ use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
 use std::fs::File;
-use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
 use std::str::FromStr;
