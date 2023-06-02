@@ -4472,8 +4472,8 @@ fn test_run_telemetry_enabled() {
 #[test]
 #[with_protocol_version]
 #[serial]
-fn test_run_telemetry_only_enabled_for_remote_queues() {
-    let name = "test_run_telemetry_only_enabled_for_remote_queues";
+fn test_run_with_pat_and_run_id_that_doesnt_exist() {
+    let name = "test_run_with_pat_and_run_id_that_doesnt_exist";
     let conf = CSConfigOptions {
         use_auth_token: true,
         tls: true,
@@ -4492,14 +4492,26 @@ fn test_run_telemetry_only_enabled_for_remote_queues() {
 
     {
         let mut server = Server::new();
-        let record_test_run_mock = server
-            .mock("POST", "/record_test_run")
-            .match_header("Authorization", format!("Bearer {}", access_token).as_str())
+        let in_run_id = "test-run-id";
+        let queue_mock = server.mock("GET", "/queue")
+            .match_header(
+                "Authorization",
+                format!("Bearer {}", access_token).as_str(),
+            )
             .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
+            .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
+                "run_id".to_string(),
+                in_run_id.to_string(),
+            )]))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(json!({}).to_string())
-            .expect(0)
+            .with_body(
+                json!({
+                    "usage_error": "Cannot use personal access token with run ID that doesn't exist",
+                    "rwx_access_token_kind": "personal_access_token",
+                }).to_string()
+            )
+            .expect(2)
             .create();
 
         let simulation = [
@@ -4540,8 +4552,9 @@ fn test_run_telemetry_only_enabled_for_remote_queues() {
             let args = vec![
                 format!("test"),
                 format!("--worker=1"),
+                format!("--run-id=test-run-id"),
+                format!("--access-token={access_token}"),
                 format!("-n=1"),
-                format!("--tls-key={}", TLS_KEY),
             ];
             let mut args = conf.extend_args_for_client(args);
             args.extend([s!("--"), simulator, simfile_path]);
@@ -4558,14 +4571,46 @@ fn test_run_telemetry_only_enabled_for_remote_queues() {
             .run();
 
         assert!(
-            exit_status.success(),
+            !exit_status.success(),
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
         assert!(
-            stdout.contains("1 tests, 0 failures"),
+            stderr.contains("`abq test` failed to run. Cannot use personal access token with run ID that doesn't exist"),
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
-        record_test_run_mock.assert();
+
+        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+        let report_args = {
+            let args = vec![
+                format!("report"),
+                format!("--reporter=dot"),
+                format!("--run-id=test-run-id"),
+                format!("--access-token={access_token}"),
+                format!("--color=never"),
+            ];
+            conf.extend_args_for_client(args)
+        };
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args)
+            .always_capture_stderr(true)
+            .env([("ABQ_API", server.url())])
+            .run();
+
+        assert!(
+            !exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("`abq report` failed to run. Cannot use personal access token with run ID that doesn't exist"),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        queue_mock.assert();
     }
 
     term(queue_proc);

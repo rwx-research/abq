@@ -397,11 +397,11 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             )
             .await?;
 
-            if queue_location.is_unsupported() {
+            if let QueueLocation::Unsupported(error_message) = &queue_location {
                 let mut cmd = Cli::command();
                 Err(cmd.error(
                     ErrorKind::InvalidValue,
-                    "`abq test` failed improve this errormessage.",
+                    format!("`abq test` failed to run. {}", error_message),
                 ))?;
             }
 
@@ -529,11 +529,11 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
 
             let client_auth = resolved_token.into();
 
-            if queue_location.is_unsupported() {
+            if let QueueLocation::Unsupported(error_message) = &queue_location {
                 let mut cmd = Cli::command();
                 Err(cmd.error(
                     ErrorKind::InvalidValue,
-                    "`abq test` failed improve this errormessage.",
+                    format!("`abq report` failed to run. {}", error_message),
                 ))?;
             }
 
@@ -665,9 +665,6 @@ enum QueueLocation {
 impl QueueLocation {
     fn is_remote(&self) -> bool {
         matches!(self, QueueLocation::Remote(_))
-    }
-    fn is_unsupported(&self) -> bool {
-        matches!(self, QueueLocation::Unsupported(_))
     }
 }
 
