@@ -2011,7 +2011,6 @@ impl QueueServer {
                 } = reported_manifest;
 
                 // Record the manifest for this run in its appropriate queue.
-                let metadata = manifest.init_meta.clone();
                 let flat_manifest = Manifest::flatten_manifest(manifest.members);
 
                 let native_runner_info = NativeRunnerInfo {
@@ -2036,7 +2035,7 @@ impl QueueServer {
                         entity,
                         run_id,
                         flat_manifest,
-                        metadata,
+                        manifest.init_meta,
                         native_runner_info,
                         stream,
                     )
