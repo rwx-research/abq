@@ -1081,7 +1081,6 @@ mod test {
                     return manifest
                         .manifest
                         .flatten()
-                        .0
                         .into_iter()
                         .map(|(spec, _)| spec)
                         .collect();

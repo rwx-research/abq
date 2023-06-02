@@ -337,7 +337,7 @@ impl From<RawManifest> for Manifest {
 
 impl Manifest {
     /// Flattens a manifest into [TestSpec]s, preserving the manifest order.
-    pub fn flatten(self) -> (Vec<(TestSpec, GroupId)>, MetadataMap) {
+    pub fn flatten(self) -> Vec<(TestSpec, GroupId)> {
         use v0_2::{Group, TestOrGroup};
         let mut collected = Vec::with_capacity(self.members.len());
 
@@ -364,7 +364,7 @@ impl Manifest {
                 }
             }
         }
-        (collected, self.init_meta)
+        collected
     }
 
     #[inline]
@@ -427,7 +427,6 @@ mod test_manifest {
             init_meta: Map::new(),
         }
         .flatten()
-        .0
     }
 
     fn test(name: &'static str) -> TestOrGroup {

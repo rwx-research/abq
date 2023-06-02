@@ -663,7 +663,6 @@ mod test {
                         let work: Vec<_> = man
                             .manifest
                             .flatten()
-                            .0
                             .into_iter()
                             .enumerate()
                             .map(|(i, (spec, ..))| WorkerTest {
