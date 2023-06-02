@@ -69,7 +69,7 @@ jobs:
             architecture: aarch64
             cross-target: 'aarch64-unknown-linux-musl'
             container: messense/rust-musl-cross:aarch64-musl@sha256:777bd4c61179c38dc213bb8472500584646d28fd4a7c3e0b30b9ef70cb446d58
-          - runs-on: macos-10.15 # use an older version for broader osx support
+          - runs-on: macos-11 # use an older version for broader osx support
             deprecated-platform: darwin_x86-64
             os: darwin
             architecture: x86_64
