@@ -66,8 +66,8 @@ struct PrefixedCiEventFormat<T: fmt::time::FormatTime> {
 }
 
 struct ConfigFromApi {
-    queue_addr: SocketAddr,
-    token: UserToken,
+    queue_addr: Option<SocketAddr>,
+    token: Option<UserToken>,
     tls_public_certificate: Option<Vec<u8>>,
     rwx_access_token_kind: AccessTokenKind,
     usage_error: Option<String>,
@@ -719,8 +719,8 @@ async fn resolve_config(
         Some(access_token) => {
             let config = get_config_from_api(access_token, run_id).await?;
             (
-                Some(config.queue_addr),
-                Some(config.token),
+                config.queue_addr,
+                config.token,
                 config.tls_public_certificate,
                 config.usage_error,
                 Some(config.rwx_access_token_kind),
