@@ -2908,7 +2908,6 @@ fn report_while_run_in_progress_is_error() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore = "TODO:flaky"]
 fn test_explicit_run_id_against_ephemeral_queue() {
     let name = "test_explicit_run_id_against_ephemeral_queue";
     let args = vec![
@@ -2924,7 +2923,10 @@ fn test_explicit_run_id_against_ephemeral_queue() {
         exit_status,
         stderr,
         stdout,
-    } = Abq::new(format!("{name}_initial")).args(args).run();
+    } = Abq::new(format!("{name}_initial"))
+        .args(args)
+        .always_capture_stderr(true)
+        .run();
     assert!(
         !exit_status.success(),
         "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
@@ -4670,6 +4672,7 @@ fn test_run_with_pat_and_run_id_that_doesnt_exist() {
             stdout,
         } = Abq::new(format!("{name}_initial"))
             .args(test_args)
+            .always_capture_stderr(true)
             .env([("ABQ_API", server.url())])
             .run();
 
