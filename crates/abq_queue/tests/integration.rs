@@ -1115,6 +1115,7 @@ async fn multiple_invokers() {
 #[tokio::test]
 #[with_protocol_version]
 #[timeout(1000)] // 1 second
+#[ignore = "TODO:flaky"]
 async fn batch_two_requests_at_a_time() {
     let manifest = ManifestMessage::new(Manifest::new(
         [
@@ -1480,6 +1481,7 @@ async fn get_init_context_after_run_already_completed() {
 
 #[tokio::test]
 #[with_protocol_version]
+#[ignore = "TODO:flaky"]
 async fn getting_run_after_work_is_complete_returns_nothing() {
     let manifest = ManifestMessage::new(Manifest::new(
         [

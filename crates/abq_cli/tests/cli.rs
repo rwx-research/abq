@@ -2923,7 +2923,10 @@ fn test_explicit_run_id_against_ephemeral_queue() {
         exit_status,
         stderr,
         stdout,
-    } = Abq::new(format!("{name}_initial")).args(args).run();
+    } = Abq::new(format!("{name}_initial"))
+        .args(args)
+        .always_capture_stderr(true)
+        .run();
     assert!(
         !exit_status.success(),
         "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
@@ -4566,6 +4569,154 @@ fn test_run_telemetry_only_enabled_for_remote_queues() {
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
         record_test_run_mock.assert();
+    }
+
+    term(queue_proc);
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn test_run_with_pat_and_run_id_that_doesnt_exist() {
+    let name = "test_run_with_pat_and_run_id_that_doesnt_exist";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+    let (queue_proc, ..) = setup_queue!(name, conf);
+    let manifest = vec![TestOrGroup::test(Test::new(
+        proto,
+        "some_test",
+        [],
+        Default::default(),
+    ))];
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let access_token = test_access_token();
+
+    {
+        let mut server = Server::new();
+        let in_run_id = "test-run-id";
+        let queue_mock = server.mock("GET", "/queue")
+            .match_header(
+                "Authorization",
+                format!("Bearer {}", access_token).as_str(),
+            )
+            .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
+            .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
+                "run_id".to_string(),
+                in_run_id.to_string(),
+            )]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "usage_error": "Cannot use personal access token with run ID that doesn't exist",
+                    "rwx_access_token_kind": "personal_access_token",
+                }).to_string()
+            )
+            .expect(2)
+            .create();
+
+        let simulation = [
+            Connect,
+            //
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            //
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![OpaqueWrite(pack(&manifest))],
+                else_do: {
+                    let mut run_tests = vec![
+                        //
+                        // Read init context message + write ACK
+                        OpaqueRead,
+                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                    ];
+
+                    // If the socket is alive (i.e. we have a test to run), pull it and give back a
+                    // faux result.
+                    // Otherwise assume we ran out of tests on our node and exit.
+                    run_tests.push(IfAliveReadAndWriteFake(Status::Success));
+                    run_tests
+                },
+            },
+            //
+            // Finish
+            Exit(0),
+        ];
+
+        let packed = pack_msgs_to_disk(simulation);
+
+        let test_args = {
+            let simulator = native_runner_simulation_bin();
+            let simfile_path = packed.path.display().to_string();
+            let args = vec![
+                format!("test"),
+                format!("--worker=1"),
+                format!("--run-id=test-run-id"),
+                format!("--access-token={access_token}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), simulator, simfile_path]);
+            args
+        };
+
+        let CmdOutput {
+            exit_status,
+            stderr,
+            stdout,
+        } = Abq::new(format!("{name}_initial"))
+            .args(test_args)
+            .always_capture_stderr(true)
+            .env([("ABQ_API", server.url())])
+            .run();
+
+        assert!(
+            !exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("ABQ was unable to find a queue to run against. Cannot use personal access token with run ID that doesn't exist"),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+        let report_args = {
+            let args = vec![
+                format!("report"),
+                format!("--reporter=dot"),
+                format!("--run-id=test-run-id"),
+                format!("--access-token={access_token}"),
+                format!("--color=never"),
+            ];
+            conf.extend_args_for_client(args)
+        };
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args)
+            .always_capture_stderr(true)
+            .env([("ABQ_API", server.url())])
+            .run();
+
+        assert!(
+            !exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("ABQ was unable to find a queue to run against. Cannot use personal access token with run ID that doesn't exist"),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        queue_mock.assert();
     }
 
     term(queue_proc);

@@ -13,7 +13,12 @@ use serde::Serialize;
 use crate::{error::Error, AccessToken};
 
 #[derive(Debug)]
-pub struct HostedQueueConfig {
+pub enum HostedQueueConfig {
+    Success(HostedQueueSuccessConfig),
+    Unsupported(HostedQueueUnsupportedConfig),
+}
+#[derive(Debug)]
+pub struct HostedQueueSuccessConfig {
     pub addr: SocketAddr,
     pub run_id: RunId,
     pub auth_token: UserToken,
@@ -21,8 +26,13 @@ pub struct HostedQueueConfig {
     pub tls_public_certificate: Option<Vec<u8>>,
     pub rwx_access_token_kind: AccessTokenKind,
 }
+#[derive(Debug)]
+pub struct HostedQueueUnsupportedConfig {
+    pub rwx_access_token_kind: AccessTokenKind,
+    pub usage_error: String,
+}
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Copy, Clone)]
 pub enum AccessTokenKind {
     #[serde(rename = "personal_access_token")]
     Personal,
@@ -31,10 +41,21 @@ pub enum AccessTokenKind {
 }
 
 #[derive(Deserialize, Debug)]
-struct HostedQueueResponse {
+#[serde(untagged)]
+enum HostedQueueResponse {
+    Success(HostedQueueSuccessResponseConfig),
+    Unsupported(HostedQueueUnsupportedResponseConfig),
+}
+#[derive(Deserialize, Debug)]
+struct HostedQueueSuccessResponseConfig {
     queue_url: Url,
     tls_public_certificate: Option<String>,
     rwx_access_token_kind: AccessTokenKind,
+}
+#[derive(Deserialize, Debug)]
+struct HostedQueueUnsupportedResponseConfig {
+    rwx_access_token_kind: AccessTokenKind,
+    usage_error: String,
 }
 
 impl HostedQueueConfig {
@@ -72,50 +93,60 @@ impl HostedQueueConfig {
             .json()
             .await?;
 
-        let HostedQueueResponse {
-            queue_url,
-            tls_public_certificate,
-            rwx_access_token_kind,
-        } = resp;
+        match resp {
+            HostedQueueResponse::Success(response) => {
+                let HostedQueueSuccessResponseConfig {
+                    queue_url,
+                    tls_public_certificate,
+                    rwx_access_token_kind,
+                } = response;
 
-        let addr = match queue_url.socket_addrs(|| None).as_deref() {
-            Ok([one]) => *one,
-            Ok(_) => {
-                return Err(Error::SchemaError(
-                    "expected exactly one resolved queue address".to_string(),
-                ))
+                let addr = match queue_url.socket_addrs(|| None).as_deref() {
+                    Ok([one]) => *one,
+                    Ok(_) => {
+                        return Err(Error::SchemaError(
+                            "expected exactly one resolved queue address".to_string(),
+                        ))
+                    }
+                    Err(e) => return Err(Error::SchemaError(e.to_string())),
+                };
+
+                let queries: HashMap<_, _> = queue_url.query_pairs().collect();
+
+                let auth_token = queries
+                    .get("token")
+                    .ok_or_else(|| Error::SchemaError("missing token".to_owned()))
+                    .and_then(|token_str| {
+                        UserToken::from_str(token_str)
+                            .map_err(|e| Error::SchemaError(format!("invalid token: {e}")))
+                    })?;
+
+                let resolved_run_id = queries
+                    .get("run_id")
+                    .map(|id| RunId(id.to_string()))
+                    .ok_or_else(|| Error::SchemaError("missing run id".to_string()))?;
+
+                if run_id != &resolved_run_id {
+                    return Err(Error::Other(
+                        "host-provided run ID differs from requested run ID".to_string(),
+                    ));
+                }
+
+                Ok(HostedQueueConfig::Success(HostedQueueSuccessConfig {
+                    addr,
+                    run_id: resolved_run_id,
+                    auth_token,
+                    tls_public_certificate: tls_public_certificate.map(String::into_bytes),
+                    rwx_access_token_kind,
+                }))
             }
-            Err(e) => return Err(Error::SchemaError(e.to_string())),
-        };
-
-        let queries: HashMap<_, _> = queue_url.query_pairs().collect();
-
-        let auth_token = queries
-            .get("token")
-            .ok_or_else(|| Error::SchemaError("missing token".to_owned()))
-            .and_then(|token_str| {
-                UserToken::from_str(token_str)
-                    .map_err(|e| Error::SchemaError(format!("invalid token: {e}")))
-            })?;
-
-        let resolved_run_id = queries
-            .get("run_id")
-            .map(|id| RunId(id.to_string()))
-            .ok_or_else(|| Error::SchemaError("missing run id".to_string()))?;
-
-        if run_id != &resolved_run_id {
-            return Err(Error::Other(
-                "host-provided run ID differs from requested run ID".to_string(),
-            ));
+            HostedQueueResponse::Unsupported(response) => Ok(HostedQueueConfig::Unsupported(
+                HostedQueueUnsupportedConfig {
+                    rwx_access_token_kind: response.rwx_access_token_kind,
+                    usage_error: response.usage_error,
+                },
+            )),
         }
-
-        Ok(HostedQueueConfig {
-            addr,
-            run_id: resolved_run_id,
-            auth_token,
-            tls_public_certificate: tls_public_certificate.map(String::into_bytes),
-            rwx_access_token_kind,
-        })
     }
 }
 
@@ -188,6 +219,7 @@ async fn send_request_with_decay_help(
 
 #[cfg(test)]
 mod test {
+    use serde_json::json;
     use std::str::FromStr;
 
     use abq_utils::{auth::UserToken, net_protocol::workers::RunId};
@@ -243,21 +275,22 @@ mod test {
             ))
             .create();
 
-        let HostedQueueConfig {
-            addr,
-            run_id,
-            auth_token,
-            tls_public_certificate,
-            rwx_access_token_kind,
-        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
-            .await
-            .unwrap();
-
-        assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
-        assert_eq!(run_id, in_run_id);
-        assert_eq!(auth_token, test_auth_token());
-        assert_eq!(tls_public_certificate.unwrap(), test_mock_cert().as_bytes());
-        assert_eq!(rwx_access_token_kind, AccessTokenKind::Organization)
+        if let HostedQueueConfig::Success(config) =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+                .await
+                .unwrap()
+        {
+            assert_eq!(config.addr, "168.220.85.45:8080".parse().unwrap());
+            assert_eq!(config.run_id, in_run_id);
+            assert_eq!(config.auth_token, test_auth_token());
+            assert_eq!(
+                config.tls_public_certificate.unwrap(),
+                test_mock_cert().as_bytes()
+            );
+            assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Organization)
+        } else {
+            unreachable!("expected success config")
+        }
     }
 
     #[tokio::test]
@@ -285,21 +318,62 @@ mod test {
             ))
             .create();
 
-        let HostedQueueConfig {
-            addr,
-            run_id,
-            auth_token,
-            tls_public_certificate,
-            rwx_access_token_kind,
-        } = HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
-            .await
-            .unwrap();
+        if let HostedQueueConfig::Success(config) =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+                .await
+                .unwrap()
+        {
+            assert_eq!(config.addr, "168.220.85.45:8080".parse().unwrap());
+            assert_eq!(config.run_id, in_run_id);
+            assert_eq!(config.auth_token, test_auth_token());
+            assert!(config.tls_public_certificate.is_none());
+            assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Personal)
+        } else {
+            unreachable!("expected success config")
+        }
+    }
 
-        assert_eq!(addr, "168.220.85.45:8080".parse().unwrap());
-        assert_eq!(run_id, in_run_id);
-        assert_eq!(auth_token, test_auth_token());
-        assert!(tls_public_certificate.is_none());
-        assert_eq!(rwx_access_token_kind, AccessTokenKind::Personal)
+    #[tokio::test]
+    async fn get_hosted_queue_config_unsupported_usage() {
+        let mut server = Server::new();
+
+        let in_run_id = RunId("1234".to_string());
+
+        let _m = server
+            .mock("GET", "/queue")
+            .match_header(
+                "Authorization",
+                format!("Bearer {}", test_access_token()).as_str(),
+            )
+            .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
+            .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
+                "run_id".to_string(),
+                in_run_id.to_string(),
+            )]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "usage_error":"This usage is not supported",
+                    "rwx_access_token_kind":"personal_access_token",
+                })
+                .to_string(),
+            )
+            .create();
+
+        if let HostedQueueConfig::Unsupported(config) =
+            HostedQueueConfig::from_api(server.url(), &test_access_token(), &in_run_id)
+                .await
+                .unwrap()
+        {
+            assert_eq!(config.rwx_access_token_kind, AccessTokenKind::Personal);
+            assert_eq!(
+                config.usage_error,
+                "This usage is not supported".to_string()
+            )
+        } else {
+            unreachable!("expected unsupported config")
+        }
     }
 
     #[tokio::test]
