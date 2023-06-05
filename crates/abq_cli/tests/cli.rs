@@ -2908,7 +2908,6 @@ fn report_while_run_in_progress_is_error() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn test_explicit_run_id_against_ephemeral_queue() {
     let name = "test_explicit_run_id_against_ephemeral_queue";
     let args = vec![
@@ -2938,7 +2937,6 @@ fn test_explicit_run_id_against_ephemeral_queue() {
 #[test]
 #[with_protocol_version]
 #[serial]
-#[ignore]
 fn report_explicit_run_id_against_ephemeral_queue() {
     let name = "report_explicit_run_id_against_ephemeral_queue";
     let args = vec![
