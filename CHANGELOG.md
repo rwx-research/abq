@@ -1,3 +1,21 @@
+## 1.5.0
+
+ABQ 1.5.0 adds new functionality for test distribution and the ability to replay
+tests locally without modifying the remote queue.
+
+By default, ABQ assigns the next available test to a worker that requests tests.
+However, with ABQ 1.5.0, you have the option to distribute entire test files to
+workers upon request. This feature can be beneficial when dealing with test
+files that have expensive setup or teardown processes. By distributing the whole
+file to a single worker responsible for that test file, you avoid running those
+processes multiple times across multiple workers.
+
+In version 1.5.0, ABQ now supports the usage of an RWX Personal Access token.
+This token enables you to replay a remote run locally without modifying the
+remote queue. Alongside the existing methods of setting the token through
+environment variables and flags, you can now utilize the abq login command to
+store your RWX access token locally for future use.
+
 ## 1.4.0
 
 ABQ 1.4.0 adds support for loading test runs from other queue instances via
