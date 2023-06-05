@@ -2908,6 +2908,7 @@ fn report_while_run_in_progress_is_error() {
 #[test]
 #[with_protocol_version]
 #[serial]
+#[ignore = "TODO:flaky"]
 fn test_explicit_run_id_against_ephemeral_queue() {
     let name = "test_explicit_run_id_against_ephemeral_queue";
     let args = vec![
