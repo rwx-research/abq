@@ -326,11 +326,11 @@ pub enum Command {
 
         /// How ABQ will distribute the tests.
         ///
-        /// By default, ABQ will distribute the next unassigned test to a worker asking for tests.
-        /// work-strategy=by-file, abq will distribute whole-files-at-a-time to workers asking for tests.
-        /// The non-default behavior can be helpful if you have very expensive setup or teardowns in a test file
-        /// that would, by default, be run multiples times by multiples workers instead of a single time on the worker
-        /// responsible for that test file.
+        /// Options:{n}
+        ///- by-test: distribute the next test to any worker.{n}
+        ///- by-file: distribute all tests in a file to the same worker. This can be helpful to avoid running expensive
+        /// shared setups or teardowns repeatedly across multiple workers, however it may cause tests to be less evenly
+        /// distributed.
         #[clap(long, default_value = "by-test")]
         test_strategy: TestStrategy,
 
