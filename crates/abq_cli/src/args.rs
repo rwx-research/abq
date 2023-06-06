@@ -332,6 +332,8 @@ pub enum Command {
         ///- by-test: distribute the next test to any worker.{n}
         ///- by-file: distribute all tests in a file to the same worker. This ensures that expensive per-file shared setups or
         /// teardowns will run only once on one worker, however it may cause tests to be less evenly distributed.
+        ///
+        /// Note: The Jest & Playwright test frameworks run with a by-file strategy regardless of the value of this flag.
         #[clap(long, default_value = "by-test")]
         test_strategy: TestStrategy,
 
