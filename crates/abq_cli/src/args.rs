@@ -352,9 +352,7 @@ pub enum Command {
 
         /// A broad measure of inactivity timeout seconds, after which a test run is cancelled.
         ///
-        /// The inactivity timeout is applied in the following cases:
-        ///
-        /// - If a test takes longer than the timeout seconds to complete
+        /// The inactivity timeout is applied if a single test takes longer than the timeout seconds to complete
         ///
         /// When setting the inactivity, it is recommended to over-estimate
         /// based on historical test runtimes you have observed for abq.
