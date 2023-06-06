@@ -8,3 +8,9 @@ test-suites:
       print-summary: true
       reporters:
         github-step-summary:
+  # shorthand for running clippy in dev
+  dev-clippy:
+    command: cargo clippy --workspace --tests --profile=release-unstable --all-features -- --deny warnings
+  # shorthand for running tests in dev
+  dev-test-abq:
+    command: cargo nextest r --all-features --cargo-profile=release-unstable

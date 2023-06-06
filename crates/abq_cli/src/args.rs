@@ -61,6 +61,8 @@ pub enum Command {
     /// Stores an RWX access token for local usage. You can generate RWX Personal Access Tokens at: https://account.rwx.com/_/personal_access_tokens
     Login {
         /// The access token to save to the local abq config file.
+        ///
+        /// Will be asked for interactively if not provided as an argument or set in RWX_ACCESS_TOKEN env var.
         #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
         access_token: Option<AccessToken>,
     },
@@ -326,19 +328,22 @@ pub enum Command {
 
         /// How ABQ will distribute the tests.
         ///
-        /// By default, ABQ will distribute the next unassigned test to a worker asking for tests.
-        /// work-strategy=by-file, abq will distribute whole-files-at-a-time to workers asking for tests.
-        /// The non-default behavior can be helpful if you have very expensive setup or teardowns in a test file
-        /// that would, by default, be run multiples times by multiples workers instead of a single time on the worker
-        /// responsible for that test file.
+        /// Options:{n}
+        ///- by-test: distribute the next test to any worker.{n}
+        ///- by-file: distribute all tests in a file to the same worker. This ensures that expensive per-file shared setups or
+        /// teardowns will run only once on one worker, however it may cause tests to be less evenly distributed.
+        ///
+        /// Note: The Jest & Playwright test frameworks run with a by-file strategy regardless of the value of this flag.
         #[clap(long, default_value = "by-test")]
         test_strategy: TestStrategy,
 
         /// Whether to report tests with colors.
         ///
-        /// When set to `auto`, will try to emit colors unless the output channel is detected
+        /// Options:{n}
+        ///- auto: try to emit colors unless the output channel is detected
         /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
         /// TERM is set to `dumb`, amongst other heuristics.
+        ///- never: don't emit colors.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
@@ -351,9 +356,7 @@ pub enum Command {
 
         /// A broad measure of inactivity timeout seconds, after which a test run is cancelled.
         ///
-        /// The inactivity timeout is applied in the following cases:
-        ///
-        /// - If a test takes longer than the timeout seconds to complete
+        /// The inactivity timeout is applied if a single test takes longer than the timeout seconds to complete
         ///
         /// When setting the inactivity, it is recommended to over-estimate
         /// based on historical test runtimes you have observed for abq.
@@ -406,9 +409,11 @@ pub enum Command {
 
         /// Whether to report tests with colors.
         ///
-        /// When set to `auto`, will try to emit colors unless the output channel is detected
+        /// Options:{n}
+        ///- auto: try to emit colors unless the output channel is detected
         /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
         /// TERM is set to `dumb`, amongst other heuristics.
+        ///- never: don't emit colors.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 

@@ -9,6 +9,12 @@ Then install cargo-insta for testing
 cargo install cargo-insta
 ```
 
+and nextest
+
+```bash
+curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+```
+
 and set up the test data for some integration tests:
 
 ```bash
@@ -36,12 +42,16 @@ run lints similarly to how they're run in CI:
 
 ```bash
 cargo clippy --workspace --tests --profile=release-unstable --all-features -- --deny warnings
+# or with captain...
+captain run dev-clippy
 ```
 
 run tests similarly to how they're run in CI:
 
 ```bash
-cargo test --profile=release-unstable --all-features
+cargo nextest --cargo-profile=release-unstable --all-features
+# or with captain...
+captain run dev-test-abq
 ```
 
 
