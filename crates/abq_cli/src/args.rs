@@ -337,9 +337,11 @@ pub enum Command {
 
         /// Whether to report tests with colors.
         ///
-        /// When set to `auto`, will try to emit colors unless the output channel is detected
+        /// Options:{n}
+        ///- auto: try to emit colors unless the output channel is detected
         /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
         /// TERM is set to `dumb`, amongst other heuristics.
+        ///- never: don't emit colors.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
@@ -405,9 +407,11 @@ pub enum Command {
 
         /// Whether to report tests with colors.
         ///
-        /// When set to `auto`, will try to emit colors unless the output channel is detected
+        /// Options:{n}
+        ///- auto: try to emit colors unless the output channel is detected
         /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
         /// TERM is set to `dumb`, amongst other heuristics.
+        ///- never: don't emit colors.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
 
