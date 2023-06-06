@@ -61,6 +61,8 @@ pub enum Command {
     /// Stores an RWX access token for local usage. You can generate RWX Personal Access Tokens at: https://account.rwx.com/_/personal_access_tokens
     Login {
         /// The access token to save to the local abq config file.
+        ///
+        /// Will be asked for interactively if not provided as an argument or set in RWX_ACCESS_TOKEN env var.
         #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
         access_token: Option<AccessToken>,
     },
@@ -328,9 +330,8 @@ pub enum Command {
         ///
         /// Options:{n}
         ///- by-test: distribute the next test to any worker.{n}
-        ///- by-file: distribute all tests in a file to the same worker. This can be helpful to avoid running expensive
-        /// shared setups or teardowns repeatedly across multiple workers, however it may cause tests to be less evenly
-        /// distributed.
+        ///- by-file: distribute all tests in a file to the same worker. This ensures that expensive per-file shared setups or
+        /// teardowns will run only once on one worker, however it may cause tests to be less evenly distributed.
         #[clap(long, default_value = "by-test")]
         test_strategy: TestStrategy,
 
