@@ -19,6 +19,7 @@ use abq_with_protocol_version::with_protocol_version;
 use indoc::formatdoc;
 use mockito::{Matcher, Server};
 use regex::Regex;
+use serde_json as json;
 use serial_test::serial;
 use std::ops::{Deref, DerefMut};
 use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
