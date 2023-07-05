@@ -21,7 +21,6 @@ use mockito::{Matcher, Server};
 use regex::Regex;
 use serde_json as json;
 use serial_test::serial;
-use std::fs::File;
 use std::ops::{Deref, DerefMut};
 use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
 use std::str::FromStr;
@@ -1179,77 +1178,6 @@ test_all_network_config_options! {
         assert!(stdout.contains("init stderr"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert!(stdout.contains("hello from manifest stderr"), "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
     }
-}
-
-fn verify_and_sanitize_state(state: &mut json::Map<String, json::Value>) {
-    {
-        let exe_cell = state
-            .get_mut("abq_executable")
-            .expect("abq_executable missing");
-        let exe_path = Path::new(exe_cell.as_str().unwrap());
-        assert_eq!(exe_path, abq_binary());
-        *exe_cell = json::json!("<replaced abq.exe>");
-    }
-
-    {
-        let version_cell = state.get_mut("abq_version").expect("abq_version missing");
-        assert_eq!(version_cell.as_str().unwrap(), abq_utils::VERSION);
-        *version_cell = json::json!("<replaced ABQ version>");
-    }
-}
-
-#[test]
-fn write_statefile_for_worker() {
-    let name = "write_statefile_for_worker";
-    let conf = CSConfigOptions {
-        use_auth_token: false,
-        tls: false,
-    };
-
-    let statefile = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-    let statefile = statefile.to_path_buf();
-
-    let (queue_proc, queue_addr) = setup_queue!(name, conf);
-
-    let test_args = |worker: usize| {
-        vec![
-            format!("test"),
-            format!("--worker={worker}"),
-            format!("--reporter=dot"),
-            format!("--queue-addr={queue_addr}"),
-            format!("--working-dir=."),
-            format!("--run-id=my-test-run-id"),
-            format!("--num=cpu-cores"),
-            format!("--color=never"),
-            format!("--"),
-            format!("__zzz_not_a_command__"),
-        ]
-    };
-
-    let mut worker0 = Abq::new("write_statefile_for_worker0")
-        .args(test_args(0))
-        .spawn();
-
-    let _worker1 = Abq::new("write_statefile_for_worker0")
-        .args(test_args(1))
-        .env([("ABQ_STATE_FILE", statefile.display().to_string())])
-        .run();
-
-    worker0.kill().unwrap();
-    term(queue_proc);
-
-    let statefile = File::open(&statefile).unwrap();
-    let mut state = serde_json::from_reader(&statefile).unwrap();
-
-    verify_and_sanitize_state(&mut state);
-
-    insta::assert_json_snapshot!(state, @r###"
-    {
-      "abq_executable": "<replaced abq.exe>",
-      "abq_version": "<replaced ABQ version>",
-      "run_id": "my-test-run-id"
-    }
-    "###);
 }
 
 test_all_network_config_options! {

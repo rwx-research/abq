@@ -4,7 +4,6 @@ mod health;
 mod instance;
 mod report;
 mod reporting;
-mod statefile;
 mod workers;
 
 use std::io;
@@ -435,8 +434,6 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 Some(AccessTokenKind::Personal) => ExecutionMode::Readonly,
                 _ => ExecutionMode::WriteNormal,
             };
-
-            statefile::optional_write_worker_statefile(&run_id)?;
 
             let runner = RunnerKind::GenericNativeTestRunner(runner_params);
 
