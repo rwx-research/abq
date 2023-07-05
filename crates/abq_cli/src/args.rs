@@ -26,12 +26,12 @@ use crate::{
 };
 
 #[derive(Clone)]
-pub enum NumWorkers {
+pub enum NumRunners {
     CpuCores,
     Fixed(NonZeroUsize),
 }
 
-impl std::str::FromStr for NumWorkers {
+impl std::str::FromStr for NumRunners {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -286,7 +286,7 @@ pub enum Command {
         ///
         /// Set to "cpu-cores" to use the number of available (physical) CPUs cores - 1.
         #[clap(long, short = 'n', required = false, default_value = "1")]
-        num: NumWorkers,
+        num: NumRunners,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.

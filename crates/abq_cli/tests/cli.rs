@@ -1310,7 +1310,7 @@ fn retries_smoke() {
 
     let retries = 4;
     let num_tests = 64;
-    let num_workers = 6;
+    let num_runners = 6;
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
@@ -1385,7 +1385,7 @@ fn retries_smoke() {
         args
     };
 
-    let workers: Vec<_> = (0..num_workers)
+    let workers: Vec<_> = (0..num_runners)
         .map(|i| {
             Abq::new(format!("{name}_worker{i}"))
                 .args(test_args(i))
@@ -1839,7 +1839,7 @@ fn report_grouping_failures_retries() {
 
     let retries = 4;
     let num_tests = 64;
-    let num_workers = 6;
+    let num_runners = 6;
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
@@ -1914,7 +1914,7 @@ fn report_grouping_failures_retries() {
         args
     };
 
-    let workers: Vec<_> = (0..num_workers)
+    let workers: Vec<_> = (0..num_runners)
         .map(|i| {
             Abq::new(format!("{name}_worker{i}"))
                 .args(test_args(i))
@@ -2340,7 +2340,7 @@ fn out_of_process_retries_smoke() {
 
     let retries = 4;
     let num_tests = 64;
-    let num_workers = 6;
+    let num_runners = 6;
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf);
 
@@ -2418,7 +2418,7 @@ fn out_of_process_retries_smoke() {
     let mut failed_on_each_worker = vec![];
 
     for attempt in 0..retries {
-        let workers: Vec<_> = (0..num_workers)
+        let workers: Vec<_> = (0..num_runners)
             .map(|i| {
                 Abq::new(format!("{name}_worker{i}_attempt{attempt}"))
                     .args(test_args(i))

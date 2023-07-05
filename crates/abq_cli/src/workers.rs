@@ -44,7 +44,7 @@ pub struct TestRunMetadata {
 pub async fn start_workers_standalone(
     run_id: RunId,
     tag: WorkerTag,
-    num_workers: NonZeroUsize,
+    num_runners: NonZeroUsize,
     max_run_number: u32,
     runner_kind: RunnerKind,
     working_dir: PathBuf,
@@ -62,12 +62,12 @@ pub async fn start_workers_standalone(
     let test_suite_name = "suite"; // TODO: determine this correctly
     let has_stdout_reporters = reporter_kinds
         .iter()
-        .any(|r| r.outputs_to_stdout(num_workers));
+        .any(|r| r.outputs_to_stdout(num_runners));
     let reporters = build_reporters(
         reporter_kinds,
         stdout_preferences,
         test_suite_name,
-        num_workers,
+        num_runners,
     );
 
     let mut term_signals = Signals::new(TERM_SIGNALS).unwrap();
@@ -75,21 +75,6 @@ pub async fn start_workers_standalone(
     let context = WorkerContext::AlwaysWorkIn { working_dir };
 
     let (reporting_proxy, reporting_handle) = create_reporting_task(reporters);
-
-    let workers_config = WorkersConfig {
-        tag,
-        num_workers,
-        runner_kind,
-        local_results_handler: Box::new(reporting_proxy),
-        worker_context: context,
-        debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
-        has_stdout_reporters,
-        protocol_version_timeout: startup_timeout,
-        test_timeout,
-        results_batch_size_hint: batch_size.get(),
-        max_run_number,
-        should_send_results: execution_mode == ExecutionMode::WriteNormal,
-    };
 
     tracing::debug!(
         "Workers attaching to queue negotiator {}",
@@ -103,7 +88,20 @@ pub async fn start_workers_standalone(
     };
 
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(
-        workers_config,
+        WorkersConfig {
+            tag,
+            num_runners,
+            runner_kind,
+            local_results_handler: Box::new(reporting_proxy),
+            worker_context: context,
+            debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
+            has_stdout_reporters,
+            protocol_version_timeout: startup_timeout,
+            test_timeout,
+            results_batch_size_hint: batch_size.get(),
+            max_run_number,
+            should_send_results: execution_mode == ExecutionMode::WriteNormal,
+        },
         queue_negotiator,
         client_opts,
         invoke_work,
@@ -119,7 +117,7 @@ pub async fn start_workers_standalone(
     loop {
         tokio::select! {
             () = worker_pool.wait() => {
-                do_shutdown(worker_pool, reporting_handle, stdout_preferences, execution_mode, run_id, tag, num_workers, test_run_metadata).await;
+                do_shutdown(worker_pool, reporting_handle, stdout_preferences, execution_mode, run_id, tag, num_runners, test_run_metadata).await;
             }
             _ = term_signals.next() => {
                 do_cancellation_shutdown(worker_pool).await;

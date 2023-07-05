@@ -29,7 +29,7 @@ use abq_utils::{
 
 use args::{
     Cli, Command,
-    NumWorkers::{CpuCores, Fixed},
+    NumRunners::{CpuCores, Fixed},
 };
 use clap::Parser;
 
