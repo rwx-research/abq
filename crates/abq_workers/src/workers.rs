@@ -56,7 +56,7 @@ pub enum WorkerContext {
 /// Configuration for a [WorkerPool].
 pub struct WorkerPoolConfig<'a> {
     /// Number of runners to start in the pool.
-    pub size: NonZeroUsize,
+    pub num_workers: NonZeroUsize,
     /// The tagged number of the worker pool in this test run.
     pub tag: WorkerTag,
     /// The entity of the first runner in the pool.
@@ -140,8 +140,8 @@ impl SignalRunnerCompletion {
 impl WorkerPool {
     pub async fn new(config: WorkerPoolConfig<'_>) -> Self {
         let WorkerPoolConfig {
-            size,
             first_runner_entity,
+            num_workers: _,
             tag: workers_tag,
             runner_kind,
             run_id,
@@ -155,7 +155,7 @@ impl WorkerPool {
             test_timeout,
         } = config;
 
-        let num_workers = size.get();
+        let num_workers = config.num_workers.get();
         let mut runners = Vec::with_capacity(num_workers);
 
         let (live_count, signal_completed) = LiveCount::new(num_workers).await;
@@ -1043,7 +1043,7 @@ mod test {
         runner_strategy_generator: &'a StaticRunnerStrategy<'a>,
     ) -> WorkerPoolConfig<'a> {
         WorkerPoolConfig {
-            size: NonZeroUsize::new(1).unwrap(),
+            num_workers: NonZeroUsize::new(1).unwrap(),
             some_runner_should_generate_manifest: true,
             tag: worker_pool_tag,
             first_runner_entity: Entity::first_runner(worker_pool_tag),
@@ -1141,7 +1141,7 @@ mod test {
         );
 
         let config = WorkerPoolConfig {
-            size: NonZeroUsize::new(num_workers).unwrap(),
+            num_workers: NonZeroUsize::new(num_workers).unwrap(),
             ..default_config
         };
 
@@ -1455,7 +1455,7 @@ mod test {
             &runner_strategy,
         );
 
-        config.size = NonZeroUsize::new(5).unwrap();
+        config.num_workers = NonZeroUsize::new(5).unwrap();
         config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;
@@ -1499,7 +1499,7 @@ mod test {
             &runner_strategy,
         );
 
-        config.size = NonZeroUsize::new(3).unwrap();
+        config.num_workers = NonZeroUsize::new(3).unwrap();
         config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;
@@ -1539,7 +1539,7 @@ mod test {
             &runner_strategy,
         );
 
-        config.size = NonZeroUsize::new(1).unwrap();
+        config.num_workers = NonZeroUsize::new(1).unwrap();
         config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;

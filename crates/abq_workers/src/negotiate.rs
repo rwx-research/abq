@@ -250,7 +250,7 @@ impl WorkersNegotiator {
         );
 
         let pool_config = WorkerPoolConfig {
-            size: num_workers,
+            num_workers,
             some_runner_should_generate_manifest,
             tag,
             first_runner_entity,
