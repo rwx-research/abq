@@ -56,16 +56,14 @@ pub enum WorkerContext {
 /// Configuration for a [WorkerPool].
 pub struct WorkerPoolConfig<'a> {
     /// Number of runners to start in the pool.
-    pub size: NonZeroUsize,
+    pub num_runners: NonZeroUsize,
     /// The tagged number of the worker pool in this test run.
     pub tag: WorkerTag,
-    /// The entity of the first runner in the pool.
-    pub first_runner_entity: Entity,
     /// The kind of runners the workers should start.
     pub runner_kind: RunnerKind,
     /// The work run we're working for.
     pub run_id: RunId,
-    /// Whether a runner on this pool should generate the manifest.
+    /// Whether a runner on this pool should generate the manifest. This is false for retries.
     pub some_runner_should_generate_manifest: bool,
     /// How runners should communicate.
     pub runner_strategy_generator: &'a dyn runner_strategy::StrategyGenerator,
@@ -140,8 +138,7 @@ impl SignalRunnerCompletion {
 impl WorkerPool {
     pub async fn new(config: WorkerPoolConfig<'_>) -> Self {
         let WorkerPoolConfig {
-            size,
-            first_runner_entity,
+            num_runners: _,
             tag: workers_tag,
             runner_kind,
             run_id,
@@ -155,17 +152,17 @@ impl WorkerPool {
             test_timeout,
         } = config;
 
-        let num_workers = size.get();
-        let mut runners = Vec::with_capacity(num_workers);
+        let num_runners = config.num_runners.get();
+        let mut runners = Vec::with_capacity(num_runners);
 
-        let (live_count, signal_completed) = LiveCount::new(num_workers).await;
+        let (live_count, signal_completed) = LiveCount::new(num_runners).await;
         tracing::debug!(live_count=?live_count.read(), ?results_batch_size, ?run_id, "Starting worker pool");
 
-        let mut runners_shutdown = Vec::with_capacity(num_workers);
+        let mut runners_shutdown = Vec::with_capacity(num_runners);
 
-        let is_singleton_runner = num_workers == 1;
+        let is_singleton_runner = num_runners == 1;
 
-        for runner_id in 1..=num_workers {
+        for runner_id in 1..=num_runners {
             let (shutdown_tx, shutdown_rx) = oneshot_notify::make_pair();
             runners_shutdown.push(shutdown_tx);
 
@@ -174,16 +171,9 @@ impl WorkerPool {
                 signal_completed: signal_completed.clone(),
             };
 
-            let entity = if runner_id == 1 {
-                first_runner_entity
-            } else {
-                Entity::runner(workers_tag, runner_id as u32)
-            };
+            let entity = Entity::runner(workers_tag, runner_id as u32);
             let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(runner_id as u32));
             let runner_meta = RunnerMeta::new(runner, is_singleton_runner, has_stdout_reporters);
-
-            // Have the first runner generate the manifest, if applicable.
-            let should_generate_manifest = some_runner_should_generate_manifest && runner_id == 1;
 
             let RunnerStrategy {
                 notify_manifest,
@@ -192,7 +182,12 @@ impl WorkerPool {
                 results_handler,
                 notify_all_tests_run,
                 notify_cancellation,
-            } = runner_strategy_generator.generate(entity, should_generate_manifest);
+            } = {
+                // Have the first runner generate the manifest, if applicable.
+                let should_generate_manifest =
+                    some_runner_should_generate_manifest && runner_id == 1;
+                runner_strategy_generator.generate(entity, should_generate_manifest)
+            };
 
             let runner_env = RunnerEnv {
                 entity,
@@ -214,12 +209,14 @@ impl WorkerPool {
 
             let runner_kind = {
                 let mut runner = runner_kind.clone();
-                runner.set_runner_id(runner_id);
+                // ensure native runner has env var ABQ_RUNNER set
+                runner.set_abq_runner_env_var(runner_id);
                 runner
             };
 
             runners.push((
                 runner_meta,
+                // start the runner
                 ThreadWorker::new(runner_kind, runner_env, mark_runner_complete),
             ));
         }
@@ -1043,10 +1040,9 @@ mod test {
         runner_strategy_generator: &'a StaticRunnerStrategy<'a>,
     ) -> WorkerPoolConfig<'a> {
         WorkerPoolConfig {
-            size: NonZeroUsize::new(1).unwrap(),
+            num_runners: NonZeroUsize::new(1).unwrap(),
             some_runner_should_generate_manifest: true,
             tag: worker_pool_tag,
-            first_runner_entity: Entity::first_runner(worker_pool_tag),
             results_batch_size_hint: 5,
             runner_kind,
             runner_strategy_generator,
@@ -1110,7 +1106,7 @@ mod test {
     }
 
     // used in tokio tests
-    async fn test_echo_n(protocol: ProtocolWitness, num_workers: usize, num_echos: usize) {
+    async fn test_echo_n(protocol: ProtocolWitness, num_runners: usize, num_echos: usize) {
         let (write_work, set_done, get_next_tests) = work_writer();
         let (results, results_handler_generator) = results_collector();
         let (all_completed, notify_all_tests_run_generator) = notify_all_tests_run();
@@ -1141,7 +1137,7 @@ mod test {
         );
 
         let config = WorkerPoolConfig {
-            size: NonZeroUsize::new(num_workers).unwrap(),
+            num_runners: NonZeroUsize::new(num_runners).unwrap(),
             ..default_config
         };
 
@@ -1180,7 +1176,7 @@ mod test {
         ));
 
         let all_completed = all_completed.lock();
-        assert_eq!(all_completed.len(), num_workers);
+        assert_eq!(all_completed.len(), num_runners);
         assert!(all_completed.iter().all(|b| b.load(atomic::ORDERING)));
     }
 
@@ -1455,7 +1451,7 @@ mod test {
             &runner_strategy,
         );
 
-        config.size = NonZeroUsize::new(5).unwrap();
+        config.num_runners = NonZeroUsize::new(5).unwrap();
         config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;
@@ -1499,7 +1495,7 @@ mod test {
             &runner_strategy,
         );
 
-        config.size = NonZeroUsize::new(3).unwrap();
+        config.num_runners = NonZeroUsize::new(3).unwrap();
         config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;
@@ -1539,7 +1535,7 @@ mod test {
             &runner_strategy,
         );
 
-        config.size = NonZeroUsize::new(1).unwrap();
+        config.num_runners = NonZeroUsize::new(1).unwrap();
         config.protocol_version_timeout = Duration::from_millis(100);
 
         let mut pool = WorkerPool::new(config).await;

@@ -99,7 +99,7 @@ pub enum MessageToQueueNegotiator {
 
 pub struct WorkersConfig {
     pub tag: WorkerTag,
-    pub num_workers: NonZeroUsize,
+    pub num_runners: NonZeroUsize,
     pub runner_kind: RunnerKind,
     /// How should test results be handled, locally?
     /// The handler will be shared between all workers created on the pool.
@@ -180,7 +180,7 @@ impl NegotiatedWorkers {
 
 impl WorkersNegotiator {
     #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, client_options), fields(
-        num_workers = workers_config.num_workers
+        num_runners = workers_config.num_runners
     ))]
     pub async fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
@@ -188,14 +188,13 @@ impl WorkersNegotiator {
         client_options: ClientOptions<User>,
         invoke_data: InvokeWork,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
-        let first_runner_entity = Entity::runner(workers_config.tag, 1);
         let async_client = client_options.build_async()?;
 
         let run_id = invoke_data.run_id.clone();
 
         let execution_decision = wait_for_execution_context(
             &*async_client,
-            first_runner_entity,
+            workers_config.tag,
             queue_negotiator_handle.0,
             invoke_data,
         )
@@ -218,7 +217,7 @@ impl WorkersNegotiator {
 
         let WorkersConfig {
             tag,
-            num_workers,
+            num_runners,
             runner_kind,
             local_results_handler,
             worker_context,
@@ -249,11 +248,11 @@ impl WorkersNegotiator {
             should_send_results,
         );
 
-        let pool_config = WorkerPoolConfig {
-            size: num_workers,
+        tracing::debug!("Starting worker pool");
+        let pool = WorkerPool::new(WorkerPoolConfig {
+            num_runners,
             some_runner_should_generate_manifest,
             tag,
-            first_runner_entity,
             runner_kind,
             runner_strategy_generator: &runner_strategy_generator,
             results_batch_size_hint,
@@ -263,10 +262,8 @@ impl WorkersNegotiator {
             has_stdout_reporters,
             protocol_version_timeout,
             test_timeout,
-        };
-
-        tracing::debug!("Starting worker pool");
-        let pool = WorkerPool::new(pool_config).await;
+        })
+        .await;
         tracing::debug!("Started worker pool");
 
         Ok(NegotiatedWorkers::Pool(pool))
@@ -281,7 +278,7 @@ impl WorkersNegotiator {
 #[instrument(level = "debug", skip(client))]
 async fn wait_for_execution_context(
     client: &dyn net_async::ConfiguredClient,
-    entity: Entity,
+    worker_tag: WorkerTag,
     queue_negotiator_addr: SocketAddr,
     invoke_data: InvokeWork,
 ) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
@@ -290,7 +287,7 @@ async fn wait_for_execution_context(
     loop {
         let mut conn = client.connect(queue_negotiator_addr).await?;
         let wants_to_attach = negotiate::Request {
-            entity,
+            entity: Entity::runner(worker_tag, 1), // first runner is special
             message: MessageToQueueNegotiator::WantsToAttach {
                 invoke_data: invoke_data.clone(),
             },
@@ -889,7 +886,7 @@ mod test {
         .await;
         let workers_config = WorkersConfig {
             tag: WorkerTag::new(0),
-            num_workers: NonZeroUsize::new(1).unwrap(),
+            num_runners: NonZeroUsize::new(1).unwrap(),
             runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
             local_results_handler: Box::new(NoopResultsHandler),
             worker_context: WorkerContext::AssumeLocal,
