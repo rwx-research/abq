@@ -248,7 +248,8 @@ impl WorkersNegotiator {
             should_send_results,
         );
 
-        let pool_config = WorkerPoolConfig {
+        tracing::debug!("Starting worker pool");
+        let pool = WorkerPool::new(WorkerPoolConfig {
             num_workers,
             some_runner_should_generate_manifest,
             tag,
@@ -261,10 +262,8 @@ impl WorkersNegotiator {
             has_stdout_reporters,
             protocol_version_timeout,
             test_timeout,
-        };
-
-        tracing::debug!("Starting worker pool");
-        let pool = WorkerPool::new(pool_config).await;
+        })
+        .await;
         tracing::debug!("Started worker pool");
 
         Ok(NegotiatedWorkers::Pool(pool))
