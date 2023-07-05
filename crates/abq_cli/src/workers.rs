@@ -76,21 +76,6 @@ pub async fn start_workers_standalone(
 
     let (reporting_proxy, reporting_handle) = create_reporting_task(reporters);
 
-    let workers_config = WorkersConfig {
-        tag,
-        num_workers,
-        runner_kind,
-        local_results_handler: Box::new(reporting_proxy),
-        worker_context: context,
-        debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
-        has_stdout_reporters,
-        protocol_version_timeout: startup_timeout,
-        test_timeout,
-        results_batch_size_hint: batch_size.get(),
-        max_run_number,
-        should_send_results: execution_mode == ExecutionMode::WriteNormal,
-    };
-
     tracing::debug!(
         "Workers attaching to queue negotiator {}",
         queue_negotiator.get_address()
@@ -103,7 +88,20 @@ pub async fn start_workers_standalone(
     };
 
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(
-        workers_config,
+        WorkersConfig {
+            tag,
+            num_workers,
+            runner_kind,
+            local_results_handler: Box::new(reporting_proxy),
+            worker_context: context,
+            debug_native_runner: std::env::var_os("ABQ_DEBUG_NATIVE").is_some(),
+            has_stdout_reporters,
+            protocol_version_timeout: startup_timeout,
+            test_timeout,
+            results_batch_size_hint: batch_size.get(),
+            max_run_number,
+            should_send_results: execution_mode == ExecutionMode::WriteNormal,
+        },
         queue_negotiator,
         client_opts,
         invoke_work,
