@@ -200,10 +200,6 @@ pub mod entity {
             Self::new(Tag::Runner(WorkerRunner::new(worker, runner)))
         }
 
-        pub fn first_runner(worker: impl Into<WorkerTag>) -> Self {
-            Self::new(Tag::Runner(WorkerRunner::new(worker, 1)))
-        }
-
         pub fn local_client() -> Self {
             Self::new(Tag::LocalClient)
         }

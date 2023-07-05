@@ -188,14 +188,13 @@ impl WorkersNegotiator {
         client_options: ClientOptions<User>,
         invoke_data: InvokeWork,
     ) -> Result<NegotiatedWorkers, WorkersNegotiateError> {
-        let first_runner_entity = Entity::runner(workers_config.tag, 1);
         let async_client = client_options.build_async()?;
 
         let run_id = invoke_data.run_id.clone();
 
         let execution_decision = wait_for_execution_context(
             &*async_client,
-            first_runner_entity,
+            Entity::runner(workers_config.tag, 1),
             queue_negotiator_handle.0,
             invoke_data,
         )
@@ -253,7 +252,6 @@ impl WorkersNegotiator {
             num_workers,
             some_runner_should_generate_manifest,
             tag,
-            first_runner_entity,
             runner_kind,
             runner_strategy_generator: &runner_strategy_generator,
             results_batch_size_hint,

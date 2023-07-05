@@ -59,8 +59,6 @@ pub struct WorkerPoolConfig<'a> {
     pub num_workers: NonZeroUsize,
     /// The tagged number of the worker pool in this test run.
     pub tag: WorkerTag,
-    /// The entity of the first runner in the pool.
-    pub first_runner_entity: Entity,
     /// The kind of runners the workers should start.
     pub runner_kind: RunnerKind,
     /// The work run we're working for.
@@ -140,7 +138,6 @@ impl SignalRunnerCompletion {
 impl WorkerPool {
     pub async fn new(config: WorkerPoolConfig<'_>) -> Self {
         let WorkerPoolConfig {
-            first_runner_entity,
             num_workers: _,
             tag: workers_tag,
             runner_kind,
@@ -174,11 +171,7 @@ impl WorkerPool {
                 signal_completed: signal_completed.clone(),
             };
 
-            let entity = if runner_id == 1 {
-                first_runner_entity
-            } else {
-                Entity::runner(workers_tag, runner_id as u32)
-            };
+            let entity = Entity::runner(workers_tag, runner_id as u32);
             let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(runner_id as u32));
             let runner_meta = RunnerMeta::new(runner, is_singleton_runner, has_stdout_reporters);
 
@@ -1046,7 +1039,6 @@ mod test {
             num_workers: NonZeroUsize::new(1).unwrap(),
             some_runner_should_generate_manifest: true,
             tag: worker_pool_tag,
-            first_runner_entity: Entity::first_runner(worker_pool_tag),
             results_batch_size_hint: 5,
             runner_kind,
             runner_strategy_generator,
