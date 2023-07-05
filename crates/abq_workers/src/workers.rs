@@ -63,7 +63,7 @@ pub struct WorkerPoolConfig<'a> {
     pub runner_kind: RunnerKind,
     /// The work run we're working for.
     pub run_id: RunId,
-    /// Whether a runner on this pool should generate the manifest.
+    /// Whether a runner on this pool should generate the manifest. This is false for retries.
     pub some_runner_should_generate_manifest: bool,
     /// How runners should communicate.
     pub runner_strategy_generator: &'a dyn runner_strategy::StrategyGenerator,
@@ -175,9 +175,6 @@ impl WorkerPool {
             let runner = WorkerRunner::new(workers_tag, entity::RunnerTag::new(runner_id as u32));
             let runner_meta = RunnerMeta::new(runner, is_singleton_runner, has_stdout_reporters);
 
-            // Have the first runner generate the manifest, if applicable.
-            let should_generate_manifest = some_runner_should_generate_manifest && runner_id == 1;
-
             let RunnerStrategy {
                 notify_manifest,
                 get_init_context,
@@ -185,7 +182,12 @@ impl WorkerPool {
                 results_handler,
                 notify_all_tests_run,
                 notify_cancellation,
-            } = runner_strategy_generator.generate(entity, should_generate_manifest);
+            } = {
+                // Have the first runner generate the manifest, if applicable.
+                let should_generate_manifest =
+                    some_runner_should_generate_manifest && runner_id == 1;
+                runner_strategy_generator.generate(entity, should_generate_manifest)
+            };
 
             let runner_env = RunnerEnv {
                 entity,
@@ -214,6 +216,7 @@ impl WorkerPool {
 
             runners.push((
                 runner_meta,
+                // start the runner
                 ThreadWorker::new(runner_kind, runner_env, mark_runner_complete),
             ));
         }
