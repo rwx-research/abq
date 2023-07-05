@@ -99,7 +99,7 @@ pub enum MessageToQueueNegotiator {
 
 pub struct WorkersConfig {
     pub tag: WorkerTag,
-    pub num_workers: NonZeroUsize,
+    pub num_runners: NonZeroUsize,
     pub runner_kind: RunnerKind,
     /// How should test results be handled, locally?
     /// The handler will be shared between all workers created on the pool.
@@ -180,7 +180,7 @@ impl NegotiatedWorkers {
 
 impl WorkersNegotiator {
     #[instrument(level = "trace", skip(workers_config, queue_negotiator_handle, client_options), fields(
-        num_workers = workers_config.num_workers
+        num_runners = workers_config.num_runners
     ))]
     pub async fn negotiate_and_start_pool(
         workers_config: WorkersConfig,
@@ -217,7 +217,7 @@ impl WorkersNegotiator {
 
         let WorkersConfig {
             tag,
-            num_workers,
+            num_runners,
             runner_kind,
             local_results_handler,
             worker_context,
@@ -250,7 +250,7 @@ impl WorkersNegotiator {
 
         tracing::debug!("Starting worker pool");
         let pool = WorkerPool::new(WorkerPoolConfig {
-            num_workers,
+            num_runners,
             some_runner_should_generate_manifest,
             tag,
             runner_kind,
@@ -886,7 +886,7 @@ mod test {
         .await;
         let workers_config = WorkersConfig {
             tag: WorkerTag::new(0),
-            num_workers: NonZeroUsize::new(1).unwrap(),
+            num_runners: NonZeroUsize::new(1).unwrap(),
             runner_kind: RunnerKind::TestLikeRunner(TestLikeRunner::Echo, Box::new(manifest)),
             local_results_handler: Box::new(NoopResultsHandler),
             worker_context: WorkerContext::AssumeLocal,

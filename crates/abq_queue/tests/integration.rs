@@ -260,7 +260,7 @@ impl WorkersConfigBuilder {
     fn new(tag: impl Into<WorkerTag>, runner_kind: RunnerKind) -> Self {
         let config = WorkersConfig {
             tag: tag.into(),
-            num_workers: 2.try_into().unwrap(),
+            num_runners: 2.try_into().unwrap(),
             max_run_number: INIT_RUN_NUMBER,
             runner_kind,
             local_results_handler: Box::new(NoopResultsHandler),
@@ -288,8 +288,8 @@ impl WorkersConfigBuilder {
         self
     }
 
-    fn with_num_workers(mut self, num_workers: NonZeroUsize) -> Self {
-        self.config.num_workers = num_workers;
+    fn with_num_runners(mut self, num_runners: NonZeroUsize) -> Self {
+        self.config.num_runners = num_runners;
         self
     }
 }
@@ -866,7 +866,7 @@ async fn multiple_worker_count() {
             Run(73495),
             Wid(n),
             WorkersConfigBuilder::new(n as u32, runner.clone())
-                .with_num_workers(NonZeroUsize::new(1).unwrap()),
+                .with_num_runners(NonZeroUsize::new(1).unwrap()),
         )
     };
 
@@ -1375,7 +1375,7 @@ async fn get_init_context_from_work_server_active() {
         Box::new(manifest),
     );
 
-    let workers_config = WorkersConfigBuilder::new(1, runner).with_num_workers(one_nonzero_usize());
+    let workers_config = WorkersConfigBuilder::new(1, runner).with_num_runners(one_nonzero_usize());
 
     TestBuilder::default()
         .act([StartWorkers(Run(1), Wid(1), workers_config)])
@@ -1611,7 +1611,7 @@ async fn test_cancellation_drops_remaining_work() {
         .act([StartWorkers(
             Run(1),
             Wid(1),
-            WorkersConfigBuilder::new(1, runner.clone()).with_num_workers(one_nonzero_usize()),
+            WorkersConfigBuilder::new(1, runner.clone()).with_num_runners(one_nonzero_usize()),
         )])
         .step(
             [
@@ -1996,7 +1996,7 @@ async fn many_retries_complete() {
 async fn many_retries_many_workers_complete() {
     let attempts = 4;
     let num_tests = 64;
-    let num_workers = 6;
+    let num_runners = 6;
 
     let mut manifest = vec![];
     let mut expected_results = vec![];
@@ -2029,7 +2029,7 @@ async fn many_retries_many_workers_complete() {
     let mut start_actions = vec![];
     let mut end_workers_actions = vec![];
     let mut end_workers_asserts = vec![];
-    for i in 1..=num_workers {
+    for i in 1..=num_runners {
         let workers_config =
             WorkersConfigBuilder::new(i as u32, runner.clone()).with_max_run_number(attempts);
         start_actions.push(StartWorkers(Run(1), Wid(i), workers_config));
@@ -2104,7 +2104,7 @@ async fn many_retries_many_workers_complete() {
 async fn many_retries_many_workers_complete_native() {
     let attempts = 4;
     let num_tests = 64;
-    let num_workers = 6;
+    let num_runners = 6;
 
     let mut manifest = vec![];
     let mut expected_results = vec![];
@@ -2198,7 +2198,7 @@ async fn many_retries_many_workers_complete_native() {
 
     let mut start_actions = vec![];
     let mut end_workers_actions = vec![];
-    for i in 1..=num_workers {
+    for i in 1..=num_runners {
         let config =
             WorkersConfigBuilder::new(i as u32, runner.clone()).with_max_run_number(attempts);
         start_actions.push(StartWorkers(Run(1), Wid(i), config));
@@ -2498,7 +2498,7 @@ async fn retry_out_of_process_worker() {
 #[timeout(2000)] // 2 seconds
 async fn many_retries_of_many_out_of_process_workers() {
     let num_tests = 64;
-    let num_workers = 6;
+    let num_runners = 6;
     let num_out_of_process_retries = 4;
 
     let mut manifest = vec![];
@@ -2528,7 +2528,7 @@ async fn many_retries_of_many_out_of_process_workers() {
         let mut end_run_asserts = vec![];
 
         // Push on the workers for this set of out-of-process retries
-        for i in 0..num_workers {
+        for i in 0..num_runners {
             let runner = if retry == 1 {
                 runner0.clone()
             } else {
@@ -2536,7 +2536,7 @@ async fn many_retries_of_many_out_of_process_workers() {
             };
             let workers_config = WorkersConfigBuilder::new(i as u32, runner);
 
-            let worker_uuid = retry * num_workers + i;
+            let worker_uuid = retry * num_runners + i;
 
             start_actions.push(StartWorkers(Run(1), Wid(worker_uuid), workers_config));
 
@@ -2688,7 +2688,7 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
         .act([StartWorkers(
             Run(1),
             Wid(1),
-            WorkersConfigBuilder::new(1, runner1).with_num_workers(two),
+            WorkersConfigBuilder::new(1, runner1).with_num_runners(two),
         )])
         .act([
             StopWorkers(Wid(1)),
@@ -2730,7 +2730,7 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
         .act([StartWorkers(
             Run(1),
             Wid(2),
-            WorkersConfigBuilder::new(1, runner2).with_num_workers(two),
+            WorkersConfigBuilder::new(1, runner2).with_num_runners(two),
         )])
         .act([CancelWorkers(Wid(2)), WaitForCompletedRun(Run(1))])
         .step(
@@ -2768,7 +2768,7 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
         .act([StartWorkers(
             Run(1),
             Wid(3),
-            WorkersConfigBuilder::new(1, runner3).with_num_workers(two),
+            WorkersConfigBuilder::new(1, runner3).with_num_runners(two),
         )])
         .act([StopWorkers(Wid(3)), WaitForCompletedRun(Run(1))])
         .step(
@@ -2844,7 +2844,7 @@ async fn cancel_test_run_if_no_manifest_progress() {
         .act([StartWorkers(
             Run(1),
             Wid(1),
-            WorkersConfigBuilder::new(1, runner.clone()).with_num_workers(one_nonzero_usize()),
+            WorkersConfigBuilder::new(1, runner.clone()).with_num_runners(one_nonzero_usize()),
         )])
         .act([
             // Run should be seen as completed (cancelled) soon.
