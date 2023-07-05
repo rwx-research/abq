@@ -194,7 +194,7 @@ impl WorkersNegotiator {
 
         let execution_decision = wait_for_execution_context(
             &*async_client,
-            Entity::runner(workers_config.tag, 1),
+            workers_config.tag,
             queue_negotiator_handle.0,
             invoke_data,
         )
@@ -278,7 +278,7 @@ impl WorkersNegotiator {
 #[instrument(level = "debug", skip(client))]
 async fn wait_for_execution_context(
     client: &dyn net_async::ConfiguredClient,
-    entity: Entity,
+    worker_tag: WorkerTag,
     queue_negotiator_addr: SocketAddr,
     invoke_data: InvokeWork,
 ) -> Result<Result<ExecutionContext, NegotiatedWorkers>, WorkersNegotiateError> {
@@ -287,7 +287,7 @@ async fn wait_for_execution_context(
     loop {
         let mut conn = client.connect(queue_negotiator_addr).await?;
         let wants_to_attach = negotiate::Request {
-            entity,
+            entity: Entity::runner(worker_tag, 1), // first runner is special
             message: MessageToQueueNegotiator::WantsToAttach {
                 invoke_data: invoke_data.clone(),
             },
