@@ -207,7 +207,8 @@ impl WorkerPool {
 
             let runner_kind = {
                 let mut runner = runner_kind.clone();
-                runner.set_runner_id(runner_id);
+                // ensure native runner has env var ABQ_RUNNER set
+                runner.set_abq_runner_env_var(runner_id);
                 runner
             };
 

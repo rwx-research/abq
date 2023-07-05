@@ -362,7 +362,7 @@ pub mod workers {
     const ABQ_RUNNER: &str = "ABQ_RUNNER";
 
     impl RunnerKind {
-        pub fn set_runner_id(&mut self, id: usize) {
+        pub fn set_abq_runner_env_var(&mut self, id: usize) {
             match self {
                 RunnerKind::GenericNativeTestRunner(params) => {
                     debug_assert!(!params.extra_env.contains_key(ABQ_RUNNER));
