@@ -1,6 +1,6 @@
 //! Implements the report command.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, time::Duration};
 
 use abq_reporting::{
     output::{format_test_result_summary, ShortSummaryGrouping},
@@ -56,6 +56,21 @@ pub(crate) async fn report_results(
         wait_for_results(abq, entity, run_id, results_timeout).await?;
 
     process_results(&mut stdout, reporters, all_results.into_iter().flatten())
+}
+
+pub(crate) async fn list_tests(
+    abq: AbqInstance,
+    entity: Entity,
+    run_id: RunId,
+    results_timeout: Duration,
+    _worker: u32,
+    _runner: NonZeroUsize,
+) -> anyhow::Result<ExitCode> {
+    let _all_results: Vec<Vec<ResultsLine>> =
+        wait_for_results(abq, entity, run_id, results_timeout).await?;
+    // todo filter by worker & runner
+    // print out test ids
+    Ok(ExitCode::new(0))
 }
 
 fn process_results(

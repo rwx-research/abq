@@ -478,7 +478,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             queue_addr,
             token,
             tls_cert,
-            subcommand: None,
+            subcommand,
         } => {
             let deprecations = DeprecationRecord::default();
             let stdout_preferences = StdoutPreferences::new(color);
@@ -531,31 +531,41 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             )
             .await?;
 
-            let code = report::report_results(
-                abq,
-                entity,
-                run_id,
-                reporter,
-                stdout_preferences,
-                Duration::from_secs(timeout_seconds),
-            )
-            .await?;
+            let code = match subcommand {
+                None => {
+                    report::report_results(
+                        abq,
+                        entity,
+                        run_id,
+                        reporter,
+                        stdout_preferences,
+                        Duration::from_secs(timeout_seconds),
+                    )
+                    .await?
+                }
+                Some(Report::ListTests {
+                    run_id: _,
+                    worker,
+                    num,
+                    access_token: _,
+                    timeout_seconds: _,
+                    queue_addr: _,
+                    token: _,
+                    tls_cert: _,
+                }) => {
+                    // todo merge params with parent params
+                    report::list_tests(
+                        abq,
+                        entity,
+                        run_id,
+                        Duration::from_secs(timeout_seconds),
+                        worker,
+                        num,
+                    )
+                    .await?
+                }
+            };
             Ok(code)
-        }
-        Command::Report {
-            run_id,
-            reporter,
-            color,
-            access_token,
-            timeout_seconds,
-            queue_addr,
-            token,
-            tls_cert,
-            subcommand: Some(listTests),
-        } => {
-            println!("todo: print the tests!");
-
-            Ok(ExitCode::new(1))
         }
         Command::Health {
             queue,
