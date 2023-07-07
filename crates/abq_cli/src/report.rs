@@ -11,10 +11,10 @@ use abq_utils::{
     log_assert_stderr, net_async,
     net_protocol::{
         self,
-        entity::Entity,
+        entity::{Entity, WorkerRunner},
         queue::AssociatedTestResults,
         results::{ResultsLine, Summary},
-        runners::TestResult,
+        runners::{TestResult, TestResultSpec},
         workers::{RunId, WorkId},
     },
     retry::async_retry_n,
@@ -63,13 +63,35 @@ pub(crate) async fn list_tests(
     entity: Entity,
     run_id: RunId,
     results_timeout: Duration,
-    _worker: u32,
-    _runner: NonZeroUsize,
+    worker: u32,
+    runner: NonZeroUsize,
 ) -> anyhow::Result<ExitCode> {
-    let _all_results: Vec<Vec<ResultsLine>> =
+    let all_results: Vec<Vec<ResultsLine>> =
         wait_for_results(abq, entity, run_id, results_timeout).await?;
-    // todo filter by worker & runner
-    // print out test ids
+
+    let results = all_results
+        .into_iter()
+        .flatten()
+        .filter_map(|results_line: ResultsLine| match results_line {
+            ResultsLine::Results(results) => Some(results),
+            ResultsLine::Summary(_) => None,
+        })
+        .flatten()
+        .flat_map(|associated_test_results: AssociatedTestResults| associated_test_results.results);
+
+    let mut results_for_worker: Vec<TestResultSpec> = results
+        .filter(|test_result| {
+            test_result.source.runner == WorkerRunner::from((worker, runner.get() as u32))
+        })
+        .map(|test_result| test_result.result)
+        .collect();
+
+    results_for_worker.sort_by_key(|result| result.timestamp); // future proofing in case results change order
+
+    results_for_worker.iter().for_each(|result| {
+        println!("{:?}", result.id);
+    });
+
     Ok(ExitCode::new(0))
 }
 
