@@ -551,6 +551,7 @@ pub mod queue {
     pub struct AssociatedTestResults {
         /// The run number this test result comes from.
         pub work_id: WorkId,
+        // This number starts at 1 and is incremented for retries
         pub run_number: u32,
         pub results: Vec<TestResult>,
         pub before_any_test: StdioOutput,
