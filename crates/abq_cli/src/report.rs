@@ -104,7 +104,7 @@ fn print_tests_for_runner(
     results_for_worker.sort_by_key(|result| result.timestamp); // future proofing in case results change order
 
     results_for_worker.iter().for_each(|result| {
-        writeln!(writer, "{}", result.id);
+        writeln!(writer, "{}", result.id).unwrap();
     });
 }
 
