@@ -558,6 +558,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                         abq,
                         entity,
                         run_id,
+                        stdout_preferences,
                         Duration::from_secs(timeout_seconds),
                         worker,
                         num,
