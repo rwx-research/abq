@@ -30,6 +30,7 @@ use abq_utils::{
 use args::{
     Cli, Command,
     NumRunners::{CpuCores, Fixed},
+    Report,
 };
 use clap::Parser;
 
@@ -477,6 +478,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             queue_addr,
             token,
             tls_cert,
+            subcommand,
         } => {
             let deprecations = DeprecationRecord::default();
             let stdout_preferences = StdoutPreferences::new(color);
@@ -529,15 +531,32 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             )
             .await?;
 
-            let code = report::report_results(
-                abq,
-                entity,
-                run_id,
-                reporter,
-                stdout_preferences,
-                Duration::from_secs(timeout_seconds),
-            )
-            .await?;
+            let code = match subcommand {
+                None => {
+                    report::report_results(
+                        abq,
+                        entity,
+                        run_id,
+                        reporter,
+                        stdout_preferences,
+                        Duration::from_secs(timeout_seconds),
+                    )
+                    .await?
+                }
+                Some(Report::ListTests { worker, num }) => {
+                    // todo merge params with parent params
+                    report::list_tests(
+                        abq,
+                        entity,
+                        run_id,
+                        stdout_preferences,
+                        Duration::from_secs(timeout_seconds),
+                        worker,
+                        num,
+                    )
+                    .await?
+                }
+            };
             Ok(code)
         }
         Command::Health {

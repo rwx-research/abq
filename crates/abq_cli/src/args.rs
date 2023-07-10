@@ -396,7 +396,7 @@ pub enum Command {
     Report {
         /// Run ID of the test suite for which test results should be fetched.
         /// In CI environments, this can be inferred from CI environment variables.
-        #[clap(long, required = false, env("ABQ_RUN_ID"))]
+        #[clap(long, required = false, env("ABQ_RUN_ID"), global = true)]
         run_id: Option<RunId>,
 
         /// Test result reporter to use for a test run. Options are:{n}
@@ -420,7 +420,7 @@ pub enum Command {
         /// The access token to use when fetching queue config information from the ABQ API.
         ///
         /// Cannot be used with --queue-addr (implies: not using the ABQ API).
-        #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
+        #[clap(long, required = false, env("RWX_ACCESS_TOKEN"), global = true)]
         access_token: Option<AccessToken>,
 
         /// The maximum number of seconds to wait for test results to be available.
@@ -428,20 +428,20 @@ pub enum Command {
         /// If there are active workers, `abq report` will exit immediately with an error. However,
         /// if all workers are complete, test results may still be pending before delivery to `abq
         /// report`. The command will wait up to `--timeout-seconds` before exiting with an error.
-        #[clap(long, default_value = "300")]
+        #[clap(long, default_value = "300", global = true)]
         timeout_seconds: u64,
 
         /// Address of the queue where the report will be fetched from.
         ///
         /// Cannot be used with access_token (will fetch address from ABQ API).
-        #[clap(long, required = false)]
+        #[clap(long, required = false, global = true)]
         queue_addr: Option<SocketAddr>,
 
         /// Token to authorize messages sent to the queue with.
         /// Usually, this should be the same token that `abq start` initialized with.
         ///
         /// If --access-token is specified, the token will be ignored and the token fetched from the ABQ API will be used.
-        #[clap(long, required = false)]
+        #[clap(long, required = false, global = true)]
         token: Option<UserToken>,
 
         /// If message should only be sent with TLS, the path of the TLS cert to
@@ -450,8 +450,11 @@ pub enum Command {
         /// When set, only queues configured with this TLS cert should be provided via `--queue-addr`.
         ///
         /// If --access-token is specified, the tls flag will be ignored and the setting fetched from the ABQ API will be used.
-        #[clap(long)]
+        #[clap(long, global = true)]
         tls_cert: Option<PathBuf>,
+
+        #[clap(subcommand)]
+        subcommand: Option<Report>,
     },
     /// Checks the health of an abq instance.
     ///
@@ -493,4 +496,17 @@ pub enum Token {
     /// This only generates a well-formed token; you must still pass it when instantiating
     /// `abq start` or `abq test` for it to be used.
     New,
+}
+
+#[derive(Subcommand)]
+pub enum Report {
+    ListTests {
+        /// The id of the worker to list tests for.
+        #[clap(long, required = true)]
+        worker: u32,
+
+        /// The id of the runner to list tests for.
+        #[clap(long, short = 'n', required = false, default_value = "1")]
+        num: NonZeroUsize,
+    },
 }

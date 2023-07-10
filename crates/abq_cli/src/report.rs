@@ -1,6 +1,6 @@
 //! Implements the report command.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, time::Duration};
 
 use abq_reporting::{
     output::{format_test_result_summary, ShortSummaryGrouping},
@@ -11,10 +11,10 @@ use abq_utils::{
     log_assert_stderr, net_async,
     net_protocol::{
         self,
-        entity::Entity,
+        entity::{Entity, WorkerRunner},
         queue::AssociatedTestResults,
         results::{ResultsLine, Summary},
-        runners::TestResult,
+        runners::{TestResult, TestResultSpec},
         workers::{RunId, WorkId},
     },
     retry::async_retry_n,
@@ -56,6 +56,63 @@ pub(crate) async fn report_results(
         wait_for_results(abq, entity, run_id, results_timeout).await?;
 
     process_results(&mut stdout, reporters, all_results.into_iter().flatten())
+}
+
+pub(crate) async fn list_tests(
+    abq: AbqInstance,
+    entity: Entity,
+    run_id: RunId,
+    stdout_preferences: StdoutPreferences,
+    results_timeout: Duration,
+    worker: u32,
+    runner: NonZeroUsize,
+) -> anyhow::Result<ExitCode> {
+    let all_results: Vec<Vec<ResultsLine>> =
+        wait_for_results(abq, entity, run_id, results_timeout).await?;
+
+    print_tests_for_runner(
+        &mut stdout_preferences.stdout_stream(),
+        all_results.into_iter().flatten(),
+        WorkerRunner::from((worker, runner.get() as u32)),
+    );
+
+    Ok(ExitCode::new(0))
+}
+
+fn print_tests_for_runner(
+    writer: &mut impl termcolor::WriteColor,
+    all_results: impl IntoIterator<Item = ResultsLine>,
+    worker_runner: WorkerRunner,
+) {
+    let associated_test_results = all_results
+        .into_iter()
+        .filter_map(|results_line: ResultsLine| match results_line {
+            ResultsLine::Results(results) => Some(results),
+            ResultsLine::Summary(_) => None,
+        })
+        .flatten();
+
+    let results = associated_test_results
+        .filter_map(|associated_test_results| {
+            // run number goes up for retries.
+            if associated_test_results.run_number == 1 {
+                Some(associated_test_results.results)
+            } else {
+                None
+            }
+        })
+        .flatten();
+
+    let mut results_for_worker: Vec<TestResultSpec> = results
+        .filter(|test_result| test_result.source.runner == worker_runner)
+        .map(|test_result| test_result.result)
+        .collect();
+
+    results_for_worker.sort_by_key(|result| result.timestamp); // future proofing in case results change order
+
+    results_for_worker.iter().for_each(|result| {
+        writeln!(writer, "{}", result.id).unwrap();
+    });
 }
 
 fn process_results(
@@ -329,7 +386,7 @@ mod test {
     };
     use abq_utils::net_protocol::{
         self,
-        entity::Entity,
+        entity::{Entity, WorkerRunner},
         queue::NativeRunnerInfo,
         results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
         runners::{AbqProtocolVersion, NativeRunnerSpecification, Status},
@@ -337,7 +394,7 @@ mod test {
     };
     use abq_utils::time::EpochMillis;
 
-    use super::{process_results, wait_for_results_help};
+    use super::{print_tests_for_runner, process_results, wait_for_results_help};
 
     #[tokio::test]
     async fn fetches_chunked_tests() {
@@ -938,4 +995,108 @@ mod test {
             1   a/b/x.file
     "###
     );
+
+    #[test]
+    fn test_list_tests() {
+        let work1 = wid(1);
+
+        let test1 = "test1";
+        let test2 = "test2";
+        let test3 = "test3";
+
+        const SUCCESS: Status = Status::Success;
+        const FAILURE: Status = Status::Failure {
+            exception: None,
+            backtrace: None,
+        };
+
+        let all_results = [
+            ResultsLine::Summary(Summary {
+                manifest_size_nonce: 1,
+                native_runner_info: NativeRunnerInfo {
+                    protocol_version: AbqProtocolVersion::V0_2,
+                    specification: NativeRunnerSpecification::fake(),
+                },
+            }),
+            ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                work1,
+                INIT_RUN_NUMBER,
+                [
+                    {
+                        let mut on_other_runner = TestResultBuilder::new(test1, FAILURE)
+                            .output("test 1 filtered out 1")
+                            .build();
+                        on_other_runner.source.runner = WorkerRunner::from((0, 2));
+                        on_other_runner
+                    },
+                    {
+                        let mut on_other_worker = TestResultBuilder::new(test2, FAILURE)
+                            .output("test 2 filtered out 2")
+                            .build();
+                        on_other_worker.source.runner = WorkerRunner::from((1, 1));
+                        on_other_worker
+                    },
+                    TestResultBuilder::new(test3, SUCCESS)
+                        .output("test 3 included 1")
+                        .build(),
+                ],
+            )
+            .build()]),
+            // retries are all included
+            ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                work1,
+                INIT_RUN_NUMBER + 1,
+                [
+                    TestResultBuilder::new(test1, FAILURE).output("test 1, failure 2"),
+                    TestResultBuilder::new(test2, FAILURE).output("test 2, failure 2"),
+                ],
+            )
+            .build()]),
+            ResultsLine::Results(vec![AssociatedTestResultsBuilder::new(
+                work1,
+                INIT_RUN_NUMBER + 2,
+                [
+                    TestResultBuilder::new(test1, FAILURE).output("test 1, failure 3"),
+                    TestResultBuilder::new(test2, SUCCESS).output("test 2, success"),
+                ],
+            )
+            .build()]),
+        ];
+
+        let mut buf = SharedTestColorWriter::new(vec![]);
+        print_tests_for_runner(&mut buf, all_results.clone(), WorkerRunner::from((0, 1)));
+        let snapshot = String::from_utf8(buf.get()).unwrap();
+
+        insta::assert_snapshot!(
+            snapshot,
+            @r###"
+test3
+"###
+
+        );
+
+        let mut buf = SharedTestColorWriter::new(vec![]);
+        print_tests_for_runner(&mut buf, all_results.clone(), WorkerRunner::from((0, 2)));
+        let snapshot = String::from_utf8(buf.get()).unwrap();
+
+        insta::assert_snapshot!(
+            snapshot,
+            @r###"
+test1
+"###
+
+        );
+
+        let mut buf = SharedTestColorWriter::new(vec![]);
+        print_tests_for_runner(&mut buf, all_results, WorkerRunner::from((1, 1)));
+        let snapshot = String::from_utf8(buf.get()).unwrap();
+
+        insta::assert_snapshot!(
+            snapshot,
+            @r###"
+test2
+"###
+
+        );
+    }
 }
