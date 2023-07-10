@@ -93,7 +93,15 @@ fn print_tests_for_runner(
         .flatten();
 
     let results = associated_test_results
-        .flat_map(|associated_test_results: AssociatedTestResults| associated_test_results.results);
+        .filter_map(|associated_test_results| {
+            // run number goes up for retries.
+            if associated_test_results.run_number == 1 {
+                Some(associated_test_results.results)
+            } else {
+                None
+            }
+        })
+        .flatten();
 
     let mut results_for_worker: Vec<TestResultSpec> = results
         .filter(|test_result| test_result.source.runner == worker_runner)
@@ -1063,10 +1071,6 @@ mod test {
             snapshot,
             @r###"
 test3
-test1
-test2
-test1
-test2
 "###
 
         );
