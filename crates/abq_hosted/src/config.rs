@@ -84,7 +84,7 @@ impl HostedQueueConfig {
             client
                 .get(queue_api.clone())
                 .bearer_auth(access_token)
-                .header("User-Agent", format!("abq/{}", "1.5.0"))
+                .header("User-Agent", format!("abq/{}", abq_utils::VERSION))
                 .query(&[("run_id", run_id.to_string())])
         };
         let resp: HostedQueueResponse = send_request_with_decay(build_request)

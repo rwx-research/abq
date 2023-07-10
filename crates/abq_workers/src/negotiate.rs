@@ -374,12 +374,12 @@ impl QueueNegotiatorHandle {
             version,
         } = net_protocol::read(&mut conn).map_err(|_| CouldNotConnect)?;
 
-        // if version != abq_utils::VERSION {
-        //     return Err(QueueNegotiatorHandleError::IncompatibleVersion {
-        //         local_version: abq_utils::VERSION,
-        //         remote_version: version,
-        //     });
-        // }
+        if version != abq_utils::VERSION {
+            return Err(QueueNegotiatorHandleError::IncompatibleVersion {
+                local_version: abq_utils::VERSION,
+                remote_version: version,
+            });
+        }
 
         Ok(Self(negotiator_address))
     }
