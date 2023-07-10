@@ -543,16 +543,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                     )
                     .await?
                 }
-                Some(Report::ListTests {
-                    run_id: _,
-                    worker,
-                    num,
-                    access_token: _,
-                    timeout_seconds: _,
-                    queue_addr: _,
-                    token: _,
-                    tls_cert: _,
-                }) => {
+                Some(Report::ListTests { worker, num }) => {
                     // todo merge params with parent params
                     report::list_tests(
                         abq,
