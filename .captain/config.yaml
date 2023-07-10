@@ -8,6 +8,8 @@ test-suites:
       print-summary: true
       reporters:
         github-step-summary:
+  dev-build:
+    command: cargo build --tests --bins --profile=release-unstable --all-features
   # shorthand for running clippy in dev
   dev-clippy:
     command: cargo clippy --workspace --tests --profile=release-unstable --all-features -- --deny warnings
