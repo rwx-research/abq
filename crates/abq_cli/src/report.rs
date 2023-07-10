@@ -84,7 +84,6 @@ fn print_tests_for_runner(
     all_results: impl IntoIterator<Item = ResultsLine>,
     worker_runner: WorkerRunner,
 ) {
-    // return;
     let associated_test_results = all_results
         .into_iter()
         .filter_map(|results_line: ResultsLine| match results_line {
