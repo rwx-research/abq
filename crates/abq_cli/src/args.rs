@@ -506,7 +506,7 @@ pub enum Report {
         worker: u32,
 
         /// The id of the runner to list tests for.
-        #[clap(long, short = 'n')]
+        #[clap(long, short = 'n', required = false, default_value = "1")]
         num: NonZeroUsize,
     },
 }
