@@ -1,3 +1,8 @@
+## 1.6.0
+
+ABQ 1.6.0 adds the `abq report list-tests` command, which lists the tests that were
+run on an existing test run.
+
 ## 1.5.0
 
 ABQ 1.5.0 adds new functionality for test distribution and the ability to replay
@@ -111,7 +116,7 @@ remote storage on `abq start`:
     - `ABQ_REMOTE_PERSISTENCE_COMMAND`: A comma-delimited string of the executable
       and the head arguments that should be called to perform an operation on the
       remote persistence target. The executable will be called in the following form:
-        
+
       ```
       <executable> <...arguments> <mode> <file-type> <run-id> <local-path>
       ```
