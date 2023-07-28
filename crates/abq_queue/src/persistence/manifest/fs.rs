@@ -166,22 +166,45 @@ impl FilesystemPersistor {
         let mut offloaded_run_ids = vec![];
 
         while let Some(manifest_file) = manifest_files.next_entry().await.located(here!())? {
-            let metadata = manifest_file.metadata().await.located(here!())?;
-            log_assert!(!metadata.is_dir(), path=?manifest_file.path(), "manifest file is a directory");
+            let offload_result = self
+                .wrapped_offload_one_results_file(&manifest_file, time_now, offload_config)
+                .await;
 
-            if offload_config.file_eligible_for_offload(&time_now, &metadata)? {
-                let path = manifest_file.path();
-
-                let did_offload = self.perform_offload(path, time_now, offload_config).await?;
-
-                if did_offload {
-                    let run_id = self.run_id_of_path(&manifest_file.path())?;
-                    offloaded_run_ids.push(run_id);
+            match offload_result {
+                Ok(opt_offloaded_run_id) => offloaded_run_ids.extend(opt_offloaded_run_id),
+                Err(e) => {
+                    tracing::error!(
+                        ?e,
+                        path=?manifest_file.path(),
+                        "Error offloading manifest file."
+                    );
                 }
             }
         }
 
         Ok(OffloadSummary { offloaded_run_ids })
+    }
+
+    async fn wrapped_offload_one_results_file(
+        &self,
+        results_file: &tokio::fs::DirEntry,
+        time_now: SystemTime,
+        offload_config: OffloadConfig,
+    ) -> Result<Option<RunId>> {
+        let metadata = results_file.metadata().await.located(here!())?;
+        log_assert!(!metadata.is_dir(), path=?results_file.path(), "results file is a directory");
+
+        if offload_config.file_eligible_for_offload(&time_now, &metadata)? {
+            let path = results_file.path();
+            let run_id = self.run_id_of_path(&path)?;
+            let did_offload = self.perform_offload(path, time_now, offload_config).await?;
+
+            if did_offload {
+                return Ok(Some(run_id));
+            }
+        }
+
+        Ok(None)
     }
 
     async fn perform_offload(
