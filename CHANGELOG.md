@@ -1,3 +1,8 @@
+## 1.6.1
+
+ABQ 1.6.1 is a patch release fixing an issue that would not continue offloading
+manifest and results files if one offload attempt failed.
+
 ## 1.6.0
 
 ABQ 1.6.0 adds the `abq report list-tests` command, which lists the tests that were
