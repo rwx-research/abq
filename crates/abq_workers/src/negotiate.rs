@@ -23,7 +23,7 @@ use abq_utils::{
     auth::User,
     error::{EntityfulError, ErrorEntity, ResultLocation},
     exit::ExitCode,
-    here, log_entityful_error, net, net_async,
+    here, log_entityful, net, net_async,
     net_opt::ClientOptions,
     net_protocol::{
         self,
@@ -470,7 +470,7 @@ impl QueueNegotiator {
                         match conn {
                             Ok(conn) => conn,
                             Err(e) => {
-                                tracing::error!("error accepting connection to negotiator: {:?}", e);
+                                tracing::warn!("error accepting connection to negotiator: {:?}", e);
                                 continue;
                             }
                         }
@@ -485,7 +485,8 @@ impl QueueNegotiator {
                     async move {
                         let result = Self::handle_conn(ctx, client).await;
                         if let Err(error) = result {
-                            log_entityful_error!(
+                            log_entityful!(
+                                warn,
                                 error,
                                 "error handling connection to negotiator: {:?}"
                             );

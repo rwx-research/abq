@@ -1774,7 +1774,7 @@ impl QueueServer {
                     match conn {
                         Ok((conn, _)) => HandleConn(conn),
                         Err(e) => {
-                            tracing::error!("error accepting connection to queue: {:?}", e);
+                            tracing::warn!("error accepting connection to queue: {:?}", e);
                             continue;
                         }
                     }
@@ -1793,7 +1793,7 @@ impl QueueServer {
                     tokio::spawn(async move {
                         let result = Self::handle(ctx, client).await;
                         if let Err(error) = result {
-                            log_entityful_error!(error, "error handling connection to queue: {}")
+                            log_entityful!(warn, error, "error handling connection to queue: {}")
                         }
                     });
                 }
