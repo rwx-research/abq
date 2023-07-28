@@ -119,7 +119,16 @@ pub use crate::log_entityful_error;
 
 #[macro_export]
 macro_rules! log_entityful_error {
-    ($err:expr, $($field:tt)*) => {{
+    ($err:expr, $($field:tt)*) => {
+        $crate::log_entityful!(error, $err, $($field)*);
+    };
+}
+
+pub use crate::log_entityful;
+
+#[macro_export]
+macro_rules! log_entityful {
+    ($level:ident, $err:expr, $($field:tt)*) => {{
         let $crate::error::EntityfulError {
             error:
                 $crate::error::LocatedError {
@@ -130,7 +139,7 @@ macro_rules! log_entityful_error {
         } = $err;
         match entity {
             Some(entity) => {
-                tracing::error!(
+                tracing::$level!(
                     entity_id=%entity.display_id(),
                     entity_tag=%entity.tag,
                     file,
@@ -141,7 +150,7 @@ macro_rules! log_entityful_error {
                 );
             }
             None => {
-                tracing::error!(
+                tracing::$level!(
                     entity_id="<unknown>",
                     entity_tag="<unknown>",
                     file,
