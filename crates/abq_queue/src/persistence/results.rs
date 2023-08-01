@@ -2,6 +2,8 @@
 
 mod fs;
 mod in_memory;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 pub use fs::FilesystemPersistor;
 pub use in_memory::InMemoryPersistor;
@@ -13,13 +15,28 @@ use abq_utils::{
     error::LocatedError,
     net_protocol::{
         queue::AssociatedTestResults,
-        results::{OpaqueLazyAssociatedTestResults, ResultsLine, Summary},
+        results::{ResultsLine, Summary},
         workers::RunId,
     },
 };
 use async_trait::async_trait;
 
 type Result<T> = std::result::Result<T, LocatedError>;
+
+pub type OpaqueAsyncReader<'a> = dyn tokio::io::AsyncRead + Send + Unpin + 'a;
+
+pub struct ResultsStream<'a> {
+    pub stream: Box<&'a mut OpaqueAsyncReader<'a>>,
+    pub len: usize,
+}
+
+#[async_trait]
+pub trait WithResultsStream {
+    async fn with_results_stream<'a>(
+        self: Box<Self>,
+        results_stream: ResultsStream<'a>,
+    ) -> Result<()>;
+}
 
 #[async_trait]
 pub trait PersistResults: Send + Sync {
@@ -29,8 +46,12 @@ pub trait PersistResults: Send + Sync {
     /// Dumps the persisted results to a remote, if any is configured.
     async fn dump_to_remote(&self, run_id: &RunId) -> Result<()>;
 
-    /// Load a set of test results as [OpaqueLazyAssociatedTestResults].
-    async fn get_results(&self, run_id: &RunId) -> Result<OpaqueLazyAssociatedTestResults>;
+    /// Execute a closure with access to a stream of raw bytes interpretable as [OpaqueLazyAssociatedTestResults].
+    async fn with_results_stream(
+        &self,
+        run_id: &RunId,
+        f: Box<dyn WithResultsStream + Send>,
+    ) -> Result<()>;
 
     fn boxed_clone(&self) -> Box<dyn PersistResults>;
 }
@@ -136,16 +157,21 @@ impl ResultsPersistedCell {
         }
     }
 
+    pub fn eligible_to_retrieve(&self) -> bool {
+        self.0.processing.load(atomic::ORDERING) == 0
+    }
+
     /// Attempts to retrieve a set of test results.
     /// If there are persistence jobs pending, returns [None].
-    pub async fn retrieve(
+    pub async fn retrieve_with_callback(
         &self,
         persistence: &SharedPersistResults,
-    ) -> Option<Result<OpaqueLazyAssociatedTestResults>> {
-        if self.0.processing.load(atomic::ORDERING) != 0 {
-            return None;
-        }
-        Some(persistence.0.get_results(&self.0.run_id).await)
+        callback: Box<dyn WithResultsStream + Send>,
+    ) -> Result<()> {
+        persistence
+            .0
+            .with_results_stream(&self.0.run_id, callback)
+            .await
     }
 }
 
@@ -197,20 +223,17 @@ mod test {
 
     use crate::persistence::{
         remote::{self, fake_error, PersistenceKind},
-        results::EligibleForRemoteDump,
+        results::{test_utils::retrieve_results, EligibleForRemoteDump},
     };
 
     use super::{fs::FilesystemPersistor, ResultsPersistedCell};
 
     #[tokio::test]
-    async fn retrieve_is_none_while_pending() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let persistence = FilesystemPersistor::new_shared(tempdir.path(), 1, remote::NoopPersister);
-
+    async fn not_eligible_to_retrieve_while_there_are_pending_results() {
         let cell = ResultsPersistedCell::new(RunId::unique());
         cell.0.processing.fetch_add(1, atomic::ORDERING);
 
-        assert!(cell.retrieve(&persistence).await.is_none());
+        assert!(!cell.eligible_to_retrieve());
     }
 
     #[tokio::test]
@@ -232,8 +255,8 @@ mod test {
 
         let cell = ResultsPersistedCell::new(RunId::unique());
 
-        let retrieved = cell.retrieve(&persistence).await.unwrap().unwrap();
-        let results = retrieved.decode().unwrap();
+        let results = retrieve_results(&cell, &persistence).await.unwrap();
+        let results = results.decode().unwrap();
         assert!(results.is_empty());
     }
 
@@ -265,12 +288,11 @@ mod test {
         // That's okay. But the retrieved must definitely include at least results1.
         let retrieve_task = {
             async {
-                loop {
-                    match cell.retrieve(&persistence).await {
-                        None => tokio::time::sleep(Duration::from_micros(1)).await,
-                        Some(results) => break results,
-                    }
+                while !cell.eligible_to_retrieve() {
+                    tokio::time::sleep(Duration::from_micros(1)).await;
                 }
+
+                retrieve_results(&cell, &persistence).await
             }
         };
         let persist_task = async {
@@ -283,8 +305,7 @@ mod test {
         };
         let ((), retrieve_result) = tokio::join!(persist_task, retrieve_task);
 
-        let retrieved = retrieve_result.unwrap();
-        let results = retrieved.decode().unwrap();
+        let results = retrieve_result.unwrap().decode().unwrap();
 
         use ResultsLine::Results;
         match results.len() {

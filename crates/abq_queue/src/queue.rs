@@ -28,7 +28,7 @@ use abq_utils::net_protocol::{
     queue::{InvokeWork, Message, RunStatus},
     workers::RunId,
 };
-use abq_utils::net_protocol::{meta, publicize_addr};
+use abq_utils::net_protocol::{async_write_stream, meta, publicize_addr};
 use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::vec_map::VecMap;
@@ -49,7 +49,8 @@ use crate::persistence::manifest::{
 };
 use crate::persistence::remote::{LoadedRunState, RemotePersister};
 use crate::persistence::results::{
-    EligibleForRemoteDump, ResultsPersistedCell, SharedPersistResults,
+    EligibleForRemoteDump, ResultsPersistedCell, ResultsStream, SharedPersistResults,
+    WithResultsStream,
 };
 use crate::persistence::run_state::PersistRunStatePlan;
 use crate::timeout::{FiredTimeout, RunTimeoutManager, RunTimeoutStrategy, TimeoutReason};
@@ -2243,80 +2244,49 @@ impl QueueServer {
         entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
-        let response;
-        let result;
-
         enum Response {
             One(TestResultsResponse),
             Chunk(OpaqueLazyAssociatedTestResults),
         }
-        use Response::*;
-
-        match queues.get_read_results_cell(&run_id).located(here!()) {
+        let results_cell = match queues.get_read_results_cell(&run_id).located(here!()) {
             Ok(state) => match state {
-                ReadResultsState::ReadFromCell(cell) => {
-                    // Happy path: actually attempt the retrieval. Let's see what comes up.
-                    match cell.retrieve(&persist_results).await {
-                        Some(Ok(results)) => {
-                            response = Chunk(results);
-                            result = Ok(());
-                        }
-                        None => {
-                            response = One(TestResultsResponse::Pending);
-                            result = Ok(());
-                        }
-                        Some(Err(e)) => {
-                            response = One(TestResultsResponse::Error(e.to_string()));
-                            result = Err(e.error.to_string().located(here!()));
-                        }
-                    };
-                }
+                ReadResultsState::ReadFromCell(cell) => cell,
                 ReadResultsState::OutstandingRunners(tags) => {
-                    response = One(TestResultsResponse::OutstandingRunners(tags));
-                    result = Ok(());
-                }
-            },
-            Err(e) => {
-                response = One(TestResultsResponse::Error(e.error.to_string()));
-                result = Err(e);
-            }
-        };
+                    let response = TestResultsResponse::OutstandingRunners(tags);
 
-        match response {
-            One(response) => {
-                net_protocol::async_write(&mut stream, &response)
-                    .await
-                    .located(here!())?;
-            }
-            Chunk(results) => {
-                // Split the results into chunks that will fit in individual messages over the
-                // network.
-                //
-                // Chunking is CPU-bound and typically quite fast if there are no chunks,
-                // but might eat allocations if there is indeed material chunking to do.
-                // Since this is usually run by a client after the critical section of a test run,
-                // move it to a dedicated CPU region to avoid starving the main queue responder
-                // threads.
-                let chunks = tokio::task::spawn_blocking(|| {
-                    TestResultsResponse::chunk_results(results).located(here!())
-                })
-                .await
-                .located(here!())??;
-
-                let mut iter = chunks.into_iter().peekable();
-                while let Some(chunk) = iter.next() {
-                    let response = TestResultsResponse::Results {
-                        chunk,
-                        final_chunk: iter.peek().is_none(),
-                    };
                     net_protocol::async_write(&mut stream, &response)
                         .await
                         .located(here!())?;
+
+                    return Ok(());
                 }
+            },
+            Err(e) => {
+                let response = TestResultsResponse::Error(e.error.to_string());
+
+                net_protocol::async_write(&mut stream, &response)
+                    .await
+                    .located(here!())?;
+
+                return Err(e);
             }
+        };
+
+        if !results_cell.eligible_to_retrieve() {
+            net_protocol::async_write(&mut stream, &TestResultsResponse::Pending)
+                .await
+                .located(here!())?;
+
+            return Ok(());
         }
 
-        result
+        let stream_results_callback = StreamResultsCallback {
+            client_stream: stream,
+        };
+
+        results_cell
+            .retrieve_with_callback(&persist_results, Box::new(stream_results_callback))
+            .await
     }
 
     #[instrument(level = "trace", skip(queues))]
@@ -2415,6 +2385,42 @@ impl QueueServer {
                 Ok(())
             }
         }
+    }
+}
+
+struct StreamResultsCallback {
+    client_stream: Box<dyn net_async::ServerStream>,
+}
+
+#[async_trait]
+impl WithResultsStream for StreamResultsCallback {
+    async fn with_results_stream<'a>(
+        mut self: Box<Self>,
+        results_stream: ResultsStream<'a>,
+    ) -> OpaqueResult<()> {
+        let ResultsStream {
+            stream: mut results_stream,
+            len: results_len,
+        } = results_stream;
+
+        // Indicate the client that we are about to stream all JSON lines.
+        net_protocol::async_write(
+            &mut self.client_stream,
+            &TestResultsResponse::StreamingResults,
+        )
+        .await
+        .located(here!())?;
+
+        // Stream the entire json lines.
+        async_write_stream(
+            &mut self.client_stream,
+            results_len as _,
+            &mut results_stream,
+        )
+        .await
+        .located(here!())?;
+
+        Ok(())
     }
 }
 
@@ -4580,7 +4586,7 @@ mod persist_results {
             self,
             entity::{Entity, Tag},
             queue::{AssociatedTestResults, CancelReason, TestResultsResponse, TestStrategy},
-            results::ResultsLine,
+            results::{OpaqueLazyAssociatedTestResults, ResultsLine},
             runners::TestResult,
             workers::RunId,
         },
@@ -4589,6 +4595,7 @@ mod persist_results {
 
     use crate::{
         job_queue::JobQueue,
+        persistence::results::test_utils::retrieve_results,
         persistence::{self, results::ResultsPersistedCell},
         queue::ReadResultsState,
         worker_tracking::WorkerSet,
@@ -4636,9 +4643,12 @@ mod persist_results {
         .await
         .unwrap();
 
-        let opt_retrieved = results_cell.retrieve(&results_persistence).await;
-        assert!(opt_retrieved.is_some(), "outstanding pending results");
-        let actual_results = opt_retrieved.unwrap().unwrap().decode().unwrap();
+        assert!(
+            results_cell.eligible_to_retrieve(),
+            "outstanding pending results"
+        );
+        let retrieved = retrieve_results(&results_cell, &results_persistence).await;
+        let actual_results = retrieved.unwrap().decode().unwrap();
         assert_eq!(actual_results, vec![ResultsLine::Results(results)]);
     }
 
@@ -4679,9 +4689,12 @@ mod persist_results {
         .await
         .unwrap();
 
-        let opt_retrieved = results_cell.retrieve(&results_persistence).await;
-        assert!(opt_retrieved.is_some(), "outstanding pending results");
-        let actual_results = opt_retrieved.unwrap().unwrap().decode().unwrap();
+        assert!(
+            results_cell.eligible_to_retrieve(),
+            "outstanding pending results"
+        );
+        let retrieved = retrieve_results(&results_cell, &results_persistence).await;
+        let actual_results = retrieved.unwrap().decode().unwrap();
         assert_eq!(actual_results, vec![ResultsLine::Results(results)]);
     }
 
@@ -4719,10 +4732,13 @@ mod persist_results {
 
         assert!(result.is_err());
 
-        let opt_retrieved = results_cell.retrieve(&results_persistence).await;
-        assert!(opt_retrieved.is_some(), "outstanding pending results");
         assert!(
-            opt_retrieved.unwrap().is_err(),
+            results_cell.eligible_to_retrieve(),
+            "outstanding pending results"
+        );
+        let retrieved = retrieve_results(&results_cell, &results_persistence).await;
+        assert!(
+            retrieved.is_err(),
             "cancelled run before any results has results associated"
         );
     }
@@ -4907,14 +4923,17 @@ mod persist_results {
                     };
 
                     let read_results_fut = async move {
-                        net_protocol::async_read::<_, TestResultsResponse>(&mut client_conn)
-                            .await
-                            .unwrap()
+                        let response =
+                            net_protocol::async_read::<_, TestResultsResponse>(&mut client_conn)
+                                .await
+                                .unwrap();
+                        (response, client_conn)
                     };
 
-                    let ((), response) = tokio::join!(fetch_results_fut, read_results_fut);
+                    let ((), (response, client_conn)) =
+                        tokio::join!(fetch_results_fut, read_results_fut);
 
-                    response
+                    (response, client_conn)
                 }
             }
         };
@@ -4927,12 +4946,14 @@ mod persist_results {
                 ResultsLine::Results(results1.clone()),
                 ResultsLine::Results(results2.clone()),
             ];
-            let response = get_test_results_response().await;
+            let (response, mut conn) = get_test_results_response().await;
             match response {
-                Results {
-                    chunk: results,
-                    final_chunk: true,
-                } => {
+                StreamingResults => {
+                    let mut stream = net_protocol::async_read_stream(&mut conn).await.unwrap();
+                    let results = OpaqueLazyAssociatedTestResults::read_results_lines(&mut stream)
+                        .await
+                        .unwrap();
+
                     let results = results.decode().unwrap();
                     assert_eq!(results, expected_results);
                 }
@@ -4948,7 +4969,7 @@ mod persist_results {
                 matches!(retry_manifest, RetryManifestState::FetchFromPersistence),
                 "{retry_manifest:?}"
             );
-            let response = get_test_results_response().await;
+            let (response, _conn) = get_test_results_response().await;
             match response {
                 OutstandingRunners(tags) => {
                     assert_eq!(tags, vec![Tag::runner(1, 1)]);
@@ -4985,12 +5006,14 @@ mod persist_results {
                 ResultsLine::Results(results2),
                 ResultsLine::Results(results3),
             ];
-            let response = get_test_results_response().await;
+            let (response, mut conn) = get_test_results_response().await;
             match response {
-                Results {
-                    chunk: results,
-                    final_chunk: true,
-                } => {
+                StreamingResults => {
+                    let mut stream = net_protocol::async_read_stream(&mut conn).await.unwrap();
+                    let results = OpaqueLazyAssociatedTestResults::read_results_lines(&mut stream)
+                        .await
+                        .unwrap();
+
                     let results = results.decode().unwrap();
                     assert_eq!(results, expected_results);
                 }
