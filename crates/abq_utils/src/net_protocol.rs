@@ -767,6 +767,17 @@ pub mod results {
             }
             Ok(Self(opaque_jsonl))
         }
+
+        pub fn into_jsonl_buffer(
+            lines: &[Box<serde_json::value::RawValue>],
+        ) -> OpaqueResult<Vec<u8>> {
+            let mut buffer: Vec<u8> = Vec::new();
+            for json_line in lines {
+                serde_json::to_writer(&mut buffer, json_line).located(here!())?;
+                buffer.push(b'\n');
+            }
+            Ok(buffer)
+        }
     }
 
     impl PartialEq for OpaqueLazyAssociatedTestResults {

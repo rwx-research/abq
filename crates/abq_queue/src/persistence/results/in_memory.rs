@@ -3,7 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use abq_utils::{
     error::{ErrorLocation, ResultLocation},
     here,
-    net_protocol::{results::ResultsLine, workers::RunId},
+    net_protocol::{
+        results::{OpaqueLazyAssociatedTestResults, ResultsLine},
+        workers::RunId,
+    },
 };
 use async_trait::async_trait;
 use serde_json::value::RawValue;
@@ -46,11 +49,8 @@ impl PersistResults for InMemoryPersistor {
             .get(run_id)
             .ok_or_else(|| "results not found for run ID".located(here!()))?;
 
-        let mut readable_json_lines_buffer: Vec<u8> = Vec::new();
-        for json_line in json_lines {
-            serde_json::to_writer(&mut readable_json_lines_buffer, json_line).located(here!())?;
-            readable_json_lines_buffer.push(b'\n');
-        }
+        let readable_json_lines_buffer =
+            OpaqueLazyAssociatedTestResults::into_jsonl_buffer(json_lines).unwrap();
 
         let len = readable_json_lines_buffer.len();
         let mut slice = readable_json_lines_buffer.as_slice();
