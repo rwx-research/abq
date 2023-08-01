@@ -91,6 +91,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0 # get whole history for versioning
+          ref: ${{inputs.ref}}
 
       - name: Mark safe directory
         run: |
@@ -173,7 +174,7 @@ jobs:
       - name: Sign & Notarize Release
         if: matrix.os == 'darwin'
         run: |
-          (rcodesign --version | grep "$CODESIGN_VERSION")  || cargo install apple-codesign --force --version "$CODESIGN_VERSION"
+          (rcodesign --version | grep "$CODESIGN_VERSION")  || cargo install apple-codesign --force --locked --version "$CODESIGN_VERSION"
           echo "$RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT" > rwx-developer-id-application-cert.pem
           # first we sign the binary. This happens locally.
           rcodesign sign --pem-source rwx-developer-id-application-cert.pem --code-signature-flags runtime "$RELEASE_DIR/abq"
