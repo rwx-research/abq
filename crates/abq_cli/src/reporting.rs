@@ -267,6 +267,10 @@ impl StdoutPreferences {
     pub fn stdout_stream(&self) -> impl termcolor::WriteColor {
         StandardStream::stdout(self.color)
     }
+
+    pub fn stderr_stream(&self) -> impl termcolor::WriteColor {
+        StandardStream::stderr(self.color)
+    }
 }
 
 fn reporter_from_kind(

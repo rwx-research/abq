@@ -24,7 +24,7 @@ use crate::{
     results_handler::{MultiplexingResultsHandler, QueueResultsSender},
     test_fetching,
     workers::{GetInitContext, InitContextResult, NotifyManifest, NotifyMaterialTestsAllRun},
-    AssignedRun,
+    AssignedRunKind,
 };
 
 pub struct RunnerStrategy {
@@ -49,7 +49,7 @@ pub struct RunnerStrategyGenerator {
     work_server_addr: SocketAddr,
     local_results_handler: SharedResultsHandler,
     max_run_number: u32,
-    assigned: AssignedRun,
+    assigned: AssignedRunKind,
     should_send_results: bool,
 }
 
@@ -61,7 +61,7 @@ impl RunnerStrategyGenerator {
         work_server_addr: SocketAddr,
         local_results_handler: SharedResultsHandler,
         max_run_number: u32,
-        assigned: AssignedRun,
+        assigned: AssignedRunKind,
         should_send_results: bool,
     ) -> Self {
         Self {
@@ -91,8 +91,8 @@ impl StrategyGenerator for RunnerStrategyGenerator {
         } = &self;
 
         let sourcing_strategy = match assigned {
-            AssignedRun::Fresh { .. } => test_fetching::SourcingStrategy::Fresh,
-            AssignedRun::Retry => test_fetching::SourcingStrategy::Retry,
+            AssignedRunKind::Fresh { .. } => test_fetching::SourcingStrategy::Fresh,
+            AssignedRunKind::Retry => test_fetching::SourcingStrategy::Retry,
         };
 
         let (tests_fetcher, results_retry_tracker) = test_fetching::Fetcher::new(

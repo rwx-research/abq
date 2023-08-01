@@ -38,6 +38,7 @@ s3 = [
 ]
 
 [dev-dependencies]
+abq_reporting = { path = "../abq_reporting" }
 abq_utils = { path = "../abq_utils", features = ["expose-native-protocols"] }
 abq_test_utils = { path = "../abq_test_support/abq_test_utils" }
 abq_with_protocol_version = { path = "../abq_test_support/with_protocol_version" }

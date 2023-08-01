@@ -20,6 +20,8 @@ rand.workspace = true
 rand_chacha.workspace = true
 uuid.workspace = true
 
+blake3.workspace = true
+
 thiserror.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true

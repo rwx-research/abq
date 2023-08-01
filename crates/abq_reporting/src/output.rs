@@ -425,7 +425,7 @@ fn green_bold_spec() -> ColorSpec {
 }
 
 #[inline]
-fn yellow_bold_spec() -> ColorSpec {
+pub fn yellow_bold_spec() -> ColorSpec {
     let mut spec = ColorSpec::new();
     spec.set_fg(Some(Color::Yellow)).set_bold(true);
     spec

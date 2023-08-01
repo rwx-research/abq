@@ -20,6 +20,7 @@ use abq_queue::{
     queue::{Abq, QueueConfig},
     RunTimeoutStrategy, TimeoutReason,
 };
+use abq_reporting::writer::NoopColorWriter;
 use abq_test_utils::{artifacts_dir, assert_scoped_log, s};
 use abq_utils::{
     auth::{ClientAuthStrategy, User},
@@ -271,6 +272,7 @@ impl WorkersConfigBuilder {
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
             should_send_results: true,
+            warning_writer: Box::new(NoopColorWriter),
         };
         Self {
             config,
@@ -494,6 +496,7 @@ fn action_to_fut(
                 run_id,
                 batch_size_hint: one_nonzero(),
                 test_strategy,
+                test_command_hash: config.runner_kind.command_hash(),
             };
 
             let config = WorkersConfig {

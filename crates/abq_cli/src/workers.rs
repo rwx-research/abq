@@ -85,7 +85,10 @@ pub async fn start_workers_standalone(
         run_id: run_id.clone(),
         batch_size_hint: batch_size,
         test_strategy,
+        test_command_hash: runner_kind.command_hash(),
     };
+
+    let stderr_writer = Box::new(stdout_preferences.stderr_stream());
 
     let mut worker_pool = WorkersNegotiator::negotiate_and_start_pool(
         WorkersConfig {
@@ -101,6 +104,7 @@ pub async fn start_workers_standalone(
             results_batch_size_hint: batch_size.get(),
             max_run_number,
             should_send_results: execution_mode == ExecutionMode::WriteNormal,
+            warning_writer: stderr_writer,
         },
         queue_negotiator,
         client_opts,

@@ -7,6 +7,7 @@ use abq_utils::{
     error::OpaqueResult,
     exit::ExitCode,
     net_protocol::{entity::Entity, runners::MetadataMap, workers::RunId},
+    test_command_hash::TestCommandHash,
 };
 use serde_derive::{Deserialize, Serialize};
 use thiserror::Error;
@@ -27,6 +28,9 @@ pub struct RunState {
     pub new_worker_exit_code: ExitCode,
     pub init_metadata: MetadataMap,
     pub seen_workers: Vec<Entity>,
+    /// NB: Optional because this did not exist prior to ABQ 1.6.2.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_command_hash: Option<TestCommandHash>,
 }
 
 impl RunState {
@@ -36,6 +40,7 @@ impl RunState {
             new_worker_exit_code: ExitCode::SUCCESS,
             init_metadata: MetadataMap::new(),
             seen_workers: Vec::new(),
+            test_command_hash: Some(TestCommandHash::random()),
         }
     }
 }
@@ -135,6 +140,7 @@ mod test {
             new_worker_exit_code: ExitCode::SUCCESS,
             init_metadata: MetadataMap::new(),
             seen_workers: vec![],
+            test_command_hash: Some(TestCommandHash::from_command("yarn", &["jest".to_owned()])),
         };
         let serialized = SerializableRunState::new(run_state.clone());
         let serialized_bytes = serialized.serialize().unwrap();
@@ -146,7 +152,41 @@ mod test {
           "schema_version": 1,
           "new_worker_exit_code": 0,
           "init_metadata": {},
-          "seen_workers": []
+          "seen_workers": [],
+          "test_command_hash": [
+            115,
+            226,
+            225,
+            160,
+            14,
+            172,
+            165,
+            205,
+            140,
+            100,
+            188,
+            76,
+            56,
+            80,
+            143,
+            200,
+            177,
+            239,
+            232,
+            249,
+            38,
+            80,
+            127,
+            129,
+            4,
+            157,
+            230,
+            41,
+            123,
+            72,
+            130,
+            80
+          ]
         }
         "###);
     }
@@ -171,11 +211,36 @@ mod test {
     }
 
     #[test]
+    fn test_deserialize_missing_test_command_hash() {
+        let serialized = r###"
+        {
+          "schema_version": 1,
+          "new_worker_exit_code": 0,
+          "init_metadata": {},
+          "seen_workers": []
+        }
+        "###;
+        let result = SerializableRunState::deserialize(serialized.as_bytes()).unwrap();
+        let result = result.into_run_state();
+
+        assert_eq!(
+            result,
+            RunState {
+                new_worker_exit_code: ExitCode::SUCCESS,
+                init_metadata: MetadataMap::new(),
+                seen_workers: vec![],
+                test_command_hash: None,
+            }
+        );
+    }
+
+    #[test]
     fn test_deserialize_compatible_schema_but_different_version() {
         let run_state = RunState {
             new_worker_exit_code: ExitCode::SUCCESS,
             init_metadata: MetadataMap::new(),
             seen_workers: vec![],
+            test_command_hash: Some(TestCommandHash::random()),
         };
         let serialized = SerializableRunState(SerializedRunStateInner {
             schema_version: SchemaVersion {

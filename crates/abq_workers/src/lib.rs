@@ -9,4 +9,4 @@ pub mod workers;
 
 pub use abq_generic_test_runner::DEFAULT_PROTOCOL_VERSION_TIMEOUT;
 pub use abq_generic_test_runner::DEFAULT_RUNNER_TEST_TIMEOUT;
-pub use assigned_run::{AssignedRun, AssignedRunStatus, GetAssignedRun};
+pub use assigned_run::{AssignedRun, AssignedRunKind, AssignedRunStatus, GetAssignedRun};
