@@ -1611,4 +1611,24 @@ mod test {
         assert_eq!(num_read, msg.len());
         assert_eq!(msg, output_buffer);
     }
+
+    #[tokio::test]
+    async fn read_steam_only_given_length() {
+        let mut read_buffer = vec![];
+        // message size
+        read_buffer.extend_from_slice(&i32::to_be_bytes(2));
+        // message + cdef
+        read_buffer.extend_from_slice(b"abcdef");
+
+        let mut write_buffer = vec![];
+
+        super::async_read_stream(&mut read_buffer.as_slice())
+            .await
+            .unwrap()
+            .read_to_end(&mut write_buffer)
+            .await
+            .unwrap();
+
+        assert_eq!(write_buffer, b"ab");
+    }
 }
