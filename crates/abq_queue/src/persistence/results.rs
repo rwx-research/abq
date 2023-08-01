@@ -157,7 +157,7 @@ impl ResultsPersistedCell {
         }
     }
 
-    pub fn eligible_to_retreive(&self) -> bool {
+    pub fn eligible_to_retrieve(&self) -> bool {
         self.0.processing.load(atomic::ORDERING) == 0
     }
 
@@ -233,7 +233,7 @@ mod test {
         let cell = ResultsPersistedCell::new(RunId::unique());
         cell.0.processing.fetch_add(1, atomic::ORDERING);
 
-        assert!(!cell.eligible_to_retreive());
+        assert!(!cell.eligible_to_retrieve());
     }
 
     #[tokio::test]
@@ -288,7 +288,7 @@ mod test {
         // That's okay. But the retrieved must definitely include at least results1.
         let retrieve_task = {
             async {
-                while !cell.eligible_to_retreive() {
+                while !cell.eligible_to_retrieve() {
                     tokio::time::sleep(Duration::from_micros(1)).await;
                 }
 

@@ -2272,7 +2272,7 @@ impl QueueServer {
             }
         };
 
-        if !results_cell.eligible_to_retreive() {
+        if !results_cell.eligible_to_retrieve() {
             net_protocol::async_write(&mut stream, &TestResultsResponse::Pending)
                 .await
                 .located(here!())?;
@@ -4644,7 +4644,7 @@ mod persist_results {
         .unwrap();
 
         assert!(
-            results_cell.eligible_to_retreive(),
+            results_cell.eligible_to_retrieve(),
             "outstanding pending results"
         );
         let retrieved = retrieve_results(&results_cell, &results_persistence).await;
@@ -4690,7 +4690,7 @@ mod persist_results {
         .unwrap();
 
         assert!(
-            results_cell.eligible_to_retreive(),
+            results_cell.eligible_to_retrieve(),
             "outstanding pending results"
         );
         let retrieved = retrieve_results(&results_cell, &results_persistence).await;
@@ -4733,7 +4733,7 @@ mod persist_results {
         assert!(result.is_err());
 
         assert!(
-            results_cell.eligible_to_retreive(),
+            results_cell.eligible_to_retrieve(),
             "outstanding pending results"
         );
         let retrieved = retrieve_results(&results_cell, &results_persistence).await;
