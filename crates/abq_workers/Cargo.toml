@@ -5,6 +5,7 @@ version = "0.1.0"
 
 [dependencies]
 abq_generic_test_runner = { path = "../abq_runners/generic_test_runner" }
+abq_reporting = { path = "../abq_reporting" }
 abq_utils = { path = "../abq_utils" }
 
 thiserror.workspace = true

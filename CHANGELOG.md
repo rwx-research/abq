@@ -1,7 +1,14 @@
 ## 1.6.2
 
-ABQ 1.6.2 is a patch release fixing an issue that could result in
-denial-of-service of an ABQ queue due to large test results.
+ABQ 1.6.2 is a patch release.
+
+An issue that could result in denial-of-service of an ABQ queue due to large
+test results is fixed.
+
+ABQ will now log a warning when a worker for a given run ID is using a test
+command different from any other worker, either in the same run or during
+retries. ABQ may not function properly if the test command for a run ID changes
+between workers executing tests for that run ID.
 
 ## 1.6.1
 

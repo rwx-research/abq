@@ -4649,3 +4649,89 @@ fn test_run_with_pat_and_run_id_that_doesnt_exist() {
 
     term(queue_proc);
 }
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn warn_on_different_runner_command() {
+    let name = "warn_on_different_runner_command";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let (queue_proc, queue_addr) = setup_queue!(name, conf);
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let manifest = vec![TestOrGroup::test(Test::new(
+        proto,
+        "test1".to_string(),
+        [],
+        Default::default(),
+    ))];
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                // Read first test, write okay
+                OpaqueRead,
+                OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+            ],
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let packed = pack_msgs_to_disk(simulation);
+
+    let test_args = |instance: usize| {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = packed.path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker=0"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        // Add a fake argument to differentiate the two runs.
+        args.push("--fake-instance-arg".to_string());
+        args.push(instance.to_string());
+        args
+    };
+
+    let instance1 = Abq::new(format!("{name}_inst1")).args(test_args(0)).run();
+
+    assert!(instance1.exit_status.success());
+
+    let instance2 = Abq::new(format!("{name}_inst2")).args(test_args(1)).run();
+
+    assert!(instance2.exit_status.success());
+
+    let stdout = instance2.stdout;
+    let stderr = instance2.stderr;
+
+    assert!(
+        stderr.contains("WARNING: The passed test command differs from the one used by other ABQ workers for this run ID."),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    term(queue_proc);
+}

@@ -30,11 +30,12 @@ use abq_utils::net_protocol::{
 };
 use abq_utils::net_protocol::{async_write_stream, meta, publicize_addr};
 use abq_utils::server_shutdown::{ShutdownManager, ShutdownReceiver};
+use abq_utils::test_command_hash::TestCommandHash;
 use abq_utils::tls::ServerTlsStrategy;
 use abq_utils::vec_map::VecMap;
 use abq_utils::{atomic, illegal_state, log_assert};
 use abq_workers::negotiate::{QueueNegotiator, QueueNegotiatorHandle, QueueNegotiatorServerError};
-use abq_workers::{AssignedRun, AssignedRunStatus, GetAssignedRun};
+use abq_workers::{AssignedRun, AssignedRunKind, AssignedRunStatus, GetAssignedRun};
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
@@ -71,6 +72,11 @@ enum RunState {
 
         /// Strategy for pulling tests off the queue
         test_strategy: TestStrategy,
+
+        /// Hash of the native test runner command for this run.
+        ///
+        /// Used for validation purposes, as we expect all runners to be using the same command.
+        test_command_hash: TestCommandHash,
     },
     /// The active state of the test suite run. The queue is populated and at least one worker is
     /// connected.
@@ -90,6 +96,11 @@ enum RunState {
 
         /// A tracker of what results have been persisted.
         results_persistence: ResultsPersistedCell,
+
+        /// Hash of the native test runner command for this run.
+        ///
+        /// Used for validation purposes, as we expect all runners to be using the same command.
+        test_command_hash: TestCommandHash,
     },
     /// All items in the manifest have been handed out.
     /// Workers may still be executing locally, for example in-band retries.
@@ -110,6 +121,11 @@ enum RunState {
 
         /// A tracker of what results have been persisted.
         results_persistence: ResultsPersistence,
+
+        /// Hash of the native test runner command for this run.
+        ///
+        /// Used for validation purposes, as we expect all runners to be using the same command.
+        test_command_hash: Option<TestCommandHash>,
     },
     Cancelled {
         #[allow(unused)] // yet
@@ -311,22 +327,22 @@ enum ManifestProgressResult {
     NewProgress { newly_observed_test_index: usize },
 }
 
+#[derive(Clone, Copy)]
+struct RunParams<'a> {
+    run_id: &'a RunId,
+    batch_size_hint: NonZeroUsize,
+    test_strategy: TestStrategy,
+    runner_test_command_hash: TestCommandHash,
+    entity: Entity,
+    remote: &'a RemotePersister,
+}
+
 impl AllRuns {
     /// Finds a queue for a run, or creates a new one if the run is observed as fresh.
     /// If the given run ID already has an associated queue, an error is returned.
-    pub async fn find_or_create_run(
-        &self,
-        run_id: &RunId,
-        batch_size_hint: NonZeroUsize,
-        test_strategy: TestStrategy,
-        entity: Entity,
-        remote: &RemotePersister,
-    ) -> AssignedRunStatus {
-        if !self.runs.read().contains_key(run_id) {
-            match self
-                .try_create_run(run_id, batch_size_hint, test_strategy, entity, remote)
-                .await
-            {
+    pub async fn find_or_create_run(&self, params: RunParams<'_>) -> AssignedRunStatus {
+        if !self.runs.read().contains_key(params.run_id) {
+            match self.try_create_run(params).await {
                 ControlFlow::Break(assigned) => return assigned,
                 ControlFlow::Continue(()) => {
                     // Pass through, the run was not actually fresh and is now
@@ -335,8 +351,15 @@ impl AllRuns {
             }
         }
 
+        let RunParams {
+            run_id,
+            entity,
+            runner_test_command_hash,
+            ..
+        } = params;
+
         let runs = self.runs.read();
-        let run = match runs.get(run_id) {
+        let run = match runs.get(params.run_id) {
             Some(st) => st.read(),
             None => {
                 illegal_state!(
@@ -352,6 +375,7 @@ impl AllRuns {
                 worker_connection_times,
                 batch_size_hint: _,
                 test_strategy: _,
+                test_command_hash,
             } => {
                 let mut worker_connection_times = worker_connection_times.lock();
                 let old = worker_connection_times.insert_by_tag(entity, time::Instant::now());
@@ -361,19 +385,40 @@ impl AllRuns {
                     "same worker connecting twice for manifest"
                 );
 
-                AssignedRunStatus::Run(AssignedRun::Fresh {
-                    should_generate_manifest: false,
+                let runner_test_command_differs = test_command_hash != &runner_test_command_hash;
+                if runner_test_command_differs {
+                    log_runner_test_command_differs(run_id, entity, IsRetry(false));
+                }
+
+                AssignedRunStatus::Run(AssignedRun {
+                    kind: AssignedRunKind::Fresh {
+                        should_generate_manifest: false,
+                    },
+                    runner_test_command_differs,
                 })
             }
-            RunState::HasWork { active_workers, .. } => {
+            RunState::HasWork {
+                active_workers,
+                test_command_hash,
+                ..
+            } => {
                 let mut active_workers = active_workers.lock();
                 let old_active_worker_info = active_workers.insert_by_tag(entity, None);
+
+                let runner_test_command_differs = test_command_hash != &runner_test_command_hash;
+                if runner_test_command_differs {
+                    let is_retry = old_active_worker_info.is_some();
+                    log_runner_test_command_differs(run_id, entity, IsRetry(is_retry));
+                }
 
                 match old_active_worker_info {
                     None => {
                         // This is a fresh worker.
-                        AssignedRunStatus::Run(AssignedRun::Fresh {
-                            should_generate_manifest: false,
+                        AssignedRunStatus::Run(AssignedRun {
+                            kind: AssignedRunKind::Fresh {
+                                should_generate_manifest: false,
+                            },
+                            runner_test_command_differs,
                         })
                     }
                     Some((old_entity, old_finished_state)) => {
@@ -412,13 +457,17 @@ impl AllRuns {
                             "worker reconnecting for out-of-process retry manifest during active run"
                         );
 
-                        AssignedRunStatus::Run(AssignedRun::Retry)
+                        AssignedRunStatus::Run(AssignedRun {
+                            kind: AssignedRunKind::Retry,
+                            runner_test_command_differs,
+                        })
                     }
                 }
             }
             RunState::InitialManifestDone {
                 new_worker_exit_code,
                 seen_workers,
+                test_command_hash,
                 ..
             } => {
                 if seen_workers.read().contains_by_tag(&entity) {
@@ -429,7 +478,18 @@ impl AllRuns {
                         ?entity,
                         "worker reconnecting for out-of-process retry manifest after initial run"
                     );
-                    AssignedRunStatus::Run(AssignedRun::Retry)
+
+                    let runner_test_command_differs = test_command_hash
+                        .map(|hash| hash != runner_test_command_hash)
+                        .unwrap_or(false);
+                    if runner_test_command_differs {
+                        log_runner_test_command_differs(run_id, entity, IsRetry(true));
+                    }
+
+                    AssignedRunStatus::Run(AssignedRun {
+                        kind: AssignedRunKind::Retry,
+                        runner_test_command_differs,
+                    })
                 } else {
                     let exit_code = *new_worker_exit_code;
                     tracing::info!(
@@ -455,14 +515,16 @@ impl AllRuns {
     /// Otherwise, returning [ControlFlow::Continue] should fall back to loading the run from the
     /// queue state.
     #[inline]
-    async fn try_create_run(
-        &self,
-        run_id: &RunId,
-        batch_size_hint: NonZeroUsize,
-        test_strategy: TestStrategy,
-        entity: Entity,
-        remote: &RemotePersister,
-    ) -> ControlFlow<AssignedRunStatus> {
+    async fn try_create_run(&self, params: RunParams<'_>) -> ControlFlow<AssignedRunStatus> {
+        let RunParams {
+            run_id,
+            batch_size_hint,
+            test_strategy,
+            runner_test_command_hash,
+            entity,
+            remote,
+        } = params;
+
         let result = async move {
             match remote.try_load_run_state(run_id).await? {
                 LoadedRunState::Found(run_state) => {
@@ -475,6 +537,7 @@ impl AllRuns {
                         batch_size_hint,
                         test_strategy,
                         entity,
+                        runner_test_command_hash,
                     ))
                 }
                 LoadedRunState::IncompatibleSchemaVersion { found, expected } => {
@@ -489,6 +552,7 @@ impl AllRuns {
                         batch_size_hint,
                         test_strategy,
                         entity,
+                        runner_test_command_hash,
                     ))
                 }
             }
@@ -517,6 +581,7 @@ impl AllRuns {
         batch_size_hint: NonZeroUsize,
         test_strategy: TestStrategy,
         entity: Entity,
+        test_command_hash: TestCommandHash,
     ) -> ControlFlow<AssignedRunStatus> {
         let run = {
             let mut worker_timings = WorkerSet::default();
@@ -528,6 +593,7 @@ impl AllRuns {
                     worker_connection_times: Mutex::new(worker_timings),
                     batch_size_hint,
                     test_strategy,
+                    test_command_hash,
                 },
             }
         };
@@ -548,8 +614,11 @@ impl AllRuns {
 
             tracing::info!(?run_id, ?entity, "created fresh run");
 
-            ControlFlow::Break(AssignedRunStatus::Run(AssignedRun::Fresh {
-                should_generate_manifest: true,
+            ControlFlow::Break(AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Fresh {
+                    should_generate_manifest: true,
+                },
+                runner_test_command_differs: false,
             }))
         } else {
             ControlFlow::Continue(())
@@ -566,6 +635,7 @@ impl AllRuns {
             new_worker_exit_code,
             init_metadata,
             seen_workers,
+            test_command_hash,
         } = run_state;
 
         // No worker is currently active, as this is the first time we're seeing them on this
@@ -587,6 +657,7 @@ impl AllRuns {
                 results_persistence: ResultsPersistence::Persisted(ResultsPersistedCell::new(
                     run_id.clone(),
                 )),
+                test_command_hash,
             },
         };
 
@@ -622,28 +693,35 @@ impl AllRuns {
 
         let mut run = runs.get(run_id).expect("no run recorded").write();
 
-        let (worker_connection_times, batch_size_hint, test_strategy) = match &mut run.state {
-            RunState::WaitingForManifest {
-                worker_connection_times,
-                batch_size_hint,
-                test_strategy,
-            } => {
-                // expected state, pass through
-                let timings = Mutex::into_inner(std::mem::take(worker_connection_times));
-                (timings, *batch_size_hint, *test_strategy)
-            }
-            RunState::Cancelled { .. } => {
-                // If cancelled, do nothing.
-                return AddedManifest::RunCancelled;
-            }
-            RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
-                illegal_state!(
-                    "can only provide manifest while waiting for manifest",
-                    ?run_id
-                );
-                return AddedManifest::RunCancelled;
-            }
-        };
+        let (worker_connection_times, batch_size_hint, test_strategy, test_command_hash) =
+            match &mut run.state {
+                RunState::WaitingForManifest {
+                    worker_connection_times,
+                    batch_size_hint,
+                    test_strategy,
+                    test_command_hash,
+                } => {
+                    // expected state, pass through
+                    let timings = Mutex::into_inner(std::mem::take(worker_connection_times));
+                    (
+                        timings,
+                        *batch_size_hint,
+                        *test_strategy,
+                        *test_command_hash,
+                    )
+                }
+                RunState::Cancelled { .. } => {
+                    // If cancelled, do nothing.
+                    return AddedManifest::RunCancelled;
+                }
+                RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
+                    illegal_state!(
+                        "can only provide manifest while waiting for manifest",
+                        ?run_id
+                    );
+                    return AddedManifest::RunCancelled;
+                }
+            };
 
         let manifest_size_nonce = flat_manifest.len() as u64;
         let work_from_manifest = flat_manifest.into_iter().map(|(spec, group_id)| {
@@ -673,6 +751,7 @@ impl AllRuns {
             init_metadata,
             active_workers: Mutex::new(active_workers),
             results_persistence: results_persistence.clone(),
+            test_command_hash,
         };
 
         AddedManifest::Added {
@@ -1050,12 +1129,14 @@ impl AllRuns {
         let queue;
         let init_metadata;
         let results_persistence;
+        let test_command_hash;
         match &mut run.state {
             RunState::HasWork {
                 queue: this_queue,
                 active_workers: this_active_workers,
                 init_metadata: this_init_metadata,
                 results_persistence: this_results_persistence,
+                test_command_hash: this_test_command_hash,
                 ..
             } => {
                 log_assert!(
@@ -1066,6 +1147,7 @@ impl AllRuns {
                 queue = std::mem::take(this_queue);
                 init_metadata = std::mem::take(this_init_metadata);
                 results_persistence = this_results_persistence.clone();
+                test_command_hash = *this_test_command_hash;
             }
             RunState::Cancelled { .. } => {
                 // Cancellation always takes priority over completeness.
@@ -1106,6 +1188,7 @@ impl AllRuns {
                 new_worker_exit_code,
                 init_metadata: init_metadata.clone(),
                 seen_workers: seen_workers.iter().map(|(worker, _)| *worker).collect(),
+                test_command_hash: Some(test_command_hash),
             },
         );
 
@@ -1115,6 +1198,7 @@ impl AllRuns {
             seen_workers: RwLock::new(seen_workers),
             manifest_persistence: ManifestPersistence::Persisted(manifest_persisted),
             results_persistence: ResultsPersistence::Persisted(results_persistence),
+            test_command_hash: Some(test_command_hash),
         };
 
         // NB: Always sub last for conversative estimation.
@@ -1131,9 +1215,12 @@ impl AllRuns {
 
         let mut run = runs.get(&run_id).expect("no run recorded").write();
 
-        match run.state {
-            RunState::WaitingForManifest { .. } => {
+        let test_command_hash = match run.state {
+            RunState::WaitingForManifest {
+                test_command_hash, ..
+            } => {
                 // okay
+                test_command_hash
             }
             RunState::Cancelled { .. } => {
                 // No-op, since the run was already cancelled.
@@ -1146,7 +1233,7 @@ impl AllRuns {
                 );
                 return;
             }
-        }
+        };
 
         run.state = RunState::InitialManifestDone {
             new_worker_exit_code: ExitCode::FAILURE,
@@ -1154,6 +1241,7 @@ impl AllRuns {
             seen_workers: Default::default(),
             manifest_persistence: ManifestPersistence::ManifestNeverReceived,
             results_persistence: ResultsPersistence::ManifestNeverReceived,
+            test_command_hash: Some(test_command_hash),
         };
 
         // NB: Always sub last for conversative estimation.
@@ -1166,9 +1254,12 @@ impl AllRuns {
 
         let mut run = runs.get(&run_id).expect("no run recorded").write();
 
-        match run.state {
-            RunState::WaitingForManifest { .. } => {
+        let test_command_hash = match run.state {
+            RunState::WaitingForManifest {
+                test_command_hash, ..
+            } => {
                 // okay
+                test_command_hash
             }
             RunState::Cancelled { .. } => {
                 // No-op, since the run was already cancelled.
@@ -1181,7 +1272,7 @@ impl AllRuns {
                 );
                 return RecordedEmptyManifest::RunCancelled;
             }
-        }
+        };
 
         let results_persistence = ResultsPersistedCell::new(run_id);
 
@@ -1192,6 +1283,7 @@ impl AllRuns {
             seen_workers: Default::default(),
             manifest_persistence: ManifestPersistence::EmptyManifest,
             results_persistence: ResultsPersistence::Persisted(results_persistence.clone()),
+            test_command_hash: Some(test_command_hash),
         };
 
         // NB: Always sub last for conversative estimation.
@@ -1379,6 +1471,17 @@ impl AllRuns {
         let mut runs = self.runs.write();
         runs.insert(run_id, RwLock::new(Run { state }))
     }
+}
+
+struct IsRetry(bool);
+
+fn log_runner_test_command_differs(run_id: &RunId, runner_entity: Entity, is_retry: IsRetry) {
+    tracing::warn!(
+        ?run_id,
+        entity=?runner_entity,
+        is_retry=is_retry.0,
+        "Runner has mismatched test command for run",
+    );
 }
 
 pub struct Abq {
@@ -1656,6 +1759,7 @@ impl GetAssignedRun for ChooseRunForWorker {
             run_id,
             batch_size_hint,
             test_strategy,
+            test_command_hash,
         } = invoke_work;
 
         let batch_size_hint =
@@ -1670,13 +1774,14 @@ impl GetAssignedRun for ChooseRunForWorker {
 
         let assigned_run = self
             .queues
-            .find_or_create_run(
+            .find_or_create_run(RunParams {
                 run_id,
                 batch_size_hint,
-                *test_strategy,
+                test_strategy: *test_strategy,
+                runner_test_command_hash: *test_command_hash,
                 entity,
-                &self.remote,
-            )
+                remote: &self.remote,
+            })
             .await;
 
         // Now that we've found a run for this ID, if the run is fresh, enqueue a job to check
@@ -2735,21 +2840,10 @@ async fn fetch_persisted_manifest(
 }
 
 #[cfg(test)]
-use abq_utils::net_protocol::runners::ProtocolWitness;
-
-#[cfg(test)]
-fn fake_test_spec(proto: ProtocolWitness) -> TestSpec {
-    use abq_utils::net_protocol::{runners::TestCase, workers::WorkId};
-
-    TestSpec {
-        test_case: TestCase::new(proto, "fake-test", Default::default()),
-        work_id: WorkId::new(),
-    }
-}
+mod test_utils;
 
 #[cfg(test)]
 mod test {
-    use abq_utils::net_protocol::queue::TestStrategy;
     use std::{io, time::Instant};
 
     use crate::{
@@ -2760,15 +2854,15 @@ mod test {
             run_state,
         },
         queue::{
-            AddedManifest, CancelReason, ManifestProgressCancelReason, ManifestProgressResult,
-            PulledTestsStatus, QueueServer, RunStatus, SharedRuns, WorkScheduler,
+            test_utils::RunParamsBuilder, AddedManifest, CancelReason,
+            ManifestProgressCancelReason, ManifestProgressResult, PulledTestsStatus, QueueServer,
+            RunStatus, SharedRuns, WorkScheduler,
         },
         timeout::RunTimeoutManager,
     };
     use abq_run_n_times::n_times;
     use abq_test_utils::{
-        accept_handshake, assert_scoped_log, build_fake_connection, build_random_strategies,
-        one_nonzero_usize, spec,
+        accept_handshake, assert_scoped_log, build_fake_connection, build_random_strategies, spec,
     };
     use abq_utils::{
         auth::{build_strategies, AdminToken, ClientAuthStrategy, ServerAuthStrategy, UserToken},
@@ -2788,10 +2882,11 @@ mod test {
             workers::{RunId, WorkId},
         },
         server_shutdown::ShutdownManager,
+        test_command_hash::TestCommandHash,
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;
-    use abq_workers::{AssignedRun, AssignedRunStatus};
+    use abq_workers::{AssignedRun, AssignedRunKind, AssignedRunStatus};
     use futures::FutureExt;
     use tracing_test::traced_test;
 
@@ -3112,11 +3207,7 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote::NoopPersister::new().into(),
+                RunParamsBuilder::new(&run_id, &remote::NoopPersister::new().into()).build(),
             )
             .await;
 
@@ -3132,11 +3223,7 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote::NoopPersister::new().into(),
+                RunParamsBuilder::new(&run_id, &remote::NoopPersister::new().into()).build(),
             )
             .await;
         let added = queues.add_manifest(&run_id, vec![], Default::default());
@@ -3154,11 +3241,7 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote::NoopPersister::new().into(),
+                RunParamsBuilder::new(&run_id, &remote::NoopPersister::new().into()).build(),
             )
             .await;
         let added = queues.add_manifest(&run_id, vec![], Default::default());
@@ -3182,11 +3265,7 @@ mod test {
         for run_id in [&run_id1, &run_id2, &run_id3, &run_id4] {
             let _ = queues
                 .find_or_create_run(
-                    run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    Entity::runner(0, 1),
-                    &remote::NoopPersister::new().into(),
+                    RunParamsBuilder::new(run_id, &remote::NoopPersister::new().into()).build(),
                 )
                 .await;
         }
@@ -3212,11 +3291,9 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote::NoopPersister::new().into(),
+                RunParamsBuilder::new(&run_id, &remote::NoopPersister::new().into())
+                    .entity(Entity::runner(0, 1))
+                    .build(),
             )
             .await;
 
@@ -3241,11 +3318,9 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(Entity::runner(0, 1))
+                    .build(),
             )
             .await;
         let _ = queues.add_manifest(&run_id, vec![], Default::default());
@@ -3272,11 +3347,9 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(Entity::runner(0, 1))
+                    .build(),
             )
             .await;
 
@@ -3307,21 +3380,25 @@ mod test {
 
         let remote = remote::NoopPersister::new().into();
 
+        let test_command_hash = TestCommandHash::random();
+
         // worker0 creates run
         {
             let assigned_lookup = queues
                 .find_or_create_run(
-                    &run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    worker0,
-                    &remote,
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(worker0)
+                        .runner_test_command_hash(test_command_hash)
+                        .build(),
                 )
                 .await;
             assert_eq!(
                 assigned_lookup,
-                AssignedRunStatus::Run(AssignedRun::Fresh {
-                    should_generate_manifest: true
+                AssignedRunStatus::Run(AssignedRun {
+                    kind: AssignedRunKind::Fresh {
+                        should_generate_manifest: true
+                    },
+                    runner_test_command_differs: false
                 })
             );
             assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
@@ -3332,17 +3409,19 @@ mod test {
         {
             let assigned_lookup = queues
                 .find_or_create_run(
-                    &run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    worker1,
-                    &remote,
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(worker1)
+                        .runner_test_command_hash(test_command_hash)
+                        .build(),
                 )
                 .await;
             assert_eq!(
                 assigned_lookup,
-                AssignedRunStatus::Run(AssignedRun::Fresh {
-                    should_generate_manifest: false
+                AssignedRunStatus::Run(AssignedRun {
+                    kind: AssignedRunKind::Fresh {
+                        should_generate_manifest: false
+                    },
+                    runner_test_command_differs: false
                 })
             );
             assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
@@ -3361,17 +3440,19 @@ mod test {
         {
             let assigned_lookup = queues
                 .find_or_create_run(
-                    &run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    worker2,
-                    &remote,
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(worker2)
+                        .runner_test_command_hash(test_command_hash)
+                        .build(),
                 )
                 .await;
             assert_eq!(
                 assigned_lookup,
-                AssignedRunStatus::Run(AssignedRun::Fresh {
-                    should_generate_manifest: false
+                AssignedRunStatus::Run(AssignedRun {
+                    kind: AssignedRunKind::Fresh {
+                        should_generate_manifest: false
+                    },
+                    runner_test_command_differs: false
                 })
             );
             assert_eq!(queues.get_run_status(&run_id), Some(RunStatus::Active));
@@ -3446,11 +3527,9 @@ mod test {
             let queues = SharedRuns::default();
             let _ = queues
                 .find_or_create_run(
-                    &run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    Entity::runner(0, 1),
-                    &remote,
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(Entity::runner(0, 1))
+                        .build(),
                 )
                 .await;
             queues
@@ -3532,11 +3611,9 @@ mod test {
             let queues = SharedRuns::default();
             let _ = queues
                 .find_or_create_run(
-                    &run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    Entity::runner(0, 1),
-                    &remote,
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(Entity::runner(0, 1))
+                        .build(),
                 )
                 .await;
             queues
@@ -3616,11 +3693,9 @@ mod test {
             let queues = SharedRuns::default();
             let _ = queues
                 .find_or_create_run(
-                    &run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    Entity::runner(0, 1),
-                    &remote,
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(Entity::runner(0, 1))
+                        .build(),
                 )
                 .await;
             let added = queues.add_manifest(&run_id, vec![], Default::default());
@@ -3665,13 +3740,7 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
 
         let result = queues.handle_manifest_progress_timeout(&run_id, 0);
@@ -3692,13 +3761,7 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
         let _ = queues.add_manifest(&run_id, vec![(spec(1), GroupId::new())], Default::default());
 
@@ -3721,11 +3784,9 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(Entity::runner(0, 1))
+                    .build(),
             )
             .await;
         let _ = queues.add_manifest(
@@ -3754,11 +3815,9 @@ mod test {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(Entity::runner(0, 1))
+                    .build(),
             )
             .await;
         let _ = queues.add_manifest(&run_id, vec![(spec(1), GroupId::new())], Default::default());
@@ -3777,13 +3836,7 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
         queues.mark_cancelled(&run_id, Entity::runner(0, 1), CancelReason::User);
 
@@ -3810,13 +3863,7 @@ mod test {
         let run_id = RunId::unique();
 
         let _ = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
         let _ = queues.add_manifest(
             &run_id,
@@ -3895,20 +3942,17 @@ mod test {
         let remote = remote::NoopPersister::new().into();
 
         let assigned = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
 
         assert_eq!(queues.estimate_num_active_runs(), 1);
         assert_eq!(
             assigned,
-            AssignedRunStatus::Run(AssignedRun::Fresh {
-                should_generate_manifest: true
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Fresh {
+                    should_generate_manifest: true
+                },
+                runner_test_command_differs: false
             })
         );
     }
@@ -3922,6 +3966,8 @@ mod test {
 
         let entity = Entity::runner(0, 1);
 
+        let test_command_hash = TestCommandHash::random();
+
         let remote = remote::FakePersister::builder()
             .on_try_load_run_state({
                 let expected_run_id = run_id.clone();
@@ -3929,6 +3975,7 @@ mod test {
                     assert_eq!(run_id, &expected_run_id);
                     let run_state = run_state::RunState {
                         seen_workers: vec![entity],
+                        test_command_hash: Some(test_command_hash),
                         ..run_state::RunState::fake()
                     };
                     async { Ok(LoadedRunState::Found(run_state)) }.boxed()
@@ -3939,15 +3986,20 @@ mod test {
 
         let assigned = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                entity,
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(entity)
+                    .runner_test_command_hash(test_command_hash)
+                    .build(),
             )
             .await;
 
-        assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
+        assert_eq!(
+            assigned,
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Retry,
+                runner_test_command_differs: false
+            })
+        );
     }
 
     #[tokio::test]
@@ -3975,11 +4027,9 @@ mod test {
 
         let assigned = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(Entity::runner(0, 1))
+                    .build(),
             )
             .await;
 
@@ -4010,19 +4060,16 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
 
         assert_eq!(
             assigned,
-            AssignedRunStatus::Run(AssignedRun::Fresh {
-                should_generate_manifest: true
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Fresh {
+                    should_generate_manifest: true
+                },
+                runner_test_command_differs: false
             })
         );
     }
@@ -4052,19 +4099,16 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
 
         assert_eq!(
             assigned,
-            AssignedRunStatus::Run(AssignedRun::Fresh {
-                should_generate_manifest: true
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Fresh {
+                    should_generate_manifest: true
+                },
+                runner_test_command_differs: false
             })
         );
     }
@@ -4088,34 +4132,75 @@ mod test {
             .into();
 
         let assigned = queues
-            .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
-            )
+            .find_or_create_run(RunParamsBuilder::new(&run_id, &remote).build())
             .await;
 
         assert!(matches!(assigned, AssignedRunStatus::FatalError(_)));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn create_run_return_flag_if_command_is_different() {
+        let queues = SharedRuns::default();
+
+        let run_id = RunId::unique();
+
+        let remote = remote::NoopPersister::new().into();
+
+        {
+            let _ = queues
+                .find_or_create_run(
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(Entity::runner(0, 1))
+                        .build(),
+                )
+                .await;
+        }
+
+        let assigned_2 = queues
+            .find_or_create_run(
+                RunParamsBuilder::new(&run_id, &remote)
+                    .runner_test_command_hash(TestCommandHash::random())
+                    .entity(Entity::runner(0, 2))
+                    .build(),
+            )
+            .await;
+
+        assert_eq!(
+            assigned_2,
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Fresh {
+                    should_generate_manifest: false
+                },
+                runner_test_command_differs: true
+            })
+        );
+
+        assert_scoped_log(
+            "abq_queue::queue",
+            "Runner has mismatched test command for run",
+        );
     }
 }
 
 #[cfg(test)]
 mod test_pull_work {
     use abq_test_utils::one_nonzero_usize;
-    use abq_utils::net_protocol::{
-        entity::Entity,
-        queue::{GroupId, TestStrategy},
-        workers::{RunId, WorkerTest},
+    use abq_utils::{
+        net_protocol::{
+            entity::Entity,
+            queue::{GroupId, TestStrategy},
+            workers::{RunId, WorkerTest},
+        },
+        test_command_hash::TestCommandHash,
     };
     use abq_with_protocol_version::with_protocol_version;
 
     use crate::{
         persistence::results::ResultsPersistedCell,
         queue::{
-            fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunState, RunStatus,
-            SharedRuns,
+            test_utils::fake_test_spec, JobQueue, NextWorkResult, PulledTestsStatus, RunState,
+            RunStatus, SharedRuns,
         },
     };
 
@@ -4152,6 +4237,7 @@ mod test_pull_work {
             batch_size_hint,
             active_workers: Default::default(),
             results_persistence: ResultsPersistedCell::new(run_id.clone()),
+            test_command_hash: TestCommandHash::random(),
         };
 
         let queues = SharedRuns::default();
@@ -4208,7 +4294,7 @@ mod test_pull_work {
 
 #[cfg(test)]
 mod persistence_on_end_of_manifest {
-    use abq_utils::net_protocol::queue::TestStrategy;
+    use abq_utils::{net_protocol::queue::TestStrategy, test_command_hash::TestCommandHash};
     use futures::FutureExt;
     use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -4219,9 +4305,9 @@ mod persistence_on_end_of_manifest {
             remote::{self, RemotePersister},
             results::ResultsPersistedCell,
         },
-        queue::{fake_test_spec, NextWorkResult, RunState, SharedRuns, WorkScheduler},
+        queue::{test_utils::fake_test_spec, NextWorkResult, RunState, SharedRuns, WorkScheduler},
     };
-    use abq_test_utils::{one_nonzero_usize, spec};
+    use abq_test_utils::spec;
     use abq_utils::{
         auth::{ClientAuthStrategy, ServerAuthStrategy},
         net_async,
@@ -4237,10 +4323,12 @@ mod persistence_on_end_of_manifest {
         tls::{ClientTlsStrategy, ServerTlsStrategy},
     };
     use abq_with_protocol_version::with_protocol_version;
-    use abq_workers::{AssignedRun, AssignedRunStatus};
+    use abq_workers::{AssignedRun, AssignedRunKind, AssignedRunStatus};
     use ntest::timeout;
     use parking_lot::Mutex;
     use tokio::task::JoinHandle;
+
+    use super::test_utils::RunParamsBuilder;
 
     #[tokio::test]
     #[with_protocol_version]
@@ -4259,15 +4347,16 @@ mod persistence_on_end_of_manifest {
         let test2 = fake_test_spec(proto);
         let test3 = fake_test_spec(proto);
 
+        let test_command_hash = TestCommandHash::random();
+
         // Create run, add manifest by worker0
         {
             let _ = queues
                 .find_or_create_run(
-                    &run_id,
-                    one_nonzero_usize(),
-                    TestStrategy::ByTest,
-                    worker0,
-                    &remote,
+                    RunParamsBuilder::new(&run_id, &remote)
+                        .entity(worker0)
+                        .runner_test_command_hash(test_command_hash)
+                        .build(),
                 )
                 .await;
             let _ = queues.add_manifest(
@@ -4294,14 +4383,19 @@ mod persistence_on_end_of_manifest {
         // manifest.
         let assigned = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                worker0_shadow,
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(worker0_shadow)
+                    .runner_test_command_hash(test_command_hash)
+                    .build(),
             )
             .await;
-        assert_eq!(assigned, AssignedRunStatus::Run(AssignedRun::Retry));
+        assert_eq!(
+            assigned,
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Retry,
+                runner_test_command_differs: false
+            })
+        );
     }
 
     struct WorkSchedulerBuilder(WorkScheduler);
@@ -4382,6 +4476,7 @@ mod persistence_on_end_of_manifest {
                 batch_size_hint,
                 active_workers: Default::default(),
                 results_persistence: ResultsPersistedCell::new(run_id.clone()),
+                test_command_hash: TestCommandHash::random(),
             };
 
             let queues = SharedRuns::default();
@@ -4508,11 +4603,9 @@ mod persistence_on_end_of_manifest {
 
         let _ = queues
             .find_or_create_run(
-                &run_id,
-                one_nonzero_usize(),
-                TestStrategy::ByTest,
-                Entity::runner(0, 1),
-                &remote,
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(entity)
+                    .build(),
             )
             .await;
         let _ = queues.add_manifest(
@@ -4590,6 +4683,7 @@ mod persist_results {
             runners::TestResult,
             workers::RunId,
         },
+        test_command_hash::TestCommandHash,
     };
     use ntest::timeout;
 
@@ -4620,6 +4714,7 @@ mod persist_results {
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
                 batch_size_hint: one_nonzero_usize(),
+                test_command_hash: TestCommandHash::random(),
             };
             queues.set_state(run_id.clone(), done);
             queues
@@ -4666,6 +4761,7 @@ mod persist_results {
                 seen_workers: Default::default(),
                 manifest_persistence: ManifestPersistence::EmptyManifest,
                 results_persistence: ResultsPersistence::Persisted(results_cell.clone()),
+                test_command_hash: Some(TestCommandHash::random()),
             };
             queues.set_state(run_id.clone(), has_work);
             queues
@@ -4758,7 +4854,12 @@ mod persist_results {
 
     get_read_results_cell! {
         get_read_results_cell_when_waiting_for_manifest,
-        RunState::WaitingForManifest { worker_connection_times: Default::default(), batch_size_hint: one_nonzero_usize(), test_strategy: TestStrategy::ByTest },
+        RunState::WaitingForManifest {
+            worker_connection_times: Default::default(),
+            batch_size_hint: one_nonzero_usize(),
+            test_strategy: TestStrategy::ByTest,
+            test_command_hash: TestCommandHash::random(),
+        },
         Err(ReadResultsError::WaitingForManifest)
     }
 
@@ -4774,6 +4875,7 @@ mod persist_results {
                 batch_size_hint: one_nonzero_usize(),
                 active_workers: parking_lot::Mutex::new(active_workers),
                 results_persistence: ResultsPersistedCell::new(RunId::unique()),
+                test_command_hash: TestCommandHash::random(),
             }
         },
         Ok(ReadResultsState::OutstandingRunners(r)) if r == &[Tag::runner(1, 1)]
@@ -4791,6 +4893,7 @@ mod persist_results {
                 seen_workers: parking_lot::RwLock::new(active_workers),
                 results_persistence: ResultsPersistence::Persisted(ResultsPersistedCell::new(RunId::unique())),
                 manifest_persistence: ManifestPersistence::EmptyManifest,
+                test_command_hash: Some(TestCommandHash::random()),
             }
         },
         Ok(ReadResultsState::ReadFromCell(..))
@@ -4808,6 +4911,7 @@ mod persist_results {
                 seen_workers: parking_lot::RwLock::new(active_workers),
                 results_persistence: ResultsPersistence::Persisted(ResultsPersistedCell::new(RunId::unique())),
                 manifest_persistence: ManifestPersistence::EmptyManifest,
+                test_command_hash: Some(TestCommandHash::random()),
             }
         },
         Ok(ReadResultsState::OutstandingRunners(r)) if r == &[Tag::runner(2, 1)]
@@ -4822,6 +4926,7 @@ mod persist_results {
                 seen_workers: Default::default(),
                 results_persistence: ResultsPersistence::ManifestNeverReceived,
                 manifest_persistence: ManifestPersistence::EmptyManifest,
+                test_command_hash: Some(TestCommandHash::random()),
             }
         },
         Err(ReadResultsError::ManifestNeverReceived)
@@ -4855,6 +4960,7 @@ mod persist_results {
                 init_metadata: Default::default(),
                 active_workers: Default::default(),
                 results_persistence: results_cell.clone(),
+                test_command_hash: TestCommandHash::random(),
             };
             queues.set_state(run_id.clone(), has_work);
             queues

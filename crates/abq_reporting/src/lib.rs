@@ -8,6 +8,8 @@ use abq_utils::net_protocol::{
 pub mod colors;
 pub mod output;
 
+pub mod writer;
+
 #[must_use]
 #[derive(Debug)]
 pub struct CompletedSummary {

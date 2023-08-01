@@ -4,11 +4,19 @@ use serde_derive::{Deserialize, Serialize};
 
 /// The test run a worker should ask for work on.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub enum AssignedRun {
+pub enum AssignedRunKind {
     /// This worker is connecting for a fresh run, and should fetch tests online.
     Fresh { should_generate_manifest: bool },
     /// This worker is connecting for a retry, and should fetch its manifest from the queue once.
     Retry,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AssignedRun {
+    pub kind: AssignedRunKind,
+    /// [true] if the runner test command differs from the one associated when the run was
+    /// created.
+    pub runner_test_command_differs: bool,
 }
 
 #[must_use]
@@ -27,8 +35,11 @@ impl AssignedRunStatus {
     pub fn freshly_created(&self) -> bool {
         matches!(
             self,
-            AssignedRunStatus::Run(AssignedRun::Fresh {
-                should_generate_manifest: true
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Fresh {
+                    should_generate_manifest: true,
+                },
+                ..
             })
         )
     }

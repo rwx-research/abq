@@ -1,5 +1,6 @@
 //! Module negotiate helps worker pools attach to queues.
 
+use abq_reporting::writer::ColorWriter;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -14,10 +15,11 @@ use tokio::task::JoinHandle;
 use tracing::{error, instrument};
 
 use crate::{
+    assigned_run::AssignedRun,
     negotiate,
     runner_strategy::RunnerStrategyGenerator,
     workers::{WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus},
-    AssignedRun, AssignedRunStatus, GetAssignedRun,
+    AssignedRunKind, AssignedRunStatus, GetAssignedRun,
 };
 use abq_utils::{
     auth::User,
@@ -115,6 +117,8 @@ pub struct WorkersConfig {
     /// Max number of test suite run attempts
     pub max_run_number: u32,
     pub should_send_results: bool,
+    /// Handler to writing warnings to stderr, if any.
+    pub warning_writer: Box<dyn ColorWriter + Send>,
 }
 
 #[derive(Debug, Error)]
@@ -228,13 +232,23 @@ impl WorkersNegotiator {
             protocol_version_timeout,
             test_timeout,
             should_send_results,
+            mut warning_writer,
         } = workers_config;
 
-        let some_runner_should_generate_manifest = match assigned {
-            AssignedRun::Fresh {
+        let AssignedRun {
+            kind: assigned_kind,
+            runner_test_command_differs,
+        } = assigned;
+
+        if runner_test_command_differs {
+            write_test_command_differs_warning(&mut *warning_writer)?;
+        }
+
+        let some_runner_should_generate_manifest = match assigned_kind {
+            AssignedRunKind::Fresh {
                 should_generate_manifest,
             } => should_generate_manifest,
-            AssignedRun::Retry => false,
+            AssignedRunKind::Retry => false,
         };
 
         let runner_strategy_generator = RunnerStrategyGenerator::new(
@@ -244,7 +258,7 @@ impl WorkersNegotiator {
             work_server_addr,
             local_results_handler,
             max_run_number,
-            assigned,
+            assigned_kind,
             should_send_results,
         );
 
@@ -268,6 +282,21 @@ impl WorkersNegotiator {
 
         Ok(NegotiatedWorkers::Pool(pool))
     }
+}
+
+fn write_test_command_differs_warning(writer: &mut dyn ColorWriter) -> std::io::Result<()> {
+    writer.warn_line(
+        "The passed test command differs from the one used by other ABQ workers for this run ID.",
+    )?;
+    writer.warn_line(
+        "This may cause unexpected behavior, such as tests being run multiple times or not at all.",
+    )?;
+    writer.warn_line("Please ensure that all workers are using the same test command.")?;
+    writer.warn_line("")?;
+    writer.warn_line("If you need to use environment variables like ABQ_RUNNER or ABQ_WORKER,")?;
+    writer
+        .warn_line("consider evaluating them inside of the test process instead of the command.")?;
+    Ok(())
 }
 
 /// Waits to receive worker execution context from a queue negotiator.
@@ -596,10 +625,12 @@ mod test {
 
     use super::{MessageToQueueNegotiator, QueueNegotiator, WorkersNegotiator};
     use crate::assigned_run::fake::MockGetAssignedRun;
+    use crate::assigned_run::AssignedRun;
     use crate::negotiate::{AssignedRunStatus, WorkersConfig};
     use crate::workers::{WorkerContext, WorkersExitStatus};
-    use crate::{AssignedRun, DEFAULT_RUNNER_TEST_TIMEOUT};
+    use crate::{AssignedRunKind, DEFAULT_RUNNER_TEST_TIMEOUT};
     use abq_generic_test_runner::DEFAULT_PROTOCOL_VERSION_TIMEOUT;
+    use abq_reporting::writer::NoopColorWriter;
     use abq_test_utils::one_nonzero;
     use abq_utils::auth::{
         build_strategies, Admin, AdminToken, ClientAuthStrategy, ServerAuthStrategy, User,
@@ -621,6 +652,7 @@ mod test {
     };
     use abq_utils::results_handler::NoopResultsHandler;
     use abq_utils::server_shutdown::ShutdownManager;
+    use abq_utils::test_command_hash::TestCommandHash;
     use abq_utils::tls::{ClientTlsStrategy, ServerTlsStrategy};
     use abq_utils::{net_async, net_protocol};
     use abq_with_protocol_version::with_protocol_version;
@@ -865,8 +897,11 @@ mod test {
         ));
 
         let get_assigned_run = MockGetAssignedRun::new(|| {
-            AssignedRunStatus::Run(AssignedRun::Fresh {
-                should_generate_manifest: true,
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::Fresh {
+                    should_generate_manifest: true,
+                },
+                runner_test_command_differs: false,
             })
         });
 
@@ -898,12 +933,14 @@ mod test {
             protocol_version_timeout: DEFAULT_PROTOCOL_VERSION_TIMEOUT,
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
             should_send_results: true,
+            warning_writer: Box::new(NoopColorWriter),
         };
 
         let invoke_data = InvokeWork {
             run_id,
             batch_size_hint: one_nonzero(),
             test_strategy: TestStrategy::ByTest,
+            test_command_hash: TestCommandHash::random(),
         };
 
         let mut workers = WorkersNegotiator::negotiate_and_start_pool(
@@ -958,8 +995,11 @@ mod test {
             "0.0.0.0:0".parse().unwrap(),
             "0.0.0.0:0".parse().unwrap(),
             MockGetAssignedRun::new(|| {
-                AssignedRunStatus::Run(AssignedRun::Fresh {
-                    should_generate_manifest: true,
+                AssignedRunStatus::Run(AssignedRun {
+                    kind: AssignedRunKind::Fresh {
+                        should_generate_manifest: true,
+                    },
+                    runner_test_command_differs: false,
                 })
             }),
         )

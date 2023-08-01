@@ -235,7 +235,7 @@ pub mod workers {
         queue::TestSpec,
         runners::{AbqProtocolVersion, Manifest, ManifestMessage, NativeRunnerSpecification},
     };
-    use crate::capture_output::StdioOutput;
+    use crate::{capture_output::StdioOutput, test_command_hash::TestCommandHash};
     use serde_derive::{Deserialize, Serialize};
     use std::{
         collections::HashMap,
@@ -377,6 +377,17 @@ pub mod workers {
                 }
             }
         }
+
+        pub fn command_hash(&self) -> TestCommandHash {
+            match self {
+                RunnerKind::GenericNativeTestRunner(params) => {
+                    TestCommandHash::from_command(&params.cmd, &params.args)
+                }
+                RunnerKind::TestLikeRunner(_, _) => {
+                    TestCommandHash::from_command("test-like-runner", &[])
+                }
+            }
+        }
     }
 
     #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Clone)]
@@ -470,7 +481,7 @@ pub mod queue {
         runners::{AbqProtocolVersion, NativeRunnerSpecification, TestCase, TestResult},
         workers::{ManifestResult, RunId, WorkId},
     };
-    use crate::capture_output::StdioOutput;
+    use crate::{capture_output::StdioOutput, test_command_hash::TestCommandHash};
 
     /// Information about the queue and its negotiation server.
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -535,6 +546,7 @@ pub mod queue {
         pub run_id: RunId,
         pub batch_size_hint: NonZeroU64,
         pub test_strategy: TestStrategy,
+        pub test_command_hash: TestCommandHash,
     }
 
     /// Specification of a test case to run.
