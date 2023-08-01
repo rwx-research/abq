@@ -458,17 +458,15 @@ pub mod workers {
 }
 
 pub mod queue {
-    use std::{fmt::Display, io, net::SocketAddr, num::NonZeroU64, str::FromStr};
+    use std::{fmt::Display, net::SocketAddr, num::NonZeroU64, str::FromStr};
 
     use serde_derive::{Deserialize, Serialize};
 
     use super::{
         entity::{Entity, Tag},
         meta::DeprecationRecord,
-        results::OpaqueLazyAssociatedTestResults,
         runners::{AbqProtocolVersion, NativeRunnerSpecification, TestCase, TestResult},
         workers::{ManifestResult, RunId, WorkId},
-        LARGE_MESSAGE_SIZE,
     };
     use crate::capture_output::StdioOutput;
 
@@ -671,13 +669,9 @@ pub mod queue {
 
     #[derive(Serialize, Deserialize, Debug)]
     pub enum TestResultsResponse {
-        /// The test results are available.
-        Results {
-            /// A slice of test results.
-            /// May be split off the full list to avoid exceeding the maximum network message size.
-            chunk: OpaqueLazyAssociatedTestResults,
-            final_chunk: bool,
-        },
+        /// The test results will be streamed, and should be decoded as
+        /// [OpaqueLazyAssociatedTestResults::read_results_lines].
+        StreamingResults,
         /// Some test results are still being persisted, the request for test results should
         /// re-query in the future.
         Pending,
@@ -685,20 +679,6 @@ pub mod queue {
         OutstandingRunners(Vec<Tag>),
         /// The test results are unavailable for the given reason.
         Error(String),
-    }
-
-    impl TestResultsResponse {
-        const MAX_OVERHEAD_OF_RESPONSE_FOR_RESULTS: usize = 50;
-
-        /// Splits [OpaqueLazyAssociatedTestResults] into network-safe chunks ready for wrapping by
-        /// this response type.
-        pub fn chunk_results(
-            results: OpaqueLazyAssociatedTestResults,
-        ) -> io::Result<Vec<OpaqueLazyAssociatedTestResults>> {
-            results.into_network_safe_chunks(
-                LARGE_MESSAGE_SIZE - Self::MAX_OVERHEAD_OF_RESPONSE_FOR_RESULTS,
-            )
-        }
     }
 
     /// ABQ-internal-ID for a grouping
@@ -721,48 +701,18 @@ pub mod queue {
             write!(f, "{}", uuid::Uuid::from_bytes_ref(&self.0))
         }
     }
-
-    #[cfg(test)]
-    mod test {
-        use crate::net_protocol::results::OpaqueLazyAssociatedTestResults;
-
-        use super::TestResultsResponse;
-
-        #[test]
-        fn max_overhead_of_response_for_results() {
-            let results = OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                serde_json::value::to_raw_value(r#"RWXRWX"#).unwrap(),
-                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
-            ]);
-            let results_len = serde_json::to_vec(&results).unwrap().len();
-
-            for final_chunk in [true, false] {
-                let response = TestResultsResponse::Results {
-                    chunk: results.clone(),
-                    final_chunk,
-                };
-                let response_len = serde_json::to_vec(&response).unwrap().len();
-
-                let overhead = response_len - results_len;
-
-                assert!(
-                    overhead <= TestResultsResponse::MAX_OVERHEAD_OF_RESPONSE_FOR_RESULTS,
-                    "{overhead}"
-                );
-            }
-        }
-    }
 }
 
 pub mod results {
-    use std::io;
-
     use serde_derive::{Deserialize, Serialize};
+    use tokio::io::AsyncBufReadExt;
 
-    use super::{
-        queue::{AssociatedTestResults, NativeRunnerInfo},
-        write_message_bytes_help,
+    use crate::{
+        error::{OpaqueResult, ResultLocation},
+        here,
     };
+
+    use super::queue::{AssociatedTestResults, NativeRunnerInfo};
 
     /// A line in the results-persistence scheme.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -790,56 +740,30 @@ pub mod results {
             Self(opaque_lines)
         }
 
-        /// Splits the results into chunks that respect the [maximum network message size][MAX_MESSAGE_SIZE].
-        /// Assumes COMPRESS_LARGE is turned on, with the possibility of gz-encoded messages.
-        pub(super) fn into_network_safe_chunks(
-            self,
-            max_message_size: usize,
-        ) -> io::Result<Vec<Self>> {
-            // Preserve the order of test result lines across chunks.
-            // This is useful for reproducibility, even though the lines are opaque and can be
-            // processed out-of-order.
-            // As such, we keep a stack to process, initially populated in the same order as the
-            // opaque chunks.
-            let mut to_process = vec![self];
-            let mut processed = Vec::with_capacity(1);
-            while let Some(chunk) = to_process.pop() {
-                let (encoded_msg, _) = write_message_bytes_help::<
-                    _,
-                    true, /* COMPRESS_LARGE on */
-                >(&chunk, max_message_size)?;
-                if encoded_msg.len() > max_message_size {
-                    // Split the chunk in two.
-                    let half = chunk.0.len() / 2;
-                    let mut left = chunk.0;
-                    let right = left.split_off(half);
-                    if left.is_empty() || right.is_empty() {
-                        // The chunk was a singleton, and unfortunately, we can't split it any
-                        // further here.
-                        // TODO: we could get further by decoding the chunk into test results and
-                        // splitting those. However, I (Ayaz) suspect this will not be a problem in
-                        // practice unless someone is using a very large batch size.
-                        processed.push(OpaqueLazyAssociatedTestResults(left));
-                        processed.push(OpaqueLazyAssociatedTestResults(right));
-                    } else {
-                        // Push the chunks back on so that the first half (the left one) will be
-                        // processed first.
-                        to_process.push(OpaqueLazyAssociatedTestResults(right));
-                        to_process.push(OpaqueLazyAssociatedTestResults(left));
-                    }
-                } else {
-                    processed.push(chunk);
-                }
-            }
-            Ok(processed)
-        }
-
         pub fn decode(&self) -> serde_json::Result<Vec<ResultsLine>> {
             let mut results = Vec::with_capacity(self.0.len());
             for results_list in self.0.iter() {
                 results.push(serde_json::from_str(results_list.get())?);
             }
             Ok(results)
+        }
+
+        /// Reads the results from a reader that yields JSON lines.
+        pub async fn read_results_lines<Reader>(reader: &mut Reader) -> OpaqueResult<Self>
+        where
+            Reader: tokio::io::AsyncRead + Unpin,
+        {
+            let mut iter = tokio::io::BufReader::new(reader).lines();
+            let mut opaque_jsonl = vec![];
+            while let Some(line) = iter.next_line().await.located(here!())? {
+                match serde_json::value::RawValue::from_string(line.clone()).located(here!()) {
+                    Ok(line) => opaque_jsonl.push(line),
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(Self(opaque_jsonl))
         }
     }
 
@@ -872,43 +796,6 @@ pub mod results {
             let decoded: OpaqueLazyAssociatedTestResults = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded.0.len(), 1);
             assert_eq!(decoded.0[0].get(), r#""hello""#);
-        }
-
-        #[test]
-        fn chunking() {
-            let results = OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                // ["RWXRWX"] <- 10 bytes
-                serde_json::value::to_raw_value(r#"RWXRWX"#).unwrap(),
-                // ["R","R"] <- 9 bytes
-                serde_json::value::to_raw_value(r#"R"#).unwrap(),
-                serde_json::value::to_raw_value(r#"R"#).unwrap(),
-                // ["rwxrwx"] <- 10 bytes
-                serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
-                // ["r","r"] <- 9 bytes
-                serde_json::value::to_raw_value(r#"r"#).unwrap(),
-                serde_json::value::to_raw_value(r#"r"#).unwrap(),
-            ]);
-
-            let expected_chunks = vec![
-                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                    serde_json::value::to_raw_value(r#"RWXRWX"#).unwrap(),
-                ]),
-                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                    serde_json::value::to_raw_value(r#"R"#).unwrap(),
-                    serde_json::value::to_raw_value(r#"R"#).unwrap(),
-                ]),
-                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                    serde_json::value::to_raw_value(r#"rwxrwx"#).unwrap(),
-                ]),
-                OpaqueLazyAssociatedTestResults::from_raw_json_lines(vec![
-                    serde_json::value::to_raw_value(r#"r"#).unwrap(),
-                    serde_json::value::to_raw_value(r#"r"#).unwrap(),
-                ]),
-            ];
-
-            let chunks = results.into_network_safe_chunks(10).unwrap();
-            assert_eq!(chunks.len(), 4, "{chunks:?}");
-            assert_eq!(chunks, expected_chunks);
         }
     }
 }
@@ -1360,6 +1247,39 @@ where
     //
     //   https://github.com/tokio-rs/tls/blob/master/tokio-rustls/src/client.rs#L138-L139
     writer.write_all(&msg_buf).await?;
+    writer.flush().await?;
+
+    Ok(())
+}
+
+/// Performs a buffered copy of the given stream to the given writer.
+///
+/// The buffer size is currently given by `tokio::io::copy`, which is 8 KiB.
+///
+///   https://docs.rs/tokio/latest/tokio/io/fn.copy.html
+pub async fn async_write_stream<R, S>(
+    writer: &mut R,
+    _stream_length: u32,
+    stream: &mut S,
+) -> Result<(), std::io::Error>
+where
+    R: tokio::io::AsyncWriteExt + Unpin,
+    S: tokio::io::AsyncRead + Unpin,
+{
+    //let msg_size_buf = { i32::to_be_bytes(stream_length as i32) };
+
+    //writer.write_all(&msg_size_buf).await?;
+
+    tokio::io::copy(stream, writer).await?;
+
+    // NB: to be safe, always flush after writing. [tokio::io::AsyncWrite::poll_write] makes no
+    // guarantee about the behavior after `write_all`, including whether the implementing type must
+    // flush any intermediate buffers upon destruction.
+    //
+    // In fact, our tokio-tls shim does not ensure TLS frames are flushed upon connection
+    // destruction:
+    //
+    //   https://github.com/tokio-rs/tls/blob/master/tokio-rustls/src/client.rs#L138-L139
     writer.flush().await?;
 
     Ok(())

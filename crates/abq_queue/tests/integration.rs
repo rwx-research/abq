@@ -370,12 +370,20 @@ enum Action {
 
 type FlatResult<'a> = (WorkId, u32, &'a TestResult);
 
+#[derive(Debug)]
+enum TestResultsOutcome {
+    Results(OpaqueLazyAssociatedTestResults),
+    Error(String),
+    Pending,
+    OutstandingRunners(Vec<net_protocol::entity::Tag>),
+}
+
 #[allow(clippy::type_complexity)]
 enum Assert<'a> {
     /// Fetch the test results observed by the workers of a run.
     WorkerTestResults(Run, Box<dyn Fn(&[FlatResult<'_>]) -> bool>),
     /// Fetch the test results status observed by the queue.
-    QueueTestResults(Run, Box<dyn Fn(TestResultsResponse)>),
+    QueueTestResults(Run, Box<dyn Fn(TestResultsOutcome)>),
 
     WorkersAreRedundant(Wid),
     WorkerExitStatus(Wid, Box<dyn Fn(&WorkersExitStatus)>),
@@ -600,7 +608,7 @@ fn action_to_fut(
 
                     use queue::TestResultsResponse::*;
                     match net_protocol::async_read(&mut conn).await.unwrap() {
-                        Results { .. } => {
+                        StreamingResults { .. } => {
                             break;
                         }
                         _ => {
@@ -704,7 +712,22 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                     .await
                     .unwrap();
                     let response = net_protocol::async_read(&mut conn).await.unwrap();
-                    check(response)
+
+                    use TestResultsResponse::*;
+                    let outcome = match response {
+                        StreamingResults => {
+                            let results =
+                                OpaqueLazyAssociatedTestResults::read_results_lines(&mut conn)
+                                    .await
+                                    .unwrap();
+                            TestResultsOutcome::Results(results)
+                        }
+                        Pending => TestResultsOutcome::Pending,
+                        OutstandingRunners(tags) => TestResultsOutcome::OutstandingRunners(tags),
+                        Error(s) => TestResultsOutcome::Error(s),
+                    };
+
+                    check(outcome);
                 }
 
                 WorkersAreRedundant(n) => {
@@ -809,11 +832,8 @@ async fn multiple_jobs_complete() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results, vec![(1, s!("echo1")), (1, s!("echo2"))]);
                             assert_eq!(summary.manifest_size_nonce, 2);
                         }
@@ -911,11 +931,8 @@ async fn multiple_worker_count() {
                 QueueTestResults(
                     Run(73495),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(
                                 results,
                                 vec![
@@ -1043,11 +1060,8 @@ async fn multiple_invokers() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results, vec![(1, s!("echo1")), (1, s!("echo2"))]);
                             assert_eq!(summary.manifest_size_nonce, 2);
                         }
@@ -1057,11 +1071,8 @@ async fn multiple_invokers() {
                 QueueTestResults(
                     Run(2),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(
                                 results,
                                 vec![(1, s!("echo3")), (1, s!("echo4")), (1, s!("echo5"))]
@@ -1154,11 +1165,8 @@ async fn batch_two_requests_at_a_time() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(
                                 results,
                                 [
@@ -1226,11 +1234,8 @@ async fn empty_manifest_exits_gracefully() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results, []);
                             assert_eq!(summary.manifest_size_nonce, 0);
                         }
@@ -1522,11 +1527,8 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results, [(1, s!("echo1")), (1, s!("echo2"))]);
                             assert_eq!(summary.manifest_size_nonce, 2);
                         }
@@ -1561,11 +1563,8 @@ async fn getting_run_after_work_is_complete_returns_nothing() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results, [(1, s!("echo1")), (1, s!("echo2"))]);
                             assert_eq!(summary.manifest_size_nonce, 2);
                         }
@@ -1628,7 +1627,7 @@ async fn test_cancellation_drops_remaining_work() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Error(s) => {
+                        TestResultsOutcome::Error(s) => {
                             assert!(s.contains("cancelled"));
                         }
                         _ => unreachable!("{resp:?}"),
@@ -1655,7 +1654,7 @@ async fn test_cancellation_drops_remaining_work() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Error(s) => {
+                        TestResultsOutcome::Error(s) => {
                             assert!(s.contains("cancelled"));
                         }
                         _ => unreachable!("{resp:?}"),
@@ -1697,7 +1696,7 @@ async fn failure_to_run_worker_command_exits_gracefully() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Error(s) => {
+                        TestResultsOutcome::Error(s) => {
                             assert!(s.contains("manifest failed to be generated"), "{s:?}");
                         }
                         _ => unreachable!("{resp:?}"),
@@ -1747,7 +1746,7 @@ async fn native_runner_fails_due_to_manifest_failure() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Error(s) => {
+                        TestResultsOutcome::Error(s) => {
                             assert!(s.contains("manifest failed to be generated"), "{s:?}");
                         }
                         _ => unreachable!("{resp:?}"),
@@ -1813,11 +1812,8 @@ async fn multiple_tests_per_work_id_reported() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(
                                 vec![
                                     (1, s!("echo1")),
@@ -1955,11 +1951,8 @@ async fn many_retries_complete() {
                     Box::new({
                         let expected_queue_results = expected_queue_results.clone();
                         move |resp| match resp {
-                            TestResultsResponse::Results {
-                                chunk,
-                                final_chunk: true,
-                            } => {
-                                let (results, summary) = flatten_queue_results(chunk);
+                            TestResultsOutcome::Results(results) => {
+                                let (results, summary) = flatten_queue_results(results);
                                 assert_eq!(results, expected_queue_results);
                                 assert_eq!(summary.manifest_size_nonce, 4);
                             }
@@ -2059,11 +2052,8 @@ async fn many_retries_many_workers_complete() {
         QueueTestResults(
             Run(1),
             Box::new(move |resp| match resp {
-                TestResultsResponse::Results {
-                    chunk,
-                    final_chunk: true,
-                } => {
-                    let (results, summary) = flatten_queue_results(chunk);
+                TestResultsOutcome::Results(results) => {
+                    let (results, summary) = flatten_queue_results(results);
                     assert_eq!(results, expected_queue_results);
                     assert_eq!(summary.manifest_size_nonce, num_tests);
                 }
@@ -2230,11 +2220,8 @@ async fn many_retries_many_workers_complete_native() {
                     Box::new({
                         let expected_queue_results = expected_queue_results.clone();
                         move |resp| match resp {
-                            TestResultsResponse::Results {
-                                chunk,
-                                final_chunk: true,
-                            } => {
-                                let (results, summary) = flatten_queue_results(chunk);
+                            TestResultsOutcome::Results(results) => {
+                                let (results, summary) = flatten_queue_results(results);
                                 assert_eq!(results, expected_queue_results);
                                 assert_eq!(summary.manifest_size_nonce, num_tests);
                             }
@@ -2404,11 +2391,8 @@ async fn retry_out_of_process_worker() {
                 QueueTestResults(
                     Run(1),
                     Box::new(move |resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results, [(1, s!("echo1")), (1, s!("echo2"))]);
                             assert_eq!(summary.manifest_size_nonce, 2);
                         }
@@ -2445,11 +2429,8 @@ async fn retry_out_of_process_worker() {
             [QueueTestResults(
                 Run(1),
                 Box::new(move |resp| match resp {
-                    TestResultsResponse::Results {
-                        chunk,
-                        final_chunk: true,
-                    } => {
-                        let (results, summary) = flatten_queue_results(chunk);
+                    TestResultsOutcome::Results(results) => {
+                        let (results, summary) = flatten_queue_results(results);
                         assert_eq!(
                             results,
                             [
@@ -2572,11 +2553,8 @@ async fn many_retries_of_many_out_of_process_workers() {
                 QueueTestResults(
                     Run(1),
                     Box::new(move |resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results, expected_queue_results);
                             assert_eq!(summary.manifest_size_nonce, num_tests);
                         }
@@ -2713,11 +2691,8 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
                 QueueTestResults(
                     Run(1),
                     Box::new(move |resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results.len(), 1);
                             assert_eq!(summary.manifest_size_nonce, 1);
                         }
@@ -2751,11 +2726,8 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
                 QueueTestResults(
                     Run(1),
                     Box::new(move |resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results.len(), 1);
                             assert_eq!(summary.manifest_size_nonce, 1);
                         }
@@ -2789,11 +2761,8 @@ async fn cancellation_of_out_of_process_retry_does_not_cancel_run() {
                 QueueTestResults(
                     Run(1),
                     Box::new(move |resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(results.len(), 2);
                             assert_eq!(summary.manifest_size_nonce, 1);
                         }
@@ -2961,11 +2930,8 @@ async fn grouped_by_top_level_completes() {
                 QueueTestResults(
                     Run(1),
                     Box::new(|resp| match resp {
-                        TestResultsResponse::Results {
-                            chunk,
-                            final_chunk: true,
-                        } => {
-                            let (results, summary) = flatten_queue_results(chunk);
+                        TestResultsOutcome::Results(results) => {
+                            let (results, summary) = flatten_queue_results(results);
                             assert_eq!(
                                 results,
                                 vec![

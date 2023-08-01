@@ -3,16 +3,13 @@ use std::{collections::HashMap, sync::Arc};
 use abq_utils::{
     error::{ErrorLocation, ResultLocation},
     here,
-    net_protocol::{
-        results::{OpaqueLazyAssociatedTestResults, ResultsLine},
-        workers::RunId,
-    },
+    net_protocol::{results::ResultsLine, workers::RunId},
 };
 use async_trait::async_trait;
 use serde_json::value::RawValue;
 use tokio::sync::RwLock;
 
-use super::{PersistResults, Result, SharedPersistResults};
+use super::{PersistResults, Result, ResultsStream, SharedPersistResults, WithResultsStream};
 
 #[derive(Default, Clone)]
 pub struct InMemoryPersistor {
@@ -39,14 +36,31 @@ impl PersistResults for InMemoryPersistor {
         Ok(())
     }
 
-    async fn get_results(&self, run_id: &RunId) -> Result<OpaqueLazyAssociatedTestResults> {
+    async fn with_results_stream(
+        &self,
+        run_id: &RunId,
+        callback: Box<dyn WithResultsStream + Send>,
+    ) -> Result<()> {
         let results = self.results.read().await;
         let json_lines = results
             .get(run_id)
             .ok_or_else(|| "results not found for run ID".located(here!()))?;
-        Ok(OpaqueLazyAssociatedTestResults::from_raw_json_lines(
-            json_lines.clone(),
-        ))
+
+        let mut readable_json_lines_buffer: Vec<u8> = Vec::new();
+        for json_line in json_lines {
+            serde_json::to_writer(&mut readable_json_lines_buffer, json_line).located(here!())?;
+            readable_json_lines_buffer.push(b'\n');
+        }
+
+        let len = readable_json_lines_buffer.len();
+        let mut slice = readable_json_lines_buffer.as_slice();
+
+        callback
+            .with_results_stream(ResultsStream {
+                stream: Box::new(&mut slice),
+                len,
+            })
+            .await
     }
 
     fn boxed_clone(&self) -> Box<dyn PersistResults> {

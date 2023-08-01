@@ -9,24 +9,22 @@ use std::{
 use abq_utils::{
     error::{ErrorLocation, OpaqueResult, ResultLocation},
     here, illegal_state, log_assert,
-    net_protocol::{
-        results::{OpaqueLazyAssociatedTestResults, ResultsLine},
-        workers::RunId,
-    },
+    net_protocol::{results::ResultsLine, workers::RunId},
 };
 use async_trait::async_trait;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
     sync::{Mutex, RwLock},
 };
 
 use crate::persistence::{
     remote::{PersistenceKind, RemotePersister},
+    results::ResultsStream,
     OffloadConfig, OffloadSummary,
 };
 
-use super::{PersistResults, Result, SharedPersistResults};
+use super::{PersistResults, Result, SharedPersistResults, WithResultsStream};
 
 enum FdState {
     Open(File),
@@ -376,23 +374,33 @@ impl PersistResults for FilesystemPersistor {
         .await
     }
 
-    async fn get_results(&self, run_id: &RunId) -> Result<OpaqueLazyAssociatedTestResults> {
-        struct GetResults;
+    async fn with_results_stream(
+        &self,
+        run_id: &RunId,
+        callback: Box<dyn WithResultsStream + Send>,
+    ) -> Result<()> {
+        struct GetResults {
+            callback: Box<dyn WithResultsStream + Send>,
+        }
+
         #[async_trait]
-        impl WithFile<OpaqueLazyAssociatedTestResults> for GetResults {
+        impl WithFile<()> for GetResults {
             #[inline]
-            async fn run(self, fi: &mut File) -> Result<OpaqueLazyAssociatedTestResults> {
+            async fn run(self, fi: &mut File) -> Result<()> {
                 fi.rewind().await.located(here!())?;
 
-                let opaque_jsonl = read_results_lines(fi).await?;
+                let fi_size = fi.metadata().await.located(here!())?.len();
 
-                Ok(OpaqueLazyAssociatedTestResults::from_raw_json_lines(
-                    opaque_jsonl,
-                ))
+                let results_stream = ResultsStream {
+                    stream: Box::new(fi),
+                    len: fi_size as _,
+                };
+
+                self.callback.with_results_stream(results_stream).await
             }
         }
 
-        self.with_file(run_id, GetResults).await
+        self.with_file(run_id, GetResults { callback }).await
     }
 
     fn boxed_clone(&self) -> Box<dyn PersistResults> {
@@ -404,20 +412,6 @@ async fn write_packed_line(fi: &mut File, packed: Vec<u8>) -> OpaqueResult<()> {
     fi.write_all(&packed).await.located(here!())?;
     fi.write_all(&[b'\n']).await.located(here!())?;
     fi.flush().await.located(here!())
-}
-
-async fn read_results_lines(fi: &mut File) -> OpaqueResult<Vec<Box<serde_json::value::RawValue>>> {
-    let mut iter = tokio::io::BufReader::new(fi).lines();
-    let mut opaque_jsonl = vec![];
-    while let Some(line) = iter.next_line().await.located(here!())? {
-        match serde_json::value::RawValue::from_string(line.clone()).located(here!()) {
-            Ok(line) => opaque_jsonl.push(line),
-            Err(e) => {
-                return Err(e);
-            }
-        }
-    }
-    Ok(opaque_jsonl)
 }
 
 #[cfg(test)]
@@ -432,11 +426,14 @@ mod test {
     use abq_test_utils::wid;
     use abq_utils::{
         atomic,
-        error::{ErrorLocation, ResultLocation},
+        error::{ErrorLocation, OpaqueResult, ResultLocation},
         here,
         net_protocol::{
             queue::AssociatedTestResults,
-            results::ResultsLine::{self, Results},
+            results::{
+                OpaqueLazyAssociatedTestResults,
+                ResultsLine::{self, Results},
+            },
             runners::TestResult,
             workers::RunId,
         },
@@ -446,11 +443,32 @@ mod test {
 
     use crate::persistence::{
         remote::{self, fake_error, OneWriteFakePersister, PersistenceKind},
-        results::{fs::write_packed_line, PersistResults},
+        results::{
+            fs::write_packed_line,
+            test_utils::{ResultsLoader, ResultsWrapper},
+            PersistResults,
+        },
         OffloadConfig, OffloadSummary,
     };
 
     use super::FilesystemPersistor;
+
+    async fn get_results(
+        persistor: &FilesystemPersistor,
+        run_id: &RunId,
+    ) -> OpaqueResult<OpaqueLazyAssociatedTestResults> {
+        let results = ResultsWrapper::default();
+        let results_loader = ResultsLoader {
+            results: results.clone(),
+        };
+
+        persistor
+            .with_results_stream(run_id, Box::new(results_loader))
+            .await
+            .located(here!())?;
+
+        results.get()
+    }
 
     #[test]
     fn get_path() {
@@ -474,7 +492,11 @@ mod test {
     async fn load_from_nonexistent_file_is_error() {
         let fs = FilesystemPersistor::new("__zzz_this_is_not_a_subdir__", 1, remote::NoopPersister);
 
-        let err = fs.get_results(&RunId::unique()).await;
+        let results = ResultsWrapper::default();
+        let loader = ResultsLoader { results };
+        let err = fs
+            .with_results_stream(&RunId::unique(), Box::new(loader))
+            .await;
         assert!(err.is_err());
     }
 
@@ -496,7 +518,10 @@ mod test {
 
         fs.dump(&run_id, results1.clone()).await.unwrap();
         fs.dump(&run_id, results2.clone()).await.unwrap();
-        let results = fs.get_results(&run_id).await.unwrap().decode().unwrap();
+
+        let results = get_results(&fs, &run_id).await.unwrap();
+
+        let results = results.decode().unwrap();
 
         assert_eq!(results, vec![results1, results2]);
     }
@@ -514,7 +539,9 @@ mod test {
         ]);
 
         fs.dump(&run_id, results1.clone()).await.unwrap();
-        let results = fs.get_results(&run_id).await.unwrap().decode().unwrap();
+
+        let results = get_results(&fs, &run_id).await.unwrap();
+        let results = results.decode().unwrap();
 
         assert_eq!(results, vec![results1.clone()]);
 
@@ -523,7 +550,8 @@ mod test {
             AssociatedTestResults::fake(wid(4), vec![TestResult::fake()]),
         ]);
         fs.dump(&run_id, results2.clone()).await.unwrap();
-        let results = fs.get_results(&run_id).await.unwrap().decode().unwrap();
+        let results = get_results(&fs, &run_id).await.unwrap();
+        let results = results.decode().unwrap();
 
         assert_eq!(results, vec![results1, results2]);
     }
@@ -570,7 +598,8 @@ mod test {
         }
 
         for (run_id, expected) in expected_for_run {
-            let actual = fs.get_results(&run_id).await.unwrap().decode().unwrap();
+            let actual = get_results(&fs, &run_id).await.unwrap();
+            let actual = actual.decode().unwrap();
             assert_eq!(actual, expected);
         }
     }
@@ -618,7 +647,8 @@ mod test {
         }
 
         for (run_id, expected) in expected_for_run {
-            let actual = fs.get_results(&run_id).await.unwrap().decode().unwrap();
+            let actual = get_results(&fs, &run_id).await.unwrap();
+            let actual = actual.decode().unwrap();
             assert_eq!(actual, expected);
         }
     }
@@ -821,7 +851,7 @@ mod test {
         let tempdir = tempfile::tempdir().unwrap();
         let fs = FilesystemPersistor::new(tempdir.path(), 10, remote);
 
-        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = get_results(&fs, &run_id).await.unwrap();
         let actual_results = actual_results.decode().unwrap();
         assert_eq!(actual_results, vec![results]);
     }
@@ -856,7 +886,7 @@ mod test {
 
         fs.insert_offloaded(run_id.clone()).await.unwrap();
 
-        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = get_results(&fs, &run_id).await.unwrap();
         let actual_results = actual_results.decode().unwrap();
         assert_eq!(actual_results, vec![results]);
     }
@@ -874,7 +904,7 @@ mod test {
 
         fs.insert_offloaded(run_id.clone()).await.unwrap();
 
-        let result = fs.get_results(&run_id).await;
+        let result = get_results(&fs, &run_id).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("i failed"));
@@ -900,7 +930,7 @@ mod test {
 
         fs.dump(&run_id, results.clone()).await.unwrap();
 
-        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = get_results(&fs, &run_id).await.unwrap();
         let actual_results = actual_results.decode().unwrap();
         assert_eq!(actual_results, vec![results]);
     }
@@ -953,7 +983,7 @@ mod test {
             let results = results.clone();
             let fs = fs.clone();
             join_set.spawn(async move {
-                let actual_results = fs.get_results(&run_id).await.unwrap();
+                let actual_results = get_results(&fs, &run_id).await.unwrap();
                 let actual_results = actual_results.decode().unwrap();
                 assert_eq!(actual_results, vec![results]);
             });
@@ -1002,7 +1032,7 @@ mod test {
         // Write locally. We should try a fetch from the remote and append to it.
         fs.dump(&run_id, results2.clone()).await.unwrap();
 
-        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = get_results(&fs, &run_id).await.unwrap();
 
         let actual_results = actual_results.decode().unwrap();
         assert_eq!(actual_results, vec![results1, results2]);
@@ -1046,7 +1076,7 @@ mod test {
         // Write locally. We should try a fetch from the remote and append to it.
         fs.dump(&run_id, results2.clone()).await.unwrap();
 
-        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = get_results(&fs, &run_id).await.unwrap();
 
         let actual_results = actual_results.decode().unwrap();
         assert_eq!(actual_results, vec![results1, results2]);
@@ -1115,7 +1145,7 @@ mod test {
         fs.dump(&run_id, results1.clone()).await.unwrap();
         fs.dump(&run_id, results2.clone()).await.unwrap();
 
-        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = get_results(&fs, &run_id).await.unwrap();
         let actual_results = actual_results.decode().unwrap();
         assert_eq!(actual_results, vec![results1, results2]);
     }
@@ -1189,7 +1219,7 @@ mod test {
 
         assert_eq!(remote_loads.load(atomic::ORDERING), 1);
 
-        let actual_results = fs.get_results(&run_id).await.unwrap();
+        let actual_results = get_results(&fs, &run_id).await.unwrap();
         let mut actual_results = actual_results.decode().unwrap();
         actual_results.sort_by_key(|x| match x {
             Results(x) => x[0].work_id,
@@ -1251,7 +1281,7 @@ mod test {
 
         // Now when we load the results, we should force a fetch of the remote.
         {
-            let tests = fs.get_results(&run_id).await.unwrap();
+            let tests = get_results(&fs, &run_id).await.unwrap();
             assert_eq!(tests.decode().unwrap(), vec![results]);
 
             assert!(remote.has_data());
@@ -1323,7 +1353,7 @@ mod test {
         }
 
         // Now, loads of the results should succeed with both.
-        let results = fs.get_results(&run_id).await.unwrap();
+        let results = get_results(&fs, &run_id).await.unwrap();
         let results = results.decode().unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0], results1);
@@ -1394,7 +1424,7 @@ mod test {
                 let run_id = run_id.clone();
                 let results = results.clone();
                 async move {
-                    let real_results = fs.get_results(&run_id).await.unwrap();
+                    let real_results = get_results(&fs, &run_id).await.unwrap();
                     let real_results = real_results.decode().unwrap();
                     assert_eq!(real_results, vec![results])
                 }
