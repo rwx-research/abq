@@ -716,8 +716,10 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                     use TestResultsResponse::*;
                     let outcome = match response {
                         StreamingResults => {
+                            let mut stream =
+                                net_protocol::async_read_stream(&mut conn).await.unwrap();
                             let results =
-                                OpaqueLazyAssociatedTestResults::read_results_lines(&mut conn)
+                                OpaqueLazyAssociatedTestResults::read_results_lines(&mut stream)
                                     .await
                                     .unwrap();
                             TestResultsOutcome::Results(results)

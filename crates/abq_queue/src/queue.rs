@@ -4949,7 +4949,8 @@ mod persist_results {
             let (response, mut conn) = get_test_results_response().await;
             match response {
                 StreamingResults => {
-                    let results = OpaqueLazyAssociatedTestResults::read_results_lines(&mut conn)
+                    let mut stream = net_protocol::async_read_stream(&mut conn).await.unwrap();
+                    let results = OpaqueLazyAssociatedTestResults::read_results_lines(&mut stream)
                         .await
                         .unwrap();
 
@@ -5008,7 +5009,8 @@ mod persist_results {
             let (response, mut conn) = get_test_results_response().await;
             match response {
                 StreamingResults => {
-                    let results = OpaqueLazyAssociatedTestResults::read_results_lines(&mut conn)
+                    let mut stream = net_protocol::async_read_stream(&mut conn).await.unwrap();
+                    let results = OpaqueLazyAssociatedTestResults::read_results_lines(&mut stream)
                         .await
                         .unwrap();
 

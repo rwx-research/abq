@@ -8,6 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::io::AsyncReadExt;
+
 pub mod runners;
 
 pub mod health {
@@ -1257,18 +1259,18 @@ where
 /// The buffer size is currently given by `tokio::io::copy`, which is 8 KiB.
 ///
 ///   https://docs.rs/tokio/latest/tokio/io/fn.copy.html
-pub async fn async_write_stream<R, S>(
-    writer: &mut R,
-    _stream_length: u32,
+pub async fn async_write_stream<W, S>(
+    writer: &mut W,
+    stream_length: usize,
     stream: &mut S,
 ) -> Result<(), std::io::Error>
 where
-    R: tokio::io::AsyncWriteExt + Unpin,
+    W: tokio::io::AsyncWriteExt + Unpin,
     S: tokio::io::AsyncRead + Unpin,
 {
-    //let msg_size_buf = { i32::to_be_bytes(stream_length as i32) };
+    let msg_size_buf = { i32::to_be_bytes(stream_length as i32) };
 
-    //writer.write_all(&msg_size_buf).await?;
+    writer.write_all(&msg_size_buf).await?;
 
     tokio::io::copy(stream, writer).await?;
 
@@ -1283,6 +1285,25 @@ where
     writer.flush().await?;
 
     Ok(())
+}
+
+/// Inverse of [async_write_stream]. Returns a buffered reader that only reads until the passed
+/// stream message size is reached.
+///
+/// NOT cancellation safe!
+pub async fn async_read_stream<S>(reader: &mut S) -> Result<tokio::io::Take<&mut S>, std::io::Error>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let msg_size_buf = {
+        let mut msg_size_buf = [0u8; 4];
+        reader.read_exact(&mut msg_size_buf).await?;
+        msg_size_buf
+    };
+
+    let msg_size = i32::from_be_bytes(msg_size_buf) as u32;
+
+    Ok(reader.take(msg_size as u64))
 }
 
 #[inline]
@@ -1309,7 +1330,7 @@ mod test {
     };
 
     use rand::Rng;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::net_protocol::{read_help, AsyncReader, LARGE_MESSAGE_SIZE};
 
@@ -1550,5 +1571,33 @@ mod test {
         let read_msg: String = read_res.unwrap();
 
         assert_eq!(msg, read_msg);
+    }
+
+    #[tokio::test]
+    async fn write_read_stream() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let server = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let mut client_conn = TcpStream::connect(server.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_conn, _) = server.accept().await.unwrap();
+
+        let msg = vec![b'y'; LARGE_MESSAGE_SIZE * 2];
+        let mut msg_slice = msg.as_slice();
+        let mut output_buffer = vec![];
+
+        let (write_res, read_res) = tokio::join!(
+            super::async_write_stream(&mut client_conn, msg_slice.len(), &mut msg_slice),
+            async {
+                let mut conn = super::async_read_stream(&mut server_conn).await.unwrap();
+                conn.read_to_end(&mut output_buffer).await
+            }
+        );
+        write_res.unwrap();
+        let num_read = read_res.unwrap();
+
+        assert_eq!(num_read, msg.len());
+        assert_eq!(msg, output_buffer);
     }
 }
