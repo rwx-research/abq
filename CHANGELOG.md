@@ -1,3 +1,8 @@
+## 1.6.2
+
+ABQ 1.6.2 is a patch release fixing an issue that could result in
+denial-of-service of an ABQ queue due to large test results.
+
 ## 1.6.1
 
 ABQ 1.6.1 is a patch release fixing an issue that would not continue offloading
