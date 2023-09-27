@@ -24,5 +24,6 @@ expression: json
     "timedOut": 0,
     "todo": 0
   },
-  "tests": []
+  "tests": [],
+  "otherErrors": []
 }

@@ -6,23 +6,21 @@ expression: json
   "$schema": "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json",
   "framework": {
     "kind": "other",
-    "language": "other",
-    "providedKind": "zframework",
-    "providedLanguage": "zlang"
+    "language": "other"
   },
   "summary": {
     "status": {
-      "kind": "successful"
+      "kind": "failed"
     },
     "tests": 1,
-    "otherErrors": 0,
+    "otherErrors": 2,
     "retries": 0,
     "canceled": 0,
-    "failed": 0,
+    "failed": 1,
     "pended": 0,
     "quarantined": 0,
     "skipped": 0,
-    "successful": 1,
+    "successful": 0,
     "timedOut": 0,
     "todo": 0
   },
@@ -41,7 +39,7 @@ expression: json
         "column": 15
       },
       "attempt": {
-        "durationInNanoseconds": 11000000,
+        "durationInNanoseconds": 0,
         "meta": {
           "abq_metadata": {
             "runner": 1,
@@ -49,7 +47,8 @@ expression: json
           }
         },
         "status": {
-          "kind": "successful"
+          "kind": "failed",
+          "message": "I failed once"
         },
         "stderr": "my stdout",
         "stdout": "my stderr",
@@ -58,5 +57,12 @@ expression: json
       }
     }
   ],
-  "otherErrors": []
+  "otherErrors": [
+    {
+      "message": "Something else weird happened during in test suite"
+    },
+    {
+      "message": "Today, 1 = 2"
+    }
+  ]
 }

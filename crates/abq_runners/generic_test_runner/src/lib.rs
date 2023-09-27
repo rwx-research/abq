@@ -89,8 +89,8 @@ impl RunnerConnection {
     }
 }
 
-#[derive(Debug)]
-pub struct NativeRunnerInfo {
+#[derive(Debug, Clone)]
+pub struct NativeRunnerConfiguration {
     protocol: ProtocolWitness,
     specification: NativeRunnerSpecification,
 }
@@ -103,7 +103,7 @@ pub struct NativeRunnerInfo {
 pub async fn open_native_runner_connection(
     listener: &mut TcpListener,
     timeout: Duration,
-) -> Result<(NativeRunnerInfo, RunnerConnection), GenericRunnerErrorKind> {
+) -> Result<(NativeRunnerConfiguration, RunnerConnection), GenericRunnerErrorKind> {
     let start = Instant::now();
     let (
         NativeRunnerSpawnedMessage {
@@ -134,7 +134,7 @@ pub async fn open_native_runner_connection(
     match protocol_version.get_supported_witness() {
         None => Err(ProtocolVersionError::NotCompatible.into()),
         Some(witness) => {
-            let runner_info = NativeRunnerInfo {
+            let runner_info = NativeRunnerConfiguration {
                 protocol: witness,
                 specification: runner_specification,
             };
@@ -148,6 +148,7 @@ macro_rules! try_setup {
         $err.located(here!()).map_err(|e| GenericRunnerError {
             error: e,
             output: StdioOutput::empty(),
+            native_runner_info: None,
         })?
     };
 }
@@ -177,12 +178,14 @@ async fn retrieve_manifest<'a>(
                 return Err(GenericRunnerError {
                     error,
                     output: final_stdio_output.into(),
+                    native_runner_info: Some(native_runner.get_native_runner_info()),
                 });
             }
             Err(error) => {
                 return Err(GenericRunnerError {
                     error,
                     output: final_stdio_output.into(),
+                    native_runner_info: Some(native_runner.get_native_runner_info()),
                 });
             }
         }
@@ -227,7 +230,7 @@ pub enum GenericRunnerErrorKind {
     Io(#[from] io::Error),
     #[error("{0}")]
     ProtocolVersion(#[from] ProtocolVersionError),
-    #[error("{0}")]
+    #[error("ABQ had an error communicating with the native runner: {0}")]
     NativeRunner(#[from] NativeTestRunnerError),
 }
 
@@ -235,6 +238,7 @@ pub enum GenericRunnerErrorKind {
 pub struct GenericRunnerError {
     pub error: LocatedError,
     pub output: StdioOutput,
+    pub native_runner_info: Option<queue::NativeRunnerInfo>,
 }
 
 impl std::fmt::Display for GenericRunnerError {
@@ -244,10 +248,14 @@ impl std::fmt::Display for GenericRunnerError {
 }
 
 impl GenericRunnerError {
-    pub fn no_captures(kind: LocatedError) -> Self {
+    pub fn no_captures(
+        kind: LocatedError,
+        native_runner_info: Option<queue::NativeRunnerInfo>,
+    ) -> Self {
         Self {
             error: kind,
             output: StdioOutput::empty(),
+            native_runner_info,
         }
     }
 }
@@ -348,7 +356,7 @@ struct NativeRunnerState {
     // Needed to keep the port alive.
     _tcp_listener: TcpListener,
     conn: RunnerConnection,
-    runner_info: NativeRunnerInfo,
+    runner_info: NativeRunnerConfiguration,
     runner_meta: RunnerMeta,
     for_manifest_generation: bool,
 }
@@ -508,7 +516,11 @@ impl<'a> NativeRunnerHandle<'a> {
                     protocol_version_timeout,
                 )
                 .await;
-                return Err(GenericRunnerError { error, output });
+                return Err(GenericRunnerError {
+                    error,
+                    output,
+                    native_runner_info: None,
+                });
             }
         };
 
@@ -665,10 +677,10 @@ impl<'a> NativeRunnerHandle<'a> {
         Ok(())
     }
 
-    fn get_native_runner_info(self) -> queue::NativeRunnerInfo {
+    fn get_native_runner_info(&self) -> queue::NativeRunnerInfo {
         queue::NativeRunnerInfo {
             protocol_version: self.state.runner_info.protocol.get_version(),
-            specification: self.state.runner_info.specification,
+            specification: self.state.runner_info.specification.clone(),
         }
     }
 }
@@ -858,6 +870,7 @@ async fn run_help(
         Err(err) => Err(GenericRunnerError {
             error: err,
             output: StdioOutput { stderr, stdout },
+            native_runner_info: Some(native_runner_handle.get_native_runner_info()),
         }),
     }
 }
@@ -899,7 +912,7 @@ async fn execute_all_tests<'a>(
     runner_meta: RunnerMeta,
     test_timeout: Duration,
 ) -> Result<ExitCode, LocatedError> {
-    let NativeRunnerInfo {
+    let NativeRunnerConfiguration {
         protocol: _,
         specification: runner_spec,
     } = &native_runner_handle.runner_info;
@@ -1531,6 +1544,7 @@ pub fn execute_wrapped_runner(
         return Err(GenericRunnerError {
             error: io::Error::new(io::ErrorKind::InvalidInput, error).located(here!()),
             output: StdioOutput::empty(),
+            native_runner_info: None,
         });
     }
 

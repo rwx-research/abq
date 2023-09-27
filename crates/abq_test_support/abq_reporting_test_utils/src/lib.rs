@@ -53,6 +53,7 @@ pub fn mock_summary() -> CompletedSummary {
                 host: "zmachine".to_owned(),
             },
         }),
+        other_error_messages: vec![],
     }
 }
 

@@ -152,7 +152,7 @@ async fn do_shutdown(
         ..
     } = worker_pool.shutdown().await;
 
-    tracing::debug!("Workers shutdown");
+    tracing::debug!(?status, "Workers shutdown");
 
     let finalized_reporters = reporting_handle.join().await;
 
@@ -174,7 +174,11 @@ async fn do_shutdown(
     }
 
     let native_runner_info = native_runner_info.clone();
-    let completed_summary = CompletedSummary { native_runner_info };
+    let other_error_messages = status.error_messages().cloned().unwrap_or_default();
+    let completed_summary = CompletedSummary {
+        native_runner_info,
+        other_error_messages,
+    };
 
     let (suite_result, errors) = finalized_reporters.finish(&completed_summary);
 

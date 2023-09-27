@@ -110,6 +110,13 @@ pub enum WorkersExitStatus {
 
 impl WorkersExitStatus {
     pub const SUCCESS: Self = Self::Completed(ExitCode::SUCCESS);
+
+    pub fn error_messages(&self) -> Option<&Vec<String>> {
+        match self {
+            Self::Completed(_) => None,
+            Self::Error { errors } => Some(errors),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -303,7 +310,10 @@ impl WorkerPool {
                 Err(GenericRunnerError {
                     error: kind,
                     output,
+                    native_runner_info: this_native_runner_info,
                 }) => {
+                    native_runner_info = native_runner_info.or(this_native_runner_info);
+
                     let LocatedError {
                         error,
                         location: Location { file, line, column },
@@ -538,6 +548,7 @@ async fn start_test_like_runner(
             return Err(GenericRunnerError::no_captures(
                 io::Error::new(io::ErrorKind::Unsupported, "will not return manifest")
                     .located(here!()),
+                None,
             ));
         }
         TestLikeRunner::ExitWith(ec) => {
@@ -572,6 +583,7 @@ async fn start_test_like_runner(
                     .await;
                 return Err(GenericRunnerError::no_captures(
                     GenericRunnerErrorKind::NativeRunner(oob.into()).located(here!()),
+                    None,
                 ));
             }
         };
@@ -649,7 +661,12 @@ async fn test_like_runner_exec_loop(
     'tests_done: loop {
         let NextWorkBundle { work, eow } = match tests_fetcher.get_next_tests().await {
             Ok(bundle) => bundle,
-            Err(e) => return Some(Err(GenericRunnerError::no_captures(e.located(here!())))),
+            Err(e) => {
+                return Some(Err(GenericRunnerError::no_captures(
+                    e.located(here!()),
+                    None,
+                )))
+            }
         };
 
         for WorkerTest {
@@ -661,6 +678,7 @@ async fn test_like_runner_exec_loop(
                 return Some(Err(GenericRunnerError::no_captures(
                     io::Error::new(io::ErrorKind::Unsupported, "will not return test")
                         .located(here!()),
+                    None,
                 )));
             }
 

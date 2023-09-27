@@ -127,7 +127,7 @@ An example of how to create such a certificate follows:
 ```bash
 openssl \
   req -x509 -newkey rsa:4096 \
-  -keyout server.key -out ssl_certs/server.crt \
+  -keyout testdata/certs/server.key -out testdata/certs/server.crt \
   -days 365 -sha256 -nodes \
   -subj '/CN=abq.rwx' \
   -extensions san \

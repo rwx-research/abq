@@ -6,9 +6,7 @@ expression: json
   "$schema": "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json",
   "framework": {
     "kind": "other",
-    "language": "other",
-    "providedKind": "zframework",
-    "providedLanguage": "zlang"
+    "language": "other"
   },
   "summary": {
     "status": {
@@ -16,7 +14,7 @@ expression: json
     },
     "tests": 1,
     "otherErrors": 0,
-    "retries": 1,
+    "retries": 0,
     "canceled": 0,
     "failed": 1,
     "pended": 0,
@@ -50,49 +48,13 @@ expression: json
         },
         "status": {
           "kind": "failed",
-          "message": "I ultimately failed"
+          "message": "I failed once"
         },
         "stderr": "my stdout",
         "stdout": "my stderr",
         "startedAt": "1994-11-05T13:15:30Z",
         "finishedAt": "1994-11-05T13:17:30Z"
-      },
-      "pastAttempts": [
-        {
-          "durationInNanoseconds": 0,
-          "meta": {
-            "abq_metadata": {
-              "runner": 1,
-              "worker": 0
-            }
-          },
-          "status": {
-            "kind": "failed",
-            "message": "I failed once"
-          },
-          "stderr": "my stdout",
-          "stdout": "my stderr",
-          "startedAt": "1994-11-05T13:15:30Z",
-          "finishedAt": "1994-11-05T13:17:30Z"
-        },
-        {
-          "durationInNanoseconds": 0,
-          "meta": {
-            "abq_metadata": {
-              "runner": 1,
-              "worker": 0
-            }
-          },
-          "status": {
-            "kind": "failed",
-            "message": "I failed again"
-          },
-          "stderr": "my stdout",
-          "stdout": "my stderr",
-          "startedAt": "1994-11-05T13:15:30Z",
-          "finishedAt": "1994-11-05T13:17:30Z"
-        }
-      ]
+      }
     }
   ],
   "otherErrors": []

@@ -4717,11 +4717,17 @@ fn warn_on_different_runner_command() {
         args
     };
 
-    let instance1 = Abq::new(format!("{name}_inst1")).args(test_args(0)).run();
+    let instance1 = Abq::new(format!("{name}_inst1"))
+        .args(test_args(0))
+        .always_capture_stderr(true)
+        .run();
 
     assert!(instance1.exit_status.success());
 
-    let instance2 = Abq::new(format!("{name}_inst2")).args(test_args(1)).run();
+    let instance2 = Abq::new(format!("{name}_inst2"))
+        .args(test_args(1))
+        .always_capture_stderr(true)
+        .run();
 
     assert!(instance2.exit_status.success());
 
@@ -4734,4 +4740,170 @@ fn warn_on_different_runner_command() {
     );
 
     term(queue_proc);
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn write_partial_rwx_v1_json_results_on_early_runner_termination() {
+    let name = "warn_on_different_runner_command";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let (_queue_proc, queue_addr) = setup_queue!(name, conf);
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let manifest = vec![
+        TestOrGroup::test(Test::new(
+            proto,
+            "test1".to_string(),
+            [],
+            Default::default(),
+        )),
+        TestOrGroup::test(Test::new(
+            proto,
+            "test2".to_string(),
+            [],
+            Default::default(),
+        )),
+    ];
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = [
+        Connect,
+        //
+        // Write spawn message
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        //
+        // Write the manifest if we need to.
+        // Otherwise handle the one test.
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: vec![
+                //
+                // Read init context message + write ACK
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                // Read first test, write okay
+                OpaqueRead,
+                OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                // Read second test, bail
+                OpaqueRead,
+                Exit(1),
+            ],
+        },
+        //
+        // Finish
+        Exit(0),
+    ];
+
+    let packed = pack_msgs_to_disk(simulation);
+    let rwx_v1_json = tempfile::NamedTempFile::new().unwrap();
+
+    let test_args = {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = packed.path.display().to_string();
+        let rwx_v1_json_path = rwx_v1_json.path().display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker=0"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id=test-run-id"),
+            format!("--reporter=rwx-v1-json={rwx_v1_json_path}"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(format!("{name}_worker0"))
+        .args(test_args)
+        .always_capture_stderr(true)
+        .run();
+
+    assert!(!exit_status.success());
+    assert_eq!(exit_status.code(), Some(ExitCode::ABQ_ERROR.get()));
+
+    assert!(
+        stdout.contains("2 tests, 1 failures"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("ABQ had an error communicating with the native runner"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+
+    let rwx_v1_json = std::fs::read_to_string(rwx_v1_json.path()).unwrap();
+    let rwx_v1_json: serde_json::Value = serde_json::from_str(&rwx_v1_json).unwrap();
+    insta::assert_json_snapshot!(rwx_v1_json, {
+    }, @r###"
+    {
+      "$schema": "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json",
+      "framework": {
+        "kind": "RSpec",
+        "language": "Ruby"
+      },
+      "otherErrors": [
+        {
+          "message": "ABQ had an error communicating with the native runner: early eof at crates/abq_runners/generic_test_runner/src/lib.rs@1035:87"
+        }
+      ],
+      "summary": {
+        "canceled": 0,
+        "failed": 0,
+        "otherErrors": 2,
+        "pended": 0,
+        "quarantined": 0,
+        "retries": 0,
+        "skipped": 0,
+        "status": {
+          "kind": "failed"
+        },
+        "successful": 1,
+        "tests": 1,
+        "timedOut": 0,
+        "todo": 0
+      },
+      "tests": [
+        {
+          "attempt": {
+            "durationInNanoseconds": 0,
+            "finishedAt": "1994-11-05T13:17:30Z",
+            "meta": {
+              "abq_metadata": {
+                "runner": 1,
+                "worker": 0
+              }
+            },
+            "startedAt": "1994-11-05T13:15:30Z",
+            "status": {
+              "kind": "successful"
+            },
+            "stderr": "",
+            "stdout": ""
+          },
+          "id": "zzz-faux",
+          "lineage": [
+            "TopLevel",
+            "SubModule",
+            "Test"
+          ],
+          "location": {
+            "column": 15,
+            "file": "a/b/x.file",
+            "line": 10
+          },
+          "name": "zzz-faux"
+        }
+      ]
+    }
+    "###);
 }
