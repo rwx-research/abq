@@ -522,13 +522,7 @@ impl Collector {
 
         let framework = match runner_specification {
             Some(spec) => spec.into(),
-            None => {
-                assert!(
-                    reified_schema_tests.is_empty(),
-                    "runner specification may only be unknown if no tests were run on a node"
-                );
-                Framework::other()
-            }
+            None => Framework::other(),
         };
 
         TestResults {
@@ -911,6 +905,33 @@ mod test {
         collector
             .write_json_pretty(&mut buf, Some(&runner_spec))
             .expect("failed to write");
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
+    }
+
+    #[test]
+    fn generates_rwx_v1_json_with_unknown_framework_if_runner_info_is_missing() {
+        let mut collector = Collector::default();
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed once".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, None)
+            .expect("failed to write");
+
         let json = String::from_utf8(buf).expect("not utf8 JSON");
         insta::assert_snapshot!(json)
     }
