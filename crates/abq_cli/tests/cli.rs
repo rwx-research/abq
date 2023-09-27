@@ -4842,10 +4842,15 @@ fn write_partial_rwx_v1_json_results_on_early_runner_termination() {
         "kind": "RSpec",
         "language": "Ruby"
       },
+      "otherErrors": [
+        {
+          "message": "ABQ had an error communicating with the native runner: early eof at crates/abq_runners/generic_test_runner/src/lib.rs@1035:87"
+        }
+      ],
       "summary": {
         "canceled": 0,
         "failed": 0,
-        "otherErrors": 1,
+        "otherErrors": 2,
         "pended": 0,
         "quarantined": 0,
         "retries": 0,

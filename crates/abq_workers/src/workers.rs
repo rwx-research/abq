@@ -110,6 +110,13 @@ pub enum WorkersExitStatus {
 
 impl WorkersExitStatus {
     pub const SUCCESS: Self = Self::Completed(ExitCode::SUCCESS);
+
+    pub fn error_messages(&self) -> Option<&Vec<String>> {
+        match self {
+            Self::Completed(_) => None,
+            Self::Error { errors } => Some(errors),
+        }
+    }
 }
 
 #[derive(Debug)]

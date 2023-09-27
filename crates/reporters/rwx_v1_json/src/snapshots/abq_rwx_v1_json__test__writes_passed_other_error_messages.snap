@@ -13,7 +13,7 @@ expression: json
       "kind": "failed"
     },
     "tests": 1,
-    "otherErrors": 0,
+    "otherErrors": 2,
     "retries": 0,
     "canceled": 0,
     "failed": 1,
@@ -57,5 +57,12 @@ expression: json
       }
     }
   ],
-  "otherErrors": []
+  "otherErrors": [
+    {
+      "message": "Something else weird happened during in test suite"
+    },
+    {
+      "message": "Today, 1 = 2"
+    }
+  ]
 }

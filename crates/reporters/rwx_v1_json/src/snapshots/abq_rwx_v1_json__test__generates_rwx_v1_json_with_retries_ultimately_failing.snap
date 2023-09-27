@@ -94,5 +94,6 @@ expression: json
         }
       ]
     }
-  ]
+  ],
+  "otherErrors": []
 }
