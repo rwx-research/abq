@@ -505,6 +505,7 @@ impl Collector {
         // This is a retry.
         match Attempt::from(&test_result.result, test_result.source) {
             OptAttempt::SyntheticNativeRunnerError { error_message } => {
+                debug_assert!(false, "Synthetic native runner error as a retry result should not be possible, since runner errors are given synthetic, unique IDs.");
                 self.native_runner_errors.push(error_message);
             }
             OptAttempt::Attempt {
@@ -887,6 +888,45 @@ mod test {
                     output: Some("I failed a third time".to_string()),
                     ..TestResultSpec::fake()
                 }]),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        let mut buf = vec![];
+        collector
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
+            .expect("failed to write");
+
+        let json = String::from_utf8(buf).expect("not utf8 JSON");
+        insta::assert_snapshot!(json)
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn retry_is_native_runner_error() {
+        let mut collector = Collector::default();
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                },
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("I failed once".to_string()),
+                ..TestResultSpec::fake()
+            },
+        ));
+
+        collector.push_result(&TestResult::new(
+            RunnerMeta::fake(),
+            TestResultSpec {
+                status: Status::PrivateNativeRunnerError,
+                id: "id1".to_string(),
+                display_name: "app::module::test1".to_string(),
+                output: Some("The native runner failed!".to_string()),
                 ..TestResultSpec::fake()
             },
         ));
