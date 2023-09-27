@@ -16,7 +16,6 @@ pub struct CompletedSummary {
     /// The native test runner that was in use for this test run.
     /// Can be [None] if the returned worker never ran any tests.
     pub native_runner_info: Option<NativeRunnerInfo>,
-    pub other_error_messages: Vec<String>,
 }
 
 #[derive(Debug, Error)]

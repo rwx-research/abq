@@ -27,5 +27,9 @@ expression: json
     "todo": 0
   },
   "tests": [],
-  "otherErrors": []
+  "otherErrors": [
+    {
+      "message": "my test output"
+    }
+  ]
 }

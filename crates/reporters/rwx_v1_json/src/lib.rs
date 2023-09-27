@@ -162,10 +162,6 @@ impl Summary {
             self.status = SummaryStatus::Failed;
         }
     }
-
-    fn account_other_errors(&mut self, len: u64) {
-        self.other_errors += len;
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -249,11 +245,13 @@ pub struct Attempt {
 }
 
 enum OptAttempt {
-    SyntheticNativeRunnerError,
+    SyntheticNativeRunnerError {
+        error_message: String,
+    },
     Attempt {
         attempt: Attempt,
         past_attempts: Option<Vec<Attempt>>,
-        native_runner_errors: u64,
+        native_runner_errors: Vec<String>,
     },
 }
 
@@ -287,7 +285,13 @@ impl Attempt {
                 message: output.clone(),
                 backtrace: backtrace.clone(),
             },
-            Status::PrivateNativeRunnerError => return OptAttempt::SyntheticNativeRunnerError,
+            Status::PrivateNativeRunnerError => {
+                return OptAttempt::SyntheticNativeRunnerError {
+                    error_message: output.clone().unwrap_or_else(|| {
+                        "ABQ native runner error. No output was provided.".to_string()
+                    }),
+                }
+            }
             Status::Pending => AttemptStatus::Pended {
                 message: output.clone(),
             },
@@ -324,14 +328,14 @@ impl Attempt {
             meta
         };
 
-        let mut other_errors = 0;
+        let mut other_errors = vec![];
         let past_attempts = past_attempts.as_ref().map(|attempts| {
             let mut all_past_attempts = Vec::with_capacity(attempts.len());
 
             for attempt in attempts.iter() {
                 match Attempt::from(attempt, runner_meta) {
-                    OptAttempt::SyntheticNativeRunnerError => {
-                        other_errors += 1;
+                    OptAttempt::SyntheticNativeRunnerError { error_message } => {
+                        other_errors.push(error_message);
                     }
                     OptAttempt::Attempt {
                         attempt,
@@ -342,7 +346,7 @@ impl Attempt {
                         if let Some(extra) = past_attempts {
                             all_past_attempts.extend(extra);
                         }
-                        other_errors += past_other_errors;
+                        other_errors.extend(past_other_errors);
                     }
                 }
             }
@@ -389,9 +393,11 @@ enum TestSketch {
     /// A material test result.
     Material {
         test: Test,
-        native_runner_errors: u64,
+        native_runner_errors: Vec<String>,
     },
-    SyntheticNativeRunnerError,
+    SyntheticNativeRunnerError {
+        error_message: String,
+    },
 }
 
 impl From<&TestResult> for TestSketch {
@@ -405,7 +411,9 @@ impl From<&TestResult> for TestSketch {
         } = &test_result.deref();
 
         match Attempt::from(test_result.deref(), test_result.source) {
-            OptAttempt::SyntheticNativeRunnerError => Self::SyntheticNativeRunnerError,
+            OptAttempt::SyntheticNativeRunnerError { error_message } => {
+                Self::SyntheticNativeRunnerError { error_message }
+            }
             OptAttempt::Attempt {
                 attempt,
                 past_attempts,
@@ -467,7 +475,7 @@ pub struct TestResults {
 #[derive(Default, Clone)]
 pub struct Collector {
     tests: HashMap<String, Test>,
-    native_runner_errors: u64,
+    native_runner_errors: Vec<String>,
 }
 
 impl Collector {
@@ -479,14 +487,14 @@ impl Collector {
                 // This will account for the first test result we saw; subsequent test results
                 // (due to retries) will trace the branch above.
                 match TestSketch::from(test_result) {
-                    TestSketch::SyntheticNativeRunnerError => {
-                        self.native_runner_errors += 1;
+                    TestSketch::SyntheticNativeRunnerError { error_message } => {
+                        self.native_runner_errors.push(error_message);
                     }
                     TestSketch::Material {
                         test,
                         native_runner_errors: other_errors,
                     } => {
-                        self.native_runner_errors += other_errors;
+                        self.native_runner_errors.extend(other_errors);
                         self.tests.insert(test_result.id.clone(), test);
                     }
                 }
@@ -496,7 +504,9 @@ impl Collector {
 
         // This is a retry.
         match Attempt::from(&test_result.result, test_result.source) {
-            OptAttempt::SyntheticNativeRunnerError => todo!(),
+            OptAttempt::SyntheticNativeRunnerError { error_message } => {
+                self.native_runner_errors.push(error_message);
+            }
             OptAttempt::Attempt {
                 attempt: new_attempt,
                 past_attempts: new_attempt_previous_attempts,
@@ -517,7 +527,7 @@ impl Collector {
                     past_attempts.extend(new_attempt_previous_attempts);
                 }
 
-                self.native_runner_errors += other_errors;
+                self.native_runner_errors.extend(other_errors);
             }
         }
     }
@@ -526,38 +536,25 @@ impl Collector {
         self,
         writer: impl Write,
         runner_specification: Option<&NativeRunnerSpecification>,
-        other_error_messages: Vec<String>,
     ) -> Result<(), String> {
-        serde_json::to_writer(
-            writer,
-            &self.test_results(runner_specification, other_error_messages),
-        )
-        .map_err(|e| e.to_string())
+        serde_json::to_writer(writer, &self.test_results(runner_specification))
+            .map_err(|e| e.to_string())
     }
 
     pub fn write_json_pretty(
         self,
         writer: impl Write,
         runner_specification: Option<&NativeRunnerSpecification>,
-        other_error_messages: Vec<String>,
     ) -> Result<(), String> {
-        serde_json::to_writer_pretty(
-            writer,
-            &self.test_results(runner_specification, other_error_messages),
-        )
-        .map_err(|e| e.to_string())
+        serde_json::to_writer_pretty(writer, &self.test_results(runner_specification))
+            .map_err(|e| e.to_string())
     }
 
-    fn test_results(
-        self,
-        runner_specification: Option<&NativeRunnerSpecification>,
-        other_error_messages: Vec<String>,
-    ) -> TestResults {
+    fn test_results(self, runner_specification: Option<&NativeRunnerSpecification>) -> TestResults {
         let mut summary = Summary::default();
         self.tests.values().for_each(|test| summary.account(test));
 
-        summary.account_native_runner_errors(self.native_runner_errors);
-        summary.account_other_errors(other_error_messages.len() as _);
+        summary.account_native_runner_errors(self.native_runner_errors.len() as _);
 
         let reified_schema_tests = if cfg!(test) {
             let mut ordered_tests: Vec<Test> = self.tests.into_values().map(Into::into).collect();
@@ -572,7 +569,8 @@ impl Collector {
             None => Framework::other(),
         };
 
-        let other_errors = other_error_messages
+        let other_errors = self
+            .native_runner_errors
             .into_iter()
             .map(OtherError::from_message)
             .collect();
@@ -679,7 +677,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+                .write_json(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_all_statuses__compact", json)
@@ -689,7 +687,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+                .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_all_statuses__pretty", json)
@@ -717,7 +715,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+                .write_json(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__compact", json)
@@ -727,7 +725,7 @@ mod test {
             let mut buf = vec![];
             collector
                 .clone()
-                .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+                .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
                 .expect("failed to write");
             let json = String::from_utf8(buf).expect("not utf8 JSON");
             insta::assert_snapshot!("generates_rwx_v1_json_for_successful_runs__pretty", json)
@@ -782,7 +780,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");
@@ -834,7 +832,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");
@@ -895,7 +893,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");
@@ -911,7 +909,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()), vec![])
+            .write_json_pretty(&mut buf, Some(&NativeRunnerSpecification::fake()))
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");
@@ -934,7 +932,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, Some(&runner_spec), vec![])
+            .write_json_pretty(&mut buf, Some(&runner_spec))
             .expect("failed to write");
         let json = String::from_utf8(buf).expect("not utf8 JSON");
         insta::assert_snapshot!(json)
@@ -956,7 +954,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, Some(&runner_spec), vec![])
+            .write_json_pretty(&mut buf, Some(&runner_spec))
             .expect("failed to write");
         let json = String::from_utf8(buf).expect("not utf8 JSON");
         insta::assert_snapshot!(json)
@@ -982,39 +980,7 @@ mod test {
 
         let mut buf = vec![];
         collector
-            .write_json_pretty(&mut buf, None, vec![])
-            .expect("failed to write");
-
-        let json = String::from_utf8(buf).expect("not utf8 JSON");
-        insta::assert_snapshot!(json)
-    }
-
-    #[test]
-    fn writes_passed_other_error_messages() {
-        let mut collector = Collector::default();
-
-        collector.push_result(&TestResult::new(
-            RunnerMeta::fake(),
-            TestResultSpec {
-                status: Status::Failure {
-                    exception: None,
-                    backtrace: None,
-                },
-                id: "id1".to_string(),
-                display_name: "app::module::test1".to_string(),
-                output: Some("I failed once".to_string()),
-                ..TestResultSpec::fake()
-            },
-        ));
-
-        let other_errors = vec![
-            "Something else weird happened during in test suite".to_owned(),
-            "Today, 1 = 2".to_owned(),
-        ];
-
-        let mut buf = vec![];
-        collector
-            .write_json_pretty(&mut buf, None, other_errors)
+            .write_json_pretty(&mut buf, None)
             .expect("failed to write");
 
         let json = String::from_utf8(buf).expect("not utf8 JSON");

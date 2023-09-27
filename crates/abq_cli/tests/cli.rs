@@ -4844,6 +4844,7 @@ fn write_partial_rwx_v1_json_results_on_early_runner_termination() {
     let rwx_v1_json = std::fs::read_to_string(rwx_v1_json.path()).unwrap();
     let rwx_v1_json: serde_json::Value = serde_json::from_str(&rwx_v1_json).unwrap();
     insta::assert_json_snapshot!(rwx_v1_json, {
+        ".otherErrors[0].message" => "[Redacted test runner failure message]",
     }, @r###"
     {
       "$schema": "https://raw.githubusercontent.com/rwx-research/test-results-schema/main/v1.json",
@@ -4853,13 +4854,13 @@ fn write_partial_rwx_v1_json_results_on_early_runner_termination() {
       },
       "otherErrors": [
         {
-          "message": "ABQ had an error communicating with the native runner: early eof at crates/abq_runners/generic_test_runner/src/lib.rs@1035:87"
+          "message": "[Redacted test runner failure message]"
         }
       ],
       "summary": {
         "canceled": 0,
         "failed": 0,
-        "otherErrors": 2,
+        "otherErrors": 1,
         "pended": 0,
         "quarantined": 0,
         "retries": 0,

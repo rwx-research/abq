@@ -174,11 +174,7 @@ async fn do_shutdown(
     }
 
     let native_runner_info = native_runner_info.clone();
-    let other_error_messages = status.error_messages().cloned().unwrap_or_default();
-    let completed_summary = CompletedSummary {
-        native_runner_info,
-        other_error_messages,
-    };
+    let completed_summary = CompletedSummary { native_runner_info };
 
     let (suite_result, errors) = finalized_reporters.finish(&completed_summary);
 
