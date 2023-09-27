@@ -633,7 +633,16 @@ fn native_runner_fails_while_executing_tests() {
     let (error, mut results, _notified_all_run) =
         run_simulated_runner_to_error(simulation, None, Box::new(get_next_tests));
 
-    let GenericRunnerError { error: _, output } = error;
+    let GenericRunnerError {
+        error: _,
+        output,
+        native_runner_info,
+    } = error;
+
+    assert!(
+        native_runner_info.is_some(),
+        "Native runner info should be defined because some tests ran"
+    );
 
     check_bytes!(&output.stdout, b"I failed catastrophically");
     check_bytes!(

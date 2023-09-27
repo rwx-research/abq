@@ -152,7 +152,7 @@ async fn do_shutdown(
         ..
     } = worker_pool.shutdown().await;
 
-    tracing::debug!("Workers shutdown");
+    tracing::debug!(?status, "Workers shutdown");
 
     let finalized_reporters = reporting_handle.join().await;
 
