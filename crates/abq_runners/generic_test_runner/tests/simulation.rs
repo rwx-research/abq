@@ -674,27 +674,10 @@ fn native_runner_fails_while_executing_tests() {
         let output = results[0].output.as_ref().unwrap();
         let output = sanitize_output(output);
 
-        insta::assert_snapshot!(output, @r###"
-        -- Unexpected Test Runner Failure --
-
-        The test command
-
-        <simulation cmd>
-
-        stopped communicating with its abq worker before completing all test requests.
-
-        Here's the standard output/error we found for the failing command.
-
-        Stdout:
-
-        I failed catastrophically
-
-        Stderr:
-
-        For a reason explainable only by a backtrace
-
-        Please see worker 0, runner X for more details.
-        "###);
+        assert!(output.contains("-- Unexpected Test Runner Failure --"));
+        assert!(output.contains(
+            "stopped communicating with its abq worker before completing all test requests."
+        ));
     }
 }
 

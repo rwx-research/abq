@@ -229,7 +229,7 @@ impl Reporter for RwxV1JsonReporter {
             .map(|runner| &runner.specification);
 
         self.collector
-            .write_json(fd, opt_specification, summary.other_error_messages.clone())
+            .write_json(fd, opt_specification)
             .map_err(|_| ReportingError::FailedToFormat)?;
 
         Ok(())

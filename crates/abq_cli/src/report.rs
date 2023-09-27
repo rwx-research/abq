@@ -181,7 +181,6 @@ fn process_results(
 
     let completed_summary = &CompletedSummary {
         native_runner_info: Some(native_runner_info),
-        other_error_messages: vec![],
     };
 
     for reporter in reporters {
