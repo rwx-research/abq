@@ -4717,11 +4717,17 @@ fn warn_on_different_runner_command() {
         args
     };
 
-    let instance1 = Abq::new(format!("{name}_inst1")).args(test_args(0)).run();
+    let instance1 = Abq::new(format!("{name}_inst1"))
+        .args(test_args(0))
+        .always_capture_stderr(true)
+        .run();
 
     assert!(instance1.exit_status.success());
 
-    let instance2 = Abq::new(format!("{name}_inst2")).args(test_args(1)).run();
+    let instance2 = Abq::new(format!("{name}_inst2"))
+        .args(test_args(1))
+        .always_capture_stderr(true)
+        .run();
 
     assert!(instance2.exit_status.success());
 
@@ -4818,7 +4824,10 @@ fn write_partial_rwx_v1_json_results_on_early_runner_termination() {
         stdout,
         stderr,
         exit_status,
-    } = Abq::new(format!("{name}_worker0")).args(test_args).run();
+    } = Abq::new(format!("{name}_worker0"))
+        .args(test_args)
+        .always_capture_stderr(true)
+        .run();
 
     assert!(!exit_status.success());
     assert_eq!(exit_status.code(), Some(ExitCode::ABQ_ERROR.get()));
