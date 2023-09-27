@@ -1,3 +1,10 @@
+## 1.6.3
+
+ABQ 1.6.3 is a patch release.
+
+An issue that could cause ABQ to error when reporting test results after an ABQ
+native runner exited in an unexpected state is fixed.
+
 ## 1.6.2
 
 ABQ 1.6.2 is a patch release.
