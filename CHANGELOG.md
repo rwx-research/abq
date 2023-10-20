@@ -1,3 +1,12 @@
+## 1.6.4
+
+ABQ 1.6.4 is a patch release.
+
+Prior to this release, using `abq test` or `abq report` with an RWX organization
+access token to connect to a hosted queue that failed to find an appropriate
+queue would result in the ABQ invocation falling back to local mode. Now, ABQ
+will exit with an error.
+
 ## 1.6.3
 
 ABQ 1.6.3 is a patch release.
