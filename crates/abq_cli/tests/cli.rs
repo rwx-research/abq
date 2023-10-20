@@ -4653,6 +4653,115 @@ fn test_run_with_pat_and_run_id_that_doesnt_exist() {
 #[test]
 #[with_protocol_version]
 #[serial]
+fn test_unsupported_queue_with_org_access_token() {
+    let name = "test_unsupported_queue_with_org_access_token";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+    let (queue_proc, ..) = setup_queue!(name, conf);
+
+    let access_token = test_access_token();
+
+    {
+        let mut server = Server::new();
+        let in_run_id = "test-run-id";
+        let queue_mock = server
+            .mock("GET", "/queue")
+            .match_header("Authorization", format!("Bearer {}", access_token).as_str())
+            .match_header("User-Agent", format!("abq/{}", abq_utils::VERSION).as_str())
+            .match_query(Matcher::AnyOf(vec![Matcher::UrlEncoded(
+                "run_id".to_string(),
+                in_run_id.to_string(),
+            )]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "usage_error": "Your ABQ version is not supported.",
+                    "rwx_access_token_kind": "organization_access_token",
+                })
+                .to_string(),
+            )
+            .expect(2)
+            .create();
+
+        let test_args = {
+            let args = vec![
+                format!("test"),
+                format!("--worker=1"),
+                format!("--run-id=test-run-id"),
+                format!("--access-token={access_token}"),
+                format!("-n=1"),
+            ];
+            let mut args = conf.extend_args_for_client(args);
+            args.extend([s!("--"), s!("false")]);
+            args
+        };
+
+        let CmdOutput {
+            exit_status,
+            stderr,
+            stdout,
+        } = Abq::new(format!("{name}_initial"))
+            .args(test_args)
+            .always_capture_stderr(true)
+            .env([("ABQ_API", server.url())])
+            .run();
+
+        assert!(
+            !exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "ABQ was unable to find a queue to run against. Your ABQ version is not supported."
+            ),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?
+        let report_args = {
+            let args = vec![
+                format!("report"),
+                format!("--reporter=dot"),
+                format!("--run-id=test-run-id"),
+                format!("--access-token={access_token}"),
+                format!("--color=never"),
+            ];
+            conf.extend_args_for_client(args)
+        };
+
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report")
+            .args(report_args)
+            .always_capture_stderr(true)
+            .env([("ABQ_API", server.url())])
+            .run();
+
+        assert!(
+            !exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(
+                "ABQ was unable to find a queue to run against. Your ABQ version is not supported."
+            ),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+
+        queue_mock.assert();
+    }
+
+    term(queue_proc);
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
 fn warn_on_different_runner_command() {
     let name = "warn_on_different_runner_command";
     let conf = CSConfigOptions {

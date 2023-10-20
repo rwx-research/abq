@@ -664,7 +664,7 @@ struct QueueLocationConfig {
 
 fn determine_queue_location(config: QueueLocationConfig) -> QueueLocation {
     match config.access_token_kind {
-        Some(AccessTokenKind::Personal) => {
+        Some(_) => {
             match (
                 config.run_id_provided,
                 config.usage_error_from_api,
@@ -680,7 +680,7 @@ fn determine_queue_location(config: QueueLocationConfig) -> QueueLocation {
                 },
             }
         }
-        _ => match config.queue_addr {
+        None => match config.queue_addr {
             Some(queue_addr) => QueueLocation::Remote(queue_addr),
             None => QueueLocation::Ephemeral {
                 opt_tls_key: config.tls_key,
