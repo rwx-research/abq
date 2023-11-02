@@ -30,7 +30,7 @@ tasks:
         curl --proto '=https' --tlsv1.2 --retry 10 -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
         echo "PATH=${CARGO_HOME:-$HOME/.cargo}/bin" >> "$MINT_ENV"
       fi
-  - key: setup-rust
+  - key: setup-rustup
     from: [install-rustup, install-musl-libc]
     run: |
       rustup toolchain install 1.65.0 \
@@ -42,6 +42,10 @@ tasks:
       rustup default 1.65.0
       echo CARGO_INCREMENTAL=0 >> $MINT_ENV
       rustc +1.65.0 --version --verbose
+  - key: setup-rust
+    from: [setup-rustup]
+    run: |
+      cargo update --dry-run
   - key: linting
     from: [clone, setup-rust]
     tasks:
