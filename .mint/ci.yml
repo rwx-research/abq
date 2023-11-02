@@ -16,7 +16,6 @@ tasks:
   - key: clone
     from: [git-clone-with-dot-git]
     run: |
-      rm -rf ./.git
       # For some reason we need this, even though actions/checkout sets
       # safe.directory by default?
       # Perhaps it is because we work in a container?
