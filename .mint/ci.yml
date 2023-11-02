@@ -12,7 +12,7 @@ concurrency-pools:
     on-overflow: cancel-running
 
 tasks:
-  - key: git-clone-with-dot-git
+  - key: clone
     uses: mint/checkout
     from: []
     with:
@@ -20,15 +20,6 @@ tasks:
       sha: ${{ init.commit-sha }}
       token: ''
       ssh-key: ${{ vaults.default.secrets.CHECKOUT_SSH_KEY_ABQ_REPO }}
-  - key: clone
-    from: [git-clone-with-dot-git]
-    run: |
-      # For some reason we need this, even though actions/checkout sets
-      # safe.directory by default?
-      # Perhaps it is because we work in a container?
-      git config --global --add safe.directory "$PWD"
-      git describe
-      git fetch --tags --force
   - key: install-musl-libc
     from: []
     run: sudo apt-get update && sudo apt-get install -y musl-tools
