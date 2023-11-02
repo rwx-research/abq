@@ -2,7 +2,14 @@ github:
   on:
     push:
       init:
-        gh-sha: ${{ event.github.push.head_commit.id }}
+        commit-sha: ${{ event.github.push.head_commit.id }}
+        branch: ${{ event.github.push.ref }}
+
+concurrency-pools:
+  - id: rwx-research/abq:${{ init.branch }}
+    if: ${{ init.branch != "refs/heads/main" }}
+    capacity: 1
+    on-overflow: cancel-running
 
 tasks:
   - key: git-clone-with-dot-git
@@ -10,7 +17,7 @@ tasks:
     from: []
     with:
       repository: git@github.com:rwx-research/abq.git
-      sha: ${{ init.gh-sha }}
+      sha: ${{ init.commit-sha }}
       token: ''
       ssh-key: ${{ vaults.default.secrets.CHECKOUT_SSH_KEY_ABQ_REPO }}
   - key: clone
