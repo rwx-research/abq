@@ -45,7 +45,11 @@ tasks:
   - key: setup-rust
     from: [setup-rustup]
     run: |
+      cargo new temp_project
+      cd temp_project
       cargo update --dry-run
+      cd ..
+      rm -rf temp_project
   - key: linting
     from: [clone, setup-rust]
     tasks:
