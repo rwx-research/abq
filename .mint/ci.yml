@@ -1,0 +1,82 @@
+github:
+  on:
+    push:
+      init:
+        gh-sha: ${{ event.github.push.head_commit.id }}
+
+tasks:
+  - key: git-clone-with-dot-git
+    uses: mint/checkout
+    from: []
+    with:
+      repository: git@github.com:rwx-research/captain.git
+      sha: ${{ init.gh-sha }}
+      token: ''
+      ssh-key: ${{ vaults.default.secrets.CHECKOUT_SSH_KEY_ABQ_REPO }}
+  - key: clone
+    from: [git-clone-with-dot-git]
+    run: |
+      rm -rf ./.git
+      # For some reason we need this, even though actions/checkout sets
+      # safe.directory by default?
+      # Perhaps it is because we work in a container?
+      git config --global --add safe.directory "$PWD"
+      git describe
+      git fetch --tags --force
+  - key: install-musl-libc
+    from: []
+    run: sudo apt-get install -y musl-tools
+  - key: install-rustup
+    from: []
+    run: |
+      if ! command -v rustup &> /dev/null ; then
+        curl --proto '=https' --tlsv1.2 --retry 10 -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+        echo "PATH=${CARGO_HOME:-$HOME/.cargo}/bin" >> "$MINT_ENV"
+      fi
+  - key: setup-rust
+    from: [install-rustup, install-musl-libc]
+    run: |
+      rustup toolchain install 1.65.0 \
+        --target x86_64-unknown-linux-musl \
+        --component clippy \
+        --component rustfmt \
+        --profile minimal \
+        --no-self-update
+      rustup default 1.65.0
+      echo CARGO_INCREMENTAL=0 >> $MINT_ENV
+      rustc +1.65.0 --version --verbose
+  - key: linting
+    from: [clone, setup-rust]
+    tasks:
+      - key: clippy
+        from: []
+        run: |
+          cargo clippy --workspace --tests --profile=release-unstable --all-features --target=x86_64-unknown-linux-musl -- --deny warnings
+      - key: clippy
+        from: []
+        run: |
+          cargo fmt -- --check
+  - key: setup-node
+    uses: mint/setup-node
+    from: []
+    with:
+      node-version: 14
+      node-version-file: '' # version file is broken as of now
+  - key: load-test-dependencies
+    from: [clone, setup-node]
+    run: |
+      scripts/init_testdata
+  - key: build
+    from: [clone, setup-rust]
+    run: |
+      cargo build --tests --bins --profile=release-unstable --all-features --target=x86_64-unknown-linux-musl
+    env:
+      ABQ_DEVELOPMENT_BUILD: 1
+      ABQ_NO_REBUILD: true
+  - key: test
+    from: [build]
+    run: |
+      cargo test --profile=release-unstable --all-features --target=x86_64-unknown-linux-musl
+    env:
+      ABQ_DEVELOPMENT_BUILD: 1
+      ABQ_NO_REBUILD: true
