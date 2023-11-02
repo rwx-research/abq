@@ -9,7 +9,7 @@ tasks:
     uses: mint/checkout
     from: []
     with:
-      repository: git@github.com:rwx-research/captain.git
+      repository: git@github.com:rwx-research/abq.git
       sha: ${{ init.gh-sha }}
       token: ''
       ssh-key: ${{ vaults.default.secrets.CHECKOUT_SSH_KEY_ABQ_REPO }}
@@ -25,7 +25,7 @@ tasks:
       git fetch --tags --force
   - key: install-musl-libc
     from: []
-    run: sudo apt-get install -y musl-tools
+    run: sudo apt-get update && sudo apt-get install -y musl-tools
   - key: install-rustup
     from: []
     run: |
@@ -60,7 +60,7 @@ tasks:
     uses: mint/setup-node
     from: []
     with:
-      node-version: 14
+      node-version: 20.8.0
       node-version-file: '' # version file is broken as of now
   - key: load-test-dependencies
     from: [clone, setup-node]
