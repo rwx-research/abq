@@ -52,7 +52,7 @@ tasks:
         from: []
         run: |
           cargo clippy --workspace --tests --profile=release-unstable --all-features --target=x86_64-unknown-linux-musl -- --deny warnings
-      - key: clippy
+      - key: format
         from: []
         run: |
           cargo fmt -- --check
