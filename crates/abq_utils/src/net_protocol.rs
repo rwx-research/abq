@@ -689,8 +689,8 @@ pub mod queue {
         /// Some test results are still being persisted, the request for test results should
         /// re-query in the future.
         Pending,
-        /// Test results are not yet available because of the following outstanding runners.
-        OutstandingRunners(Vec<Tag>),
+        /// Test results are not yet available because the run is still in progress.
+        RunInProgress { active_runners: Vec<Tag> },
         /// The test results are unavailable for the given reason.
         Error(String),
     }

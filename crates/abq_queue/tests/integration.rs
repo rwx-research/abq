@@ -728,7 +728,9 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                             TestResultsOutcome::Results(results)
                         }
                         Pending => TestResultsOutcome::Pending,
-                        OutstandingRunners(tags) => TestResultsOutcome::OutstandingRunners(tags),
+                        RunInProgress { active_runners } => {
+                            TestResultsOutcome::OutstandingRunners(active_runners)
+                        }
                         Error(s) => TestResultsOutcome::Error(s),
                     };
 

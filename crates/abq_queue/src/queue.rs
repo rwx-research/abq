@@ -305,8 +305,9 @@ enum ReadResultsError {
 enum ReadResultsState {
     /// Results are ready to be retrieved, no active workers are currently seen.
     ReadFromCell(ResultsPersistedCell),
-    /// The given workers are still active.
-    OutstandingRunners(Vec<Tag>),
+    RunInProgress {
+        active_runners: Vec<Tag>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -964,7 +965,7 @@ impl AllRuns {
                     .filter(|(_, done_time)| done_time.is_none())
                     .map(|(e, _)| e.tag)
                     .collect();
-                Ok(ReadResultsState::OutstandingRunners(active_runners))
+                Ok(ReadResultsState::RunInProgress { active_runners })
             }
             RunState::InitialManifestDone {
                 results_persistence,
@@ -977,18 +978,16 @@ impl AllRuns {
                         // If we don't have any pending, the results can be fetched (subject to the
                         // linearizability consistency model; see [crate::persistence::results]).
                         let workers = seen_workers.read();
-                        let mut active_workers = workers
+                        let active_runners: Vec<_> = workers
                             .iter()
                             .filter(|(_, is_active)| *is_active)
                             .map(|(e, _)| e.tag)
-                            .peekable();
+                            .collect();
 
-                        if active_workers.peek().is_none() {
+                        if active_runners.is_empty() {
                             Ok(ReadResultsState::ReadFromCell(cell.clone()))
                         } else {
-                            Ok(ReadResultsState::OutstandingRunners(
-                                active_workers.collect(),
-                            ))
+                            Ok(ReadResultsState::RunInProgress { active_runners })
                         }
                     }
                     ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
@@ -2356,8 +2355,8 @@ impl QueueServer {
         let results_cell = match queues.get_read_results_cell(&run_id).located(here!()) {
             Ok(state) => match state {
                 ReadResultsState::ReadFromCell(cell) => cell,
-                ReadResultsState::OutstandingRunners(tags) => {
-                    let response = TestResultsResponse::OutstandingRunners(tags);
+                ReadResultsState::RunInProgress { active_runners } => {
+                    let response = TestResultsResponse::RunInProgress { active_runners };
 
                     net_protocol::async_write(&mut stream, &response)
                         .await
@@ -4878,7 +4877,7 @@ mod persist_results {
                 test_command_hash: TestCommandHash::random(),
             }
         },
-        Ok(ReadResultsState::OutstandingRunners(r)) if r == &[Tag::runner(1, 1)]
+        Ok(ReadResultsState::RunInProgress { active_runners }) if active_runners == &[Tag::runner(1, 1)]
     }
 
     get_read_results_cell! {
@@ -4914,7 +4913,7 @@ mod persist_results {
                 test_command_hash: Some(TestCommandHash::random()),
             }
         },
-        Ok(ReadResultsState::OutstandingRunners(r)) if r == &[Tag::runner(2, 1)]
+        Ok(ReadResultsState::RunInProgress { active_runners }) if active_runners == &[Tag::runner(2, 1)]
     }
 
     get_read_results_cell! {
@@ -5077,8 +5076,8 @@ mod persist_results {
             );
             let (response, _conn) = get_test_results_response().await;
             match response {
-                OutstandingRunners(tags) => {
-                    assert_eq!(tags, vec![Tag::runner(1, 1)]);
+                RunInProgress { active_runners } => {
+                    assert_eq!(active_runners, vec![Tag::runner(1, 1)]);
                 }
                 response => unreachable!("{response:?}"),
             }

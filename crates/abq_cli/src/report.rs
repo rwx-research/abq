@@ -291,8 +291,12 @@ async fn wait_for_results_help(
                 attempt += 1;
                 continue;
             }
-            OutstandingRunners(tags) => {
-                let active_runners = tags
+            RunInProgress { active_runners } => {
+                if active_runners.is_empty() {
+                    bail!("this ABQ run has not assigned all tests in your test suite, but there are no active runners to assign them to. Please either add more runners, or launch a new run.")
+                }
+
+                let active_runners = active_runners
                     .into_iter()
                     .map(|t| t.to_string())
                     .collect::<Vec<_>>()
