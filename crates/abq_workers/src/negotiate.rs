@@ -248,7 +248,7 @@ impl WorkersNegotiator {
             AssignedRunKind::Fresh {
                 should_generate_manifest,
             } => should_generate_manifest,
-            AssignedRunKind::Retry | AssignedRunKind::RetryAndContinue => false,
+            AssignedRunKind::RetryAndContinue => false,
         };
 
         let runner_strategy_generator = RunnerStrategyGenerator::new(

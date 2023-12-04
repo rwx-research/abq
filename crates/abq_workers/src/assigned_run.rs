@@ -7,9 +7,7 @@ use serde_derive::{Deserialize, Serialize};
 pub enum AssignedRunKind {
     /// This worker is connecting for a fresh run, and should fetch tests online.
     Fresh { should_generate_manifest: bool },
-    /// This worker is connecting for a retry, and should fetch its manifest from the queue once.
-    Retry,
-    /// This worker should pull the retry manifest, and then continue to fetch tests online.
+    /// This worker should pull its retry manifest, and then continue to fetch tests online.
     RetryAndContinue,
 }
 

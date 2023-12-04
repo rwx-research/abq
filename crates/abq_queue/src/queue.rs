@@ -458,18 +458,8 @@ impl AllRuns {
                             "worker reconnecting for out-of-process retry manifest during active run"
                         );
 
-                        // If the runner died unexpectedly (i.e. without requesting a cancellation)
-                        // before we hand out everything in the manifest, let's have it replay what
-                        // it retried, and continue reading from the manifest thereafter.
-                        let runner_should_continue = old_finished_time.is_none();
-                        let assignment = if runner_should_continue {
-                            AssignedRunKind::RetryAndContinue
-                        } else {
-                            AssignedRunKind::Retry
-                        };
-
                         AssignedRunStatus::Run(AssignedRun {
-                            kind: assignment,
+                            kind: AssignedRunKind::RetryAndContinue,
                             runner_test_command_differs,
                         })
                     }
@@ -498,7 +488,7 @@ impl AllRuns {
                     }
 
                     AssignedRunStatus::Run(AssignedRun {
-                        kind: AssignedRunKind::Retry,
+                        kind: AssignedRunKind::RetryAndContinue,
                         runner_test_command_differs,
                     })
                 } else {
@@ -1315,21 +1305,11 @@ impl AllRuns {
                 // legal cancellation states
             }
             RunState::InitialManifestDone { seen_workers, .. } => {
-                // Since we already have issued the full manifest out, don't mark this run as
-                // cancelled; this might be a stragling worker or a worker that cancelled an
-                // out-of-process retry.
                 tracing::info!(
                     ?run_id,
                     "refusing to cancel run whose manifest has already been exhausted"
                 );
-                // Mark the worker as now-inactive.
-                let old_tag = seen_workers.write().insert_by_tag(entity, false);
-                log_assert!(
-                    old_tag.is_some(),
-                    ?entity,
-                    ?run_id,
-                    "entity was not seen before it marked cancellation"
-                );
+                seen_workers.write().insert_by_tag(entity, false);
                 return;
             }
         }
@@ -4005,7 +3985,7 @@ mod test {
         assert_eq!(
             assigned,
             AssignedRunStatus::Run(AssignedRun {
-                kind: AssignedRunKind::Retry,
+                kind: AssignedRunKind::RetryAndContinue,
                 runner_test_command_differs: false
             })
         );
@@ -4466,7 +4446,7 @@ mod persistence_on_end_of_manifest {
         assert_eq!(
             assigned,
             AssignedRunStatus::Run(AssignedRun {
-                kind: AssignedRunKind::Retry,
+                kind: AssignedRunKind::RetryAndContinue,
                 runner_test_command_differs: false
             })
         );
