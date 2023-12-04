@@ -9,6 +9,8 @@ pub enum AssignedRunKind {
     Fresh { should_generate_manifest: bool },
     /// This worker is connecting for a retry, and should fetch its manifest from the queue once.
     Retry,
+    /// This worker should pull the retry manifest, and then continue to fetch tests online.
+    RetryAndContinue,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]

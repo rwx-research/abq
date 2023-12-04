@@ -91,8 +91,12 @@ impl StrategyGenerator for RunnerStrategyGenerator {
         } = &self;
 
         let sourcing_strategy = match assigned {
-            AssignedRunKind::Fresh { .. } => test_fetching::SourcingStrategy::Fresh,
-            AssignedRunKind::Retry => test_fetching::SourcingStrategy::Retry,
+            AssignedRunKind::Fresh { .. } => vec![test_fetching::SourcingStrategy::Queue],
+            AssignedRunKind::Retry => vec![test_fetching::SourcingStrategy::RetryManifest],
+            AssignedRunKind::RetryAndContinue => vec![
+                test_fetching::SourcingStrategy::RetryManifest,
+                test_fetching::SourcingStrategy::Queue,
+            ],
         };
 
         let (tests_fetcher, results_retry_tracker) = test_fetching::Fetcher::new(

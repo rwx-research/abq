@@ -422,7 +422,7 @@ impl AllRuns {
                             runner_test_command_differs,
                         })
                     }
-                    Some((old_entity, old_finished_state)) => {
+                    Some((old_entity, old_finished_time)) => {
                         if old_entity.id == entity.id {
                             // The same worker entity is connecting twice - this implies that the
                             // same worker process is asking to find a run more than once, which
@@ -453,13 +453,23 @@ impl AllRuns {
                         // itself, and if this is done we could hand out the manifest right here,
                         // rather than asking the runner to reconnect to retrieve the manifest.
                         tracing::info!(
-                            ?old_finished_state,
+                            ?old_finished_time,
                             ?entity,
                             "worker reconnecting for out-of-process retry manifest during active run"
                         );
 
+                        // If the runner died unexpectedly (i.e. without requesting a cancellation)
+                        // before we hand out everything in the manifest, let's have it replay what
+                        // it retried, and continue reading from the manifest thereafter.
+                        let runner_should_continue = old_finished_time.is_none();
+                        let assignment = if runner_should_continue {
+                            AssignedRunKind::RetryAndContinue
+                        } else {
+                            AssignedRunKind::Retry
+                        };
+
                         AssignedRunStatus::Run(AssignedRun {
-                            kind: AssignedRunKind::Retry,
+                            kind: assignment,
                             runner_test_command_differs,
                         })
                     }
@@ -4331,7 +4341,7 @@ mod persistence_on_end_of_manifest {
 
     #[tokio::test]
     #[with_protocol_version]
-    async fn worker_told_to_pull_retry_manifest() {
+    async fn worker_told_to_pull_retry_manifest_and_continue() {
         let queues = SharedRuns::default();
         let remote = remote::NoopPersister::new().into();
 
@@ -4388,6 +4398,71 @@ mod persistence_on_end_of_manifest {
                     .build(),
             )
             .await;
+
+        assert_eq!(
+            assigned,
+            AssignedRunStatus::Run(AssignedRun {
+                kind: AssignedRunKind::RetryAndContinue,
+                runner_test_command_differs: false
+            })
+        );
+    }
+
+    #[tokio::test]
+    #[with_protocol_version]
+    async fn worker_told_to_pull_retry_manifest_no_continue() {
+        let queues = SharedRuns::default();
+        let remote = remote::NoopPersister::new().into();
+
+        let run_id = RunId::unique();
+
+        let worker0 = Entity::runner(1, 1);
+        let worker0_shadow = Entity::runner(1, 1);
+        assert_ne!(worker0.id, worker0_shadow.id);
+        assert_eq!(worker0.tag, worker0_shadow.tag);
+
+        let test1 = fake_test_spec(proto);
+        let test2 = fake_test_spec(proto);
+        let test3 = fake_test_spec(proto);
+
+        let test_command_hash = TestCommandHash::random();
+
+        // Create run, add manifest by worker0
+        {
+            let run_params = RunParamsBuilder::new(&run_id, &remote)
+                .entity(worker0)
+                .runner_test_command_hash(test_command_hash)
+                .build();
+            let manifest = vec![
+                (test1.clone(), GroupId::new()),
+                (test2, GroupId::new()),
+                (test3, GroupId::new()),
+            ];
+            let _ = queues.find_or_create_run(run_params).await;
+            let _ = queues.add_manifest(&run_id, manifest, Default::default());
+        }
+
+        // worker0 pulls tests
+        {
+            let NextWorkResult { bundle, .. } = queues.next_work(worker0, &run_id);
+            assert_eq!(
+                bundle.work,
+                vec![WorkerTest::new(test1.clone(), INIT_RUN_NUMBER)]
+            );
+        }
+
+        queues.mark_worker_complete(&run_id, worker0, std::time::Instant::now());
+
+        // Suppose worker0 re-runs.
+        let assigned = queues
+            .find_or_create_run(
+                RunParamsBuilder::new(&run_id, &remote)
+                    .entity(worker0_shadow)
+                    .runner_test_command_hash(test_command_hash)
+                    .build(),
+            )
+            .await;
+
         assert_eq!(
             assigned,
             AssignedRunStatus::Run(AssignedRun {

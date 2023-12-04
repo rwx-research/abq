@@ -5066,8 +5066,7 @@ fn retry_continued_manifest_read_on_worker_death() {
                         OpaqueRead,
                         OpaqueWrite(pack(InitSuccessMessage::new(proto))),
                         // Read first test, write okay
-                        OpaqueRead,
-                        OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+                        IfAliveReadAndWriteFake(Status::Success),
                         Stdout("finished running first test\n".into()),
                     ];
                     if i == 1 {
@@ -5075,9 +5074,7 @@ fn retry_continued_manifest_read_on_worker_death() {
                         actions.push(Sleep(Duration::from_secs(600)));
                     } else {
                         for _ in 0..3 {
-                            // Second run: read the next test, write okay
-                            actions.push(OpaqueRead);
-                            actions.push(OpaqueWrite(pack(RawTestResultMessage::fake(proto))));
+                            actions.push(IfAliveReadAndWriteFake(Status::Success));
                         }
                     }
                     actions
@@ -5149,7 +5146,10 @@ fn retry_continued_manifest_read_on_worker_death() {
         } = Abq::new(format!("{name}_worker0_attempt1"))
             .args(test_args)
             .run();
-        assert!(exit_status.success());
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
         assert!(
             stdout.contains("4 tests, 0 failures"),
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
