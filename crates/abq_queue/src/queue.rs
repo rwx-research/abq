@@ -4877,7 +4877,7 @@ mod persist_results {
                 test_command_hash: TestCommandHash::random(),
             }
         },
-        Ok(ReadResultsState::RunInProgress(r)) if r == &[Tag::runner(1, 1)]
+        Ok(ReadResultsState::RunInProgress { active_runners }) if active_runners == &[Tag::runner(1, 1)]
     }
 
     get_read_results_cell! {
@@ -4913,7 +4913,7 @@ mod persist_results {
                 test_command_hash: Some(TestCommandHash::random()),
             }
         },
-        Ok(ReadResultsState::RunInProgress { active_runners: [r] }) if r == &[Tag::runner(2, 1)]
+        Ok(ReadResultsState::RunInProgress { active_runners }) if active_runners == &[Tag::runner(2, 1)]
     }
 
     get_read_results_cell! {
