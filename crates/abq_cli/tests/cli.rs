@@ -417,12 +417,15 @@ fn wait_for_live_worker(worker_stderr: &mut ChildStderr) {
 
 // Waits for the debug line "starting execution of all tests" in the worker.
 fn wait_for_worker_executing(worker_stderr: &mut ChildStderr) {
-    let mut worker_reader = BufReader::new(worker_stderr).lines();
-    // Spin until we know the worker0 is UP
+    wait_for_line(worker_stderr, "starting execution of all tests");
+}
+
+fn wait_for_line<R: std::io::Read>(reader: R, output: &str) {
+    let mut reader = BufReader::new(reader).lines();
     loop {
-        if let Some(line) = worker_reader.next() {
+        if let Some(line) = reader.next() {
             let line = line.expect("line is not a string");
-            if line.contains("starting execution of all tests") {
+            if line.contains(output) {
                 break;
             }
         }
@@ -5016,4 +5019,155 @@ fn write_partial_rwx_v1_json_results_on_early_runner_termination() {
       ]
     }
     "###);
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn retry_continued_manifest_read_on_worker_death() {
+    let name = "retry_continued_manifest_read_on_worker_death";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: true,
+    };
+
+    let (_queue_proc, queue_addr) = setup_queue!(name, conf);
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let manifest = (0..4)
+        .map(|i| {
+            TestOrGroup::test(Test::new(
+                proto,
+                format!("test{}", i),
+                [],
+                Default::default(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let make_simulation = |i| {
+        [
+            Connect,
+            //
+            // Write spawn message
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            //
+            // Write the manifest if we need to.
+            // Otherwise handle the one test.
+            IfGenerateManifest {
+                then_do: vec![OpaqueWrite(pack(&manifest))],
+                else_do: {
+                    let mut actions = vec![
+                        //
+                        // Read init context message + write ACK
+                        OpaqueRead,
+                        OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                        // Read first test, write okay
+                        IfAliveReadAndWriteFake(Status::Success),
+                        Stdout("finished running first test\n".into()),
+                    ];
+                    if i == 1 {
+                        // First run: sleep forever, we will kill the worker.
+                        actions.push(Sleep(Duration::from_secs(600)));
+                    } else {
+                        for _ in 0..3 {
+                            actions.push(IfAliveReadAndWriteFake(Status::Success));
+                        }
+                    }
+                    actions
+                },
+            },
+            //
+            // Finish
+            Exit(0),
+        ]
+    };
+
+    let simulation1 = make_simulation(1);
+    let simulation2 = make_simulation(2);
+
+    let packed = pack_msgs_to_disk(simulation1);
+
+    let run_id = "test-run-id";
+
+    let test_args = {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = packed.path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker=0"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--batch-size=1"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let report_args = {
+        let args = vec![
+            format!("report"),
+            format!("--reporter=dot"),
+            format!("--queue-addr={queue_addr}"),
+            format!("--run-id={run_id}"),
+            format!("--color=never"),
+        ];
+        conf.extend_args_for_client(args)
+    };
+
+    let mut worker0_attempt1 = Abq::new(format!("{name}_worker0_attempt1"))
+        .args(&test_args)
+        .spawn();
+
+    let attempt1_stdout = worker0_attempt1.stdout.as_mut().unwrap();
+    wait_for_line(attempt1_stdout, "finished running first test");
+
+    // Kill the worker.
+    worker0_attempt1.kill().unwrap();
+
+    {
+        let CmdOutput { exit_status, .. } = Abq::new(name.to_string() + "_report1")
+            .args(&report_args)
+            .run();
+        assert!(!exit_status.success());
+    }
+
+    std::fs::write(packed.path, pack_msgs(simulation2)).unwrap();
+
+    {
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(format!("{name}_worker0_attempt1"))
+            .args(test_args)
+            .run();
+        assert!(
+            exit_status.success(),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("4 tests, 0 failures"),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+
+    {
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new(name.to_string() + "_report2")
+            .args(report_args)
+            .run();
+        assert!(exit_status.success());
+        assert!(
+            stdout.contains("4 tests, 0 failures"),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
 }

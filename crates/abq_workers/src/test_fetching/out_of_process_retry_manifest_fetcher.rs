@@ -65,7 +65,7 @@ impl OutOfProcessRetryManifestFetcher {
 }
 
 impl OutOfProcessRetryManifestFetcher {
-    pub async fn get_next_tests(self) -> Result<NextWorkBundle, FetchTestsError> {
+    pub async fn get_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
         let Self {
             entity,
             work_server_addr,
@@ -83,7 +83,7 @@ impl OutOfProcessRetryManifestFetcher {
                         attempt
                     );
                 }
-                client.connect(work_server_addr)
+                client.connect(*work_server_addr)
             })
             .await
             .expect("work server not available");
@@ -91,10 +91,10 @@ impl OutOfProcessRetryManifestFetcher {
             use net_protocol::work_server::{Message, Request, RetryManifestResponse::*};
 
             let request = Request {
-                entity,
+                entity: *entity,
                 message: Message::RetryManifestPartition {
                     run_id: run_id.clone(),
-                    entity,
+                    entity: *entity,
                 },
             };
             net_protocol::async_write(&mut conn, &request)
@@ -109,15 +109,15 @@ impl OutOfProcessRetryManifestFetcher {
         };
 
         async_retry_n(
-            fetch_manifest_attempts,
-            fetch_manifest_backoff,
+            *fetch_manifest_attempts,
+            *fetch_manifest_backoff,
             try_fetch_manifest,
         )
         .await
         .unwrap_or_else(|_| {
             panic!(
                 "failed to fetch manifest after {} seconds",
-                fetch_manifest_attempts * (fetch_manifest_backoff.as_secs() as usize)
+                (*fetch_manifest_attempts) * (fetch_manifest_backoff.as_secs() as usize)
             )
         })
     }
@@ -208,7 +208,7 @@ pub mod test {
 
     #[tokio::test]
     async fn smoke() {
-        let (server, fetcher) = scaffold_server().await;
+        let (server, mut fetcher) = scaffold_server().await;
 
         let server_task = async move {
             let mut conn = server_establish(&*server).await;
@@ -226,7 +226,7 @@ pub mod test {
 
     #[tokio::test]
     async fn pending_finally_succeeds() {
-        let (server, fetcher) = scaffold_server_help(3, Duration::ZERO).await;
+        let (server, mut fetcher) = scaffold_server_help(3, Duration::ZERO).await;
 
         let server_task = async move {
             // Accept, then say pending manifest
@@ -260,7 +260,7 @@ pub mod test {
             $(
             #[tokio::test]
             async fn $test() {
-                let (server, fetcher) = scaffold_server().await;
+                let (server, mut fetcher) = scaffold_server().await;
 
                 let server_task = async move {
                     let mut conn = server_establish(&*server).await;

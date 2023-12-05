@@ -1,3 +1,18 @@
+## 1.7.0
+
+ABQ 1.7.0 is a minor release.
+
+This release improves ABQ's behavior when an ABQ runner is terminated before
+being assigned all applicable test in a run manifest. In previous versions of
+ABQ, retrying such a runner would only retry the tests the runner was assigned
+before it terminated. Starting with ABQ 1.7.0, a runner that connects for a run
+ID after it was terminated will run all tests it ran on its first connection,
+and then pull tests from the run queue.
+
+ABQ continues to cancel runs when a runner is terminated with SIGTERM, SIGINT,
+or SIGQUIT. The changes in 1.7.0 apply to runners terminated in other ways, for
+example via SIGKILL.
+
 ## 1.6.4
 
 ABQ 1.6.4 is a patch release.

@@ -39,7 +39,7 @@ use retries::RetryTracker;
 /// NEW_PROCESS_RETRY: takes the place of FRESH if this is a re-run of a previously-completed
 /// execution of a test suite by a worker.
 pub struct Fetcher {
-    initial_source: Option<InitialSource>,
+    initial_sources_rev: Vec<InitialSource>,
     retry_source: RetryTracker,
     pending_retry_manifest_wait_time: Duration,
 }
@@ -48,23 +48,21 @@ const DEFAULT_PENDING_RETRY_MANIFEST_WAIT_TIME: Duration = Duration::from_millis
 
 /// How the initial manifest from the queue should be sourced.
 pub enum SourcingStrategy {
-    /// This runner is new to the given test; use the FRESH strategy.
-    Fresh,
-    /// This runner is retrying a given test run; use NEW_PROCESS_RETRY strategy.
-    Retry,
+    Queue,
+    RetryManifest,
 }
 
 impl Fetcher {
     pub fn new(
-        sourcing_strategy: SourcingStrategy,
+        sourcing_strategies: impl IntoIterator<Item = SourcingStrategy>,
         entity: Entity,
         work_server_addr: SocketAddr,
         client: Box<dyn ConfiguredClient>,
         run_id: RunId,
         max_run_number: u32,
     ) -> (Self, ResultsTracker) {
-        let initial_source = InitialSource::from_strategy(
-            sourcing_strategy,
+        let initial_source = InitialSource::from_strategies(
+            sourcing_strategies,
             entity,
             work_server_addr,
             client,
@@ -79,13 +77,13 @@ impl Fetcher {
     }
 
     fn new_help(
-        initial_source: InitialSource,
+        initial_sources: Vec<InitialSource>,
         max_run_number: u32,
         pending_retry_manifest_wait_time: Duration,
     ) -> (Self, ResultsTracker) {
         let (retry_source, results_tracker) = retries::build_tracking_pair(max_run_number);
         let me = Self {
-            initial_source: Some(initial_source),
+            initial_sources_rev: initial_sources.into_iter().rev().collect(),
             retry_source,
             pending_retry_manifest_wait_time,
         };
@@ -93,10 +91,9 @@ impl Fetcher {
     }
 }
 
-/// The initial source of tests; this is either FRESH or NEW_PROCESS_RETRY.
 enum InitialSource {
-    Fresh(PersistedTestsFetcher),
-    Retry(OutOfProcessRetryManifestFetcher),
+    Queue(PersistedTestsFetcher),
+    ServerRetryManifest(OutOfProcessRetryManifestFetcher),
 }
 
 impl InitialSource {
@@ -108,19 +105,37 @@ impl InitialSource {
         run_id: RunId,
     ) -> Self {
         match strategy {
-            SourcingStrategy::Fresh => Self::Fresh(persistent_test_fetcher::start(
+            SourcingStrategy::Queue => Self::Queue(persistent_test_fetcher::start(
                 entity,
                 work_server_addr,
                 client,
                 run_id,
             )),
-            SourcingStrategy::Retry => Self::Retry(OutOfProcessRetryManifestFetcher::new(
-                entity,
-                work_server_addr,
-                client,
-                run_id,
-            )),
+            SourcingStrategy::RetryManifest => Self::ServerRetryManifest(
+                OutOfProcessRetryManifestFetcher::new(entity, work_server_addr, client, run_id),
+            ),
         }
+    }
+
+    fn from_strategies(
+        strategies: impl IntoIterator<Item = SourcingStrategy>,
+        entity: Entity,
+        work_server_addr: SocketAddr,
+        client: Box<dyn ConfiguredClient>,
+        run_id: RunId,
+    ) -> Vec<Self> {
+        strategies
+            .into_iter()
+            .map(|strategy| {
+                Self::from_strategy(
+                    strategy,
+                    entity,
+                    work_server_addr,
+                    client.boxed_clone(),
+                    run_id.clone(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -128,8 +143,7 @@ impl Fetcher {
     async fn fetch_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
         // Test fetching works in two phases:
         //
-        //   1. Fetch the schedule of the manifest to be run by the worker from the queue, either
-        //      online (FRESH) or offline (NEW_PROCESS_RETRY).
+        //   1. Fetch the schedule of the manifest to be run by the worker from the queue.
         //      This schedule is used to hydrate the retry manifest tracker as it comes in.
         //   2. After the full manifest has been pulled, defer to the manifest tracker to supply
         //      all tests that should be re-run.
@@ -138,19 +152,28 @@ impl Fetcher {
         //      One the retry manifest issues [NextWork::EndOfWork], there are no more tests to be
         //      run.
         loop {
-            let initial_source = std::mem::take(&mut self.initial_source);
+            let initial_sources = &mut self.initial_sources_rev;
 
-            match initial_source {
+            match initial_sources.last_mut() {
                 Some(source) => {
-                    let tests = match source {
-                        InitialSource::Fresh(mut s) => {
-                            let tests = s.get_next_tests().await;
-                            // Put the source back, we may need it to fetch incremental tests again.
-                            self.initial_source = Some(InitialSource::Fresh(s));
-                            tests
+                    let mut tests = match source {
+                        InitialSource::Queue(s) => {
+                            tracing::debug!("Fetching from fresh manifest");
+                            s.get_next_tests().await
                         }
-                        InitialSource::Retry(s) => s.get_next_tests().await?,
+                        InitialSource::ServerRetryManifest(s) => {
+                            tracing::debug!("Fetching from retry manifest");
+                            s.get_next_tests().await?
+                        }
                     };
+
+                    if tests.eow.0 {
+                        self.initial_sources_rev.pop();
+                    }
+                    if tests.work.is_empty() && !self.initial_sources_rev.is_empty() {
+                        continue;
+                    }
+                    tests.eow = Eow(tests.eow.0 && self.initial_sources_rev.is_empty());
 
                     let hydration_status = self
                         .retry_source
@@ -169,8 +192,6 @@ impl Fetcher {
                                 tests.eow.0,
                                 "reached hydration end of manifest status, but not EOW"
                             );
-
-                            self.initial_source = None;
 
                             if tests.work.is_empty() {
                                 // This is a non-empty manifest but there is no work in this batch;
@@ -240,7 +261,7 @@ mod test {
 
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, _results) = Fetcher::new_help(
-            InitialSource::Fresh(queue_fetcher),
+            vec![InitialSource::Queue(queue_fetcher)],
             INIT_RUN_NUMBER,
             Duration::MAX,
         );
@@ -266,7 +287,7 @@ mod test {
 
         let (server, queue_fetcher) = scaffold_server().await;
         let (mut fetcher, _results) = Fetcher::new_help(
-            InitialSource::Retry(queue_fetcher),
+            vec![InitialSource::ServerRetryManifest(queue_fetcher)],
             INIT_RUN_NUMBER,
             Duration::MAX,
         );
@@ -292,7 +313,7 @@ mod test {
 
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, _results) = Fetcher::new_help(
-            InitialSource::Fresh(queue_fetcher),
+            vec![InitialSource::Queue(queue_fetcher)],
             INIT_RUN_NUMBER,
             Duration::MAX,
         );
@@ -353,7 +374,7 @@ mod test {
 
         let (server, queue_fetcher) = scaffold_server().await;
         let (mut fetcher, _results) = Fetcher::new_help(
-            InitialSource::Retry(queue_fetcher),
+            vec![InitialSource::ServerRetryManifest(queue_fetcher)],
             INIT_RUN_NUMBER,
             Duration::MAX,
         );
@@ -398,7 +419,7 @@ mod test {
 
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, _results) = Fetcher::new_help(
-            InitialSource::Fresh(queue_fetcher),
+            vec![InitialSource::Queue(queue_fetcher)],
             INIT_RUN_NUMBER,
             Duration::MAX,
         );
@@ -548,7 +569,7 @@ mod test {
 
             let (server, queue_fetcher) = scaffold_server(1).await;
             let (mut fetcher, mut results_tracker) = Fetcher::new_help(
-                InitialSource::Fresh(queue_fetcher),
+                vec![InitialSource::Queue(queue_fetcher)],
                 INIT_RUN_NUMBER + 2,
                 Duration::MAX,
             );
@@ -563,7 +584,7 @@ mod test {
 
             let (server, queue_fetcher) = scaffold_server().await;
             let (mut fetcher, mut results_tracker) = Fetcher::new_help(
-                InitialSource::Retry(queue_fetcher),
+                vec![InitialSource::ServerRetryManifest(queue_fetcher)],
                 INIT_RUN_NUMBER + 2,
                 Duration::MAX,
             );
@@ -580,7 +601,7 @@ mod test {
 
         let (server, queue_fetcher) = scaffold_server(1).await;
         let (mut fetcher, mut results_tracker) = Fetcher::new_help(
-            InitialSource::Fresh(queue_fetcher),
+            vec![InitialSource::Queue(queue_fetcher)],
             INIT_RUN_NUMBER + 1,
             Duration::MAX,
         );
@@ -646,7 +667,7 @@ mod test {
 
         let (server, queue_fetcher) = scaffold_server().await;
         let (mut fetcher, mut results_tracker) = Fetcher::new_help(
-            InitialSource::Retry(queue_fetcher),
+            vec![InitialSource::ServerRetryManifest(queue_fetcher)],
             INIT_RUN_NUMBER + 1,
             Duration::MAX,
         );
@@ -701,5 +722,130 @@ mod test {
         };
 
         let ((), ()) = tokio::join!(server_task, fetch_task);
+    }
+
+    #[tokio::test]
+    async fn fetch_retry_manifest_then_fetch_from_queue() {
+        use out_of_process_retry_manifest_fetcher::test as rm;
+        use persistent_test_fetcher::test as pf;
+
+        let (retry_server, retry_fetcher) = rm::scaffold_server().await;
+        let (queue_server, queue_fetcher) = pf::scaffold_server(1).await;
+        let (mut fetcher, mut results_tracker) = Fetcher::new_help(
+            vec![
+                InitialSource::ServerRetryManifest(retry_fetcher),
+                InitialSource::Queue(queue_fetcher),
+            ],
+            INIT_RUN_NUMBER + 1,
+            Duration::MAX,
+        );
+
+        let retry_sender_task = async move {
+            for i in 0..2 {
+                let mut conn = rm::server_establish(&*retry_server).await;
+                rm::server_send_bundle(
+                    &mut conn,
+                    [WorkerTest::new(spec(i + 1), INIT_RUN_NUMBER)],
+                    Eow(i == 1),
+                )
+                .await;
+            }
+        };
+
+        let queue_sender_task = async move {
+            let mut conn = pf::server_establish(&*queue_server).await;
+            for i in 0..2 {
+                pf::server_send_bundle(
+                    &mut conn,
+                    [WorkerTest::new(spec(i + 3), INIT_RUN_NUMBER)],
+                    Eow(i == 1),
+                )
+                .await;
+            }
+        };
+
+        let fetch_task = async move {
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert_eq!(work, [WorkerTest::new(spec(1), INIT_RUN_NUMBER)]);
+            assert!(!eow, "should come back for server retry manifest");
+
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert_eq!(work, [WorkerTest::new(spec(2), INIT_RUN_NUMBER)]);
+            assert!(!eow, "should come back for online queue");
+
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert_eq!(work, [WorkerTest::new(spec(3), INIT_RUN_NUMBER)]);
+            assert!(!eow, "should come back for online queue");
+
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert_eq!(work, [WorkerTest::new(spec(4), INIT_RUN_NUMBER)]);
+            assert!(!eow, "should come back for online queue");
+
+            for i in 0..4 {
+                results_tracker.account_results([&AssociatedTestResultsBuilder::new(
+                    wid(i + 1),
+                    INIT_RUN_NUMBER,
+                    [TestResultBuilder::new(test(i + 1), SUCCESS)],
+                )
+                .build()]);
+            }
+
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert!(work.is_empty());
+            assert!(eow, "should have nothing to retry");
+        };
+
+        tokio::join!(retry_sender_task, queue_sender_task, fetch_task);
+    }
+
+    #[tokio::test]
+    async fn fetch_empty_retry_manifest_then_immediately_fetch_from_queue() {
+        use out_of_process_retry_manifest_fetcher::test as rm;
+        use persistent_test_fetcher::test as pf;
+
+        let (retry_server, retry_fetcher) = rm::scaffold_server().await;
+        let (queue_server, queue_fetcher) = pf::scaffold_server(1).await;
+        let (mut fetcher, mut results_tracker) = Fetcher::new_help(
+            vec![
+                InitialSource::ServerRetryManifest(retry_fetcher),
+                InitialSource::Queue(queue_fetcher),
+            ],
+            INIT_RUN_NUMBER + 1,
+            Duration::MAX,
+        );
+
+        let retry_sender_task = async move {
+            let mut conn = rm::server_establish(&*retry_server).await;
+            rm::server_send_bundle(&mut conn, [], Eow(true)).await;
+        };
+
+        let queue_sender_task = async move {
+            let mut conn = pf::server_establish(&*queue_server).await;
+            pf::server_send_bundle(
+                &mut conn,
+                [WorkerTest::new(spec(1), INIT_RUN_NUMBER)],
+                Eow(true),
+            )
+            .await;
+        };
+
+        let fetch_task = async move {
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert_eq!(work, [WorkerTest::new(spec(1), INIT_RUN_NUMBER)]);
+            assert!(!eow, "should come back for server retry manifest");
+
+            results_tracker.account_results([&AssociatedTestResultsBuilder::new(
+                wid(1),
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new(test(1), SUCCESS)],
+            )
+            .build()]);
+
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert!(work.is_empty());
+            assert!(eow, "should have nothing to retry");
+        };
+
+        tokio::join!(retry_sender_task, queue_sender_task, fetch_task);
     }
 }
