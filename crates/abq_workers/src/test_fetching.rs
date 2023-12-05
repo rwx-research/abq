@@ -170,6 +170,9 @@ impl Fetcher {
                     if tests.eow.0 {
                         self.initial_sources_rev.pop();
                     }
+                    if tests.work.is_empty() && !self.initial_sources_rev.is_empty() {
+                        continue;
+                    }
                     tests.eow = Eow(tests.eow.0 && self.initial_sources_rev.is_empty());
 
                     let hydration_status = self
@@ -786,6 +789,57 @@ mod test {
                 )
                 .build()]);
             }
+
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert!(work.is_empty());
+            assert!(eow, "should have nothing to retry");
+        };
+
+        tokio::join!(retry_sender_task, queue_sender_task, fetch_task);
+    }
+
+    #[tokio::test]
+    async fn fetch_empty_retry_manifest_then_immediately_fetch_from_queue() {
+        use out_of_process_retry_manifest_fetcher::test as rm;
+        use persistent_test_fetcher::test as pf;
+
+        let (retry_server, retry_fetcher) = rm::scaffold_server().await;
+        let (queue_server, queue_fetcher) = pf::scaffold_server(1).await;
+        let (mut fetcher, mut results_tracker) = Fetcher::new_help(
+            vec![
+                InitialSource::ServerRetryManifest(retry_fetcher),
+                InitialSource::Queue(queue_fetcher),
+            ],
+            INIT_RUN_NUMBER + 1,
+            Duration::MAX,
+        );
+
+        let retry_sender_task = async move {
+            let mut conn = rm::server_establish(&*retry_server).await;
+            rm::server_send_bundle(&mut conn, [], Eow(true)).await;
+        };
+
+        let queue_sender_task = async move {
+            let mut conn = pf::server_establish(&*queue_server).await;
+            pf::server_send_bundle(
+                &mut conn,
+                [WorkerTest::new(spec(1), INIT_RUN_NUMBER)],
+                Eow(true),
+            )
+            .await;
+        };
+
+        let fetch_task = async move {
+            let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
+            assert_eq!(work, [WorkerTest::new(spec(1), INIT_RUN_NUMBER)]);
+            assert!(!eow, "should come back for server retry manifest");
+
+            results_tracker.account_results([&AssociatedTestResultsBuilder::new(
+                wid(1),
+                INIT_RUN_NUMBER,
+                [TestResultBuilder::new(test(1), SUCCESS)],
+            )
+            .build()]);
 
             let NextWorkBundle { work, eow } = fetcher.get_next_tests().await.unwrap();
             assert!(work.is_empty());
