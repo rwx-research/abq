@@ -293,7 +293,7 @@ async fn wait_for_results_help(
             }
             RunInProgress { active_runners } => {
                 if active_runners.is_empty() {
-                    bail!("this ABQ run has not assigned all tests in your test suite, but there are no active runners to assign them to. Please either add more runners, or launch a new run.")
+                    bail!("this ABQ run has not assigned all tests in your test suite, but there are no active runners to assign them to. Please retry a runner, add more runners, or launch a new run.")
                 }
 
                 let active_runners = active_runners
