@@ -410,7 +410,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tls_cert: resolved_tls,
                 rwx_access_token_kind,
                 queue_location,
-            } = resolve_config_with_api(ResolveConfigOptions {
+            } = resolve_config(ResolveConfigOptions {
                 token_from_cli: token,
                 queue_addr_from_cli: queue_addr,
                 tls_cert_from_cli: tls_cert,
@@ -525,7 +525,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 tls_cert: resolved_tls,
                 rwx_access_token_kind: _resolved_rwx_access_token_kind,
                 queue_location,
-            } = resolve_config_with_api(ResolveConfigOptions {
+            } = resolve_config(ResolveConfigOptions {
                 token_from_cli: token,
                 queue_addr_from_cli: queue_addr,
                 tls_cert_from_cli: tls_cert,
@@ -673,7 +673,7 @@ impl QueueLocation {
     }
 }
 
-fn resolve_api_config(api_config: ConfigFromApi) -> ResolvedConfig {
+fn resolve_config_with_api_config(api_config: ConfigFromApi) -> ResolvedConfig {
     match api_config {
         ConfigFromApi::Success(config) => ResolvedConfig {
             token: Some(config.token),
@@ -699,31 +699,12 @@ fn resolve_api_config(api_config: ConfigFromApi) -> ResolvedConfig {
     }
 }
 
-struct ResolveConfigOptions {
-    token_from_cli: Option<UserToken>,
+fn resolve_config_from_cli_args(
     queue_addr_from_cli: Option<SocketAddr>,
-    tls_cert_from_cli: Option<Vec<u8>>,
     tls_key: Option<Vec<u8>>,
-    api_config: Option<ConfigFromApi>,
-    explicit_run_id_provided: bool,
-}
-
-fn resolve_config_with_api(options: ResolveConfigOptions) -> ResolvedConfig {
-    let ResolveConfigOptions {
-        token_from_cli,
-        queue_addr_from_cli,
-        tls_cert_from_cli,
-        tls_key,
-        api_config,
-        explicit_run_id_provided,
-    } = options;
-
-    if let Some(api_config) = api_config {
-        if api_config.access_token_kind() != AccessTokenKind::Personal || explicit_run_id_provided {
-            return resolve_api_config(api_config);
-        }
-    }
-
+    token_from_cli: Option<UserToken>,
+    tls_cert_from_cli: Option<Vec<u8>>,
+) -> ResolvedConfig {
     let queue_location = match queue_addr_from_cli {
         Some(addr) => QueueLocation::Remote(addr),
         None => QueueLocation::Ephemeral {
@@ -736,6 +717,39 @@ fn resolve_config_with_api(options: ResolveConfigOptions) -> ResolvedConfig {
         rwx_access_token_kind: None,
         queue_location,
     }
+}
+
+struct ResolveConfigOptions {
+    token_from_cli: Option<UserToken>,
+    queue_addr_from_cli: Option<SocketAddr>,
+    tls_cert_from_cli: Option<Vec<u8>>,
+    tls_key: Option<Vec<u8>>,
+    api_config: Option<ConfigFromApi>,
+    explicit_run_id_provided: bool,
+}
+
+fn resolve_config(options: ResolveConfigOptions) -> ResolvedConfig {
+    let ResolveConfigOptions {
+        token_from_cli,
+        queue_addr_from_cli,
+        tls_cert_from_cli,
+        tls_key,
+        api_config,
+        explicit_run_id_provided,
+    } = options;
+
+    if let Some(api_config) = api_config {
+        if api_config.access_token_kind() != AccessTokenKind::Personal || explicit_run_id_provided {
+            return resolve_config_with_api_config(api_config);
+        }
+    }
+
+    resolve_config_from_cli_args(
+        queue_addr_from_cli,
+        tls_key,
+        token_from_cli,
+        tls_cert_from_cli,
+    )
 }
 
 fn get_abq_config_filepath() -> Option<PathBuf> {
@@ -1026,7 +1040,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_pat_no_run_id_provided_uses_ephemeral() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: None,
             tls_cert_from_cli: None,
@@ -1048,7 +1062,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_pat_nonexistent_run_id_unsupported() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: None,
             tls_cert_from_cli: None,
@@ -1072,7 +1086,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_org_nonexistent_run_id_unsupported() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: None,
             tls_cert_from_cli: None,
@@ -1096,7 +1110,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_pat_existing_run_id_remote() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: None,
             tls_cert_from_cli: None,
@@ -1118,7 +1132,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_explicit_run_id_no_queue_addr_ephemeral() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: None,
             tls_cert_from_cli: None,
@@ -1135,7 +1149,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_org_explicit_run_id_queue_addr_remote() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: None,
             tls_cert_from_cli: None,
@@ -1157,7 +1171,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_org_no_explicit_run_id_queue_addr_remote() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: None,
             tls_cert_from_cli: None,
@@ -1179,7 +1193,7 @@ mod test {
 
     #[test]
     fn determine_queue_location_noauthtoken_existing_queue_addr_remote() {
-        let resolved = super::resolve_config_with_api(crate::ResolveConfigOptions {
+        let resolved = super::resolve_config(crate::ResolveConfigOptions {
             token_from_cli: None,
             queue_addr_from_cli: Some("127.0.0.1:8000".parse().unwrap()),
             tls_cert_from_cli: None,
