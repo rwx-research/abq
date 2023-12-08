@@ -1,3 +1,12 @@
+## 1.7.1
+
+ABQ 1.7.1 is a patch release.
+
+This release fixes an unintentional breaking change introduced in ABQ 1.6.4 that
+could result in ABQ runs using an organization access token with a run ID
+determined from CI environment variables to use an ephemeral queue, rather than
+the RWX-hosted remote queue.
+
 ## 1.7.0
 
 ABQ 1.7.0 is a minor release.
