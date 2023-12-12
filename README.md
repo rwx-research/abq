@@ -1,6 +1,6 @@
 # <img src="https://www.rwx.com/abq.svg" height="60" alt="abq">
 
-:globe_with_meridians: [abq.build](https://abq.build) &ensp;
+:globe_with_meridians: [website](https://rwx.com/abq) &ensp;
 :bird: [@rwx_research](https://twitter.com/rwx_research) &ensp;
 :speech_balloon: [discord](https://discord.gg/h4ha5Cue7j) &ensp;
 :books: [documentation](https://www.rwx.com/docs/abq)
