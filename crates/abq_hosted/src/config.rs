@@ -67,7 +67,7 @@ impl HostedQueueConfig {
     where
         U: AsRef<str>,
     {
-        // e.g. abq.build/api/queue
+        // e.g. cloud.rwx.com/abq/api/queue
         let queue_api = Url::try_from(api_url.as_ref())
             .map_err(|e| Error::InvalidUrl(e.to_string()))
             .and_then(|mut api| {

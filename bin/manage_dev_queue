@@ -6,7 +6,7 @@ cd $(git rev-parse --show-toplevel)
 
 source bin/dev_queue_state.sh
 
-MANUAL_API='https://staging.abq.build/api/queue/manual'
+MANUAL_API='https://staging.cloud.rwx.com/abq/api/queue/manual'
 AUTH_HEADER="Authorization: Bearer $ABQ_CREATE_MANUAL_ACCESS_TOKEN"
 
 echoerr() { echo "$@" 1>&2; }
@@ -21,7 +21,7 @@ infer_queue_version () {
 }
 
 fetch_state () {
-  curl 'https://staging.abq.build/api/queue/manual' \
+  curl 'https://staging.cloud.rwx.com/abq/api/queue/manual' \
     -X GET \
     -H "Authorization: Bearer $ABQ_CREATE_MANUAL_ACCESS_TOKEN" \
     -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \

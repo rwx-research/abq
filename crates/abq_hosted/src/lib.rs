@@ -3,7 +3,7 @@ mod config;
 mod error;
 mod notify;
 
-pub const DEFAULT_RWX_ABQ_API_URL: &str = "https://abq.build/api";
+pub const DEFAULT_RWX_ABQ_API_URL: &str = "https://cloud.rwx.com/abq/api";
 
 pub use access_token::AccessToken;
 pub use config::AccessTokenKind;
