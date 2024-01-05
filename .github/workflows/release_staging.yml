@@ -25,7 +25,7 @@ jobs:
       - name: Register a new release with the abq api to a release channel
         if: inputs.release_channel != ''
         run: |
-          curl -X "POST" "https://staging.abq.build/api/releases" \
+          curl -X "POST" "https://staging.cloud.rwx.com/abq/api/releases" \
           --fail-with-body \
           -H 'Authorization: Bearer ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}' \
           -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
@@ -34,7 +34,7 @@ jobs:
       - name: Register a new release with the abq api without a release channel
         if: inputs.release_channel == ''
         run: |
-          curl -X "POST" "https://staging.abq.build/api/releases" \
+          curl -X "POST" "https://staging.cloud.rwx.com/abq/api/releases" \
           --fail-with-body \
           -H 'Authorization: Bearer ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}' \
           -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
