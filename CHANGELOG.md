@@ -1,3 +1,10 @@
+# 1.7.2
+
+ABQ 1.7.2 is a patch release.
+
+This release changes the underlying default abq remote host when interacting with
+the rwx cloud api.
+
 ## 1.7.1
 
 ABQ 1.7.1 is a patch release.
