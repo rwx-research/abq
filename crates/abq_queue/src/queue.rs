@@ -1921,10 +1921,11 @@ impl QueueServer {
             .await
             .located(here!())
             .no_entity()?;
-        let Request { entity, message } = net_protocol::async_read(&mut stream)
-            .await
-            .located(here!())
-            .no_entity()?;
+        let (Request { entity, message }, request_message_size) =
+            net_protocol::async_read_with_size(&mut stream)
+                .await
+                .located(here!())
+                .no_entity()?;
 
         let result: OpaqueResult<()> = match message {
             Message::HealthCheck => Self::handle_healthcheck(entity, stream).await,
@@ -1972,6 +1973,7 @@ impl QueueServer {
                     run_id,
                     entity,
                     results,
+                    request_message_size,
                     stream,
                 )
                 .await
@@ -2277,16 +2279,17 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "trace", skip(queues, persist_results))]
+    #[instrument(level = "info", skip_all, fields(run_id, entity, results_message_size))]
     async fn handle_worker_results(
         queues: SharedRuns,
         persist_results: SharedPersistResults,
         run_id: RunId,
         entity: Entity,
         results: Vec<AssociatedTestResults>,
+        results_message_size: usize,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
-        tracing::debug!(?entity, ?run_id, "got result");
+        tracing::debug!(?entity, ?run_id, ?results_message_size, "got result");
 
         // Build a plan for persistence of the result, then immediately chuck the test result ACK
         // over the wire before executing the plan.
@@ -3703,6 +3706,7 @@ mod test {
             run_id.clone(),
             entity,
             vec![result],
+            0,
             server_conn,
         );
         let cancellation_fut =
@@ -4787,6 +4791,7 @@ mod persist_results {
             run_id.clone(),
             Entity::runner(0, 1),
             results.clone(),
+            0,
             server_conn,
         )
         .await
@@ -4834,6 +4839,7 @@ mod persist_results {
             run_id.clone(),
             Entity::runner(0, 1),
             results.clone(),
+            0,
             server_conn,
         )
         .await
@@ -4876,6 +4882,7 @@ mod persist_results {
             run_id.clone(),
             Entity::runner(0, 1),
             results.clone(),
+            0,
             server_conn,
         )
         .await;
@@ -5038,6 +5045,7 @@ mod persist_results {
                 run_id.clone(),
                 Entity::runner(0, 1),
                 results,
+                0,
                 server_conn,
             )
             .await
@@ -5154,6 +5162,7 @@ mod persist_results {
                 run_id.clone(),
                 Entity::runner(1, 1),
                 results3.clone(),
+                0,
                 server_conn,
             )
             .await

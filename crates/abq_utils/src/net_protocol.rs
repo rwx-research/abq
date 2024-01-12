@@ -1106,7 +1106,10 @@ impl<const COMPRESS_LARGE: bool> AsyncReader<COMPRESS_LARGE> {
     ///
     /// Cancellation-safe, but the same `reader` must be provided between cancellable calls.
     /// If errors, not resumable.
-    pub async fn next<R, T: serde::de::DeserializeOwned>(&mut self, reader: &mut R) -> io::Result<T>
+    pub async fn next<R, T: serde::de::DeserializeOwned>(
+        &mut self,
+        reader: &mut R,
+    ) -> io::Result<(T, usize)>
     where
         R: tokio::io::AsyncReadExt + Unpin,
     {
@@ -1178,7 +1181,7 @@ impl<const COMPRESS_LARGE: bool> AsyncReader<COMPRESS_LARGE> {
                         self.msg_buf.clear();
                         self.next_expiration = None;
 
-                        return Ok(msg);
+                        return Ok((msg, size));
                     }
                 }
             }
@@ -1192,6 +1195,16 @@ impl<const COMPRESS_LARGE: bool> AsyncReader<COMPRESS_LARGE> {
 pub async fn async_read<R, T: serde::de::DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T, std::io::Error>
+where
+    R: tokio::io::AsyncReadExt + Unpin,
+{
+    let (msg, _) = AsyncReader::<true>::new(READ_TIMEOUT).next(reader).await?;
+    Ok(msg)
+}
+
+pub async fn async_read_with_size<R, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> Result<(T, usize), std::io::Error>
 where
     R: tokio::io::AsyncReadExt + Unpin,
 {
@@ -1210,7 +1223,8 @@ pub async fn async_read_local<R, T: serde::de::DeserializeOwned>(
 where
     R: tokio::io::AsyncReadExt + Unpin,
 {
-    AsyncReader::<false>::new(READ_TIMEOUT).next(reader).await
+    let (msg, _) = AsyncReader::<false>::new(READ_TIMEOUT).next(reader).await?;
+    Ok(msg)
 }
 
 /// Like [write], but async.
@@ -1388,7 +1402,7 @@ mod test {
         let msg_size = 10_u32.to_be_bytes();
         client_conn.write_all(&msg_size).await.unwrap();
 
-        let read_result: Result<(), _> = AsyncReader::<true>::new(Duration::from_secs(0))
+        let read_result: Result<((), _), _> = AsyncReader::<true>::new(Duration::from_secs(0))
             .next(&mut server_conn)
             .await;
         assert!(read_result.is_err());
@@ -1440,8 +1454,9 @@ mod test {
             } else {
                 // After we read the last message, we should in fact end up with the message we
                 // expect.
-                let msg = handle.await.unwrap().unwrap();
+                let (msg, size) = handle.await.unwrap().unwrap();
                 assert_eq!(msg, "11111111");
+                assert_eq!(size, 8);
             }
         }
     }
@@ -1525,7 +1540,7 @@ mod test {
                 } else {
                     // After we read the last message, we should in fact end up with the message we
                     // expect.
-                    let msg = handle.await.unwrap().unwrap();
+                    let (msg, _) = handle.await.unwrap().unwrap();
                     assert_eq!(msg, expected_str);
                 }
             }

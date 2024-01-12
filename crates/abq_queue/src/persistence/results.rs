@@ -108,6 +108,12 @@ pub enum EligibleForRemoteDump {
     No,
 }
 
+impl EligibleForRemoteDump {
+    fn bool(self) -> bool {
+        self == Self::Yes
+    }
+}
+
 impl ResultsPersistedCell {
     pub fn new(run_id: RunId) -> Self {
         Self(Arc::new(CellInner {
@@ -183,6 +189,7 @@ pub struct PersistencePlan<'a> {
 }
 
 impl<'a> PersistencePlan<'a> {
+    #[tracing::instrument(level = "info", skip_all, fields(run_id = %self.cell.run_id, eligible_for_remote_dump = %self.eligible_for_remote_dump.bool()))]
     pub async fn execute(self) -> Result<()> {
         let result = self
             .persist_results
