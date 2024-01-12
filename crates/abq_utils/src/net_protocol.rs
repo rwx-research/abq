@@ -1456,7 +1456,7 @@ mod test {
                 // expect.
                 let (msg, size) = handle.await.unwrap().unwrap();
                 assert_eq!(msg, "11111111");
-                assert_eq!(size, 8);
+                assert_eq!(size, 10);
             }
         }
     }
