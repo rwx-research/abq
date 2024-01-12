@@ -1,3 +1,9 @@
+# 1.7.3
+
+ABQ 1.7.3 is a patch release.
+
+This release adds additional info logging for message sizes.
+
 # 1.7.2
 
 ABQ 1.7.2 is a patch release.
