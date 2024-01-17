@@ -2279,7 +2279,7 @@ impl QueueServer {
         Ok(())
     }
 
-    #[instrument(level = "info", skip_all, fields(run_id, entity, results_message_size))]
+    #[instrument(level = "info", skip_all, fields(run_id=%run_id, entity=?entity, results_message_size=%results_message_size))]
     async fn handle_worker_results(
         queues: SharedRuns,
         persist_results: SharedPersistResults,
