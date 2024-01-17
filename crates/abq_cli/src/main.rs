@@ -259,7 +259,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 },
                 None => {
                     let mut input = String::new();
-                    println!("Generate a Personal Access Token at https://account.rwx.com/_/personal_access_tokens");
+                    println!("Generate a Personal Access Token at https://cloud.rwx.com/_/personal_access_tokens");
                     println!("\n");
                     println!("Enter your RWX Personal Access Token:");
 
