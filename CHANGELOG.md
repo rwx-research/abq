@@ -1,3 +1,10 @@
+# 1.7.4
+
+ABQ 1.7.4 is a patch release.
+
+This release fixes a typo in the specification of the RWX Cloud API, and a typo
+in the configuration of certain logs.
+
 # 1.7.3
 
 ABQ 1.7.3 is a patch release.

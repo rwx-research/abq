@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "abq"
-version = "1.7.3"
+version = "1.7.4"
 dependencies = [
  "abq_dot_reporter",
  "abq_hosted",
