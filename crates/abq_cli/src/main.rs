@@ -238,8 +238,7 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
     if abq_run_id.is_ok() || ci.unwrap_or_else(|_| String::from("false")) == *"false" {
         return None;
     }
-    // note: if you change this, change it in setup-abq, too
-    // https://github.com/rwx-research/setup-abq/blob/8c5044343fceef53b4efea83d64062f006bf6758/src/index.ts#L23-L28
+
     let run_id_result = buildkite_build_id
         .or(circle_workflow_id)
         .or(github_run_id)
