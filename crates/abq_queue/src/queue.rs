@@ -113,7 +113,7 @@ enum RunState {
         init_metadata: MetadataMap,
 
         /// Workers that have been seen for this run, and whether they are still active.
-        /// Any seen worker is elligible for out-of-process retries.
+        /// Any seen worker is eligible for out-of-process retries.
         seen_workers: RwLock<WorkerSet<bool>>,
 
         /// A marker of whether the manifest associated with this run has been persisted.

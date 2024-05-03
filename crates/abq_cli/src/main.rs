@@ -98,6 +98,7 @@ struct RunIdEnvironment {
     buildkite_build_id: Result<String, std::env::VarError>,
     circle_workflow_id: Result<String, std::env::VarError>,
     github_run_id: Result<String, std::env::VarError>,
+    mint_run_id: Result<String, std::env::VarError>,
 }
 
 impl RunIdEnvironment {
@@ -108,6 +109,7 @@ impl RunIdEnvironment {
             buildkite_build_id: std::env::var("BUILDKITE_BUILD_ID"),
             circle_workflow_id: std::env::var("CIRCLE_WORKFLOW_ID"),
             github_run_id: std::env::var("GITHUB_RUN_ID"),
+            mint_run_id: std::env::var("MINT_RUN_ID"),
         }
     }
 }
@@ -230,14 +232,17 @@ fn get_inferred_run_id(run_id_environment: RunIdEnvironment) -> Option<RunId> {
         buildkite_build_id,
         circle_workflow_id,
         github_run_id,
+        mint_run_id,
     } = run_id_environment;
 
     if abq_run_id.is_ok() || ci.unwrap_or_else(|_| String::from("false")) == *"false" {
         return None;
     }
-    // note: if you change this, change it in setup-abq, too
-    // https://github.com/rwx-research/setup-abq/blob/8c5044343fceef53b4efea83d64062f006bf6758/src/index.ts#L23-L28
-    let run_id_result = buildkite_build_id.or(circle_workflow_id).or(github_run_id);
+
+    let run_id_result = buildkite_build_id
+        .or(circle_workflow_id)
+        .or(github_run_id)
+        .or(mint_run_id);
     run_id_result.ok().map(RunId)
 }
 
@@ -927,6 +932,7 @@ mod test {
                 buildkite_build_id: Err(VarError::NotPresent),
                 circle_workflow_id: Err(VarError::NotPresent),
                 github_run_id: Err(VarError::NotPresent),
+                mint_run_id: Err(VarError::NotPresent),
             }
         }
     }
@@ -1003,6 +1009,17 @@ mod test {
         });
 
         assert_eq!(run_id.unwrap(), RunId::from_str("buildkite-id").unwrap());
+    }
+
+    #[test]
+    fn get_inferred_run_id_mint() {
+        let run_id = get_inferred_run_id(RunIdEnvironment {
+            ci: Ok(String::from("true")),
+            mint_run_id: Ok(String::from("mint-id")),
+            ..Default::default()
+        });
+
+        assert_eq!(run_id.unwrap(), RunId::from_str("mint-id").unwrap());
     }
 
     #[test]
