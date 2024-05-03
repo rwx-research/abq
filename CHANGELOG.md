@@ -1,17 +1,23 @@
-# 1.7.4
+## 1.8.0
+
+ABQ 1.8.0 is a minor release.
+
+This release expands run ID inference to support [Mint](https://www.rwx.com/mint).
+
+## 1.7.4
 
 ABQ 1.7.4 is a patch release.
 
 This release fixes a typo in the specification of the RWX Cloud API, and a typo
 in the configuration of certain logs.
 
-# 1.7.3
+## 1.7.3
 
 ABQ 1.7.3 is a patch release.
 
 This release adds additional info logging for message sizes.
 
-# 1.7.2
+## 1.7.2
 
 ABQ 1.7.2 is a patch release.
 
@@ -119,26 +125,26 @@ At this time, loading test runs from other queue instances includes the
 following restrictions:
 
 - `run_state` files are schema-versioned, and no schema-version compatibility
-    guarantees across versions of ABQ queues are provided at this time.
-    `run_state` files are guaranteed to be compatible if shared between ABQ
-    queues of the same version.
-    If an ABQ queue loads a `run_state` file that it is incompatible with, the
-    remote test run state will not be loaded. Executing a test suite whose
-    run state file failed to be loaded will fall back on executing the test
-    suite as a fresh run, similar to the pre-1.4.0 behavior.
+  guarantees across versions of ABQ queues are provided at this time.
+  `run_state` files are guaranteed to be compatible if shared between ABQ
+  queues of the same version.
+  If an ABQ queue loads a `run_state` file that it is incompatible with, the
+  remote test run state will not be loaded. Executing a test suite whose
+  run state file failed to be loaded will fall back on executing the test
+  suite as a fresh run, similar to the pre-1.4.0 behavior.
 
 - The same run ID may not be executed, in parallel, on two different ABQ queue
-    instances sharing the same remote persistence. For a given run ID, an ABQ
-    queue will **assume** exclusive ownership of the test suite run associated
-    with that run ID.
-    At this time, ABQ does **not** verify whether it indeed has exclusive
-    ownership of a run ID. If you are self-hosting ABQ, you must ensure that
-    run IDs are routed to a unique ABQ instance for the duration of a test run;
-    however, once a test run is complete, retries of the test run may be routed
-    to another ABQ instance, so long as the exclusive ownership constraint
-    continues to apply for the duration of the retry.
-    If you would like to avoid self-hosting, [RWX's managed hosting of ABQ][abq_pricing]
-    supports routing test runs under these constraints.
+  instances sharing the same remote persistence. For a given run ID, an ABQ
+  queue will **assume** exclusive ownership of the test suite run associated
+  with that run ID.
+  At this time, ABQ does **not** verify whether it indeed has exclusive
+  ownership of a run ID. If you are self-hosting ABQ, you must ensure that
+  run IDs are routed to a unique ABQ instance for the duration of a test run;
+  however, once a test run is complete, retries of the test run may be routed
+  to another ABQ instance, so long as the exclusive ownership constraint
+  continues to apply for the duration of the retry.
+  If you would like to avoid self-hosting, [RWX's managed hosting of ABQ][abq_pricing]
+  supports routing test runs under these constraints.
 
 See the [ABQ documentation][abq_docs_persistence] for more details on persistence.
 
@@ -152,6 +158,7 @@ test results are stored.
 ABQ 1.3.4 is a patch release with feature preview of remote persisted storage.
 
 A remote storage source is used to
+
 - synchronize ABQ manifests and test results stored on local disk to the remote
   source
 - offload manifests and test results at a configured frequency, synchronizing
@@ -174,6 +181,7 @@ remote storage on `abq start`:
 - `ABQ_REMOTE_PERSISTENCE_STRATEGY`: What remote persistence strategy should be
   used. If unset, no remote persistence will be configured. The options for
   remote persistence are:
+
   - `s3`: manifests and results will be persisted to an AWS S3 bucket. This
     strategy requires the following additional environment variables to be
     set:
@@ -199,11 +207,12 @@ remote storage on `abq start`:
       ```
 
       Where
-        - `<mode>` is either "store" or "load", depending on whether the file should be stored
+
+      - `<mode>` is either "store" or "load", depending on whether the file should be stored
         into the remote location, or loaded from the remote location.
-        - `<file-type>` is either "manifest" or "results".
-        - `<run-id>` is the run ID of the test suite run.
-        - `<local-path>` is the path to the file on the local filesystem. If the mode is "store",
+      - `<file-type>` is either "manifest" or "results".
+      - `<run-id>` is the run ID of the test suite run.
+      - `<local-path>` is the path to the file on the local filesystem. If the mode is "store",
         the content to upload should be read from this path. If the mode is "load", the
         downloaded content should be written to this path.
 
