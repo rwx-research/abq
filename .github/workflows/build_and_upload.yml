@@ -5,26 +5,26 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: 'ref to build'
+        description: "ref to build"
         required: true
         type: string
       release_channel:
-        description: 'release channel'
+        description: "release channel"
         required: true
         type: choice
         options:
-        - "v1"
-        - "unstable"
+          - "v1"
+          - "unstable"
 
   # for automatic release from main on the unstable release channel
   workflow_call:
     inputs:
       ref:
-        description: 'ref to build'
+        description: "ref to build"
         required: true
         type: string
       release_channel:
-        description: 'release channel'
+        description: "release channel"
         required: true
         type: string
     secrets:
@@ -61,24 +61,24 @@ jobs:
             deprecated-platform: linux_x86-64
             os: linux
             architecture: x86_64
-            cross-target: 'x86_64-unknown-linux-musl'
+            cross-target: "x86_64-unknown-linux-musl"
             install-musl-tools: true
           - runs-on: ubuntu-latest
             deprecated-platform: linux_aarch64
             os: linux
             architecture: aarch64
-            cross-target: 'aarch64-unknown-linux-musl'
+            cross-target: "aarch64-unknown-linux-musl"
             container: messense/rust-musl-cross:aarch64-musl@sha256:777bd4c61179c38dc213bb8472500584646d28fd4a7c3e0b30b9ef70cb446d58
           - runs-on: macos-11 # use an older version for broader osx support
             deprecated-platform: darwin_x86-64
             os: darwin
             architecture: x86_64
-            cross-target: ''
+            cross-target: ""
           - runs-on: macos-11 # first OS X to support arm64 -- so the first os for cross compilation
             deprecated-platform: darwin_aarch64
             os: darwin
             architecture: aarch64
-            cross-target: 'aarch64-apple-darwin'
+            cross-target: "aarch64-apple-darwin"
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
     outputs:
@@ -126,13 +126,22 @@ jobs:
           target: ${{ matrix.cross-target }}
 
       # We don't build a musl ABQ on MacOS
+      # - name: Install musl libc tools
+      #   if: matrix.install-musl-tools
+      #   run: |
+      #     sudo apt-get install -y musl-tools
       - name: Install musl libc tools
         if: matrix.install-musl-tools
         run: |
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y build-essential
+          curl -fsLO https://musl.libc.org/releases/musl-1.2.5.tar.gz
+          tar -zxvf musl-1.2.5.tar.gz
+          cd musl-1.2.5
+          ./configure --exec-prefix=/usr/local
+          make install
 
       - name: Build release
-        if: '!matrix.cross-target'
+        if: "!matrix.cross-target"
         run: cargo build --release --all-features
 
       - name: Build release
