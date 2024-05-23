@@ -56,7 +56,7 @@ jobs:
       # in the future we'll want to release against different architectures
       matrix:
         include:
-          - runs-on: ubuntu-latest
+          - runs-on: ubuntu-24.04
             # todo: deprecate plaform key when we move to RFC 20 style abq uploads
             deprecated-platform: linux_x86-64
             os: linux
