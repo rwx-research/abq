@@ -8,6 +8,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  temporary_build_and_upload:
+    name: Build and Upload
+    uses: ./.github/workflows/build_and_upload.yml
+    with:
+      ref: ${{ github.ref }}
+      release_channel: unstable
+    secrets: inherit
+
   test_and_package_development:
     name: Test and package development build
     uses: ./.github/workflows/test_and_package_development.yml

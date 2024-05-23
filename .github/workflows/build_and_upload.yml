@@ -138,7 +138,8 @@ jobs:
           tar -zxvf musl-1.2.5.tar.gz
           cd musl-1.2.5
           ./configure --exec-prefix=/usr/local
-          make install
+          make
+          sudo make install
 
       - name: Build release
         if: "!matrix.cross-target"
