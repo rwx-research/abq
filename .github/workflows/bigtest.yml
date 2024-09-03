@@ -73,7 +73,7 @@ jobs:
           scripts/init_bigtest
 
       - name: Load dev queue state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: dev_queue_state
           path: .dev_queue_state/
@@ -145,7 +145,7 @@ jobs:
           scripts/init_bigtest
 
       - name: Load dev queue state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: dev_queue_state
           path: .dev_queue_state/
@@ -189,7 +189,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4.1.7
       - id: collect
         run: |
           results="$(cat ./*/exports-* | jq -c --slurp .)"
@@ -247,7 +247,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Load dev queue state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4.1.7
         with:
           name: dev_queue_state
           path: .dev_queue_state/
