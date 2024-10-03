@@ -618,6 +618,8 @@ pub mod queue {
         User,
         /// Timed out because no progress was made popping items off the manifest.
         ManifestHadNoProgress,
+        /// Timed out because the manifest was never received
+        ManifestNeverReceived,
     }
 
     /// A request sent to the queue.

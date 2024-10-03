@@ -32,7 +32,7 @@ use abq_utils::{
         entity::{Entity, WorkerTag},
         meta::DeprecationRecord,
         publicize_addr,
-        queue::{InvokeWork, NegotiatorInfo},
+        queue::{CancelReason, InvokeWork, NegotiatorInfo},
         workers::{RunId, RunnerKind},
     },
     results_handler::SharedResultsHandler,
@@ -80,6 +80,9 @@ enum MessageFromQueueNegotiator {
     /// immediately exit.
     RunAlreadyCompleted {
         exit_code: ExitCode,
+    },
+    RunCancelled {
+        reason: CancelReason,
     },
     /// The context a worker set should execute a run with.
     ExecutionContext(ExecutionContext),
@@ -141,6 +144,8 @@ pub struct WorkersNegotiator(Box<dyn net::ClientStream>, WorkerContext);
 pub enum NegotiatedWorkers {
     /// No more workers were created, because there is no more work to be done.
     Redundant { exit_code: ExitCode },
+    /// No more workers were created because the run is cancelled
+    Cancelled { error: String },
     /// A pool of workers were created.
     Pool(WorkerPool),
 }
@@ -155,6 +160,15 @@ impl NegotiatedWorkers {
                 process_outputs: Default::default(),
                 native_runner_info: None,
             },
+            NegotiatedWorkers::Cancelled { error } => WorkersExit {
+                status: WorkersExitStatus::Error {
+                    errors: vec![error.to_string()],
+                },
+                manifest_generation_output: None,
+                final_stdio_outputs: Default::default(),
+                process_outputs: Default::default(),
+                native_runner_info: None,
+            },
             NegotiatedWorkers::Pool(pool) => pool.shutdown().await,
         }
     }
@@ -162,6 +176,7 @@ impl NegotiatedWorkers {
     pub async fn cancel(&mut self) {
         match self {
             NegotiatedWorkers::Redundant { .. } => {}
+            NegotiatedWorkers::Cancelled { .. } => {}
             NegotiatedWorkers::Pool(pool) => pool.cancel().await,
         }
     }
@@ -170,6 +185,7 @@ impl NegotiatedWorkers {
     pub async fn wait(&mut self) {
         match self {
             NegotiatedWorkers::Redundant { .. } => {}
+            NegotiatedWorkers::Cancelled { .. } => {}
             NegotiatedWorkers::Pool(pool) => pool.wait().await,
         }
     }
@@ -177,6 +193,7 @@ impl NegotiatedWorkers {
     pub fn workers_alive(&self) -> bool {
         match self {
             NegotiatedWorkers::Redundant { .. } => false,
+            NegotiatedWorkers::Cancelled { .. } => false,
             NegotiatedWorkers::Pool(pool) => pool.workers_alive(),
         }
     }
@@ -325,6 +342,20 @@ async fn wait_for_execution_context(
 
         let worker_set_decision = match net_protocol::async_read(&mut conn).await? {
             MessageFromQueueNegotiator::ExecutionContext(ctx) => Ok(ctx),
+            MessageFromQueueNegotiator::RunCancelled { reason } => {
+                let error_suffix = match reason {
+                    CancelReason::User => {
+                        "a worker received a cancellation signal while still working on tests."
+                    }
+                    CancelReason::ManifestHadNoProgress => {
+                        "the run timed out before any tests were completed."
+                    }
+                    CancelReason::ManifestNeverReceived => {
+                        "the run timed out before the test manifest was received."
+                    }
+                };
+                Err(NegotiatedWorkers::Cancelled { error: format!("{}{}", "Error: This ABQ run was cancelled. When an ABQ run is cancelled, it can no longer be retried. You must start a run with a new run ID instead.\nThis run was cancelled because ", error_suffix) })
+            }
             MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code } => {
                 Err(NegotiatedWorkers::Redundant { exit_code })
             }
@@ -587,6 +618,10 @@ impl QueueNegotiator {
                     AlreadyDone { exit_code } => {
                         tracing::debug!(?run_id, "run already completed");
                         MessageFromQueueNegotiator::RunAlreadyCompleted { exit_code }
+                    }
+                    Cancelled { reason } => {
+                        tracing::debug!(?run_id, "run cancelled");
+                        MessageFromQueueNegotiator::RunCancelled { reason }
                     }
                     RunUnknown => {
                         tracing::debug!(?run_id, "run not yet known");
