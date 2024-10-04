@@ -178,11 +178,11 @@ async fn do_shutdown(
 
     let (suite_result, errors) = finalized_reporters.finish(&completed_summary);
 
-    if let WorkersExitStatus::Completed { .. } = status {
-        for error in errors {
-            eprintln!("{error}");
-        }
+    for error in errors {
+        eprintln!("{error}");
+    }
 
+    if matches!(status, WorkersExitStatus::Completed { .. }) || suite_result.count > 0 {
         print!("\n\n");
         suite_result
             .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)

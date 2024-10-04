@@ -291,6 +291,8 @@ enum ReadResultsError {
     RunNotFound,
     #[error("results cannot be read before manifest is received")]
     WaitingForManifest,
+    #[error("a manifest failed to be generated")]
+    ManifestNeverReceived,
     #[error("the run was cancelled before all test results were received")]
     RunCancelled,
 }
@@ -983,7 +985,11 @@ impl AllRuns {
                     }
                 }
             }
-            RunState::Cancelled { .. } => Err(RunCancelled),
+            RunState::Cancelled { reason } => match reason {
+                CancelReason::User => Err(RunCancelled),
+                CancelReason::ManifestHadNoProgress => Err(RunCancelled),
+                CancelReason::ManifestNeverReceived => Err(ManifestNeverReceived),
+            },
         }
     }
 
