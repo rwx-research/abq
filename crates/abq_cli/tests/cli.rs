@@ -2297,7 +2297,7 @@ test_all_network_config_options! {
 
         assert_eq!(exit_status.code().unwrap(), 101, "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
         assert!(
-            stderr.contains("Error: This ABQ run was cancelled. When an ABQ run is cancelled, it can no longer be retried. You must start a run with a new run ID instead.\nThis run was cancelled because a worker received a cancellation signal while still working on tests."),
+            stderr.contains("This run was cancelled because a worker received a cancellation signal while still working on tests."),
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
 

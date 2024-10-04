@@ -1,3 +1,7 @@
+## 1.8.1
+
+ABQ 1.8.1 improves the error messaging when attempting to retry a run that has been cancelled.
+
 ## 1.8.0
 
 ABQ 1.8.0 is a minor release.
