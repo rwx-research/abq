@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'ABQ version to test'
+        description: "ABQ version to test"
         required: true
         type: string
 
   workflow_call:
     inputs:
       version:
-        description: 'ABQ version to test'
+        description: "ABQ version to test"
         required: true
         type: string
     secrets:
@@ -35,10 +35,11 @@ jobs:
         run: |
           bin/manage_dev_queue start ${{ inputs.version }}
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: dev_queue_state
           path: .dev_queue_state/
+          include-hidden-files: true
 
   single_benches:
     runs-on: ubuntu-latest
@@ -64,16 +65,16 @@ jobs:
           bundler-cache: true
       - uses: actions/setup-node@v3
         with:
-          node-version: '16'
-          cache: 'npm'
-          cache-dependency-path: 'bigtest/**/package-lock.json'
+          node-version: "16"
+          cache: "npm"
+          cache-dependency-path: "bigtest/**/package-lock.json"
 
       - name: Load testdata
         run: |
           scripts/init_bigtest
 
       - name: Load dev queue state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: dev_queue_state
           path: .dev_queue_state/
@@ -136,16 +137,16 @@ jobs:
           bundler-cache: true
       - uses: actions/setup-node@v3
         with:
-          node-version: '16'
-          cache: 'npm'
-          cache-dependency-path: 'bigtest/**/package-lock.json'
+          node-version: "16"
+          cache: "npm"
+          cache-dependency-path: "bigtest/**/package-lock.json"
 
       - name: Load testdata
         run: |
           scripts/init_bigtest
 
       - name: Load dev queue state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: dev_queue_state
           path: .dev_queue_state/
@@ -174,10 +175,11 @@ jobs:
 
           exit $EXIT
 
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: concurrent-results-${{ matrix.shard }}
           path: exports-${{ matrix.shard }}
+          include-hidden-files: true
 
   parallel_benches:
     runs-on: ubuntu-latest
@@ -189,7 +191,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
       - id: collect
         run: |
           results="$(cat ./*/exports-* | jq -c --slurp .)"
@@ -247,7 +249,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Load dev queue state
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: dev_queue_state
           path: .dev_queue_state/
