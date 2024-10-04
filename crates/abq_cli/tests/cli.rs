@@ -475,7 +475,7 @@ test_all_network_config_options! {
             exit_status,
         } = Abq::new(name)
             .args(args)
-            .working_dir(&testdata_project("jest/npm-jest-project"))
+            .working_dir(testdata_project("jest/npm-jest-project"))
             .run();
 
         assert!(exit_status.success());
@@ -496,7 +496,7 @@ test_all_network_config_options! {
             exit_status,
         } = Abq::new(name)
             .args(args)
-            .working_dir(&testdata_project("jest/npm-jest-project"))
+            .working_dir(testdata_project("jest/npm-jest-project"))
             .run();
 
         assert!(exit_status.success());
@@ -688,7 +688,7 @@ test_all_network_config_options! {
         let CmdOutput { stdout, stderr, exit_status } =
             Abq::new(name.to_string() + "_worker0")
             .args(test_args(0))
-            .working_dir(&testdata_project("jest/npm-jest-project"))
+            .working_dir(testdata_project("jest/npm-jest-project"))
             .run();
         assert!(!exit_status.success());
         assert!(stdout.contains("-- Test Timeout --"), "STDOUT:\n{}STDERR:\n{}", stdout, stderr);
@@ -718,7 +718,7 @@ test_all_network_config_options! {
             exit_status,
         } = Abq::new(name)
             .args(test_args)
-            .working_dir(&testdata_project("jest/npm-jest-project-with-failures"))
+            .working_dir(testdata_project("jest/npm-jest-project-with-failures"))
             .run();
 
         let code = exit_status.code().expect("process killed");
@@ -1542,7 +1542,7 @@ fn test_grouping_without_failures() {
 
     let stdout = String::from_utf8_lossy(&stdout).to_string();
     let stderr = String::from_utf8_lossy(&stderr).to_string();
-    let stdouts = vec![&stdout];
+    let stdouts = [&stdout];
     assert_sum_of_run_tests(stdouts.iter().map(|s| s.as_str()), 64);
     assert_sum_of_run_test_failures(stdouts.iter().map(|s| s.as_str()), 0);
     assert_sum_of_run_test_retries(stdouts.iter().map(|s| s.as_str()), 0);
@@ -1672,7 +1672,7 @@ fn test_grouping_with_failures_without_retries() {
 
     let stdout = String::from_utf8_lossy(&stdout).to_string();
     let stderr = String::from_utf8_lossy(&stderr).to_string();
-    let stdouts = vec![&stdout];
+    let stdouts = [&stdout];
     assert_sum_of_run_tests(stdouts.iter().map(|s| s.as_str()), 64);
     assert_sum_of_run_test_failures(stdouts.iter().map(|s| s.as_str()), 64);
     assert_sum_of_run_test_retries(stdouts.iter().map(|s| s.as_str()), 0);
@@ -1802,7 +1802,7 @@ fn test_grouping_failures_retries() {
 
     let stdout = String::from_utf8_lossy(&stdout).to_string();
     let stderr = String::from_utf8_lossy(&stderr).to_string();
-    let stdouts = vec![&stdout];
+    let stdouts = [&stdout];
     assert_sum_of_run_tests(stdouts.iter().map(|s| s.as_str()), 64);
     assert_sum_of_run_test_failures(stdouts.iter().map(|s| s.as_str()), 64);
     assert_sum_of_run_test_retries(stdouts.iter().map(|s| s.as_str()), 64);
@@ -2295,7 +2295,11 @@ test_all_network_config_options! {
             exit_status,
         } = Abq::new(name.to_string() + "_test1").args(test_args(1)).run();
 
-        assert_eq!(exit_status.code().unwrap(), 1, "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert_eq!(exit_status.code().unwrap(), 101, "STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
+        assert!(
+            stderr.contains("Error: This ABQ run was cancelled. When an ABQ run is cancelled, it can no longer be retried. You must start a run with a new run ID instead.\nThis run was cancelled because a worker received a cancellation signal while still working on tests."),
+            "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
 
         // ABQ report should error because the test run was cancelled.
         // abq report --reporter dot --queue-addr ... --run-id ... (--token ...)?

@@ -71,14 +71,6 @@ struct Run(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Wid(usize);
 
-/// External party ID
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ExternId(usize);
-
-/// ID of a spawned action
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SpawnId(usize);
-
 /// External dependencies that must be preserved while a test is ongoing.
 struct QueueExtDeps {
     _manifests_path: TempDir,
@@ -377,7 +369,7 @@ enum TestResultsOutcome {
     Results(OpaqueLazyAssociatedTestResults),
     Error(String),
     Pending,
-    OutstandingRunners(Vec<net_protocol::entity::Tag>),
+    OutstandingRunners,
 }
 
 #[allow(clippy::type_complexity)]
@@ -728,9 +720,7 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                             TestResultsOutcome::Results(results)
                         }
                         Pending => TestResultsOutcome::Pending,
-                        RunInProgress { active_runners } => {
-                            TestResultsOutcome::OutstandingRunners(active_runners)
-                        }
+                        RunInProgress { .. } => TestResultsOutcome::OutstandingRunners,
                         Error(s) => TestResultsOutcome::Error(s),
                     };
 
@@ -1656,7 +1646,7 @@ async fn test_cancellation_drops_remaining_work() {
             [
                 WorkerExitStatus(
                     Wid(2),
-                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+                    Box::new(|e| assert_eq!(e, &WorkersExitStatus::Error { errors: vec![String::from("Error: This ABQ run was cancelled. When an ABQ run is cancelled, it can no longer be retried. You must start a run with a new run ID instead.\nThis run was cancelled because a worker received a cancellation signal while still working on tests.")] })),
                 ),
                 QueueTestResults(
                     Run(1),
@@ -2345,7 +2335,7 @@ async fn cancellation_native() {
             ],
             [WorkerExitStatus(
                 Wid(2),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Error { errors: vec![String::from("Error: This ABQ run was cancelled. When an ABQ run is cancelled, it can no longer be retried. You must start a run with a new run ID instead.\nThis run was cancelled because a worker received a cancellation signal while still working on tests.")] })),
             )],
         )
         .test()
@@ -2840,7 +2830,7 @@ async fn cancel_test_run_if_no_manifest_progress() {
             ],
             [WorkerExitStatus(
                 Wid(2),
-                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Completed(ExitCode::CANCELLED))),
+                Box::new(|e| assert_eq!(e, &WorkersExitStatus::Error { errors: vec![String::from("Error: This ABQ run was cancelled. When an ABQ run is cancelled, it can no longer be retried. You must start a run with a new run ID instead.\nThis run was cancelled because the run timed out before any tests were completed.")] })),
             )],
         )
         .test()

@@ -17,7 +17,7 @@ use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, GroupId, NativeRunnerInfo, NegotiatorInfo, Request,
     TestResultsResponse, TestSpec, TestStrategy,
 };
-use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
+use abq_utils::net_protocol::results::{self};
 use abq_utils::net_protocol::runners::{Manifest, MetadataMap, StdioOutput};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
@@ -136,14 +136,12 @@ enum RunState {
 #[derive(Debug)]
 enum ManifestPersistence {
     Persisted(ManifestPersistedCell),
-    ManifestNeverReceived,
     EmptyManifest,
 }
 
 #[derive(Debug)]
 enum ResultsPersistence {
     Persisted(ResultsPersistedCell),
-    ManifestNeverReceived,
 }
 
 const MAX_BATCH_SIZE: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(100) };
@@ -283,8 +281,6 @@ enum WriteResultsError {
     RunNotFound,
     #[error("attempting to write results before manifest received")]
     WaitingForManifest,
-    #[error("attempting to write results when manifest failed to be generated")]
-    ManifestNeverReceived,
     #[error("attempting to write results for cancelled run")]
     RunCancelled,
 }
@@ -504,9 +500,7 @@ impl AllRuns {
                     AssignedRunStatus::AlreadyDone { exit_code }
                 }
             }
-            RunState::Cancelled { .. } => AssignedRunStatus::AlreadyDone {
-                exit_code: ExitCode::CANCELLED,
-            },
+            RunState::Cancelled { reason } => AssignedRunStatus::Cancelled { reason: *reason },
         }
     }
 
@@ -938,7 +932,6 @@ impl AllRuns {
                 ResultsPersistence::Persisted(cell) => {
                     Ok((cell.clone(), EligibleForRemoteDump::Yes))
                 }
-                ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
             },
             RunState::Cancelled { .. } => Err(RunCancelled),
         }
@@ -990,10 +983,13 @@ impl AllRuns {
                             Ok(ReadResultsState::RunInProgress { active_runners })
                         }
                     }
-                    ResultsPersistence::ManifestNeverReceived => Err(ManifestNeverReceived),
                 }
             }
-            RunState::Cancelled { .. } => Err(RunCancelled),
+            RunState::Cancelled { reason } => match reason {
+                CancelReason::User => Err(RunCancelled),
+                CancelReason::ManifestHadNoProgress => Err(RunCancelled),
+                CancelReason::ManifestNeverReceived => Err(ManifestNeverReceived),
+            },
         }
     }
 
@@ -1049,9 +1045,6 @@ impl AllRuns {
                     } else {
                         RetryManifestState::NotYetPersisted
                     }
-                }
-                ManifestPersistence::ManifestNeverReceived => {
-                    RetryManifestState::Error(RetryManifestError::ManifestNeverReceived)
                 }
                 ManifestPersistence::EmptyManifest => {
                     // Ship the empty manifest over.
@@ -1214,37 +1207,24 @@ impl AllRuns {
 
         let mut run = runs.get(&run_id).expect("no run recorded").write();
 
-        let test_command_hash = match run.state {
-            RunState::WaitingForManifest {
-                test_command_hash, ..
-            } => {
-                // okay
-                test_command_hash
+        match run.state {
+            RunState::WaitingForManifest { .. } => {
+                run.state = RunState::Cancelled {
+                    reason: CancelReason::ManifestNeverReceived,
+                };
+                // NB: Always sub last for conversative estimation.
+                self.num_active.fetch_sub(1, atomic::ORDERING);
             }
             RunState::Cancelled { .. } => {
                 // No-op, since the run was already cancelled.
-                return;
             }
             RunState::HasWork { .. } | RunState::InitialManifestDone { .. } => {
                 illegal_state!(
                     "attempting to mark failed to receive manifest after manifest was received",
                     ?run_id
                 );
-                return;
             }
         };
-
-        run.state = RunState::InitialManifestDone {
-            new_worker_exit_code: ExitCode::FAILURE,
-            init_metadata: Default::default(),
-            seen_workers: Default::default(),
-            manifest_persistence: ManifestPersistence::ManifestNeverReceived,
-            results_persistence: ResultsPersistence::ManifestNeverReceived,
-            test_command_hash: Some(test_command_hash),
-        };
-
-        // NB: Always sub last for conversative estimation.
-        self.num_active.fetch_sub(1, atomic::ORDERING);
     }
 
     /// Marks a run as complete because it had the trivial manifest.
@@ -1572,6 +1552,7 @@ impl Drop for Abq {
         if self.active {
             // Our user never called shutdown; try to perform a clean exit.
             // We can't do anything with an error, since this is a drop.
+            #[allow(clippy::let_underscore_future)]
             let _ = self.shutdown();
         }
     }
@@ -2221,7 +2202,7 @@ impl QueueServer {
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
         // If a worker failed to generate a manifest, or the manifest is empty,
-        // we're going to immediately end the test run.
+        // we're going to immediately cancel the test run.
         //
         // In the former case this indicates a failure in the underlying test runners,
         // and in the latter case we have nothing to do.
@@ -2341,10 +2322,6 @@ impl QueueServer {
         entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
-        enum Response {
-            One(TestResultsResponse),
-            Chunk(OpaqueLazyAssociatedTestResults),
-        }
         let results_cell = match queues.get_read_results_cell(&run_id).located(here!()) {
             Ok(state) => match state {
                 ReadResultsState::ReadFromCell(cell) => cell,
@@ -4976,21 +4953,6 @@ mod persist_results {
             }
         },
         Ok(ReadResultsState::RunInProgress { active_runners }) if active_runners == &[Tag::runner(2, 1)]
-    }
-
-    get_read_results_cell! {
-        get_read_results_cell_when_done_with_manifest_never_received,
-        {
-            RunState::InitialManifestDone {
-                new_worker_exit_code: ExitCode::SUCCESS,
-                init_metadata: Default::default(),
-                seen_workers: Default::default(),
-                results_persistence: ResultsPersistence::ManifestNeverReceived,
-                manifest_persistence: ManifestPersistence::EmptyManifest,
-                test_command_hash: Some(TestCommandHash::random()),
-            }
-        },
-        Err(ReadResultsError::ManifestNeverReceived)
     }
 
     get_read_results_cell! {

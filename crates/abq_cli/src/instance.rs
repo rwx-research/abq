@@ -19,7 +19,6 @@ use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
 use std::net::{IpAddr, SocketAddr};
 use std::thread;
-use tempfile::TempDir;
 use tokio_cron_scheduler::JobScheduler;
 
 use thiserror::Error;
@@ -280,12 +279,7 @@ enum AbqLocator {
         queue_negotiator: QueueNegotiatorHandle,
         server_addr: SocketAddr,
     },
-    Local(Abq, EphemeralAbqGuards),
-}
-
-struct EphemeralAbqGuards {
-    _manifests_path: TempDir,
-    _results_path: TempDir,
+    Local(Abq),
 }
 
 #[derive(Debug, Error)]
@@ -312,14 +306,14 @@ impl AbqInstance {
             AbqLocator::Remote {
                 queue_negotiator, ..
             } => *queue_negotiator,
-            AbqLocator::Local(abq, _) => abq.get_negotiator_handle(),
+            AbqLocator::Local(abq) => abq.get_negotiator_handle(),
         }
     }
 
     pub fn server_addr(&self) -> SocketAddr {
         match &self.locator {
             AbqLocator::Remote { server_addr, .. } => *server_addr,
-            AbqLocator::Local(abq, _) => abq.server_addr(),
+            AbqLocator::Local(abq) => abq.server_addr(),
         }
     }
 
@@ -359,13 +353,9 @@ impl AbqInstance {
         config.server_options = ServerOptions::new(server_auth, server_tls);
 
         let queue = Abq::start(config).await;
-        let guards = EphemeralAbqGuards {
-            _manifests_path: manifests_path,
-            _results_path: results_path,
-        };
 
         AbqInstance {
-            locator: AbqLocator::Local(queue, guards),
+            locator: AbqLocator::Local(queue),
             client_options: ClientOptions::new(client_auth, client_tls),
         }
     }

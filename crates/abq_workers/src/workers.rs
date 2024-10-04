@@ -799,15 +799,6 @@ async fn attempt_test_id_for_test_like_runner(
                     vec![test]
                 }
             }
-            #[cfg(feature = "test-test_ids")]
-            (R::EchoOnRetry(succeed_on), s) => {
-                if succeed_on == _attempt {
-                    let result = echo::EchoWorker::run(echo::EchoWork { message: s });
-                    vec![result]
-                } else {
-                    panic!("Failed to echo!");
-                }
-            }
             (runner, test_id) => unreachable!(
                 "Invalid runner/test_id combination: {:?} and {:?}",
                 runner, test_id
@@ -1124,7 +1115,7 @@ mod test {
 
         let run_id = RunId::unique();
         let mut expected_results = HashMap::new();
-        let tests = (0..num_echos).into_iter().map(|i| {
+        let tests = (0..num_echos).map(|i| {
             let echo_string = format!("echo {}", i);
             expected_results.insert(WorkId([i as _; 16]), vec![echo_string.clone()]);
 
@@ -1227,139 +1218,6 @@ mod test {
     #[with_protocol_version]
     async fn test_2_workers_8_echos() {
         test_echo_n(proto, 2, 8).await;
-    }
-
-    #[test]
-    #[cfg(feature = "test-test_ids")]
-    fn test_timeout() {
-        let (write_work, get_next_tests) = work_writer();
-        let (results, results_handler) = results_collector();
-
-        let run_id = RunId::new();
-        let manifest = ManifestMessage {
-            test_ids: vec![TestId::Echo("mona lisa".to_string())],
-        };
-
-        let (default_config, manifest_collector) = setup_pool(
-            TestLikeRunner::InduceTimeout,
-            run_id,
-            manifest,
-            get_next_tests,
-            results_handler,
-        );
-
-        let timeout = Duration::from_millis(1);
-        let config = WorkerPoolConfig {
-            work_timeout: timeout,
-            work_retries: 0,
-            ..default_config
-        };
-        let mut pool = WorkerPool::new(config);
-
-        for test_id in await_manifest_test_specs(manifest_collector) {
-            write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
-        }
-
-        write_work(NextWork::EndOfWork);
-
-        await_results(results, |results| {
-            let results = results.lock().unwrap();
-            if results.is_empty() {
-                return false;
-            }
-
-            results.get("id1").unwrap() == &WorkerResult::Timeout(timeout)
-        });
-
-        pool.shutdown();
-    }
-
-    #[test]
-    #[cfg(feature = "test-test_ids")]
-    fn test_panic_no_retries() {
-        let (write_work, get_next_tests) = work_writer();
-        let (results, results_handler) = results_collector();
-
-        let run_id = RunId::new();
-        let manifest = ManifestMessage {
-            test_ids: vec![TestId::Echo("".to_string())],
-        };
-
-        let (default_config, manifest_collector) = setup_pool(
-            TestLikeRunner::EchoOnRetry(10),
-            run_id,
-            manifest,
-            get_next_tests,
-            results_handler,
-        );
-
-        let config = WorkerPoolConfig {
-            work_retries: 0,
-            ..default_config
-        };
-        let mut pool = WorkerPool::new(config);
-
-        for test_id in await_manifest_test_specs(manifest_collector) {
-            write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
-        }
-        write_work(NextWork::EndOfWork);
-
-        await_results(results, |results| {
-            let results = results.lock().unwrap();
-            if results.is_empty() {
-                return false;
-            }
-
-            results.get("id1").unwrap() == &WorkerResult::Panic("Failed to echo!".to_string())
-        });
-
-        pool.shutdown();
-    }
-
-    #[test]
-    #[cfg(feature = "test-test_ids")]
-    fn test_panic_succeed_after_retry() {
-        let (write_work, get_next_tests) = work_writer();
-        let (results, results_handler) = results_collector();
-
-        let run_id = RunId::new();
-        let manifest = ManifestMessage {
-            test_ids: vec![TestId::Echo("okay".to_string())],
-        };
-
-        let (default_config, manifest_collector) = setup_pool(
-            TestLikeRunner::EchoOnRetry(2),
-            run_id,
-            manifest,
-            get_next_tests,
-            results_handler,
-        );
-
-        let config = WorkerPoolConfig {
-            work_retries: 1,
-            ..default_config
-        };
-        let mut pool = WorkerPool::new(config);
-
-        for test_id in await_manifest_test_specs(manifest_collector) {
-            write_work(local_work(test_id, run_id, WorkId("id1".to_string())));
-        }
-        write_work(NextWork::EndOfWork);
-
-        await_results(results, |results| {
-            let results = results.lock().unwrap();
-            if results.is_empty() {
-                return false;
-            }
-
-            results.get("id1").unwrap()
-                == &WorkerResult::Output(Output {
-                    success: true,
-                    message: "okay".to_string(),
-                })
-        });
-
-        pool.shutdown();
     }
 
     #[tokio::test]

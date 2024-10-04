@@ -618,6 +618,8 @@ pub mod queue {
         User,
         /// Timed out because no progress was made popping items off the manifest.
         ManifestHadNoProgress,
+        /// Timed out because the manifest was never received
+        ManifestNeverReceived,
     }
 
     /// A request sent to the queue.
@@ -1425,9 +1427,9 @@ mod test {
             &[0u8, 0] as &[u8],
             &[0, 10],
             // Chop up the rest of the message
-            &[b'"', b'1', b'1'],
-            &[b'1', b'1'],
-            &[b'1', b'1', b'1', b'1', b'"'],
+            b"\"11",
+            b"11",
+            b"1111\"",
         ];
 
         let mut async_reader = AsyncReader::default();
@@ -1509,8 +1511,8 @@ mod test {
                 let mut splits = vec![];
                 let mut i = 0;
                 for j in split_idxs {
-                    splits.push(&msg[i..j as usize]);
-                    i = j as usize;
+                    splits.push(&msg[i..j]);
+                    i = j;
                 }
                 assert_eq!(splits.iter().map(|l| l.len()).sum::<usize>(), msg_len);
                 splits

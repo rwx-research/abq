@@ -1,4 +1,7 @@
-use abq_utils::net_protocol::{entity::Entity, queue::InvokeWork};
+use abq_utils::net_protocol::{
+    entity::Entity,
+    queue::{CancelReason, InvokeWork},
+};
 use async_trait::async_trait;
 use serde_derive::{Deserialize, Serialize};
 
@@ -26,6 +29,9 @@ pub enum AssignedRunStatus {
     Run(AssignedRun),
     AlreadyDone {
         exit_code: abq_utils::exit::ExitCode,
+    },
+    Cancelled {
+        reason: CancelReason,
     },
     FatalError(String),
 }

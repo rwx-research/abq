@@ -112,7 +112,7 @@ impl Reporter for ProgressReporter {
 
             if is_fail_like {
                 if self.wrote_first_output {
-                    output::write(&mut self.buffer, &[b'\n'])?;
+                    output::write(&mut self.buffer, b"\n")?;
                 }
                 format_result_line(&mut self.buffer, test_result)?;
                 self.wrote_first_output = true;

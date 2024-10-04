@@ -182,22 +182,24 @@ async fn do_shutdown(
         eprintln!("{error}");
     }
 
-    print!("\n\n");
-    suite_result
-        .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)
-        .unwrap();
-    println!("\n");
-    if execution_mode == ExecutionMode::WriteNormal {
-        println!("Run the following command to replay these tests locally:");
+    if matches!(status, WorkersExitStatus::Completed { .. }) || suite_result.count > 0 {
+        print!("\n\n");
+        suite_result
+            .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)
+            .unwrap();
         println!("\n");
-        println!(
-            "\tabq test --run-id {} --worker {} --num {} -- <your-test-command>",
-            run_id,
-            worker_tag.index(),
-            num_runners,
-        );
-        println!("\n");
-        println!("Specify your Access Token with the RWX_ACCESS_TOKEN env variable, passing --access-token, or running `abq login`.");
+        if execution_mode == ExecutionMode::WriteNormal {
+            println!("Run the following command to replay these tests locally:");
+            println!("\n");
+            println!(
+                "\tabq test --run-id {} --worker {} --num {} -- <your-test-command>",
+                run_id,
+                worker_tag.index(),
+                num_runners,
+            );
+            println!("\n");
+            println!("Specify your Access Token with the RWX_ACCESS_TOKEN env variable, passing --access-token, or running `abq login`.");
+        }
     }
 
     // If the workers didn't fault, exit with whatever status the test suite run is at; otherwise,

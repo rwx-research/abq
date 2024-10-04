@@ -11,8 +11,6 @@ use tokio::net::ToSocketAddrs;
 use super::UnverifiedServerStream;
 use crate::auth::{ClientAuthStrategy, Role, ServerAuthStrategy};
 
-pub struct RawServerStream(tokio::net::TcpStream);
-
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct ClientStream(tokio::net::TcpStream);

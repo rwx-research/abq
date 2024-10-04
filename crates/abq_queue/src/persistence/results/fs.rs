@@ -410,7 +410,7 @@ impl PersistResults for FilesystemPersistor {
 
 async fn write_packed_line(fi: &mut File, packed: Vec<u8>) -> OpaqueResult<()> {
     fi.write_all(&packed).await.located(here!())?;
-    fi.write_all(&[b'\n']).await.located(here!())?;
+    fi.write_all(b"\n").await.located(here!())?;
     fi.flush().await.located(here!())
 }
 

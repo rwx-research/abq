@@ -1,4 +1,3 @@
-#![cfg(test)]
 use abq_test_utils::one_nonzero_usize;
 use abq_utils::{
     net_protocol::{

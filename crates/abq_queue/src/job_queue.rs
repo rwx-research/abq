@@ -69,7 +69,7 @@ impl JobQueue {
         entity_tag: Tag,
         suggested_batch_size: NonZeroUsize,
     ) -> impl ExactSizeIterator<Item = &(WorkerTest, GroupId)> + '_ {
-        let suggested_batch_size = suggested_batch_size.get() as usize;
+        let suggested_batch_size = suggested_batch_size.get();
         let queue_len = self.queue.len();
 
         // If the start index was past the end of the queue, return fast

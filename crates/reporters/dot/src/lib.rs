@@ -62,7 +62,7 @@ impl Reporter for DotReporter {
 
         if self.num_results % DOT_REPORTER_LINE_LIMIT == 0 {
             // Print a newline
-            write(&mut self.buffer, &[b'\n'])?;
+            write(&mut self.buffer, b"\n")?;
         }
 
         // Make sure to flush the dot out to avoid buffering them!
@@ -99,7 +99,7 @@ impl Reporter for DotReporter {
 
     fn after_all_results(&mut self) {
         if self.num_results % DOT_REPORTER_LINE_LIMIT != 0 {
-            let _ = write(&mut self.buffer, &[b'\n']);
+            let _ = write(&mut self.buffer, b"\n");
         }
     }
 
