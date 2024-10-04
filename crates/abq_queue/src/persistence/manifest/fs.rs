@@ -89,6 +89,7 @@ impl FilesystemPersistor {
         tokio::task::spawn_blocking(move || {
             let fi = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(path)

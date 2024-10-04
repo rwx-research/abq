@@ -25,7 +25,7 @@ use abq_utils::{
     auth::User,
     error::{EntityfulError, ErrorEntity, ResultLocation},
     exit::ExitCode,
-    here, log_entityful, net, net_async,
+    here, log_entityful, net_async,
     net_opt::ClientOptions,
     net_protocol::{
         self,
@@ -139,7 +139,7 @@ pub enum WorkersNegotiateError {
 }
 
 /// The worker pool side of the negotiation.
-pub struct WorkersNegotiator(Box<dyn net::ClientStream>, WorkerContext);
+pub struct WorkersNegotiator();
 
 pub enum NegotiatedWorkers {
     /// No more workers were created, because there is no more work to be done.

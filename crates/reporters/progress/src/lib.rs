@@ -112,7 +112,7 @@ impl Reporter for ProgressReporter {
 
             if is_fail_like {
                 if self.wrote_first_output {
-                    output::write(&mut self.buffer, &[b'\n'])?;
+                    output::write(&mut self.buffer, b"\n")?;
                 }
                 format_result_line(&mut self.buffer, test_result)?;
                 self.wrote_first_output = true;
@@ -358,59 +358,59 @@ mod test {
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 1 tests run<reset>, <green-bold>1 passed<reset>, <reset>0 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 1 tests run<reset>, <green-bold>1 passed<reset>, <reset>0 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 1 tests run<reset>, <green-bold>1 passed<reset>, <reset>0 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 2 tests run<reset>, <green-bold>1 passed<reset>, <red-bold>1 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 2 tests run<reset>, <green-bold>1 passed<reset>, <red-bold>1 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 2 tests run<reset>, <green-bold>1 passed<reset>, <red-bold>1 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 3 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>1 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 3 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>1 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 3 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>1 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 4 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>2 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 4 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>2 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 4 tests run<reset>, <green-bold>2 passed<reset>, <red-bold>2 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 5 tests run<reset>, <green-bold>3 passed<reset>, <red-bold>2 failing<reset>
 
-                                                                                                            
+
         <bold>> ABQ status<reset>
         <bold>> [0 seconds] 5 tests run<reset>, <green-bold>3 passed<reset>, <red-bold>2 failing<reset>
 
-                                                                                                            
+
         "###);
     }
 

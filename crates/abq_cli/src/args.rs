@@ -150,12 +150,12 @@ pub enum Command {
         ///
         /// The remote persistence options are:{n}
         ///  - s3: files are remotely persisted to an S3 bucket. Requires `ABQ_REMOTE_PERSISTENCE_S3_BUCKET`
-        ///  and `ABQ_REMOTE_PERSISTENCE_S3_KEY_PREFIX` to be set as well. AWS credentials and region
-        ///  information are read from the environment, using the standard AWS environment variable
-        ///  support (https://docs.aws.amazon.com/sdkref/latest/guide/environment-variables.html).{n}
+        ///    and `ABQ_REMOTE_PERSISTENCE_S3_KEY_PREFIX` to be set as well. AWS credentials and region
+        ///    information are read from the environment, using the standard AWS environment variable
+        ///    support (https://docs.aws.amazon.com/sdkref/latest/guide/environment-variables.html).{n}
         ///
         ///  - custom: files are remotely persisted by calling a provided executable. See
-        ///  `--remote-persistence-command` for more information.{n}
+        ///    `--remote-persistence-command` for more information.{n}
         #[clap(long, required = false, env(ENV_REMOTE_PERSISTENCE_STRATEGY))]
         remote_persistence_strategy: Option<RemotePersistenceStrategy>,
 
@@ -169,7 +169,7 @@ pub enum Command {
         ///
         /// Where{n}
         ///   - <mode> is either "store" or "load", depending on whether the file should be stored
-        ///   into the remote location, or loaded from the remote location.{n}
+        ///     into the remote location, or loaded from the remote location.{n}
         ///   - <file-type> is "manifest", "results", or "run_state".{n}
         ///   - <run-id> is the run ID of the test suite run.{n}
         ///   - <local-path> is the path to the file on the local filesystem.{n}
@@ -331,7 +331,7 @@ pub enum Command {
         /// Options:{n}
         ///- by-test: distribute the next test to any worker.{n}
         ///- by-file: distribute all tests in a file to the same worker. This ensures that expensive per-file shared setups or
-        /// teardowns will run only once on one worker, however it may cause tests to be less evenly distributed.
+        ///  teardowns will run only once on one worker, however it may cause tests to be less evenly distributed.
         ///
         /// Note: The Jest & Playwright test frameworks run with a by-file strategy regardless of the value of this flag.
         #[clap(long, default_value = "by-test")]
@@ -341,8 +341,8 @@ pub enum Command {
         ///
         /// Options:{n}
         ///- auto: try to emit colors unless the output channel is detected
-        /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
-        /// TERM is set to `dumb`, amongst other heuristics.
+        ///   not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
+        ///   TERM is set to `dumb`, amongst other heuristics.
         ///- never: don't emit colors.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,
@@ -411,8 +411,8 @@ pub enum Command {
         ///
         /// Options:{n}
         ///- auto: try to emit colors unless the output channel is detected
-        /// not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
-        /// TERM is set to `dumb`, amongst other heuristics.
+        ///   not to be a TTY, if (on Windows) the console isn't available, if NO_COLOR is set, if
+        ///   TERM is set to `dumb`, amongst other heuristics.
         ///- never: don't emit colors.
         #[clap(long, default_value = "auto")]
         color: ColorPreference,

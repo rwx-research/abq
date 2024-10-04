@@ -1846,7 +1846,6 @@ mod test_abq_jest {
     fn write_leading_markers(s: &[u8]) -> String {
         String::from_utf8_lossy(s)
             .lines()
-            .into_iter()
             .map(|s| format!("|{s}"))
             .collect::<Vec<_>>()
             .join("\n")

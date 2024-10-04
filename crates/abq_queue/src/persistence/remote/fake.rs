@@ -36,7 +36,6 @@ pub struct FakePersister {
     on_try_load_run_state: Arc<OnTryLoadRunState>,
 }
 
-#[track_caller]
 pub async fn unreachable(_x: PersistenceKind, _y: RunId, _z: PathBuf) -> OpaqueResult<()> {
     unreachable!()
 }
@@ -220,11 +219,11 @@ impl RemotePersistence for OneWriteFakePersister {
         _run_id: &RunId,
         _run_state: SerializableRunState,
     ) -> OpaqueResult<()> {
-        unimplemented!("FakePersister does not support storing run state.");
+        Err("FakePersister does not support storing run state.".located(here!()))
     }
 
     async fn try_load_run_state(&self, _run_id: &RunId) -> OpaqueResult<LoadedRunState> {
-        unimplemented!("FakePersister does not support loading run state.");
+        Err("FakePersister does not support loading run state.".located(here!()))
     }
 
     fn boxed_clone(&self) -> Box<dyn RemotePersistence + Send + Sync> {

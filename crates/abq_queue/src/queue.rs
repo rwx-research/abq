@@ -17,7 +17,7 @@ use abq_utils::net_protocol::queue::{
     AssociatedTestResults, CancelReason, GroupId, NativeRunnerInfo, NegotiatorInfo, Request,
     TestResultsResponse, TestSpec, TestStrategy,
 };
-use abq_utils::net_protocol::results::{self, OpaqueLazyAssociatedTestResults};
+use abq_utils::net_protocol::results::{self};
 use abq_utils::net_protocol::runners::{Manifest, MetadataMap, StdioOutput};
 use abq_utils::net_protocol::work_server::{self, RetryManifestResponse};
 use abq_utils::net_protocol::workers::{
@@ -1546,6 +1546,7 @@ impl Drop for Abq {
         if self.active {
             // Our user never called shutdown; try to perform a clean exit.
             // We can't do anything with an error, since this is a drop.
+            #[allow(clippy::let_underscore_future)]
             let _ = self.shutdown();
         }
     }
@@ -2315,10 +2316,6 @@ impl QueueServer {
         entity: Entity,
         mut stream: Box<dyn net_async::ServerStream>,
     ) -> OpaqueResult<()> {
-        enum Response {
-            One(TestResultsResponse),
-            Chunk(OpaqueLazyAssociatedTestResults),
-        }
         let results_cell = match queues.get_read_results_cell(&run_id).located(here!()) {
             Ok(state) => match state {
                 ReadResultsState::ReadFromCell(cell) => cell,

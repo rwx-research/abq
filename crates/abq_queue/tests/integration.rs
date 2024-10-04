@@ -71,14 +71,6 @@ struct Run(usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Wid(usize);
 
-/// External party ID
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ExternId(usize);
-
-/// ID of a spawned action
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SpawnId(usize);
-
 /// External dependencies that must be preserved while a test is ongoing.
 struct QueueExtDeps {
     _manifests_path: TempDir,
@@ -377,7 +369,7 @@ enum TestResultsOutcome {
     Results(OpaqueLazyAssociatedTestResults),
     Error(String),
     Pending,
-    OutstandingRunners(Vec<net_protocol::entity::Tag>),
+    OutstandingRunners,
 }
 
 #[allow(clippy::type_complexity)]
@@ -728,9 +720,7 @@ async fn run_test(server: Server, steps: Steps<'_>) {
                             TestResultsOutcome::Results(results)
                         }
                         Pending => TestResultsOutcome::Pending,
-                        RunInProgress { active_runners } => {
-                            TestResultsOutcome::OutstandingRunners(active_runners)
-                        }
+                        RunInProgress { .. } => TestResultsOutcome::OutstandingRunners,
                         Error(s) => TestResultsOutcome::Error(s),
                     };
 
