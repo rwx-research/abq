@@ -2819,6 +2819,84 @@ fn test_with_personal_access_token_and_auto_generated_run_id_uses_ephemeral_queu
 #[test]
 #[with_protocol_version]
 #[serial]
+fn test_with_access_token_and_local_uses_ephemeral_queue() {
+    let name = "test_with_access_token_and_local_uses_ephemeral_queue";
+    let conf = CSConfigOptions {
+        use_auth_token: true,
+        tls: false,
+    };
+
+    let server = Server::new();
+    let access_token = test_access_token();
+
+    let manifest = vec![TestOrGroup::test(Test::new(
+        proto,
+        "some_test",
+        [],
+        Default::default(),
+    ))];
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    let simulation = [
+        Connect,
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: vec![
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                OpaqueRead,
+                OpaqueWrite(pack(RawTestResultMessage::fake(proto))),
+            ],
+        },
+        Exit(0),
+    ];
+    let packed = pack_msgs_to_disk(simulation);
+
+    let test_args = {
+        let simulator = native_runner_simulation_bin();
+        let simfile_path = packed.path.display().to_string();
+        let args = vec![
+            format!("test"),
+            format!("--worker=1"),
+            format!("-n=1"),
+            format!("--local"),
+        ];
+        let mut args = conf.extend_args_for_client(args);
+        args.extend([s!("--"), simulator, simfile_path]);
+        args
+    };
+
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(format!("{name}_test"))
+        .args(test_args)
+        .env([
+            ("ABQ_API", &server.url()),
+            ("RWX_ACCESS_TOKEN", &access_token.to_string()),
+        ])
+        .run();
+    assert!(
+        exit_status.success(),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 tests, 0 failures"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Run the following command to replay these tests locally"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
 fn test_with_personal_access_token_and_auto_generated_run_id_uses_ephemeral_queue_even_if_api_is_positive(
 ) {
     let name = "test_with_personal_access_token_and_auto_generated_run_id_uses_ephemeral_queue_even_if_api_is_positive";

@@ -386,6 +386,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             startup_timeout_seconds,
             test_strategy,
             inactivity_timeout_seconds,
+            local,
         } => {
             let deprecations = DeprecationRecord::default();
             let stdout_preferences = StdoutPreferences::new(color);
@@ -400,14 +401,20 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let tls_cert = read_opt_path_bytes(tls_cert)?;
             let tls_key = read_opt_path_bytes(tls_key)?;
 
-            let access_token = access_token.or_else(|| {
-                let config = abq_config::read_abq_config(get_abq_config_filepath())?;
-                Some(config.rwx_access_token)
-            });
+            let (access_token, api_config) = if local {
+                (None, None)
+            } else {
+                let access_token = access_token.or_else(|| {
+                    let config = abq_config::read_abq_config(get_abq_config_filepath())?;
+                    Some(config.rwx_access_token)
+                });
 
-            let api_config = match access_token.as_ref() {
-                Some(access_token) => Some(get_config_from_api(access_token, &run_id).await?),
-                None => None,
+                let api_config = match access_token.as_ref() {
+                    Some(access_token) => Some(get_config_from_api(access_token, &run_id).await?),
+                    None => None,
+                };
+
+                (access_token, api_config)
             };
 
             let ResolvedConfig {
@@ -467,6 +474,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
                 access_token,
                 run_id: run_id.clone(),
                 record_telemetry: queue_location.is_remote(),
+                queue_location,
             };
 
             workers::start_workers_standalone(
