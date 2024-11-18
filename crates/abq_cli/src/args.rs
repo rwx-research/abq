@@ -245,6 +245,12 @@ pub enum Command {
             .conflicts_with("tls_key"),
         )
     )]
+    #[command(group(
+        ArgGroup::new("local-queue-addr-exclusion") // don't allow both queue_addr and local params
+            .multiple(false)
+            .args(["local", "queue_addr"]),
+        )
+    )]
     Test {
         /// The number of the test worker connecting for a test suite run.
         ///
@@ -273,6 +279,12 @@ pub enum Command {
         /// Cannot be used with --queue-addr (implies: not using the ABQ API).
         #[clap(long, required = false, env("RWX_ACCESS_TOKEN"))]
         access_token: Option<AccessToken>,
+
+        /// When specified, runs ABQ in local mode only.
+        ///
+        /// Cannot be used with --queue-addr since a local queue will be used.
+        #[clap(long, required = false, env("ABQ_LOCAL"), action)]
+        local: bool,
 
         /// Address of the queue where the test command will be sent.
         ///

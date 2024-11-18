@@ -24,6 +24,7 @@ use signal_hook_tokio::Signals;
 
 use crate::reporting::{build_reporters, ReporterKind, StdoutPreferences};
 use crate::workers::reporting::create_reporting_task;
+use crate::QueueLocation;
 
 use self::reporting::ReportingTaskHandle;
 
@@ -39,6 +40,7 @@ pub struct TestRunMetadata {
     pub access_token: Option<abq_hosted::AccessToken>,
     pub run_id: RunId,
     pub record_telemetry: bool,
+    pub queue_location: QueueLocation,
 }
 
 pub async fn start_workers_standalone(
@@ -188,7 +190,9 @@ async fn do_shutdown(
             .write_short_summary_lines(&mut stdout, ShortSummaryGrouping::Runner)
             .unwrap();
         println!("\n");
-        if execution_mode == ExecutionMode::WriteNormal {
+        if execution_mode == ExecutionMode::WriteNormal
+            && test_run_metadata.queue_location.is_remote()
+        {
             println!("Run the following command to replay these tests locally:");
             println!("\n");
             println!(
