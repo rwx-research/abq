@@ -29,7 +29,7 @@ jobs:
       ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: START dev queue
         run: |
@@ -59,11 +59,11 @@ jobs:
       jest_abq_time: ${{ steps.benchmark.outputs.jest_abq_worker_time }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
           bundler-cache: true
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: "16"
           cache: "npm"
@@ -131,11 +131,11 @@ jobs:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
           bundler-cache: true
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: "16"
           cache: "npm"
@@ -190,7 +190,7 @@ jobs:
       overhead_stddev: ${{ steps.collect.outputs.overhead_stddev }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
       - id: collect
         run: |
@@ -211,7 +211,7 @@ jobs:
       ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       - name: Get status emoji
         id: status
         if: always()

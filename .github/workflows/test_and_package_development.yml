@@ -36,7 +36,7 @@ jobs:
       ABQ_NO_REBUILD: true
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0 # get whole history for versioning
 
@@ -95,12 +95,12 @@ jobs:
       - name: Lint github workflows
         run: |
           echo "::add-matcher::.github/actionlint-matcher.json"
-          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/3a2f2c755b6442ec7999b28dfd107e1bb9853389/scripts/download-actionlint.bash)
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/97871a555712e90a2f4f9ae0f42794bd61af88bc/scripts/download-actionlint.bash)
           ./actionlint -color
         shell: bash
 
       # setup testdata
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v4
         with:
           node-version: "14"
           cache: "npm"
