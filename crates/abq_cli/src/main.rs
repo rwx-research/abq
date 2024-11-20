@@ -392,7 +392,7 @@ async fn abq_main() -> anyhow::Result<ExitCode> {
             let stdout_preferences = StdoutPreferences::new(color);
 
             let external_run_id = run_id.or(inferred_run_id);
-            let explicit_run_id_provided = external_run_id.is_some();
+            let explicit_run_id_provided = external_run_id.is_some() && !local;
             let run_id = external_run_id.unwrap_or_else(RunId::unique);
 
             let working_dir =
