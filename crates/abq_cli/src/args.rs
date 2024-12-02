@@ -255,7 +255,7 @@ pub enum Command {
         /// The number of the test worker connecting for a test suite run.
         ///
         /// There may not be duplicate worker numberings in an ABQ test suite run.
-        #[clap(long, required = false, default_value_t = 0)]
+        #[clap(long, required = false, default_value_t = 0, env("ABQ_WORKER"))]
         worker: u32,
 
         /// How many times to retry failed tests.
@@ -297,7 +297,13 @@ pub enum Command {
         /// Number of runners to start on the worker.
         ///
         /// Set to "cpu-cores" to use the number of available (physical) CPUs cores - 1.
-        #[clap(long, short = 'n', required = false, default_value = "1")]
+        #[clap(
+            long,
+            short = 'n',
+            required = false,
+            default_value = "1",
+            env("ABQ_RUNNERS")
+        )]
         num: NumRunners,
 
         /// Token to authorize messages sent to the queue with.
@@ -335,7 +341,7 @@ pub enum Command {
         reporter: Vec<ReporterKind>,
 
         /// How many tests to send to a worker a time.
-        #[clap(long, default_value = "7")]
+        #[clap(long, default_value = "7", env("ABQ_BATCH_SIZE"))]
         batch_size: NonZeroU64,
 
         /// How ABQ will distribute the tests.
