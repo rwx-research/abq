@@ -189,7 +189,7 @@ pub struct PersistencePlan<'a> {
 }
 
 impl<'a> PersistencePlan<'a> {
-    #[tracing::instrument(level = "info", skip_all, fields(run_id = %self.cell.run_id, eligible_for_remote_dump = %self.eligible_for_remote_dump.bool()))]
+    #[tracing::instrument(level = "trace", skip_all, fields(run_id = %self.cell.run_id, eligible_for_remote_dump = %self.eligible_for_remote_dump.bool()))]
     pub async fn execute(self) -> Result<()> {
         let result = self
             .persist_results
