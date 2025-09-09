@@ -21,7 +21,7 @@ serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
 
-tokio = { version = "1.26.0", features = [
+tokio = { version = "1.29.1", features = [
   "fs",
   "io-util",
   "io-std",
