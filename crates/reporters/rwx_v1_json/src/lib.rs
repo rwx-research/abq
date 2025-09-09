@@ -495,7 +495,27 @@ impl Collector {
                         native_runner_errors: other_errors,
                     } => {
                         self.native_runner_errors.extend(other_errors);
-                        self.tests.insert(test_result.id.clone(), test);
+
+                        // If the test failed and has no location, treat it as an other error instead of a test
+                        if test.location.is_none() {
+                            match &test.attempt.status {
+                                AttemptStatus::Failed { message, .. } => {
+                                    let error_message = format!(
+                                        "'{}': {}",
+                                        test.name,
+                                        message
+                                            .as_deref()
+                                            .unwrap_or("failed outside the test suite")
+                                    );
+                                    self.native_runner_errors.push(error_message);
+                                }
+                                _ => {
+                                    self.tests.insert(test_result.id.clone(), test);
+                                }
+                            };
+                        } else {
+                            self.tests.insert(test_result.id.clone(), test);
+                        }
                     }
                 }
                 return;
