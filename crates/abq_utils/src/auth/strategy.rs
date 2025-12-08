@@ -122,7 +122,7 @@ enum RoleInner {
     Admin,
 }
 
-/// The permissable role of a entity accepted by a [ServerAuthStrategy].
+/// The permissible role of a entity accepted by a [ServerAuthStrategy].
 #[must_use]
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]

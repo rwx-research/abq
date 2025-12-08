@@ -175,7 +175,7 @@ the following behavior:
 - Manifests are synced to the remote persistence target after all entries in
   a test run's manifest have been assigned to a worker. The manifest is not
   modified again.
-- Results are synced to the remote persitence target when there are no writes of
+- Results are synced to the remote persistence target when there are no writes of
   results to the local persistence target in-flight. That is, writes to the
   remote target are batched and executed when the local state is stable.
 

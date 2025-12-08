@@ -2685,7 +2685,11 @@ impl WorkScheduler {
                     // timing out the test run when the last test in the queue is handed out.
                     // However, the behavior could still be made better, in particular by
                     // re-enqueuing dropped tests.
-                    opt_read_error.located(here!())?
+                    let result = opt_read_error.located(here!());
+                    if let Err(ref e) = result {
+                        tracing::warn!(?e, ?run_id, ?entity, "failed to read next test request from worker connection, worker will need to reconnect");
+                    }
+                    result?
                 }
             };
 
