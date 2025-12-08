@@ -784,7 +784,7 @@ async fn run_help(
     test_timeout: Duration,
 ) -> Result<TestRunnerExit, GenericRunnerError> {
     // If we need to retrieve the manifest, do that first.
-    // If the native runner is erroring and we are generating the manigest,
+    // If the native runner is erroring and we are generating the manifest,
     // the error will be attached to the generated manifest; otherwise, bail out.
     let mut native_runner_handle;
     let mut manifest_generation_output = None;
