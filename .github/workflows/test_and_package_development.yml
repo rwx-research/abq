@@ -95,7 +95,7 @@ jobs:
       - name: Lint github workflows
         run: |
           echo "::add-matcher::.github/actionlint-matcher.json"
-          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/97871a555712e90a2f4f9ae0f42794bd61af88bc/scripts/download-actionlint.bash)
+          bash <(curl https://raw.githubusercontent.com/rhysd/actionlint/dc8cca81866af081bdd0e0653474916d7046c5c5/scripts/download-actionlint.bash)
           ./actionlint -color
         shell: bash
 
