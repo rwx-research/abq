@@ -907,6 +907,7 @@ impl RawTestResultMessage {
         }
     }
 
+    #[cfg(feature = "expose-native-protocols")]
     pub fn from_test_result(witness: ProtocolWitness, test_result: TestResult) -> Self {
         use PrivProtocolWitness::*;
         match witness.0 {

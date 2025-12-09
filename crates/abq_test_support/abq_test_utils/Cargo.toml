@@ -9,4 +9,4 @@ tokio.workspace = true
 tracing-test.workspace = true
 tempfile.workspace = true
 termcolor.workspace = true
-abq_utils = { path = "../../abq_utils" }
+abq_utils = { path = "../../abq_utils", features = ["expose-native-protocols"] }
