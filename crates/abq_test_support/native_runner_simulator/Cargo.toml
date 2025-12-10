@@ -36,4 +36,4 @@ tokio = { version = "1.26.0", features = [
 
 tempfile.workspace = true
 
-abq_utils = { path = "../../abq_utils" }
+abq_utils = { path = "../../abq_utils", features = ["expose-native-protocols"] }
