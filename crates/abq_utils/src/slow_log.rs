@@ -11,11 +11,7 @@ use tokio::pin;
 /// most once per call; does not force a timeout.
 ///
 /// Intended for diagnosing hangs at network/channel call sites that are otherwise unbounded.
-pub async fn log_if_slow<F: Future>(
-    label: &'static str,
-    threshold: Duration,
-    fut: F,
-) -> F::Output {
+pub async fn log_if_slow<F: Future>(label: &'static str, threshold: Duration, fut: F) -> F::Output {
     pin!(fut);
     tokio::select! {
         v = &mut fut => return v,

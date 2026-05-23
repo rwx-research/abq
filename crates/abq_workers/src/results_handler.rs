@@ -98,14 +98,22 @@ impl NotifyResults for QueueResultsSender {
             Duration::from_secs(30),
             async_retry_n(5, Duration::from_secs(3), |attempt| async move {
                 if attempt > 1 {
-                    tracing::info!(?entity, "reattempting connection to queue for results {}", attempt);
+                    tracing::info!(
+                        ?entity,
+                        "reattempting connection to queue for results {}",
+                        attempt
+                    );
                 }
                 client.connect(queue_results_addr).await
             }),
         )
         .await
         .located(here!())
-        .unwrap_or_else(|e| panic!("failed to connect after 5 attempts (entity={entity:?} run_id={run_id:?}): {e:?}"));
+        .unwrap_or_else(|e| {
+            panic!(
+                "failed to connect after 5 attempts (entity={entity:?} run_id={run_id:?}): {e:?}"
+            )
+        });
 
         log_if_slow(
             "QueueResultsSender::write",

@@ -896,10 +896,7 @@ async fn try_send_result_to_channel(
         async {
             let r = results_chan.send(msg).await;
             if r.is_err() {
-                tracing::warn!(
-                    ?work_id,
-                    "try_send_result_to_channel: receiver dropped"
-                );
+                tracing::warn!(?work_id, "try_send_result_to_channel: receiver dropped");
             }
             r
         },
