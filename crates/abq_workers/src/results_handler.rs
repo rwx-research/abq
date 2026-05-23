@@ -8,6 +8,7 @@ use abq_utils::{
     net_protocol::{self, entity::Entity, queue::AssociatedTestResults, workers::RunId},
     results_handler::{NotifyResults, SharedResultsHandler},
     retry::async_retry_n,
+    slow_log::log_if_slow,
 };
 use async_trait::async_trait;
 use tracing::instrument;
@@ -79,32 +80,49 @@ impl QueueResultsSender {
 #[async_trait]
 impl NotifyResults for QueueResultsSender {
     async fn send_results(&mut self, results: Vec<AssociatedTestResults>) {
+        let entity = self.entity;
+        let run_id = self.run_id.clone();
+        let queue_results_addr = self.queue_results_addr;
+        let client = &self.client;
+
         let request = net_protocol::queue::Request {
-            entity: self.entity,
+            entity,
             message: net_protocol::queue::Message::WorkerResult(self.run_id.clone(), results),
         };
 
-        let client = &self.client;
-        let queue_results_addr = self.queue_results_addr;
-
-        let mut stream = async_retry_n(5, Duration::from_secs(3), |attempt| async move {
-            if attempt > 1 {
-                tracing::info!("reattempting connection to queue for results {}", attempt);
-            }
-            client.connect(queue_results_addr).await
-        })
+        // Wrap each network phase in `log_if_slow` so that if any one of them hangs (connect,
+        // write, or ACK read) we get a warn-level breadcrumb tagged with the runner entity
+        // identifying *which* runner is stuck and at *which* phase.
+        let mut stream = log_if_slow(
+            "QueueResultsSender::connect",
+            Duration::from_secs(30),
+            async_retry_n(5, Duration::from_secs(3), |attempt| async move {
+                if attempt > 1 {
+                    tracing::info!(?entity, "reattempting connection to queue for results {}", attempt);
+                }
+                client.connect(queue_results_addr).await
+            }),
+        )
         .await
         .located(here!())
-        .expect("failed to connected after 5 attempts");
+        .unwrap_or_else(|e| panic!("failed to connect after 5 attempts (entity={entity:?} run_id={run_id:?}): {e:?}"));
 
-        net_protocol::async_write(&mut stream, &request)
-            .await
-            .located(here!())
-            .expect("failed to write results after connection");
+        log_if_slow(
+            "QueueResultsSender::write",
+            Duration::from_secs(30),
+            net_protocol::async_write(&mut stream, &request),
+        )
+        .await
+        .located(here!())
+        .unwrap_or_else(|e| panic!("failed to write results after connection (entity={entity:?} run_id={run_id:?}): {e:?}"));
 
-        let net_protocol::queue::AckTestResults {} = net_protocol::async_read(&mut stream)
-            .await
-            .located(here!())
-            .expect("failed to read results ACK after connection");
+        let net_protocol::queue::AckTestResults {} = log_if_slow(
+            "QueueResultsSender::ack_read",
+            Duration::from_secs(30),
+            net_protocol::async_read(&mut stream),
+        )
+        .await
+        .located(here!())
+        .unwrap_or_else(|e| panic!("failed to read results ACK after connection (entity={entity:?} run_id={run_id:?}): {e:?}"));
     }
 }

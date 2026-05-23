@@ -1,6 +1,6 @@
 //! Implements a persistent test-fetching connection from workers to the queue.
 
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, time::Duration};
 
 use abq_utils::{
     net_async::{ClientStream, ConfiguredClient},
@@ -9,6 +9,7 @@ use abq_utils::{
         entity::Entity,
         workers::{NextWorkBundle, RunId},
     },
+    slow_log::log_if_slow,
 };
 use tracing::instrument;
 
@@ -62,7 +63,11 @@ impl PersistedTestsFetcher {
 }
 
 impl PersistedTestsFetcher {
-    #[instrument(level = "trace", skip_all, fields(run_id=?self.run_id, work_server=?self.work_server_addr))]
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
+    #[instrument(level = "trace", skip_all, fields(entity=?self.entity, run_id=?self.run_id, work_server=?self.work_server_addr))]
     pub async fn get_next_tests(&mut self) -> NextWorkBundle {
         // TODO: propagate errors here upwards rather than panicking
         self.wait_for_next_work_bundle().await.unwrap()
@@ -77,11 +82,17 @@ impl PersistedTestsFetcher {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self.try_request().await {
+            let try_result = log_if_slow(
+                "PersistedTestsFetcher::try_request",
+                Duration::from_secs(30),
+                self.try_request(),
+            )
+            .await;
+            match try_result {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     if attempt < self.max_attempts_in_cycle {
-                        tracing::warn!(?attempt, ?self.run_id, "Retrying fetch of work bundle");
+                        tracing::warn!(?attempt, entity=?self.entity, ?self.run_id, "Retrying fetch of work bundle");
                         // Assume the connection was dropped, and force a re-connect.
                         self.conn = None;
                         continue;

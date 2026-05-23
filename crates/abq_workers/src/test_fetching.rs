@@ -158,11 +158,11 @@ impl Fetcher {
                 Some(source) => {
                     let mut tests = match source {
                         InitialSource::Queue(s) => {
-                            tracing::debug!("Fetching from fresh manifest");
+                            tracing::debug!(entity=?s.entity(), "Fetching from fresh manifest");
                             s.get_next_tests().await
                         }
                         InitialSource::ServerRetryManifest(s) => {
-                            tracing::debug!("Fetching from retry manifest");
+                            tracing::debug!(entity=?s.entity(), "Fetching from retry manifest");
                             s.get_next_tests().await?
                         }
                     };
