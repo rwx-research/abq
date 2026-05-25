@@ -86,14 +86,15 @@ impl PersistedTestsFetcher {
         // peer (kernel never delivers FIN, or queue task exits in a way that the FIN isn't
         // observed) would otherwise hang the fetcher forever. Converting that hang into an
         // `io::Error::TimedOut` lets the existing retry loop drop the connection and reconnect.
-        const TRY_REQUEST_HARD_TIMEOUT: Duration = Duration::from_secs(60);
+        const TRY_REQUEST_HARD_TIMEOUT: Duration = Duration::from_secs(10);
+        const TRY_REQUEST_SLOW_LOG: Duration = Duration::from_secs(5);
 
         let mut attempt = 0;
         loop {
             attempt += 1;
             let try_request_fut = log_if_slow(
                 "PersistedTestsFetcher::try_request",
-                Duration::from_secs(30),
+                TRY_REQUEST_SLOW_LOG,
                 self.try_request(),
             );
             let try_result = match tokio::time::timeout(TRY_REQUEST_HARD_TIMEOUT, try_request_fut)
