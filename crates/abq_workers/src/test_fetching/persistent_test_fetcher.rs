@@ -79,20 +79,49 @@ impl PersistedTestsFetcher {
     async fn wait_for_next_work_bundle(&mut self) -> io::Result<NextWorkBundle> {
         // As mentioned above (see PersistedConnection), the lock here is mostly ceremonious.
         // Take it for the entirety of the fetch to avoid needless contention with ourselves.
+        //
+        // Hard timeout: after writing a NextTestRequest we always expect a response from the
+        // in-process queue promptly. `net_protocol::async_read` does not time out the size-prefix
+        // read by design (the queue side waits indefinitely for the next request), so a silent
+        // peer (kernel never delivers FIN, or queue task exits in a way that the FIN isn't
+        // observed) would otherwise hang the fetcher forever. Converting that hang into an
+        // `io::Error::TimedOut` lets the existing retry loop drop the connection and reconnect.
+        const TRY_REQUEST_HARD_TIMEOUT: Duration = Duration::from_secs(60);
+
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let try_result = log_if_slow(
+            let try_request_fut = log_if_slow(
                 "PersistedTestsFetcher::try_request",
                 Duration::from_secs(30),
                 self.try_request(),
-            )
-            .await;
+            );
+            let try_result = match tokio::time::timeout(TRY_REQUEST_HARD_TIMEOUT, try_request_fut)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        ?attempt,
+                        entity = ?self.entity,
+                        run_id = ?self.run_id,
+                        timeout_secs = TRY_REQUEST_HARD_TIMEOUT.as_secs(),
+                        "PersistedTestsFetcher::try_request hard-timed-out — treating as connection failure"
+                    );
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "try_request timed out after {}s",
+                            TRY_REQUEST_HARD_TIMEOUT.as_secs()
+                        ),
+                    ))
+                }
+            };
             match try_result {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     if attempt < self.max_attempts_in_cycle {
-                        tracing::warn!(?attempt, entity=?self.entity, ?self.run_id, "Retrying fetch of work bundle");
+                        tracing::warn!(?attempt, entity=?self.entity, ?self.run_id, ?e, "Retrying fetch of work bundle");
                         // Assume the connection was dropped, and force a re-connect.
                         self.conn = None;
                         continue;
