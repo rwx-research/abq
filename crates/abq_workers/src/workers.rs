@@ -158,6 +158,32 @@ impl WorkerPool {
         let (live_count, signal_completed) = LiveCount::new(num_runners).await;
         tracing::debug!(live_count=?live_count.read(), ?results_batch_size, ?run_id, "Starting worker pool");
 
+        {
+            // Heartbeat: emit the live runner count every 30s while the pool is alive.
+            // Cheap to leave on; helps confirm whether the pool stalled with N>0 runners
+            // still "alive" (i.e. a runner is hung) versus simply exiting cleanly.
+            let snapshot = live_count.snapshot_handle();
+            let hb_workers_tag = workers_tag;
+            let hb_run_id = run_id.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.tick().await; // discard immediate first tick
+                loop {
+                    interval.tick().await;
+                    let count = snapshot.read();
+                    if count == 0 {
+                        break;
+                    }
+                    tracing::debug!(
+                        live_runners = count,
+                        worker_tag = ?hb_workers_tag,
+                        run_id = ?hb_run_id,
+                        "worker pool heartbeat"
+                    );
+                }
+            });
+        }
+
         let mut runners_shutdown = Vec::with_capacity(num_runners);
 
         let is_singleton_runner = num_runners == 1;

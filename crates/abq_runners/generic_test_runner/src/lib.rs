@@ -15,6 +15,7 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::error::FetchTestsError;
 use abq_utils::oneshot_notify::{self, OneshotRx};
 use abq_utils::results_handler::{ResultsHandler, StaticResultsHandler};
+use abq_utils::slow_log::log_if_slow;
 use abq_utils::timeout_future::TimeoutFuture;
 use async_trait::async_trait;
 use buffered_results::BufferedResults;
@@ -889,7 +890,18 @@ async fn try_send_result_to_channel(
     results_chan: &ResultsChanRx,
     msg: ResultsMsg,
 ) -> io::Result<()> {
-    let send_to_chan_result = results_chan.send(msg).await;
+    let send_to_chan_result = log_if_slow(
+        "try_send_result_to_channel",
+        Duration::from_secs(30),
+        async {
+            let r = results_chan.send(msg).await;
+            if r.is_err() {
+                tracing::warn!(?work_id, "try_send_result_to_channel: receiver dropped");
+            }
+            r
+        },
+    )
+    .await;
 
     if send_to_chan_result.is_err() {
         tracing::error!(?work_id, "results channel closed prematurely");
@@ -1059,7 +1071,7 @@ async fn execute_all_tests<'a>(
         Ok(ExitCode::from(exit_status))
     };
 
-    tracing::info!("starting execution of all tests");
+    tracing::info!(runner = %runner_meta.runner, "starting execution of all tests");
     let (fetch_tests_result, run_tests_result, ()) =
         tokio::join!(fetch_tests_task, run_tests_task, send_results_task);
 

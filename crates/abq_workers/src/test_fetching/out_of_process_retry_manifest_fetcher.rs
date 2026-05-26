@@ -65,6 +65,10 @@ impl OutOfProcessRetryManifestFetcher {
 }
 
 impl OutOfProcessRetryManifestFetcher {
+    pub fn entity(&self) -> Entity {
+        self.entity
+    }
+
     pub async fn get_next_tests(&mut self) -> Result<NextWorkBundle, FetchTestsError> {
         let Self {
             entity,

@@ -2630,14 +2630,36 @@ impl WorkScheduler {
                     .entity(entity)?;
             }
             PersistentWorkerNextTestsConnection(run_id) => {
-                tokio::spawn(Self::start_persistent_next_tests_requests_task(
-                    ctx.queues,
-                    ctx.persist_manifest,
-                    ctx.remote,
-                    run_id,
-                    stream,
-                    entity,
-                ));
+                let queues = ctx.queues;
+                let persist_manifest = ctx.persist_manifest;
+                let remote = ctx.remote;
+                let run_id_for_log = run_id.clone();
+                tokio::spawn(async move {
+                    let result = Self::start_persistent_next_tests_requests_task(
+                        queues,
+                        persist_manifest,
+                        remote,
+                        run_id,
+                        stream,
+                        entity,
+                    )
+                    .await;
+                    // Make the exit visible. Previously this task's JoinHandle was dropped
+                    // immediately, so any panic or error path silently closed the connection.
+                    match &result {
+                        Ok(()) => tracing::debug!(
+                            ?entity,
+                            run_id = ?run_id_for_log,
+                            "persistent next-tests task exited cleanly"
+                        ),
+                        Err(e) => tracing::warn!(
+                            ?entity,
+                            run_id = ?run_id_for_log,
+                            ?e,
+                            "persistent next-tests task exited with error"
+                        ),
+                    }
+                });
             }
             RetryManifestPartition { run_id, entity } => {
                 use net_protocol::work_server::RetryManifestResponse;
@@ -2706,9 +2728,15 @@ impl WorkScheduler {
 
             let response = NextTestResponse::Bundle(bundle);
 
-            net_protocol::async_write(&mut conn, &response)
-                .await
-                .located(here!())?;
+            if let Err(e) = net_protocol::async_write(&mut conn, &response).await {
+                tracing::warn!(
+                    ?entity,
+                    ?run_id,
+                    ?e,
+                    "persistent next-tests task: failed to write response to worker"
+                );
+                return Err(e).located(here!());
+            }
 
             if let Some(PersistAfterManifestDone {
                 persist_manifest_plan,
@@ -2733,11 +2761,21 @@ impl WorkScheduler {
                     ?status,
                     "got a manifest plan, but did not reach end of tests"
                 );
+                tracing::debug!(
+                    ?entity,
+                    ?run_id,
+                    "persistent next-tests task exiting after manifest-done persistence"
+                );
                 return Ok(());
             }
 
             if status.reached_end_of_tests() {
                 // Exit, since the worker should not ask us for tests again.
+                tracing::debug!(
+                    ?entity,
+                    ?run_id,
+                    "persistent next-tests task exiting after sending end-of-tests bundle"
+                );
                 return Ok(());
             }
         }

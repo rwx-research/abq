@@ -71,6 +71,26 @@ impl LiveCount {
     pub fn read(&self) -> usize {
         self.count.load(atomic::ORDERING)
     }
+
+    /// Returns a cheap, read-only handle that can be moved into a background task to observe the
+    /// live worker count without holding a reference to the owning [`LiveCount`].
+    pub fn snapshot_handle(&self) -> LiveCountSnapshot {
+        LiveCountSnapshot {
+            count: self.count.clone(),
+        }
+    }
+}
+
+/// Read-only handle returned by [`LiveCount::snapshot_handle`].
+#[derive(Clone)]
+pub struct LiveCountSnapshot {
+    count: Arc<AtomicUsize>,
+}
+
+impl LiveCountSnapshot {
+    pub fn read(&self) -> usize {
+        self.count.load(atomic::ORDERING)
+    }
 }
 
 /// A signal to [LiveCount] that a worker has completed.
