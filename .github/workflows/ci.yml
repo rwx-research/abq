@@ -11,6 +11,9 @@ jobs:
   test_and_package_development:
     name: Test and package development build
     uses: ./.github/workflows/test_and_package_development.yml
+    permissions:
+      contents: read
+      id-token: write
     with:
       ref: ${{ github.ref }}
     secrets: inherit
@@ -18,6 +21,10 @@ jobs:
   bigtest:
     needs: test_and_package_development
     uses: ./.github/workflows/bigtest.yml
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
     secrets: inherit
     with:
       version: ${{ needs.test_and_package_development.outputs.abq_version }}
@@ -27,6 +34,9 @@ jobs:
     needs: bigtest
     if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/build_and_upload.yml
+    permissions:
+      contents: read
+      id-token: write
     with:
       ref: ${{ github.ref }}
       release_channel: unstable

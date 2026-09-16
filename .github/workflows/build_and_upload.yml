@@ -32,18 +32,6 @@ on:
         required: true
       RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
-      AWS_S3_ABQ_RELEASES_DEVELOPMENT_ACCESS_KEY_ID:
-        required: true
-      AWS_S3_ABQ_RELEASES_DEVELOPMENT_SECRET_ACCESS_KEY:
-        required: true
-      AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
-        required: true
-      AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY:
-        required: true
-      AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID:
-        required: true
-      AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY:
-        required: true
       RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT:
         required: true
       RWX_APPLE_APP_STORE_CONNECT_API_KEY:
@@ -81,6 +69,9 @@ jobs:
             cross-target: "aarch64-apple-darwin"
     runs-on: ${{ matrix.runs-on }}
     container: ${{ matrix.container }}
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
     env:
@@ -217,22 +208,45 @@ jobs:
 
           apt-get update && apt-get install jq -y
 
+      - name: Configure AWS credentials for development S3
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.AWS_ABQ_RELEASES_DEVELOPMENT_ROLE }}
+          role-session-name: abq-release-development-upload
+          aws-region: us-east-2
+
       - name: Push release to development S3
         env:
           RELEASE_BUCKET: abq-releases-development
         run: |
-          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_DEVELOPMENT_SECRET_ACCESS_KEY }} development
+          scripts/upload-to-aws.sh
+
+      - name: Configure AWS credentials for staging S3
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.AWS_ABQ_RELEASES_STAGING_ROLE }}
+          role-session-name: abq-release-staging-upload
+          aws-region: us-east-2
 
       - name: Push release to staging S3
         env:
           RELEASE_BUCKET: abq-releases-staging
         run: |
-          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} staging
+          scripts/upload-to-aws.sh
+
+      - name: Configure AWS credentials for production S3
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.AWS_ABQ_RELEASES_PRODUCTION_ROLE }}
+          role-session-name: abq-release-production-upload
+          aws-region: us-east-2
+
       - name: Push release to production S3
         env:
           RELEASE_BUCKET: abq-releases
         run: |
-          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_PRODUCTION_SECRET_ACCESS_KEY }} production
+          scripts/upload-to-aws.sh
+
       - name: export abq version
         id: abq_version
         run: |

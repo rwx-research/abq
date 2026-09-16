@@ -17,10 +17,6 @@ on:
     secrets:
       ABQ_CREATE_MANUAL_ACCESS_TOKEN:
         required: true
-      AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
-        required: true
-      AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY:
-        required: true
 
 jobs:
   launch:
@@ -43,6 +39,9 @@ jobs:
 
   single_benches:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
@@ -79,13 +78,18 @@ jobs:
           name: dev_queue_state
           path: .dev_queue_state/
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.AWS_ABQ_RELEASES_STAGING_ROLE }}
+          role-session-name: abq-bigtest-single-benches
+          aws-region: us-east-2
+
       - name: Pull down abq binary to test
         run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
           ABQ_BIN="$PWD/abq-bin"
           mkdir -p "$ABQ_BIN"
-          aws s3 cp "s3://abq-releases-staging/abq/${{ inputs.version }}/linux/x86_64/abq" "$ABQ_BIN/abq" --profile staging
+          aws s3 cp "s3://abq-releases-staging/abq/${{ inputs.version }}/linux/x86_64/abq" "$ABQ_BIN/abq"
           chmod 755 "$ABQ_BIN/abq"
           echo "$ABQ_BIN" >> "$GITHUB_PATH"
 
@@ -121,6 +125,9 @@ jobs:
 
   parallel_benches_exec:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     env:
       AWS_DEFAULT_REGION: us-east-2
       AWS_DEFAULT_OUTPUT: json
@@ -151,13 +158,18 @@ jobs:
           name: dev_queue_state
           path: .dev_queue_state/
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.AWS_ABQ_RELEASES_STAGING_ROLE }}
+          role-session-name: abq-bigtest-parallel-benches
+          aws-region: us-east-2
+
       - name: Pull down abq binary to test
         run: |
-          aws configure set aws_access_key_id ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} --profile staging
-          aws configure set aws_secret_access_key ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} --profile staging
           ABQ_BIN="$PWD/abq-bin"
           mkdir -p "$ABQ_BIN"
-          aws s3 cp "s3://abq-releases-staging/abq/${{ inputs.version }}/linux/x86_64/abq" "$ABQ_BIN/abq" --profile staging
+          aws s3 cp "s3://abq-releases-staging/abq/${{ inputs.version }}/linux/x86_64/abq" "$ABQ_BIN/abq"
           chmod 755 "$ABQ_BIN/abq"
           echo "$ABQ_BIN" >> "$GITHUB_PATH"
 

@@ -16,16 +16,15 @@ on:
         required: true
       RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
-      AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID:
-        required: true
-      AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY:
-        required: true
 
 jobs:
   release:
     name: Build, Upload, Release ABQ
     # We only need x86-64 statically-linked binaries for development testing.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     outputs:
       abq_version: ${{ steps.abq_version.outputs.abq_version }}
     env:
@@ -169,11 +168,18 @@ jobs:
           cp "target/$RUST_TARGET/release-unstable/abq_tester_harness" "${RELEASE_DIR}"
           tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+        with:
+          role-to-assume: ${{ vars.AWS_ABQ_RELEASES_STAGING_ROLE }}
+          role-session-name: abq-development-build-upload
+          aws-region: us-east-2
+
       - name: Push release to staging S3
         env:
           RELEASE_BUCKET: abq-releases-staging
         run: |
-          scripts/upload-to-aws.sh ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_ACCESS_KEY_ID }} ${{ secrets.AWS_S3_ABQ_RELEASES_STAGING_SECRET_ACCESS_KEY }} staging
+          scripts/upload-to-aws.sh
 
       - name: export abq version
         id: abq_version
