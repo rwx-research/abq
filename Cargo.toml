@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.dependencies]
-serde = "1.0.158"
+serde = { version = "1.0.158", features = ["derive"] }
 serde_derive = "1.0.158"
 serde_json = { version = "1.0.94", features = ["raw_value"] }
 
@@ -90,7 +90,7 @@ insta = { version = "1.29.0", features = ["json", "redactions"] }
 paste = "1.0.12"
 mockito = "1.0.1"
 
-tempfile = "3.4.0"
+tempfile = "3.27.0"
 tracing-test = { version = "0.2.4", features = ["no-env-filter"] }
 
 ntest = "0.9.0"

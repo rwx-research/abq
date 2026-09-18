@@ -404,13 +404,6 @@ pub enum Command {
             .args(["access_token", "queue_addr"]),
         )
     )]
-    #[command(group(
-        ArgGroup::new("server-key-exclusion") // don't allow server-side cert key if running in non-local mode
-            .multiple(false)
-            .args(["access_token", "queue_addr"])
-            .conflicts_with("tls_key"),
-        )
-    )]
     Report {
         /// Run ID of the test suite for which test results should be fetched.
         /// In CI environments, this can be inferred from CI environment variables.
@@ -527,4 +520,16 @@ pub enum Report {
         #[clap(long, short = 'n', required = false, default_value = "1")]
         num: NonZeroUsize,
     },
+}
+
+#[cfg(test)]
+mod test {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn cli_argument_definitions_are_valid() {
+        Cli::command().debug_assert();
+    }
 }

@@ -3752,7 +3752,7 @@ fn custom_remote_persistence() {
         tls: true,
     };
 
-    let custom_persisted_path = tempfile::tempdir().unwrap().into_path();
+    let custom_persisted_path = tempfile::tempdir().unwrap().keep();
     let custom_script = write_to_temp(&formatdoc! {
         "
         const fs = require(`fs`);
@@ -4052,7 +4052,7 @@ fn manifest_loaded_from_remote_persistence() {
 
     let custom_persister = CopyToDirPersister::new();
 
-    let local_manifests_dir = tempfile::tempdir().unwrap().into_path();
+    let local_manifests_dir = tempfile::tempdir().unwrap().keep();
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
         ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
@@ -4180,7 +4180,7 @@ fn manifest_offloaded_to_remote_persistence_and_restored() {
 
     let custom_persister = CopyToDirPersister::new();
 
-    let local_manifests_dir = tempfile::tempdir().unwrap().into_path();
+    let local_manifests_dir = tempfile::tempdir().unwrap().keep();
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
         ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
@@ -4305,7 +4305,7 @@ fn results_offloaded_to_remote_persistence_and_restored() {
 
     let custom_persister = CopyToDirPersister::new();
 
-    let local_results_dir = tempfile::tempdir().unwrap().into_path();
+    let local_results_dir = tempfile::tempdir().unwrap().keep();
 
     let (queue_proc, queue_addr) = setup_queue!(name, conf, env:[
         ("ABQ_REMOTE_PERSISTENCE_STRATEGY", "custom"),
@@ -4434,8 +4434,8 @@ fn results_offloaded_to_remote_persistence_and_restored() {
 fn persisted_runs_between_queue_instances() {
     let custom_persister = CopyToDirPersister::new();
 
-    let local_results_dir = tempfile::tempdir().unwrap().into_path();
-    let local_manifests_dir = tempfile::tempdir().unwrap().into_path();
+    let local_results_dir = tempfile::tempdir().unwrap().keep();
+    let local_manifests_dir = tempfile::tempdir().unwrap().keep();
 
     let run_cycle = |n| {
         let name = &format!("results_offloaded_to_remote_persistence_and_restored_{n}");
