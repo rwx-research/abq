@@ -8,65 +8,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  dependabot:
-    name: Test dependency updates
-    if: github.actor == 'dependabot[bot]' || startsWith(github.ref, 'refs/heads/dependabot/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      RUST_TARGET: x86_64-unknown-linux-musl
-      ABQ_DEVELOPMENT_BUILD: 1
-      ABQ_NO_REBUILD: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # get whole history for versioning
-      - name: Install musl libc tools
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: dependabot-linux-musl-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-      - uses: rwx-research/rust-toolchain@abq
-        with:
-          toolchain: 1.81.0
-          target: ${{ env.RUST_TARGET }}
-          components: clippy, rustfmt
-      - name: Check formatting
-        run: cargo fmt -- --check
-      - name: Run lints
-        run: cargo clippy --workspace --tests --profile=release-unstable --all-features --target="$RUST_TARGET" -- --deny warnings
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "16"
-          cache: npm
-          cache-dependency-path: |
-            testdata/**/package-lock.json
-            bigtest/benchmark_jest/package-lock.json
-      - name: Load test dependencies
-        run: scripts/init_testdata
-      - name: Build release with tests
-        run: cargo build --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
-      - uses: taiki-e/install-action@nextest
-      - name: Run tests without Captain credentials
-        run: cargo nextest run --profile ci --all-features --cargo-profile=release-unstable --target="$RUST_TARGET"
-        env:
-          CI: false
-      - name: Test Jest benchmark dependencies without a remote queue
-        working-directory: bigtest/benchmark_jest
-        run: |
-          npm ci --include=dev
-          npm test
-
   test_and_package_development:
     name: Test and package development build
-    # Dependabot has no Actions secrets; test it without publishing a release.
-    if: github.actor != 'dependabot[bot]' && !startsWith(github.ref, 'refs/heads/dependabot/')
     uses: ./.github/workflows/test_and_package_development.yml
     permissions:
       contents: read
@@ -77,7 +20,6 @@ jobs:
 
   bigtest:
     needs: test_and_package_development
-    if: github.actor != 'dependabot[bot]' && !startsWith(github.ref, 'refs/heads/dependabot/')
     uses: ./.github/workflows/bigtest.yml
     permissions:
       contents: read
