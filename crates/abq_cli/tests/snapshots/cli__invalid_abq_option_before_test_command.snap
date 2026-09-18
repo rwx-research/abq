@@ -4,9 +4,8 @@ expression: stderr
 ---
 error: unexpected argument '--zzz-not-an-abq-option' found
 
-  note: to pass '--zzz-not-an-abq-option' as a value, use '-- --zzz-not-an-abq-option'
+  tip: to pass '--zzz-not-an-abq-option' as a value, use '-- --zzz-not-an-abq-option'
 
 Usage: abq test [OPTIONS] -- <ARGS>...
 
 For more information, try '--help'.
-

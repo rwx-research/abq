@@ -252,7 +252,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_with_tls() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let in_run_id = RunId("1234".to_string());
 
@@ -295,7 +295,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_without_tls() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let in_run_id = RunId("1234".to_string());
 
@@ -335,7 +335,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_unsupported_usage() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let in_run_id = RunId("1234".to_string());
 
@@ -378,7 +378,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_wrong_authn() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let _m = server
             .mock("GET", "/queue")
@@ -396,7 +396,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_wrong_authz() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let _m = server
             .mock("GET", "/queue")
@@ -414,7 +414,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_unexpected_response() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let in_run_id = RunId("1234".to_string());
 
@@ -456,7 +456,7 @@ mod test {
 
     #[tokio::test]
     async fn retry_request_on_429() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let mut m = server
             .mock("GET", "/")
@@ -493,7 +493,7 @@ mod test {
 
     #[tokio::test]
     async fn retry_request_on_500() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let mut m = server
             .mock("GET", "/")
@@ -530,7 +530,7 @@ mod test {
 
     #[tokio::test]
     async fn do_not_retry_request_on_400_level() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let mut m = server
             .mock("GET", "/")
@@ -567,7 +567,7 @@ mod test {
 
     #[tokio::test]
     async fn do_not_retry_request_when_retrier_is_done() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let _m = server
             .mock("GET", "/")
