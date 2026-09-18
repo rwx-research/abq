@@ -64,7 +64,7 @@ jobs:
           bundler-cache: true
       - uses: actions/setup-node@v4
         with:
-          node-version: "16"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: "bigtest/**/package-lock.json"
 
@@ -144,7 +144,7 @@ jobs:
           bundler-cache: true
       - uses: actions/setup-node@v4
         with:
-          node-version: "16"
+          node-version: "24"
           cache: "npm"
           cache-dependency-path: "bigtest/**/package-lock.json"
 
