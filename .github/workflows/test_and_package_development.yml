@@ -52,7 +52,7 @@ jobs:
         run: git fetch --tags --force
 
       - name: check for typos
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
 
       - name: Install musl libc tools
         run: |
