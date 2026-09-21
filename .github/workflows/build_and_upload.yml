@@ -187,24 +187,13 @@ jobs:
         # we do this in its own step so that for darwin, abq is already signed
         run: tar -czvf "${RELEASE_ARCHIVE}" "${RELEASE_DIR}"
 
-      - name: Install tools to container that are baked into default image
+      - name: Install release upload tools in container
         if: matrix.container
-        # we need to install aws tools if we use a container. The default images have the tools baked in.
-        # The AWS code is approximately copied from the native image, https://github.com/actions/runner-images/blob/4aeccc7b5b5a63058b2d8a9a29072708e1f267bf/images/linux/scripts/installers/aws.sh#L11
-        # perhaps we should fork the musl container
+        # scripts/upload-to-aws.sh needs AWS CLI and jq, which are baked into the default images.
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          curl --fail --show-error --location "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip -qq awscliv2.zip
           ./aws/install -i /usr/local/aws-cli -b /usr/local/bin
-
-          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
-          apt install -y ./session-manager-plugin.deb
-
-          # Download & install the latest aws sam cli release
-          curl -L "https://github.com/aws/aws-sam-cli/releases/latest/download/aws-sam-cli-linux-x86_64.zip" -o "aws-sam-cli-linux-x86_64.zip"
-          mkdir aws-sam
-          unzip aws-sam-cli-linux-x86_64.zip -d aws-sam
-          ./aws-sam/install
 
           apt-get update && apt-get install jq -y
 
