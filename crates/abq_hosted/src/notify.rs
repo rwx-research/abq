@@ -132,7 +132,7 @@ mod test {
     #[tokio::test]
     async fn send_success() {
         let run_id = RunId("1234".to_string());
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
 
         let _m = server.mock("POST", "/record_test_run")
             .match_header(
@@ -159,7 +159,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_wrong_authn() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
         let _m = server
             .mock("POST", "/record_test_run")
             .match_query(Matcher::Any)
@@ -181,7 +181,7 @@ mod test {
 
     #[tokio::test]
     async fn get_hosted_queue_config_wrong_authz() {
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
         let _m = server
             .mock("POST", "/record_test_run")
             .match_query(Matcher::Any)
