@@ -116,6 +116,7 @@ pub struct WorkersConfig {
     pub protocol_version_timeout: Duration,
     pub test_timeout: Duration,
     /// Hint for how many test results should be sent back in a batch.
+    /// Zero sends results individually and disables test prefetching.
     pub results_batch_size_hint: u64,
     /// Max number of test suite run attempts
     pub max_run_number: u32,

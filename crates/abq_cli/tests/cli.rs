@@ -2819,6 +2819,55 @@ fn test_with_personal_access_token_and_auto_generated_run_id_uses_ephemeral_queu
 #[test]
 #[with_protocol_version]
 #[serial]
+fn batch_size_zero_runs_tests_and_retries() {
+    let manifest = (0..3)
+        .map(|i| TestOrGroup::test(Test::new(proto, format!("test{i}"), [], Default::default())))
+        .collect::<Vec<_>>();
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+    let packed = pack_msgs_to_disk([
+        Connect,
+        OpaqueWrite(pack(legal_spawned_message(proto))),
+        IfGenerateManifest {
+            then_do: vec![OpaqueWrite(pack(&manifest))],
+            else_do: vec![
+                OpaqueRead,
+                OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+                IfAliveReadAndWriteFake(Status::Failure {
+                    exception: None,
+                    backtrace: None,
+                }),
+                IfAliveReadAndWriteFake(Status::Success),
+                IfAliveReadAndWriteFake(Status::Success),
+            ],
+        },
+        Exit(0),
+    ]);
+
+    for options in [vec!["--batch-size=0"], vec!["--local"]] {
+        let mut args = vec![s!("test"), s!("-n=1"), s!("--retries=1")];
+        args.extend(options.into_iter().map(String::from));
+        args.extend([
+            s!("--"),
+            native_runner_simulation_bin(),
+            packed.path.display().to_string(),
+        ]);
+        let CmdOutput {
+            stdout,
+            stderr,
+            exit_status,
+        } = Abq::new("batch_size_zero_runs_tests_and_retries")
+            .args(args)
+            .run();
+        // The first test fails again when its runner restarts for the retry.
+        assert_eq!(exit_status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stdout.contains("3 tests, 1 failures"), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 retried"), "{stdout}\n{stderr}");
+    }
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
 fn test_with_access_token_and_local_uses_ephemeral_queue() {
     let name = "test_with_access_token_and_local_uses_ephemeral_queue";
     let conf = CSConfigOptions {

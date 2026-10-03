@@ -52,7 +52,7 @@ pub async fn start_workers_standalone(
     working_dir: PathBuf,
     reporter_kinds: Vec<ReporterKind>,
     stdout_preferences: StdoutPreferences,
-    batch_size: NonZeroU64,
+    batch_size: u64,
     test_strategy: TestStrategy,
     test_timeout: Duration,
     queue_negotiator: QueueNegotiatorHandle,
@@ -85,7 +85,8 @@ pub async fn start_workers_standalone(
 
     let invoke_work = InvokeWork {
         run_id: run_id.clone(),
-        batch_size_hint: batch_size,
+        // On-demand runners request one test at a time from the queue.
+        batch_size_hint: NonZeroU64::new(batch_size.max(1)).unwrap(),
         test_strategy,
         test_command_hash: runner_kind.command_hash(),
     };
@@ -103,7 +104,7 @@ pub async fn start_workers_standalone(
             has_stdout_reporters,
             protocol_version_timeout: startup_timeout,
             test_timeout,
-            results_batch_size_hint: batch_size.get(),
+            results_batch_size_hint: batch_size,
             max_run_number,
             should_send_results: execution_mode == ExecutionMode::WriteNormal,
             warning_writer: stderr_writer,
