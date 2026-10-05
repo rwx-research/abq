@@ -1,0 +1,31 @@
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+tool-cache:
+  vault: abq_main
+
+tasks:
+  - key: code
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/rwx-research/abq.git
+      ref: ${{ init.commit-sha }}
+      preserve-git-dir: true
+      fetch-full-depth: true
+
+  - key: setup
+    use: code
+    call: ${{ run.dir }}/packages/setup.yml
+
+  - key: sandbox
+    use: [code, setup]
+    runner:
+      cpus: 8
+      memory: 32gb
+    run: rwx-sandbox

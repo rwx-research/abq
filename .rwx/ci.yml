@@ -1,0 +1,92 @@
+# Keep the existing GitHub workflow enabled until the entire staging/benchmark
+# pipeline is migrated and verified. This CLI entry point verifies the build
+# and local test suite without publishing a release.
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+tool-cache:
+  vault: abq_main
+
+tasks:
+  - key: code
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/rwx-research/abq.git
+      ref: ${{ init.commit-sha }}
+      preserve-git-dir: true
+      fetch-full-depth: true
+
+  - key: setup
+    use: code
+    call: ${{ run.dir }}/packages/setup.yml
+
+  - key: lint-tools
+    run: |
+      curl -fsSL https://github.com/crate-ci/typos/releases/download/v1.50.2/typos-v1.50.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp ./typos
+      sudo install /tmp/typos /usr/local/bin/typos
+      curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz | tar xz -C /tmp actionlint
+      sudo install /tmp/actionlint /usr/local/bin/actionlint
+      sudo apt-get update
+      sudo apt-get install -y shellcheck
+      sudo apt-get clean
+
+  - key: typos
+    use: [code, lint-tools]
+    run: typos
+
+  - key: actionlint
+    use: [code, lint-tools]
+    run: actionlint -color
+
+  - key: format
+    use: [code, setup.rust-components]
+    run: cargo fmt -- --check
+
+  - key: clippy
+    use: [code, setup.system, setup.rust-components]
+    tool-cache: abq-clippy-musl
+    timeout: 30m
+    runner:
+      cpus: 8
+      memory: 32gb
+    run: |
+      # The version build script reads git history, which Cargo does not track.
+      # Do not reuse an abq_utils version from an earlier tool-cache layer.
+      cargo clean -p abq_utils --profile=release-unstable --target="$RUST_TARGET"
+      cargo clippy --locked --workspace --tests --profile=release-unstable --all-features --target="$RUST_TARGET" -- --deny warnings
+
+  - key: build
+    use: [code, setup.system, setup.rust-components]
+    tool-cache: abq-build-musl
+    timeout: 30m
+    runner:
+      cpus: 8
+      memory: 32gb
+    run: |
+      cargo clean -p abq_utils --profile=release-unstable --target="$RUST_TARGET"
+      cargo build --locked --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
+    outputs:
+      artifacts:
+        - key: abq
+          path: target/x86_64-unknown-linux-musl/release-unstable/abq
+        - key: abq-tester-harness
+          path: target/x86_64-unknown-linux-musl/release-unstable/abq_tester_harness
+        - key: version
+          path: build_artifact/abq_version.txt
+
+  - key: test
+    use: [build, setup.nextest, setup.captain, setup.test-dependencies]
+    timeout: 5m
+    env:
+      CI: "false"
+    run: |
+      mkdir -p "$RWX_RETRY_ACTIONS/debug/env"
+      echo 'Retry with debug output' > "$RWX_RETRY_ACTIONS/debug/label"
+      echo 1 > "$RWX_RETRY_ACTIONS/debug/env/ABQ_DEBUG_CLI_TESTS_FOR_CI"
+      captain run test-abq

@@ -1,5 +1,27 @@
 # Development
 
+## RWX sandbox
+
+With the [RWX CLI](https://www.rwx.com/docs/cli) installed and authenticated,
+run commands in the Linux sandbox:
+
+```bash
+rwx sandbox exec -- cargo clippy --workspace --tests --profile=release-unstable --all-features -- --deny warnings
+rwx sandbox exec -- cargo nextest run --all-features --cargo-profile=release-unstable
+```
+
+The sandbox shares Rust, musl, Node, nextest, and test dependencies with the RWX
+CI definition. Local edits sync automatically before each command. Use
+`rwx sandbox stop` when finished, or `rwx sandbox reset` for a fresh environment.
+
+Run the Linux build, lint, and local test checks with `rwx run .rwx/ci.yml --wait`.
+The migration is not yet active on pushes: staging publication and remote
+benchmarks still run through GitHub Actions until their RWX credentials are
+configured and the complete replacement has passed. macOS builds and signing
+remain on GitHub Actions.
+
+## Local setup
+
 Install [rustup](https://rustup.rs); local versions of Rust will be populated
 when you run `cargo` in this project.
 
