@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Exercise queue cleanup without contacting the staging API.
+root=$(git rev-parse --show-toplevel)
+export QUEUE_TEST_ROOT
+QUEUE_TEST_ROOT=$(mktemp -d)
+trap 'rm -rf "$QUEUE_TEST_ROOT"' EXIT
+mkdir -p "$QUEUE_TEST_ROOT/bin" "$QUEUE_TEST_ROOT/mock"
+cp "$root/bin/manage_dev_queue" "$root/bin/dev_queue_state.sh" "$QUEUE_TEST_ROOT/bin/"
+
+cat > "$QUEUE_TEST_ROOT/mock/git" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$QUEUE_TEST_ROOT"
+EOF
+cat > "$QUEUE_TEST_ROOT/mock/curl" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" -X POST "*) echo '{"instance_id":"test-queue-123"}' ;;
+  *" -X GET "*)
+    if [[ ${QUEUE_TEST_GET_FAILURE:-0} == 1 ]]; then exit 22; fi
+    echo '{"state":"healthy","tls_public_certificate":"certificate","public_host":"example.invalid","queue_port":1234,"user_token":"test-token"}'
+    ;;
+  *" -X DELETE "*)
+    [[ " $* " == *" --fail-with-body "* ]] || exit 90
+    [[ " $* " == *" id=test-queue-123 "* ]] || exit 91
+    if [[ ${QUEUE_TEST_DELETE_FAILURE:-0} == 1 ]]; then exit 22; fi
+    echo '{}'
+    ;;
+  *) exit 92 ;;
+esac
+EOF
+chmod +x "$QUEUE_TEST_ROOT/mock/"*
+export PATH="$QUEUE_TEST_ROOT/mock:$PATH"
+export ABQ_CREATE_MANUAL_ACCESS_TOKEN=test-only
+
+if QUEUE_TEST_GET_FAILURE=1 bash "$QUEUE_TEST_ROOT/bin/manage_dev_queue" start test-version; then
+  echo 'Expected startup to fail' >&2
+  exit 1
+fi
+test "$(cat "$QUEUE_TEST_ROOT/.dev_queue_state/id")" = test-queue-123
+if QUEUE_TEST_DELETE_FAILURE=1 bash "$QUEUE_TEST_ROOT/bin/manage_dev_queue" stop; then
+  echo 'Expected deletion to fail' >&2
+  exit 1
+fi
+test -f "$QUEUE_TEST_ROOT/.dev_queue_state/id"
+bash "$QUEUE_TEST_ROOT/bin/manage_dev_queue" stop
+test ! -d "$QUEUE_TEST_ROOT/.dev_queue_state"
+
+bash "$QUEUE_TEST_ROOT/bin/manage_dev_queue" start test-version
+test "$(cat "$QUEUE_TEST_ROOT/.dev_queue_state/version")" = test-version
+test "$(cat "$QUEUE_TEST_ROOT/.dev_queue_state/ip")" = example.invalid:1234
+bash "$QUEUE_TEST_ROOT/bin/manage_dev_queue" stop
+test ! -d "$QUEUE_TEST_ROOT/.dev_queue_state"
+echo 'Queue startup and cleanup checks passed'

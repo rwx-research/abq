@@ -14,11 +14,26 @@ The sandbox shares Rust, musl, Node, nextest, and test dependencies with the RWX
 CI definition. Local edits sync automatically before each command. Use
 `rwx sandbox stop` when finished, or `rwx sandbox reset` for a fresh environment.
 
-Run the Linux build, lint, and local test checks with `rwx run .rwx/ci.yml --wait`.
-The migration is not yet active on pushes: staging publication and remote
-benchmarks still run through GitHub Actions until their RWX credentials are
-configured and the complete replacement has passed. macOS builds and signing
-remain on GitHub Actions.
+Run the complete feature-branch pipeline with `rwx run .rwx/ci.yml --wait`.
+It runs on every push and includes Linux build/lint/test checks, publication to
+staging, remote benchmarks (including ten concurrent RSpec runs), and result-size
+fuzzing. This command writes staging release artifacts and starts a temporary
+remote queue. Use `--target test` for only the local Rust/Jest suite.
+
+Tool caches for Cargo, npm, and Bundler live in `abq_main`; only trusted main
+runs populate them. Staging credentials and the AWS OIDC token live in
+`abq_development`. CLI users need access to that vault for the complete pipeline.
+
+GitHub Actions waits for the main commit's RWX result before the existing
+multi-platform release workflow runs. That release workflow, including macOS
+builds and signing, remains on GitHub Actions. Its `RWX_ACCESS_TOKEN` needs
+permission to read RWX runs; the manual Bigtest wrapper also needs permission
+to start runs and access `abq_development`.
+
+CI runs queue rather than automatically cancelling an in-flight benchmark.
+Cleanup runs after benchmark failures or timeouts. If you manually cancel an
+entire run after queue launch, RWX also cancels its cleanup task: stop the queue
+using its instance ID from the launch log and the staging manual-queue API.
 
 ## Local setup
 
@@ -79,8 +94,8 @@ captain run dev-test-abq
 
 ## Dev queues
 
-[Automated tests](.github/workflows/bigtest.yml) are run against remote instances of
-feature-branch queues when you submit a PR. These feature-branch queues are
+[Automated tests](.rwx/bigtest.yml) are run against remote instances of
+feature-branch queues on pushes. These feature-branch queues are
 called "dev queues" and have `-devel` version suffixes, e.g. `1.0.0-15-gd923df5-devel`.
 
 Sometimes, you may want to perform local manual testing against a remote dev
@@ -103,7 +118,7 @@ aws ssm get-parameter --name /captain_staging/env/ABQ_CREATE_MANUAL_ACCESS_TOKEN
 
 - `bin/manage_dev_queue start <version>` - start the dev queue instance. If no
   version is provided, the head commit version will be used. You should make
-  sure that the version has been [built and published](.github/workflows/test_and_package_development.yml)
+  sure that the version has been [built and published](.rwx/ci.yml)
   to Captain/ABQ staging for this to work.
   - Only one dev queue can be active at a time.
 - `bin/manage_dev_queue stop` - stops the active dev queue instance, if any.

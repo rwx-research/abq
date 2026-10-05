@@ -1,0 +1,152 @@
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+tool-cache:
+  vault: abq_main
+
+tasks:
+  - key: code
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/rwx-research/abq.git
+      ref: ${{ init.commit-sha }}
+      preserve-git-dir: true
+
+  - key: ruby
+    use: code
+    filter: [.ruby-version]
+    call: ruby/install 2.0.1
+    with:
+      ruby-version-file: .ruby-version
+
+  - key: gems
+    use: [code, ruby]
+    filter: [Gemfile, Gemfile.lock]
+    tool-cache: abq-bigtest-gems
+    run: |
+      gem install bundler -v 2.3.13 --no-document
+      bundle config set --local path vendor/bundle
+      bundle config set --local frozen true
+      bundle _2.3.13_ install
+
+  - key: node
+    call: nodejs/install 1.2.0
+    with:
+      node-version: "24.21.0"
+
+  - key: npm
+    use: [code, node]
+    filter: [bigtest/benchmark_jest/package.json, bigtest/benchmark_jest/package-lock.json]
+    tool-cache: abq-bigtest-npm
+    run: npm ci --include=dev --prefix bigtest/benchmark_jest
+
+  - key: system
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y uuid-runtime
+      sudo apt-get clean
+
+  - key: aws-cli
+    call: aws/install-cli 1.1.0
+
+  - key: staging-role
+    call: aws/assume-role 2.1.0
+    with:
+      region: us-east-2
+      role-to-assume: ${{ vaults.abq_development.vars.AWS_ABQ_RELEASES_STAGING_ROLE }}
+
+  - key: binary
+    use: [code, aws-cli, staging-role]
+    cache: false
+    env:
+      AWS_OIDC_TOKEN_PATH: ${{ vaults.abq_development.oidc.aws.path }}
+      ABQ_VERSION: ${{ init.abq-version }}
+    run: |
+      mkdir -p abq-bin
+      aws s3 cp "s3://abq-releases-staging/abq/$ABQ_VERSION/linux/x86_64/abq" abq-bin/abq
+      chmod +x abq-bin/abq
+    outputs:
+      artifacts:
+        - key: abq
+          path: abq-bin/abq
+
+  - key: launch
+    use: [code, gems, npm, system]
+    cache: false
+    timeout: 10m
+    terminate-grace-period-seconds: 60
+    env:
+      ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ vaults.abq_development.secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
+      ABQ_VERSION: ${{ init.abq-version }}
+      ABQ_BINARY: ${{ tasks.binary.artifacts.abq }}
+    run: |
+      sudo install "$ABQ_BINARY" /usr/local/bin/abq
+      trap 'if [[ -f .dev_queue_state/id ]]; then bin/manage_dev_queue stop; fi' ERR
+      trap 'if [[ -f .dev_queue_state/id ]]; then bin/manage_dev_queue stop; fi; exit 143' TERM
+      timeout 8m bin/manage_dev_queue start "$ABQ_VERSION"
+
+  - key: single-benchmarks
+    use: launch
+    cache: false
+    timeout: 15m
+    run: |
+      unset RWX_ACCESS_TOKEN
+      result=0
+      node bigtest/benchmark_rspec/bench.js || result=$?
+      node bigtest/benchmark_jest/bench.js || result=$?
+      exit "$result"
+    outputs:
+      artifacts:
+        - key: rspec
+          path: bigtest/benchmark_rspec/out/exports
+        - key: jest
+          path: bigtest/benchmark_jest/out/exports
+
+  - key: parallel-benchmarks
+    use: launch
+    parallel: 10
+    cache: false
+    timeout: 15m
+    run: |
+      unset RWX_ACCESS_TOKEN
+      ABQ_ONLY=1 node bigtest/benchmark_rspec/bench.js
+      source bigtest/benchmark_rspec/out/exports
+      jq -n --arg abq "$ABQ_WORKER_TIME" --argjson shard "$RWX_PARALLEL_INDEX" \
+        '{shard: $shard, abq: $abq}' > "$RWX_ARTIFACTS/result.json"
+
+  - key: fuzz-result-sizes
+    use: launch
+    cache: false
+    timeout: 15m
+    run: |
+      unset RWX_ACCESS_TOKEN
+      bigtest/fuzz_result_sizes/test.sh
+
+  - key: summary
+    use: [code, node]
+    env:
+      RSPEC_RESULTS: ${{ tasks.single-benchmarks.artifacts.rspec }}
+      JEST_RESULTS: ${{ tasks.single-benchmarks.artifacts.jest }}
+      PARALLEL_RESULTS: ${{ tasks.parallel-benchmarks.artifacts['result.json'] }}
+    run: |
+      source "$RSPEC_RESULTS"
+      {
+        echo "RSpec: $ABQ_WORKER_OVERHEAD% overhead (raw $RAW_TIME s, ABQ $ABQ_WORKER_TIME s)"
+        jq -s . "$PARALLEL_RESULTS"/*/result.json | node scripts/concurrent_bench_summary.js "$RAW_TIME"
+        source "$JEST_RESULTS"
+        echo "Jest: $ABQ_WORKER_OVERHEAD% overhead (raw $RAW_TIME s, ABQ $ABQ_WORKER_TIME s)"
+      } | tee "$RWX_ARTIFACTS/benchmarks.txt"
+
+  - key: cleanup
+    use: launch
+    after: ${{ (single-benchmarks.finished || single-benchmarks.aborted || single-benchmarks.skipped) && (parallel-benchmarks.finished || parallel-benchmarks.aborted || parallel-benchmarks.skipped) && (fuzz-result-sizes.finished || fuzz-result-sizes.aborted || fuzz-result-sizes.skipped) }}
+    cache: false
+    env:
+      ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ vaults.abq_development.secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
+    run: bin/manage_dev_queue stop
