@@ -1,7 +1,7 @@
 name: Migrate staging secrets to RWX
 
 on:
-  workflow_dispatch:
+  push:
 
 permissions: {}
 
