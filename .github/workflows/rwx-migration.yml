@@ -1,0 +1,32 @@
+name: Migrate staging secrets to RWX
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Install RWX CLI
+        run: |
+          curl -fsSL https://github.com/rwx-cloud/rwx/releases/download/v3.33.0/rwx-linux-x86_64 -o "$RUNNER_TEMP/rwx"
+          chmod +x "$RUNNER_TEMP/rwx"
+          "$RUNNER_TEMP/rwx" --version
+
+      - name: Copy staging secrets to abq_development
+        env:
+          RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+          ABQ_CREATE_MANUAL_ACCESS_TOKEN: ${{ secrets.ABQ_CREATE_MANUAL_ACCESS_TOKEN }}
+          RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN: ${{ secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}
+        run: |
+          # Fail before writing either secret if a source value is missing.
+          : "${RWX_ACCESS_TOKEN:?Set RWX_ACCESS_TOKEN with permission to write vault secrets}"
+          : "${ABQ_CREATE_MANUAL_ACCESS_TOKEN:?Missing GitHub secret}"
+          : "${RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN:?Missing GitHub secret}"
+
+          "$RUNNER_TEMP/rwx" vaults secrets set --vault abq_development \
+            "ABQ_CREATE_MANUAL_ACCESS_TOKEN=$ABQ_CREATE_MANUAL_ACCESS_TOKEN" \
+            "RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN=$RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN"
