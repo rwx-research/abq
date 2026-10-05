@@ -959,7 +959,13 @@ async fn execute_all_tests<'a>(
         };
     }
 
-    let results_batch_size = results_batch_size as usize;
+    let refill_strategy = if results_batch_size == 0 {
+        RefillStrategy::OnDemand
+    } else {
+        RefillStrategy::HalfConsumed
+    };
+    // On-demand execution sends results individually, but channels still need capacity.
+    let results_batch_size = results_batch_size.max(1) as usize;
 
     // Assume that the size of the test batches we'll receive from the queue are
     // roughly the same size as the size of the batches of test results we send back.
@@ -968,8 +974,7 @@ async fn execute_all_tests<'a>(
     // While we likely don't gain much from using a channel of unbounded size, it's important to
     // take care that we refill the channel at a frequency that avoids blocking execution on the
     // native test runner.
-    let (tests_tx, mut tests_rx) =
-        message_buffer::channel(results_batch_size, RefillStrategy::HalfConsumed);
+    let (tests_tx, mut tests_rx) = message_buffer::channel(results_batch_size, refill_strategy);
 
     let fetch_tests_task = tests_tx.start(NextBundleFetcher { test_fetcher });
 

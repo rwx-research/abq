@@ -68,6 +68,7 @@ pub struct WorkerPoolConfig<'a> {
     /// How runners should communicate.
     pub runner_strategy_generator: &'a dyn runner_strategy::StrategyGenerator,
     /// How many results should be sent back at a time?
+    /// Zero sends results individually and disables test prefetching.
     pub results_batch_size_hint: u64,
     /// Context under which workers should operate.
     pub worker_context: WorkerContext,

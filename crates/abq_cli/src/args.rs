@@ -1,6 +1,6 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroUsize,
     path::PathBuf,
 };
 
@@ -340,9 +340,16 @@ pub enum Command {
         #[clap(long, default_value = "default")]
         reporter: Vec<ReporterKind>,
 
-        /// How many tests to send to a worker a time.
-        #[clap(long, default_value = "7", env("ABQ_BATCH_SIZE"))]
-        batch_size: NonZeroU64,
+        /// How many tests to send to a worker at a time. Zero fetches one test on demand,
+        /// without prefetching. By-file scheduling still assigns whole files.
+        /// Defaults to 0 with --local, otherwise 7.
+        #[clap(
+            long,
+            default_value = "7",
+            default_value_if("local", "true", "0"),
+            env("ABQ_BATCH_SIZE")
+        )]
+        batch_size: u64,
 
         /// How ABQ will distribute the tests.
         ///
@@ -527,6 +534,33 @@ mod test {
     use clap::CommandFactory;
 
     use super::Cli;
+
+    #[test]
+    fn batch_size_defaults_and_overrides() {
+        for (options, expected) in [
+            (vec![], 7),
+            (vec!["--local"], 0),
+            (vec!["--batch-size", "0"], 0),
+            (vec!["--local", "--batch-size", "3"], 3),
+        ] {
+            // Remove environment bindings so the caller's environment cannot change defaults.
+            let command = Cli::command().mut_subcommand("test", |command| {
+                command
+                    .mut_arg("batch_size", |arg| arg.env(None::<&str>))
+                    .mut_arg("local", |arg| arg.env(None::<&str>))
+            });
+            let matches = command
+                .try_get_matches_from(
+                    ["abq", "test"]
+                        .into_iter()
+                        .chain(options)
+                        .chain(["--", "test-runner"]),
+                )
+                .unwrap();
+            let test = matches.subcommand_matches("test").unwrap();
+            assert_eq!(*test.get_one::<u64>("batch_size").unwrap(), expected);
+        }
+    }
 
     #[test]
     fn cli_argument_definitions_are_valid() {

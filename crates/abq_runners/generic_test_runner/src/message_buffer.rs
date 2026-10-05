@@ -27,6 +27,7 @@ impl<T> std::fmt::Debug for Msg<T> {
 pub(crate) struct BatchedProducer<T> {
     msg_tx: mpsc::Sender<Msg<T>>,
     refill_rx: mpsc::Receiver<()>,
+    wait_for_initial_demand: bool,
 }
 
 pub(crate) struct BatchedConsumer<T> {
@@ -45,10 +46,13 @@ pub(crate) struct BatchedConsumer<T> {
 }
 
 /// When a producer should refill the batch buffer of messages.
+#[derive(Clone, Copy)]
 pub(crate) enum RefillStrategy {
     /// The producer should begin to refill the buffer with a new batch when the last batch is
     /// half-consumed.
     HalfConsumed,
+    /// Fetch only when the consumer asks for work after processing the previous batch.
+    OnDemand,
 }
 
 /// Create (producer, consumer) channels for processing batched messages.
@@ -61,7 +65,11 @@ pub(crate) fn channel<T>(
     let (msg_tx, msg_rx) = mpsc::channel(capacity * 2);
     let (refill_tx, refill_rx) = mpsc::channel(1);
 
-    let producer = BatchedProducer { msg_tx, refill_rx };
+    let producer = BatchedProducer {
+        msg_tx,
+        refill_rx,
+        wait_for_initial_demand: matches!(refill_strategy, RefillStrategy::OnDemand),
+    };
     let consumer = BatchedConsumer {
         msg_rx,
         refill_tx,
@@ -92,6 +100,10 @@ impl<T> BatchedProducer<T> {
     where
         F: FetchMessages<T = T>,
     {
+        if self.wait_for_initial_demand && self.refill_rx.recv().await.is_none() {
+            return Ok(());
+        }
+
         loop {
             let (msgs, completed) = fetcher.fetch().await.located(here!())?;
 
@@ -137,6 +149,14 @@ pub(crate) enum RecvMsg<T> {
 impl<T> BatchedConsumer<T> {
     /// Returns the next message in the channel, or [None] if the channel is complete.
     pub async fn recv(&mut self) -> Option<RecvMsg<T>> {
+        if matches!(self.refill_strategy, RefillStrategy::OnDemand)
+            && self.eligible_for_refill
+            && self.current_batch_processed == self.current_batch_size
+        {
+            let _err = self.refill_tx.send(()).await;
+            self.eligible_for_refill = false;
+        }
+
         // If the channel is closed, we're all done.
         let msg = self.msg_rx.recv().await?;
 
@@ -164,6 +184,7 @@ impl<T> BatchedConsumer<T> {
                 RefillStrategy::HalfConsumed => {
                     self.current_batch_processed >= self.current_batch_size / 2
                 }
+                RefillStrategy::OnDemand => false,
             };
 
         if should_refill {
@@ -223,6 +244,68 @@ mod test {
     use async_trait::async_trait;
 
     use super::{channel, Eow, FetchMessages, RecvMsg, RefillStrategy};
+
+    #[tokio::test]
+    async fn on_demand_does_not_fetch_until_consumer_is_ready() {
+        struct Fetcher(Arc<AtomicU8>);
+
+        #[async_trait]
+        impl FetchMessages for Fetcher {
+            type T = u8;
+            type Iter = std::array::IntoIter<u8, 1>;
+
+            async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError> {
+                let n = self.0.fetch_add(1, atomic::ORDERING) + 1;
+                Ok(([n].into_iter(), Eow(n == 3)))
+            }
+        }
+
+        let count = Arc::new(AtomicU8::new(0));
+        let (tx, mut rx) = channel(1, RefillStrategy::OnDemand);
+        let producer = tx.start(Fetcher(count.clone()));
+        tokio::pin!(producer);
+
+        assert!(futures::poll!(&mut producer).is_pending());
+        assert_eq!(count.load(atomic::ORDERING), 0);
+
+        for n in 1..=3 {
+            assert!(futures::poll!(Box::pin(rx.recv())).is_pending());
+            assert!(futures::poll!(&mut producer).is_pending());
+            assert_eq!(rx.recv().await, Some(RecvMsg::Item(n)));
+
+            // Poll the producer while the consumer is busy executing this test. Even
+            // with a one-test batch, it must not fetch another test in the background.
+            let status = futures::poll!(&mut producer);
+            assert_eq!(count.load(atomic::ORDERING), n);
+            if n < 3 {
+                assert!(status.is_pending());
+            } else {
+                assert!(status.is_ready());
+            }
+            assert_eq!(rx.recv().await, Some(RecvMsg::FlushProcessed));
+        }
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn on_demand_shutdown_before_first_request_does_not_fetch() {
+        struct Fetcher;
+
+        #[async_trait]
+        impl FetchMessages for Fetcher {
+            type T = u8;
+            type Iter = std::array::IntoIter<u8, 1>;
+
+            async fn fetch(&mut self) -> Result<(Self::Iter, Eow), FetchTestsError> {
+                panic!("shutdown must not fetch work");
+            }
+        }
+
+        let (tx, rx) = channel(1, RefillStrategy::OnDemand);
+        let (result, remaining) = tokio::join!(tx.start(Fetcher), rx.flush());
+        result.unwrap();
+        assert!(remaining.is_empty());
+    }
 
     async fn run_channels<F, E, C, CFut>(
         capacity: usize,
