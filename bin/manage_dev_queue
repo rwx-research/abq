@@ -46,7 +46,10 @@ start () {
     exit 1
   fi
 
-  instance_id=$(echo "$create_output" | jq -r '.instance_id')
+  instance_id=$(echo "$create_output" | jq -er '.instance_id')
+  # Persist the ID before polling so CI can stop the queue if startup times out.
+  mkdir -p "$STATEDIR"
+  echo "$instance_id" > "$INSTANCE_FILE"
   echoerr "Waiting for $instance_id to be healthy..."
   while : ; do
     data="$(fetch_state $instance_id)"
@@ -59,8 +62,6 @@ start () {
     sleep 1
   done
 
-  mkdir -p $STATEDIR
-  echo "$instance_id" > $INSTANCE_FILE
   echo "$data" | jq -r '.tls_public_certificate' > $CERT_FILE
   echo "$(echo "$data" | jq -r '.public_host')" > $HOST_FILE
   echo "$(echo "$data" | jq -r '.queue_port')" > $PORT_FILE
@@ -85,11 +86,11 @@ stop () {
     exit 1
   fi
 
-  curl "$MANUAL_API" \
+  curl --fail-with-body --silent --show-error --max-time 45 "$MANUAL_API" \
     -X DELETE \
     -H "$AUTH_HEADER" \
     -H 'Content-Type: application/x-www-form-urlencoded; charset=utf-8' \
-    --data-urlencode "id=$(cat $INSTANCE_FILE)" 2> /dev/null
+    --data-urlencode "id=$(cat $INSTANCE_FILE)"
 
   rm -rf $STATEDIR
 }

@@ -1,0 +1,53 @@
+package: true
+
+tool-cache:
+  vault: abq_main
+
+tasks:
+  - key: system
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y build-essential musl-tools pkg-config libssl-dev
+      sudo apt-get clean
+
+  - key: rust-components
+    use: package.use
+    filter: [rust-toolchain.toml]
+    run: |
+      curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none
+      export PATH="$HOME/.cargo/bin:$PATH"
+      echo "$HOME/.cargo/bin" > "$RWX_ENV/PATH"
+      rustup component add clippy rustfmt
+      rustup target add x86_64-unknown-linux-musl
+      echo x86_64-unknown-linux-musl > "$RWX_ENV/RUST_TARGET"
+      echo 1 > "$RWX_ENV/ABQ_DEVELOPMENT_BUILD"
+
+  - key: nextest
+    run: |
+      curl -fsSL https://get.nexte.st/0.9.82/linux | tar xz -C /tmp
+      sudo install /tmp/cargo-nextest /usr/local/bin/cargo-nextest
+      rm /tmp/cargo-nextest
+
+  - key: captain
+    call: rwx/install-captain 1.2.0
+
+  - key: node
+    call: nodejs/install 1.2.0
+    with:
+      node-version: "24.21.0"
+
+  - key: yarn
+    use: node
+    run: |
+      npm install --global --prefix "$HOME/.local" yarn@1.22.22
+      echo "$HOME/.local/bin" > "$RWX_ENV/PATH"
+
+  - key: test-dependencies
+    use: [package.use, yarn]
+    tool-cache: abq-test-dependencies
+    filter:
+      - testdata/jest/**/package.json
+      - testdata/jest/**/package-lock.json
+    run: |
+      npm ci --include=dev --prefix testdata/jest/npm-jest-project
+      npm ci --include=dev --prefix testdata/jest/npm-jest-project-with-failures

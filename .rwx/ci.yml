@@ -1,0 +1,164 @@
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      branch: ${{ event.git.branch }}
+  github:
+    push:
+      init:
+        commit-sha: ${{ event.git.sha }}
+        branch: ${{ event.git.branch }}
+
+# Let an in-flight benchmark finish and clean up its remote queue.
+concurrency-pools:
+  - id: abq-ci-${{ init.branch }}
+    capacity: 1
+    on-overflow: queue
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+tool-cache:
+  vault: abq_main
+
+tasks:
+  - key: aws-cli
+    call: aws/install-cli 1.1.0
+
+  - key: staging-role
+    use: code
+    filter: []
+    call: aws/assume-role 2.1.0
+    with:
+      region: us-east-2
+      role-to-assume: ${{ vaults.abq_development.vars.AWS_ABQ_RELEASES_STAGING_ROLE }}
+
+  - key: staging-access
+    use: [aws-cli, staging-role]
+    cache: false
+    env:
+      AWS_OIDC_TOKEN_PATH: ${{ vaults.abq_development.oidc.aws.path }}
+    run: aws sts get-caller-identity
+
+  - key: code
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/rwx-research/abq.git
+      ref: ${{ init.commit-sha }}
+      preserve-git-dir: true
+      fetch-full-depth: true
+
+  - key: setup
+    use: code
+    call: ${{ run.dir }}/packages/setup.yml
+
+  - key: lint-tools
+    run: |
+      curl -fsSL https://github.com/crate-ci/typos/releases/download/v1.50.2/typos-v1.50.2-x86_64-unknown-linux-musl.tar.gz | tar xz -C /tmp ./typos
+      sudo install /tmp/typos /usr/local/bin/typos
+      curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz | tar xz -C /tmp actionlint
+      sudo install /tmp/actionlint /usr/local/bin/actionlint
+      sudo apt-get update
+      sudo apt-get install -y shellcheck
+      sudo apt-get clean
+
+  - key: typos
+    use: [code, lint-tools]
+    run: typos
+
+  - key: actionlint
+    use: [code, lint-tools]
+    run: actionlint -color
+
+  - key: format
+    use: [code, setup.rust-components]
+    run: cargo fmt -- --check
+
+  - key: queue-script-test
+    use: code
+    run: bash scripts/test_manage_dev_queue
+
+  - key: clippy
+    use: [code, setup.system, setup.rust-components]
+    tool-cache: abq-clippy-musl
+    timeout: 30m
+    runner:
+      cpus: 8
+      memory: 32gb
+    run: |
+      # The version build script reads git history, which Cargo does not track.
+      # Do not reuse an abq_utils version from an earlier tool-cache layer.
+      cargo clean -p abq_utils --profile=release-unstable --target="$RUST_TARGET"
+      cargo clippy --locked --workspace --tests --profile=release-unstable --all-features --target="$RUST_TARGET" -- --deny warnings
+
+  - key: build
+    use: [code, setup.system, setup.rust-components]
+    tool-cache: abq-build-musl
+    timeout: 30m
+    runner:
+      cpus: 8
+      memory: 32gb
+    run: |
+      cargo clean -p abq_utils --profile=release-unstable --target="$RUST_TARGET"
+      cargo build --locked --tests --bins --profile=release-unstable --all-features --target="$RUST_TARGET"
+      cat build_artifact/abq_version.txt > "$RWX_VALUES/abq-version"
+    outputs:
+      artifacts:
+        - key: abq
+          path: target/x86_64-unknown-linux-musl/release-unstable/abq
+        - key: abq-tester-harness
+          path: target/x86_64-unknown-linux-musl/release-unstable/abq_tester_harness
+        - key: version
+          path: build_artifact/abq_version.txt
+
+  - key: test
+    use: [build, setup.nextest, setup.captain, setup.test-dependencies]
+    timeout: 5m
+    runner:
+      cpus: 4
+      memory: 16gb
+    env:
+      CI: "false"
+    run: |
+      mkdir -p "$RWX_RETRY_ACTIONS/debug/env"
+      echo 'Retry with debug output' > "$RWX_RETRY_ACTIONS/debug/label"
+      echo 1 > "$RWX_RETRY_ACTIONS/debug/env/ABQ_DEBUG_CLI_TESTS_FOR_CI"
+      captain run test-abq
+
+  - key: publish-staging
+    use: [code, aws-cli, staging-role]
+    after: [test, clippy, format, typos, actionlint, queue-script-test, staging-access]
+    cache: false
+    env:
+      AWS_OIDC_TOKEN_PATH: ${{ vaults.abq_development.oidc.aws.path }}
+      RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN: ${{ vaults.abq_development.secrets.RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN }}
+      ABQ_VERSION: ${{ tasks.build.values.abq-version }}
+      ABQ_BINARY: ${{ tasks.build.artifacts.abq }}
+      HARNESS_BINARY: ${{ tasks.build.artifacts.abq-tester-harness }}
+    run: |
+      export RELEASE_BUCKET=abq-releases-staging
+      export RELEASE_DIR="abq_${ABQ_VERSION}_linux_x86-64"
+      export RELEASE_ARCHIVE="${RELEASE_DIR}.tar.gz"
+      export RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/${RELEASE_ARCHIVE}"
+      export RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/abq_nightly_linux_x86-64
+      export NEW_RELEASE_S3_OBJECT="abq/${ABQ_VERSION}/linux/x86_64/abq"
+      export NEW_RELEASE_S3_NIGHTLY_OBJECT=abq/nightly/linux/x86_64/abq
+      export NEW_RELEASE_S3_OBJECT_TESTER_HARNESS="abq/${ABQ_VERSION}/linux/x86_64/abq_tester_harness"
+      export NEW_RELEASE_S3_NIGHTLY_OBJECT_TESTER_HARNESS=abq/nightly/linux/x86_64/abq_tester_harness
+      mkdir "$RELEASE_DIR"
+      cp "$ABQ_BINARY" "$RELEASE_DIR/abq"
+      cp "$HARNESS_BINARY" "$RELEASE_DIR/abq_tester_harness"
+      tar -czf "$RELEASE_ARCHIVE" "$RELEASE_DIR"
+      scripts/upload-to-aws.sh
+      curl --fail-with-body --silent --show-error \
+        -X POST https://cloud.rwxstaging.com/abq/api/releases \
+        -H "Authorization: Bearer $RWX_STAGING_CREATE_RELEASE_ACCESS_TOKEN" \
+        --data-urlencode "version=$ABQ_VERSION"
+
+  - key: bigtest
+    after: publish-staging
+    call: ${{ run.dir }}/bigtest.yml
+    init:
+      commit-sha: ${{ init.commit-sha }}
+      abq-version: ${{ tasks.build.values.abq-version }}

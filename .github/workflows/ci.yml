@@ -1,37 +1,49 @@
 name: CI
 
 on:
-  - push
+  push:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  test_and_package_development:
-    name: Test and package development build
-    uses: ./.github/workflows/test_and_package_development.yml
+  ci:
+    name: Wait for RWX CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
-      id-token: write
-    with:
-      ref: ${{ github.ref }}
-    secrets: inherit
-
-  bigtest:
-    needs: test_and_package_development
-    uses: ./.github/workflows/bigtest.yml
-    permissions:
-      contents: read
-      id-token: write
-      pull-requests: write
-    secrets: inherit
-    with:
-      version: ${{ needs.test_and_package_development.outputs.abq_version }}
+    steps:
+      - name: Install RWX CLI
+        run: |
+          curl -fsSL https://github.com/rwx-cloud/rwx/releases/download/v3.33.0/rwx-linux-x86_64 -o "$RUNNER_TEMP/rwx"
+          chmod +x "$RUNNER_TEMP/rwx"
+      - name: Wait for this commit's native RWX run
+        env:
+          RWX_ACCESS_TOKEN: ${{ secrets.RWX_ACCESS_TOKEN }}
+        run: |
+          # The push webhook may reach GitHub Actions before RWX. Resolve the
+          # run first, then wait once; never retry a completed failing CI run.
+          run_id=""
+          for _ in {1..60}; do
+            "$RUNNER_TEMP/rwx" results --repo "$GITHUB_REPOSITORY" --branch main \
+              --commit "$GITHUB_SHA" --definition .rwx/ci.yml --json \
+              > "$RUNNER_TEMP/rwx-results.json" || true
+            run_id=$(jq -r '.RunID // empty' "$RUNNER_TEMP/rwx-results.json")
+            if [[ -n "$run_id" ]]; then break; fi
+            sleep 5
+          done
+          if [[ -z "$run_id" ]]; then
+            echo "No RWX CI run found for $GITHUB_SHA" >&2
+            exit 1
+          fi
+          "$RUNNER_TEMP/rwx" results "$run_id" --wait
 
   release_unstable:
     name: Release new abq to API
-    needs: bigtest
+    needs: ci
     if: github.ref == 'refs/heads/main'
     uses: ./.github/workflows/build_and_upload.yml
     permissions:
