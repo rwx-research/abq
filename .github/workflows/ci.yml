@@ -28,7 +28,7 @@ jobs:
           # run first, then wait once; never retry a completed failing CI run.
           run_id=""
           for _ in {1..60}; do
-            "$RUNNER_TEMP/rwx" results --repo "$GITHUB_REPOSITORY" --branch main \
+            "$RUNNER_TEMP/rwx" results --repo abq --branch main \
               --commit "$GITHUB_SHA" --definition .rwx/ci.yml --json \
               > "$RUNNER_TEMP/rwx-results.json" || true
             run_id=$(jq -r '.RunID // empty' "$RUNNER_TEMP/rwx-results.json")
