@@ -32,7 +32,7 @@ on:
         required: true
       RWX_PRODUCTION_CREATE_RELEASE_ACCESS_TOKEN:
         required: true
-      RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT:
+      RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT_2027:
         required: true
       RWX_APPLE_APP_STORE_CONNECT_API_KEY:
         required: true
@@ -176,7 +176,7 @@ jobs:
           echo "submission_id=$submission_id" >> "$GITHUB_OUTPUT"
         env:
           CODESIGN_VERSION: 0.22.0
-          RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT: ${{ secrets.RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT }}
+          RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT: ${{ secrets.RWX_APPLE_DEVELOPER_ID_APPLICATION_CERT_2027 }}
           RWX_APPLE_APP_STORE_CONNECT_API_KEY: ${{ secrets.RWX_APPLE_APP_STORE_CONNECT_API_KEY }}
       - name: ensure sign & notary cleanup happens
         if: matrix.os == 'darwin' && always()
