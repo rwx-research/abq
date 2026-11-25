@@ -367,6 +367,20 @@ impl Manifest {
         collected
     }
 
+    /// Keeps only the tests whose ID satisfies `keep`, dropping groups left without tests.
+    pub fn retain_tests(&mut self, mut keep: impl FnMut(&TestId) -> bool) {
+        fn retain(members: &mut Vec<v0_2::TestOrGroup>, keep: &mut impl FnMut(&TestId) -> bool) {
+            members.retain_mut(|member| match member {
+                v0_2::TestOrGroup::Test(test) => keep(&test.id),
+                v0_2::TestOrGroup::Group(group) => {
+                    retain(&mut group.members, keep);
+                    !group.members.is_empty()
+                }
+            });
+        }
+        retain(&mut self.members, &mut keep);
+    }
+
     #[inline]
     fn add_test_to_collected(
         v0_2::Test { id, meta, .. }: v0_2::Test,
@@ -452,6 +466,30 @@ mod test_manifest {
                 .into(),
             ),
             TestOrGroup::Group(_) => panic!("expected a test"),
+        }
+    }
+
+    #[test]
+    fn retain_tests_drops_tests_and_emptied_groups() {
+        let mut manifest = super::Manifest {
+            members: vec![
+                group([test("a"), group([test("b")]), test("c")]),
+                group([test("d"), group([test("e")])]),
+                test("f"),
+            ],
+            init_meta: Map::new(),
+        };
+        manifest.retain_tests(|id| !["b", "c", "d", "e", "f"].contains(&id.as_str()));
+
+        let remaining: Vec<_> = super::Manifest::flatten_manifest(manifest.members.clone())
+            .into_iter()
+            .map(|(spec, _)| spec.test_case.id().clone())
+            .collect();
+        assert_eq!(remaining, vec!["a".to_string()]);
+        assert_eq!(manifest.members.len(), 1, "emptied groups must be dropped");
+        match &manifest.members[0] {
+            TestOrGroup::Group(g) => assert_eq!(g.members.len(), 1),
+            TestOrGroup::Test(_) => panic!("expected the group holding `a`"),
         }
     }
 

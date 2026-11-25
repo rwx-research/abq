@@ -13,13 +13,14 @@ use abq_utils::{
 use async_trait::async_trait;
 use tracing::instrument;
 
-use crate::test_fetching;
+use crate::{resume::ResumeLog, test_fetching};
 
 /// A results handler that dispatches results to the remote queue, and also any local handlers.
 pub(crate) struct MultiplexingResultsHandler {
     remote_handler: Option<QueueResultsSender>,
     local_handler: SharedResultsHandler,
     results_retry_tracker: test_fetching::ResultsTracker,
+    resume_log: Option<ResumeLog>,
 }
 
 impl MultiplexingResultsHandler {
@@ -27,11 +28,13 @@ impl MultiplexingResultsHandler {
         remote_handler: Option<QueueResultsSender>,
         local_handler: SharedResultsHandler,
         results_retry_tracker: test_fetching::ResultsTracker,
+        resume_log: Option<ResumeLog>,
     ) -> Self {
         Self {
             remote_handler,
             local_handler,
             results_retry_tracker,
+            resume_log,
         }
     }
 }
@@ -41,6 +44,14 @@ impl NotifyResults for MultiplexingResultsHandler {
     #[instrument(level="trace", skip_all, fields(results=results.len()))]
     async fn send_results(&mut self, results: Vec<AssociatedTestResults>) {
         self.results_retry_tracker.account_results(results.iter());
+        if let Some(resume_log) = &self.resume_log {
+            for result in results.iter() {
+                match self.results_retry_tracker.test_id(result.work_id) {
+                    Some(test_id) => resume_log.record(test_id, result.clone()),
+                    None => tracing::warn!(work_id=?result.work_id, "result for unknown work"),
+                }
+            }
+        }
         if let Some(remote_handler) = self.remote_handler.as_mut() {
             let ((), ()) = tokio::join!(
                 remote_handler.send_results(results.clone()),

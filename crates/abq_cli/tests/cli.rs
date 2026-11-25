@@ -9,7 +9,7 @@ use abq_test_utils::{artifacts_dir, s, sanitize_output, write_to_temp, WORKSPACE
 use abq_utils::auth::{AdminToken, UserToken};
 use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::runners::{
-    AbqProtocolVersion, InitSuccessMessage, Manifest, ManifestMessage, RawTestResultMessage,
+    AbqProtocolVersion, Group, InitSuccessMessage, Manifest, ManifestMessage, RawTestResultMessage,
     Status, Test, TestOrGroup,
 };
 use abq_utils::net_protocol::runners::{
@@ -6147,4 +6147,175 @@ fn test_with_org_access_token_and_auto_generated_run_id() {
             "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
         );
     }
+}
+
+#[test]
+#[with_protocol_version]
+#[serial]
+fn local_run_resumes_after_spot_interruption() {
+    let name = "local_run_resumes_after_spot_interruption";
+    let proto = AbqProtocolVersion::V0_2.get_supported_witness().unwrap();
+
+    // Groups exercise dropping completed tests from a nested manifest.
+    let test = |id: &str| TestOrGroup::test(Test::new(proto, id, [], Default::default()));
+    let group = |members: Vec<_>| {
+        TestOrGroup::group(Group::new(proto, "group", members, [], Default::default()))
+    };
+    let manifest = vec![
+        group(vec![test("test0"), test("test1")]),
+        group(vec![test("test2"), test("test3")]),
+    ];
+    let manifest = ManifestMessage::new(Manifest::new(manifest, Default::default()));
+
+    let simulation = |run_tests: Vec<_>| {
+        let mut else_do = vec![
+            OpaqueRead,
+            OpaqueWrite(pack(InitSuccessMessage::new(proto))),
+        ];
+        else_do.extend(run_tests);
+        pack_msgs_to_disk([
+            Connect,
+            OpaqueWrite(pack(legal_spawned_message(proto))),
+            IfGenerateManifest {
+                then_do: vec![OpaqueWrite(pack(&manifest))],
+                else_do,
+            },
+            Exit(0),
+        ])
+    };
+    let failure = Status::Failure {
+        exception: None,
+        backtrace: None,
+    };
+
+    let tempdir = TempDir::new().unwrap();
+    let results_json = tempdir.path().join("results.json");
+    let test_args = |simulation: &abq_native_runner_simulation::PackedFile| {
+        vec![
+            s!("test"),
+            s!("--local"),
+            s!("-n=1"),
+            s!("--color=never"),
+            s!("--reporter=line"),
+            format!("--reporter=rwx-v1-json={}", results_json.display()),
+            s!("--"),
+            native_runner_simulation_bin(),
+            simulation.path.display().to_string(),
+        ]
+    };
+    let num_json_tests = || {
+        let results: json::Value =
+            json::from_str(&std::fs::read_to_string(&results_json).unwrap()).unwrap();
+        results["tests"].as_array().unwrap().len()
+    };
+
+    // Attempt 1: test0 passes and test1 fails, then the spot interruption notice comes in while
+    // test2 is running.
+    let retry_actions = tempdir.path().join("retry-actions");
+    let notice_file = tempdir.path().join("spot-interruption-notice");
+    std::fs::create_dir_all(tempdir.path().join("tmp1")).unwrap();
+    let simulation1 = simulation(vec![
+        IfAliveReadAndWriteFake(Status::Success),
+        IfAliveReadAndWriteFake(failure.clone()),
+        OpaqueRead,
+        Sleep(Duration::from_secs(600)),
+    ]);
+    let mut attempt1 = Abq::new(format!("{name}_attempt1"))
+        .args(test_args(&simulation1))
+        .env([
+            ("RWX_RETRY_ACTIONS", retry_actions.display().to_string()),
+            (
+                "RWX_SPOT_INTERRUPTION_FILE",
+                notice_file.display().to_string(),
+            ),
+            ("TMPDIR", tempdir.path().join("tmp1").display().to_string()),
+        ])
+        .spawn();
+    wait_for_line(attempt1.stdout.as_mut().unwrap(), ": FAILED");
+
+    std::fs::write(&notice_file, "2026-11-25T18:04:05Z\n").unwrap();
+
+    let attempt1 = attempt1.wait_with_output().unwrap();
+    assert_eq!(
+        attempt1.status.code(),
+        Some(86),
+        "STDERR:\n{}",
+        String::from_utf8_lossy(&attempt1.stderr)
+    );
+    let action = retry_actions.join("spot-interruption");
+    assert_eq!(
+        std::fs::read_to_string(action.join("env/RWX_SPOT_INTERRUPTION_RETRY")).unwrap(),
+        "true"
+    );
+    assert_eq!(num_json_tests(), 2, "results so far are written out");
+
+    let tmp2 = tempdir.path().join("tmp2");
+    std::fs::create_dir_all(&tmp2).unwrap();
+
+    // Attempt 2, as Mint retries it: only test2 and test3 run, and the results include all four.
+    let simulation2 = simulation(vec![
+        IfAliveReadAndWriteFake(Status::Success),
+        IfAliveReadAndWriteFake(Status::Success),
+        IfAliveReadAndWriteFake(Status::Success),
+        IfAliveReadAndWriteFake(Status::Success),
+    ]);
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(format!("{name}_attempt2"))
+        .args(test_args(&simulation2))
+        .env([
+            (
+                "RWX_RETRY_ACTIONS",
+                tempdir.path().join("retry-actions-2").display().to_string(),
+            ),
+            ("RWX_RETRY_DATA", action.join("data").display().to_string()),
+            ("RWX_SPOT_INTERRUPTION_RETRY", s!("true")),
+            (
+                "RWX_SPOT_INTERRUPTION_FILE",
+                tempdir.path().join("notice-2").display().to_string(),
+            ),
+            ("TMPDIR", tmp2.display().to_string()),
+        ])
+        .always_capture_stderr(true)
+        .run();
+    assert_eq!(
+        exit_status.code(),
+        Some(1),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("4 tests, 1 failures"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
+    assert_eq!(num_json_tests(), 4);
+
+    // A later run in the same retried task, such as Captain retrying failed tests, runs its tests
+    // rather than resuming again.
+    let CmdOutput {
+        stdout,
+        stderr,
+        exit_status,
+    } = Abq::new(format!("{name}_attempt2_retry"))
+        .args(test_args(&simulation2))
+        .env([
+            (
+                "RWX_RETRY_ACTIONS",
+                tempdir.path().join("retry-actions-2").display().to_string(),
+            ),
+            ("RWX_RETRY_DATA", action.join("data").display().to_string()),
+            ("RWX_SPOT_INTERRUPTION_RETRY", s!("true")),
+            (
+                "RWX_SPOT_INTERRUPTION_FILE",
+                tempdir.path().join("notice-2").display().to_string(),
+            ),
+            ("TMPDIR", tmp2.display().to_string()),
+        ])
+        .always_capture_stderr(true)
+        .run();
+    assert!(
+        exit_status.success() && stdout.contains("4 tests, 0 failures"),
+        "STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+    );
 }

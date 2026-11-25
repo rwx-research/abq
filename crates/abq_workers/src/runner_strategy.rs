@@ -22,6 +22,7 @@ use tracing::instrument;
 
 use crate::{
     results_handler::{MultiplexingResultsHandler, QueueResultsSender},
+    resume::ResumeLog,
     test_fetching,
     workers::{GetInitContext, InitContextResult, NotifyManifest, NotifyMaterialTestsAllRun},
     AssignedRunKind,
@@ -51,6 +52,7 @@ pub struct RunnerStrategyGenerator {
     max_run_number: u32,
     assigned: AssignedRunKind,
     should_send_results: bool,
+    resume_log: Option<ResumeLog>,
 }
 
 impl RunnerStrategyGenerator {
@@ -63,6 +65,7 @@ impl RunnerStrategyGenerator {
         max_run_number: u32,
         assigned: AssignedRunKind,
         should_send_results: bool,
+        resume_log: Option<ResumeLog>,
     ) -> Self {
         Self {
             client,
@@ -73,6 +76,7 @@ impl RunnerStrategyGenerator {
             max_run_number,
             assigned,
             should_send_results,
+            resume_log,
         }
     }
 }
@@ -88,6 +92,7 @@ impl StrategyGenerator for RunnerStrategyGenerator {
             max_run_number,
             assigned,
             should_send_results,
+            resume_log,
         } = &self;
 
         let sourcing_strategy = match assigned {
@@ -123,6 +128,7 @@ impl StrategyGenerator for RunnerStrategyGenerator {
                     entity: runner_entity,
                     client: client.boxed_clone(),
                     queue_results_addr: *queue_results_addr,
+                    resume_log: resume_log.clone(),
                 }
             }))
         } else {
@@ -143,6 +149,7 @@ impl StrategyGenerator for RunnerStrategyGenerator {
                 queue_handler,
                 local_results_handler.boxed_clone(),
                 results_retry_tracker,
+                resume_log.clone(),
             );
 
             Box::new(notifier)
@@ -269,6 +276,7 @@ struct SendManifestOnline {
     entity: Entity,
     client: Box<dyn net_async::ConfiguredClient>,
     queue_results_addr: SocketAddr,
+    resume_log: Option<ResumeLog>,
 }
 
 /// Asks the work server for native runner initialization context.
@@ -276,13 +284,20 @@ struct SendManifestOnline {
 #[async_trait]
 impl ManifestSender for SendManifestOnline {
     #[instrument(level = "trace", skip_all, fields(run_id=?self.run_id, queue_server=?self.queue_results_addr))]
-    async fn send_manifest(self: Box<Self>, manifest_result: ManifestResult) {
+    async fn send_manifest(self: Box<Self>, mut manifest_result: ManifestResult) {
         let Self {
             run_id,
             entity,
             client,
             queue_results_addr,
+            resume_log,
         } = *self;
+
+        if let (Some(resume_log), ManifestResult::Manifest(reported)) =
+            (resume_log, &mut manifest_result)
+        {
+            resume_log.filter_manifest(&mut reported.manifest);
+        }
 
         let message = net_protocol::queue::Request {
             entity,

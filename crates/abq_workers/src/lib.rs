@@ -2,6 +2,7 @@ mod assigned_run;
 mod liveness;
 pub mod negotiate;
 pub mod results_handler;
+pub mod resume;
 mod runner_strategy;
 mod test_fetching;
 mod test_like_runner;

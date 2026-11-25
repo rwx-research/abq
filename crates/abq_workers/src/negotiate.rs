@@ -17,6 +17,7 @@ use tracing::{error, instrument};
 use crate::{
     assigned_run::AssignedRun,
     negotiate,
+    resume::ResumeLog,
     runner_strategy::RunnerStrategyGenerator,
     workers::{WorkerContext, WorkerPool, WorkerPoolConfig, WorkersExit, WorkersExitStatus},
     AssignedRunKind, AssignedRunStatus, GetAssignedRun,
@@ -123,6 +124,8 @@ pub struct WorkersConfig {
     pub should_send_results: bool,
     /// Handler to writing warnings to stderr, if any.
     pub warning_writer: Box<dyn ColorWriter + Send>,
+    /// If set, records completed tests, and skips the tests a previous attempt completed.
+    pub resume_log: Option<ResumeLog>,
 }
 
 #[derive(Debug, Error)]
@@ -251,6 +254,7 @@ impl WorkersNegotiator {
             test_timeout,
             should_send_results,
             mut warning_writer,
+            resume_log,
         } = workers_config;
 
         let AssignedRun {
@@ -278,6 +282,7 @@ impl WorkersNegotiator {
             max_run_number,
             assigned_kind,
             should_send_results,
+            resume_log,
         );
 
         tracing::debug!("Starting worker pool");
@@ -970,6 +975,7 @@ mod test {
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
             should_send_results: true,
             warning_writer: Box::new(NoopColorWriter),
+            resume_log: None,
         };
 
         let invoke_data = InvokeWork {

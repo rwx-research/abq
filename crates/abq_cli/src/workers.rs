@@ -10,13 +10,16 @@ use abq_utils::exit::ExitCode;
 use abq_utils::net_protocol::entity::{WorkerRunner, WorkerTag};
 use abq_utils::net_protocol::queue::{InvokeWork, TestStrategy};
 use abq_utils::net_protocol::workers::{RunId, RunnerKind};
+use abq_utils::results_handler::NotifyResults;
 use abq_utils::whitespace::is_blank;
 use abq_workers::negotiate::{
     NegotiatedWorkers, QueueNegotiatorHandle, WorkersConfig, WorkersNegotiator,
 };
+use abq_workers::resume::ResumeLog;
 use abq_workers::workers::{WorkerContext, WorkersExit, WorkersExitStatus};
 
 mod reporting;
+mod spot_interruption;
 
 use futures::stream::StreamExt;
 use signal_hook::consts::TERM_SIGNALS;
@@ -27,6 +30,7 @@ use crate::workers::reporting::create_reporting_task;
 use crate::QueueLocation;
 
 use self::reporting::ReportingTaskHandle;
+use self::spot_interruption::SpotInterruption;
 
 type ClientOptions = abq_utils::net_opt::ClientOptions<abq_utils::auth::User>;
 
@@ -78,6 +82,17 @@ pub async fn start_workers_standalone(
 
     let (reporting_proxy, reporting_handle) = create_reporting_task(reporters);
 
+    // Only local runs can resume after a spot interruption, since their queue lives and dies with
+    // this process.
+    let spot_interruption = match test_run_metadata.queue_location.is_remote() {
+        true => None,
+        false => SpotInterruption::from_env(),
+    };
+    let resume_log = match spot_interruption {
+        Some(_) => Some(resume_from_previous_attempt(reporting_proxy.clone()).await),
+        None => None,
+    };
+
     tracing::debug!(
         "Workers attaching to queue negotiator {}",
         queue_negotiator.get_address()
@@ -108,6 +123,7 @@ pub async fn start_workers_standalone(
             max_run_number,
             should_send_results: execution_mode == ExecutionMode::WriteNormal,
             warning_writer: stderr_writer,
+            resume_log: resume_log.clone(),
         },
         queue_negotiator,
         client_opts,
@@ -129,8 +145,45 @@ pub async fn start_workers_standalone(
             _ = term_signals.next() => {
                 do_cancellation_shutdown(worker_pool).await;
             }
+            () = spot_interruption_notice(&spot_interruption) => {
+                do_spot_interruption_shutdown(
+                    worker_pool,
+                    reporting_handle,
+                    spot_interruption.as_ref().unwrap(),
+                    resume_log.as_ref().unwrap(),
+                )
+                .await;
+            }
         }
     }
+}
+
+async fn spot_interruption_notice(spot_interruption: &Option<SpotInterruption>) {
+    match spot_interruption {
+        Some(spot_interruption) => spot_interruption.notice().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Starts this attempt where an interrupted previous attempt left off, if there was one: reports
+/// the tests it completed, and returns a log that skips them in this attempt.
+async fn resume_from_previous_attempt(mut reporting_proxy: impl NotifyResults) -> ResumeLog {
+    let completed_tests = match SpotInterruption::previous_attempt() {
+        Ok(completed_tests) => completed_tests,
+        Err(error) => {
+            eprintln!("Could not resume after spot interruption, running all tests: {error}");
+            vec![]
+        }
+    };
+    if !completed_tests.is_empty() {
+        eprintln!(
+            "Resuming after spot interruption: skipping {} tests completed by the interrupted attempt.",
+            completed_tests.len()
+        );
+        let results = completed_tests.iter().map(|t| t.results.clone()).collect();
+        reporting_proxy.send_results(results).await;
+    }
+    ResumeLog::resume_from(completed_tests)
 }
 
 fn runner_header(runner: &WorkerRunner) -> String {
@@ -246,6 +299,37 @@ async fn do_cancellation_shutdown(mut worker_pool: NegotiatedWorkers) -> ! {
     tracing::debug!("Workers cancelled");
 
     std::process::exit(ExitCode::CANCELLED.get());
+}
+
+/// Stops the run, records the tests completed so far for the retry Mint is about to start, and
+/// writes out the results reported so far.
+async fn do_spot_interruption_shutdown(
+    mut worker_pool: NegotiatedWorkers,
+    reporting_handle: ReportingTaskHandle,
+    spot_interruption: &SpotInterruption,
+    resume_log: &ResumeLog,
+) -> ! {
+    eprintln!("Received spot interruption notice; stopping so the run can resume on retry.");
+
+    worker_pool.cancel().await;
+    let WorkersExit {
+        native_runner_info, ..
+    } = worker_pool.shutdown().await;
+
+    // Record the completed tests first; the retry depends on them, and Mint gives us little time.
+    if let Err(error) = spot_interruption.write_retry_action(resume_log.completed()) {
+        eprintln!("Failed to record completed tests for the spot interruption retry: {error}");
+    }
+
+    let (_, errors) = reporting_handle
+        .join()
+        .await
+        .finish(&CompletedSummary { native_runner_info });
+    for error in errors {
+        eprintln!("{error}");
+    }
+
+    std::process::exit(spot_interruption::EXIT_CODE.get());
 }
 
 const MANIFEST_GENERATION_HEADER: &str =

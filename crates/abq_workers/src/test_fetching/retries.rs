@@ -341,6 +341,13 @@ impl ResultsTracker {
     ) {
         self.0.lock().account_results(results)
     }
+
+    /// The ID of the manifest entry assigned the given work ID, if it is part of the local manifest.
+    pub fn test_id(&self, work_id: WorkId) -> Option<TestId> {
+        let tracker = self.0.lock();
+        let index = *tracker.entry_indices.get(&work_id)?;
+        Some(tracker.entries[index].spec.test_case.id().clone())
+    }
 }
 
 pub fn build_tracking_pair(max_run_number: u32) -> (RetryTracker, ResultsTracker) {

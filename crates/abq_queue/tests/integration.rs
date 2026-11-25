@@ -265,6 +265,7 @@ impl WorkersConfigBuilder {
             test_timeout: DEFAULT_RUNNER_TEST_TIMEOUT,
             should_send_results: true,
             warning_writer: Box::new(NoopColorWriter),
+            resume_log: None,
         };
         Self {
             config,
