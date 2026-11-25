@@ -1,3 +1,14 @@
+## 1.11.0
+
+ABQ 1.11.0 is a minor release.
+
+When running `abq test --local` on [Mint](https://www.rwx.com/mint), ABQ now
+resumes where it left off after a spot instance interruption. When Mint gives
+notice of the interruption, ABQ stops, writes out the results reported so far,
+records the tests it completed in Mint's `spot-interruption` retry action, and
+exits with code 86. On Mint's retry, ABQ reports the recorded results and runs
+only the remaining tests.
+
 ## 1.8.1
 
 ABQ 1.8.1 improves the error messaging when attempting to retry a run that has been cancelled.
